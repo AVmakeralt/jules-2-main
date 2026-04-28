@@ -1156,16 +1156,16 @@ impl CommonSubexprEliminator {
         let stmts = std::mem::take(&mut block.stmts);
         for stmt in stmts {
             match stmt {
-                Stmt::Let { span, pattern, init: Some(expr), ty } => {
+                Stmt::Let { span, pattern, init: Some(expr), ty, mutable } => {
                     let (processed, extra) = self.eliminate_expr_collecting(expr, &mut emitted);
                     new_stmts.extend(extra);
                     // Invalidate cached exprs that reference any variable written here.
                     if let Pattern::Ident { name, .. } = &pattern {
                         self.invalidate_var(name);
                     }
-                    new_stmts.push(Stmt::Let { span, pattern, init: Some(processed), ty });
+                    new_stmts.push(Stmt::Let { span, pattern, init: Some(processed), ty, mutable });
                 }
-                Stmt::Expr { span, expr } => {
+                Stmt::Expr { span, expr, has_semi } => {
                     // If this is an assignment, flush cached exprs for the target.
                     if let Expr::Assign { target, .. } = &expr {
                         if let Expr::Ident { name, .. } = target.as_ref() {
@@ -1178,7 +1178,7 @@ impl CommonSubexprEliminator {
                     }
                     let (processed, extra) = self.eliminate_expr_collecting(expr, &mut emitted);
                     new_stmts.extend(extra);
-                    new_stmts.push(Stmt::Expr { span, expr: processed });
+                    new_stmts.push(Stmt::Expr { span, expr: processed, has_semi });
                 }
                 other => new_stmts.push(other),
             }

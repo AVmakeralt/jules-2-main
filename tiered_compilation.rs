@@ -31,7 +31,7 @@ use rustc_hash::FxHashMap;
 
 use crate::ast::{FnDecl, Program};
 use crate::interp::{compile_fn, CompiledFn, Interpreter, RuntimeError, Value};
-use crate::jit;
+use crate::phase3_jit as jit;
 use crate::tracing_jit::TracingJIT;
 
 // =============================================================================
