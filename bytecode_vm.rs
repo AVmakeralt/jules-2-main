@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 
 use crate::ast::{BinOpKind, Program};
 use crate::interp::{RuntimeError, Value};
-use crate::memory_management::PrefetchController;
+use crate::memory_management::PrefetchEngine;
 
 // =============================================================================
 // §1  BYTECODE INSTRUCTION SET
@@ -577,7 +577,7 @@ pub struct BytecodeVM {
     /// Execution statistics
     total_instructions: u64,
     total_time_ns: u64,
-    prefetch: PrefetchController,
+    prefetch: PrefetchEngine,
 }
 
 impl BytecodeVM {
@@ -590,7 +590,7 @@ impl BytecodeVM {
             profiler: None,
             total_instructions: 0,
             total_time_ns: 0,
-            prefetch: PrefetchController::default(),
+            prefetch: PrefetchEngine::default(),
         }
     }
     
@@ -661,8 +661,8 @@ impl BytecodeVM {
 
             // Direct instruction fetch with zero bounds checking
             let instr = unsafe { &*instr_ptr.add(pc) };
-            self.prefetch.update_distance(branch_density);
-            self.prefetch.prefetch_instruction(instr_ptr, pc, func_len);
+            self.prefetch.tick(branch_density);
+            self.prefetch.prefetch_insn(instr_ptr, pc, func_len);
             
             match instr {
                 // ── HOT PATH: Constant loads (most frequent) ──
