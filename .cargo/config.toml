@@ -1,0 +1,15 @@
+# =============================================================================
+# CARGO CONFIGURATION
+# =============================================================================
+
+[build]
+# Use all available CPU cores for parallel compilation
+jobs = 8
+
+# Default rustflags: enable native CPU features for ALL builds
+# These affect runtime performance, NOT compile time
+[target.'cfg(target_arch = "x86_64")']
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+lzcnt,+popcnt,+avx,+sse4.2,+sse4.1,+ssse3",
+]

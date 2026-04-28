@@ -1,0 +1,142 @@
+// Generated Jules: 10 functions (seed=42)
+
+fn f_000001() {
+    let mut v_1_0 = 14.250;
+    for i in 0..20 {
+        v_1_0 = v_1_0 + 27.000;
+    }
+    v_1_0 = v_1_0 + 14.875;
+    println("f_000001 result:", v_1_0);
+}
+
+fn f_000002() {
+    let mut v_2_0 = 214;
+    let mut v_2_1 = 3;
+    let v_2_2 = 27.000;
+    let mut v_2_3 = 21.500;
+    let mut v_2_4 = 22.875;
+    if v_2_0 > 235 {
+        v_2_0 = v_2_0 - 63;
+    } else {
+        v_2_0 = v_2_0 + 63;
+    }
+    println("f_000002: v_2_3", v_2_3);
+    v_2_4 = v_2_4 - 12.250;
+    println("f_000002 result:", v_2_0);
+}
+
+fn f_000003() {
+    let mut v_3_0 = 40;
+    for i in 0..10 {
+        v_3_0 = v_3_0 + i + 232;
+    }
+    if v_3_0 > 83 {
+        v_3_0 = v_3_0 - 189;
+    } else {
+        v_3_0 = v_3_0 + 189;
+    }
+    println("f_000003 result:", v_3_0);
+}
+
+fn f_000004() {
+    let mut v_4_0 = 36;
+    let mut v_4_1 = 15.625;
+    v_4_1 = v_4_1 * 14.000;
+    for i in 0..9 {
+        v_4_0 = v_4_0 + i + 16;
+    }
+    println("f_000004 result:", v_4_1);
+}
+
+fn f_000005() {
+    let mut v_5_0 = 20.125;
+    let mut v_5_1 = 234;
+    let mut v_5_2 = 16.750;
+    let v_5_3 = 25.500;
+    v_5_1 = v_5_1 * 252;
+    v_5_0 = v_5_0 + 9.750;
+    let mut t_v_5_3 = v_5_3;
+    if t_v_5_3 > 4.000 {
+        t_v_5_3 = t_v_5_3 - 24.625;
+    } else {
+        t_v_5_3 = t_v_5_3 + 24.625;
+    }
+    println("f_000005 result:", v_5_3);
+}
+
+fn f_000006() {
+    let v_6_0 = 5;
+    let mut v_6_1 = 17.000;
+    let v_6_2 = 18.750;
+    let mut v_6_3 = 134;
+    let v_6_4 = 54;
+    let tmp_v_6_4 = v_6_4 + 101;
+    v_6_1 = v_6_1 * 0.000;
+    if v_6_3 > 9 {
+        v_6_3 = v_6_3 - 57;
+    } else {
+        v_6_3 = v_6_3 + 57;
+    }
+    println("f_000006: v_6_2", v_6_2);
+    println("f_000006 result:", v_6_1);
+}
+
+fn f_000007() {
+    let v_7_0 = 31.000;
+    let v_7_1 = 64;
+    let mut v_7_2 = 84;
+    let mut v_7_3 = 216;
+    let v_7_4 = 102;
+    v_7_2 = v_7_2 - 231;
+    let tmp_v_7_1 = v_7_1 + 32;
+    let tmp_v_7_4 = v_7_4 + 117;
+    let mut t_v_7_0 = v_7_0;
+    if t_v_7_0 > 4.500 {
+        t_v_7_0 = t_v_7_0 - 3.750;
+    } else {
+        t_v_7_0 = t_v_7_0 + 3.750;
+    }
+    println("f_000007 result:", v_7_1);
+}
+
+fn f_000008() {
+    let v_8_0 = 36;
+    let tmp_v_8_0 = v_8_0 + 109;
+    let mut t_v_8_0 = v_8_0;
+    if t_v_8_0 > 124 {
+        t_v_8_0 = t_v_8_0 - 242;
+    } else {
+        t_v_8_0 = t_v_8_0 + 242;
+    }
+    let mut t_v_8_0 = v_8_0;
+    for i in 0..5 {
+        t_v_8_0 = t_v_8_0 + i + 49;
+    }
+    let mut t_v_8_0 = v_8_0;
+    for i in 0..15 {
+        t_v_8_0 = t_v_8_0 + i + 210;
+    }
+    println("f_000008 result:", v_8_0);
+}
+
+fn f_000009() {
+    let mut v_9_0 = 50;
+    v_9_0 = v_9_0 + 127;
+    v_9_0 = v_9_0 + 216;
+    println("f_000009 result:", v_9_0);
+}
+
+fn f_000010() {
+    let mut v_10_0 = 38;
+    let mut v_10_1 = 50;
+    let mut v_10_2 = 7;
+    println("f_000010: v_10_0", v_10_0);
+    v_10_0 = v_10_0 - 30;
+    println("f_000010 result:", v_10_0);
+}
+
+fn main() {
+    f_000001();
+    f_000002();
+    f_000003();
+}

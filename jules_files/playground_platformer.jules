@@ -1,0 +1,33 @@
+fn main() {
+  let mut x = 0;
+  let mut y = 1;
+  let mut v = 1;
+  let target_x = 18;
+  let mut hp = 24;
+  let mut score = 0;
+  let mut t = 0;
+  while t < 10 && hp > 0 {
+    let r = (x * 31 + t * 17) % 100;
+    if r < 20 { y = 2; }
+    if r >= 20 { y = 1; }
+
+    let mut tile = 0;
+    if (x == 4 || x == 9 || x == 13) && y == 1 { tile = 2; }
+    if (x == 6 || x == 11) && y == 2 { tile = 3; }
+    if tile == 2 { hp = hp - 4; score = score - 6; }
+    if r >= 14 && r < 20 {
+      v = v + 1;
+      if v < 1 { v = 1; }
+      if v > 5 { v = 5; }
+      score = score + 3;
+    }
+    if tile == 3 { hp = hp + 2; score = score + 5; }
+    x = x + v;
+    if (x == 17 && y == 1) || x >= target_x {
+      println("platformer", "win", "score", score + 80 - t);
+      return;
+    }
+    t = t + 1;
+  }
+  println("platformer", "end", "score", score - (target_x - x));
+}

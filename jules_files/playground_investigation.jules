@@ -1,0 +1,30 @@
+fn main() {
+  let need = 4;
+  let mut clues = 0;
+  let mut stealth = 11;
+  let mut score = 0;
+  let mut x = 1;
+  let mut y = 1;
+  let mut t = 0;
+  while t < 12 && clues < need && stealth > 0 {
+    let r = (t * 29 + clues * 13) % 100;
+    let mut dx = 0;
+    if r < 33 { dx = 1; }
+    if r >= 33 && r < 66 { dx = -1; }
+    let mut dy = -1;
+    if r % 2 == 0 { dy = 1; }
+    x = x + dx; if x < 1 { x = 1; } if x > 4 { x = 4; }
+    y = y + dy; if y < 1 { y = 1; } if y > 4 { y = 4; }
+
+    let mut tile = 0;
+    if (x == 2 && y == 2) || (x == 4 && y == 1) || (x == 1 && y == 4) || (x == 4 && y == 4) { tile = 4; }
+    if (x == 3 && y == 2) || (x == 2 && y == 4) { tile = 2; }
+    if tile == 4 { clues = clues + 1; score = score + 4; }
+    if tile == 2 { stealth = stealth - 2; score = score - 6; }
+    if tile == 0 && r >= 34 && r < 42 { stealth = stealth + 1; score = score + 2; }
+    t = t + 1;
+  }
+  if clues >= need { println("investigation", "solved", "score", score + 85 - t); return; }
+  if stealth <= 0 { println("investigation", "caught", "score", score - 50); return; }
+  println("investigation", "timeout", "score", score - 10);
+}

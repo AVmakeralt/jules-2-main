@@ -1,0 +1,11 @@
+fn main() {
+    let score = 0;
+    let hp = 100;
+    let mut tick_total = 0;
+
+    for i in 0..10 {
+        tick_total = tick_total + i;
+    }
+
+    let final_state = score + hp + tick_total;
+}

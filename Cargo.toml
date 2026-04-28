@@ -1,0 +1,131 @@
+[package]
+name = "jules"
+version = "0.2.0"
+edition = "2021"
+authors = ["jules"]
+description = "Jules programming language compiler/interpreter with game dev, ML, and FFI support"
+license = "MIT"
+autobenches = false
+
+[lib]
+name = "jules"
+path = "lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "jules"
+path = "main.rs"
+
+[[bin]]
+name = "bench-ecs"
+path = "benches/bench_ecs.rs"
+
+[[bin]]
+name = "micro-benchmark"
+path = "micro-benchmark.rs"
+
+[[bin]]
+name = "bench-chess-ml"
+path = "tools/bench_chess_ml.rs"
+
+[[bin]]
+name = "bench-interp-vs-rust"
+path = "tools/bench_interp_vs_rust.rs"
+
+[[bin]]
+name = "bench-prime-race"
+path = "tools/bench_prime_race.rs"
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
+numpy = { version = "0.21", optional = true }
+libc = "0.2"
+lazy_static = "1.4"
+parking_lot = "0.12"
+matrixmultiply = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+rustyline = "12"
+rustc-hash = "2"
+rayon = "1"
+bumpalo = "3.14"
+smallvec = { version = "1", features = ["union", "const_generics"] }
+ahash = "0.8"
+memmap2 = "0.9"
+cranelift-codegen = { version = "0.110", optional = true }
+cranelift-module = { version = "0.110", optional = true }
+cranelift-jit = { version = "0.110", optional = true }
+region = "3.0"
+
+[features]
+default = ["ffi-c", "phase1", "phase2", "phase3-jit"]
+python = ["pyo3", "numpy"]
+ffi-c = []
+nightly = []
+phase1 = []
+phase2 = []
+phase3-jit = ["cranelift-codegen", "cranelift-module", "cranelift-jit"]
+phase4-llvm = []
+phase5-cow = []
+phase6-simd = []
+ultra-fast = ["phase3-jit", "phase6-simd"]
+full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd"]
+
+[lints.rust]
+dead_code = "allow"
+unused_variables = "allow"
+unused_mut = "allow"
+unused_imports = "allow"
+unused_macros = "allow"
+unused_doc_comments = "allow"
+private_interfaces = "allow"
+non_camel_case_types = "allow"
+unreachable_patterns = "allow"
+
+# =============================================================================
+# PERFORMANCE PROFILES
+# =============================================================================
+
+# Fast compile for development (default: `cargo build`)
+[profile.dev]
+opt-level = 1              # Basic optimizations for speed
+codegen-units = 16         # Parallel codegen for fast builds
+incremental = true         # Incremental compilation
+debug = "line-tables-only" # Minimal debug info
+panic = "unwind"
+overflow-checks = true
+
+# Production release: balanced speed/compile time
+[profile.release]
+opt-level = 3
+lto = "thin"               # Thin LTO (much faster than fat LTO)
+codegen-units = 4          # Parallel codegen (4 units for speed)
+panic = "abort"
+strip = "symbols"
+incremental = false
+debug = false
+overflow-checks = false
+rpath = false
+
+# Benchmarks: same as release
+[profile.bench]
+inherits = "release"
+
+# MAXIMUM PERFORMANCE: use only for final builds (slow compile!)
+[profile.max-perf]
+inherits = "release"
+lto = "fat"                # Full LTO (slow but best performance)
+codegen-units = 1          # Single unit for maximum inlining
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"
+debug = false
+overflow-checks = false
+
+[profile.release.build-override]
+opt-level = 3
+
+[profile.max-perf.build-override]
+opt-level = 3

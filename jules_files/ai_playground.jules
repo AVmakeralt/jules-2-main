@@ -1,0 +1,11 @@
+fn main() {
+  println("AI Playground Full Games");
+  println("Run these full scenarios with: jules run <file>");
+  println("- playground_platformer.jules");
+  println("- playground_fighting.jules");
+  println("- playground_investigation.jules");
+  println("- playground_connect4.jules");
+  println("- playground_hide_seek.jules");
+  println("- playground_pong.jules");
+  println("All six scripts are runnable and include rules/effects for their game.");
+}

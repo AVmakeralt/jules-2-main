@@ -1,0 +1,226 @@
+// Winter Ant Strategy (text-rendered)
+// A strategy simulation where ants must survive winter with a tiny NN policy.
+
+fn main() {
+  let ticks = 360;
+  let winter_start = 250;
+  let inv_rand = 0.0000000004656613; // 1.0 / 2147483647.0
+
+  let mut workers = 80.0;
+  let mut soldiers = 18.0;
+  let mut scouts = 10.0;
+  let mut food = 220.0;
+  let mut wood = 80.0;
+  let mut heat = 40.0;
+  let mut morale = 0.55;
+  let mut threat = 0.25;
+  let mut snow = 0.0;
+
+  // Tiny NN (6 -> 4 -> 4), linear hidden for parser compatibility.
+  let mut h00 = 0.12; let mut h01 = -0.04; let mut h02 = 0.06; let mut h03 = 0.05; let mut h04 = -0.10; let mut h05 = 0.09;
+  let mut h10 = -0.08; let mut h11 = 0.11; let mut h12 = 0.04; let mut h13 = -0.05; let mut h14 = 0.09; let mut h15 = 0.03;
+  let mut h20 = 0.03; let mut h21 = 0.02; let mut h22 = 0.12; let mut h23 = 0.07; let mut h24 = -0.06; let mut h25 = 0.08;
+  let mut h30 = -0.02; let mut h31 = 0.05; let mut h32 = -0.03; let mut h33 = 0.14; let mut h34 = 0.04; let mut h35 = 0.01;
+
+  // outputs: forage / build_heat / scout / rest
+  let mut o00 = 0.11; let mut o01 = 0.08; let mut o02 = 0.05; let mut o03 = -0.03;
+  let mut o10 = -0.06; let mut o11 = 0.14; let mut o12 = 0.03; let mut o13 = 0.07;
+  let mut o20 = 0.05; let mut o21 = -0.02; let mut o22 = 0.13; let mut o23 = 0.04;
+  let mut o30 = 0.07; let mut o31 = 0.06; let mut o32 = -0.05; let mut o33 = 0.10;
+
+  let lr = 0.010;
+  let gamma = 0.94;
+  let mut rng = 424242;
+  let mut score = 0.0;
+
+  for t in 0..ticks {
+    let is_winter = if t >= winter_start { 1.0 } else { 0.0 };
+    if is_winter > 0.5 {
+      snow = snow + 0.005;
+      if snow > 1.0 { snow = 1.0; }
+      threat = threat + 0.0015;
+    } else {
+      snow = snow * 0.99;
+      threat = threat * 0.998;
+    }
+
+    let f0 = 1.0;
+    let f1 = food * 0.003;
+    let f2 = wood * 0.004;
+    let f3 = heat * 0.010;
+    let f4 = threat;
+    let f5 = morale;
+
+    let a0 = h00*f0 + h01*f1 + h02*f2 + h03*f3 + h04*f4 + h05*f5;
+    let a1 = h10*f0 + h11*f1 + h12*f2 + h13*f3 + h14*f4 + h15*f5;
+    let a2 = h20*f0 + h21*f1 + h22*f2 + h23*f3 + h24*f4 + h25*f5;
+    let a3 = h30*f0 + h31*f1 + h32*f2 + h33*f3 + h34*f4 + h35*f5;
+
+    let q0 = o00*a0 + o01*a1 + o02*a2 + o03*a3;
+    let q1 = o10*a0 + o11*a1 + o12*a2 + o13*a3;
+    let q2 = o20*a0 + o21*a1 + o22*a2 + o23*a3;
+    let q3 = o30*a0 + o31*a1 + o32*a2 + o33*a3;
+
+    let mut action = 0.0;
+    let mut best = q0;
+    if q1 > best { best = q1; action = 1.0; }
+    if q2 > best { best = q2; action = 2.0; }
+    if q3 > best { best = q3; action = 3.0; }
+
+    rng = (rng * 1664525 + 1013904223) % 2147483647;
+    let r = (rng as f32) * inv_rand;
+    let mut eps = 0.18 - (t as f32) * 0.00035;
+    if eps < 0.03 { eps = 0.03; }
+    if r < eps {
+      rng = (rng * 1664525 + 1013904223) % 2147483647;
+      let ra = (rng as f32) * inv_rand;
+      if ra < 0.25 {
+        action = 0.0;
+      } else {
+        if ra < 0.5 {
+          action = 1.0;
+        } else {
+          if ra < 0.75 { action = 2.0; } else { action = 3.0; }
+        }
+      }
+    }
+
+    let prev_food = food;
+    let prev_heat = heat;
+    let prev_workers = workers;
+
+    if action < 0.5 {
+      rng = (rng * 1664525 + 1013904223) % 2147483647;
+      let rr = (rng as f32) * inv_rand;
+      let weather_penalty = 1.0 - snow * 0.65;
+      let gained = workers * (0.055 + 0.020*morale) * weather_penalty * (0.55 + rr);
+      food = food + gained;
+      heat = heat - 0.45;
+      morale = morale + 0.002;
+    }
+
+    if action >= 0.5 {
+      if action < 1.5 {
+        let burn = workers * 0.025;
+        let mut used = burn;
+        let over = used - wood;
+        if over > 0.0 { used = used - over; }
+        wood = wood - used;
+        heat = heat + used * (0.36 + 0.10*morale);
+        morale = morale + 0.001;
+      }
+    }
+
+    if action >= 1.5 {
+      if action < 2.5 {
+        let scout_eff = scouts * 0.010;
+        threat = threat - scout_eff;
+        if threat < 0.02 { threat = 0.02; }
+        rng = (rng * 1664525 + 1013904223) % 2147483647;
+        let rs = (rng as f32) * inv_rand;
+        if rs > 0.78 {
+          food = food + 4.0 + scouts * 0.08;
+        }
+      }
+    }
+
+    if action >= 2.5 {
+      morale = morale + 0.003;
+      heat = heat + 0.25;
+    }
+
+    let pop = workers + soldiers + scouts;
+    food = food - pop * (0.012 + 0.015*snow);
+    heat = heat - (0.22 + snow * 0.48);
+
+    if food < 0.0 { food = 0.0; }
+    if heat < 0.0 { heat = 0.0; }
+    if morale > 1.0 { morale = 1.0; }
+    if morale < 0.05 { morale = 0.05; }
+    if threat > 1.6 { threat = 1.6; }
+
+    let cold = if heat < 8.0 { (8.0 - heat) * 0.020 } else { 0.0 };
+    let hunger = if food < 40.0 { (40.0 - food) * 0.0006 } else { 0.0 };
+    let raid = threat * 0.0025;
+    let losses = pop * (0.0008 + cold + hunger + raid);
+
+    workers = workers - losses * 0.75;
+    soldiers = soldiers - losses * 0.18;
+    scouts = scouts - losses * 0.07;
+
+    if workers < 12.0 { workers = 12.0; }
+    if soldiers < 3.0 { soldiers = 3.0; }
+    if scouts < 2.0 { scouts = 2.0; }
+
+    if is_winter < 0.5 {
+      let births = if food > 120.0 { (food - 120.0) * 0.0012 } else { 0.0 };
+      workers = workers + births;
+      if workers > 140.0 && soldiers < 40.0 { soldiers = soldiers + 0.03 * (workers - 140.0); }
+      if workers > 100.0 && scouts < 30.0 { scouts = scouts + 0.02 * (workers - 100.0); }
+    }
+
+    let rew =
+      (food - prev_food) * 0.025
+      + (heat - prev_heat) * 0.10
+      + (workers - prev_workers) * 0.35
+      - cold * 42.0
+      - hunger * 28.0
+      - threat * 0.05;
+
+    let nf1 = food * 0.003;
+    let nf2 = wood * 0.004;
+    let nf3 = heat * 0.010;
+    let nf4 = threat;
+    let nf5 = morale;
+
+    let na0 = h00*1.0 + h01*nf1 + h02*nf2 + h03*nf3 + h04*nf4 + h05*nf5;
+    let na1 = h10*1.0 + h11*nf1 + h12*nf2 + h13*nf3 + h14*nf4 + h15*nf5;
+    let na2 = h20*1.0 + h21*nf1 + h22*nf2 + h23*nf3 + h24*nf4 + h25*nf5;
+    let na3 = h30*1.0 + h31*nf1 + h32*nf2 + h33*nf3 + h34*nf4 + h35*nf5;
+
+    let nq0 = o00*na0 + o01*na1 + o02*na2 + o03*na3;
+    let nq1 = o10*na0 + o11*na1 + o12*na2 + o13*na3;
+    let nq2 = o20*na0 + o21*na1 + o22*na2 + o23*na3;
+    let nq3 = o30*na0 + o31*na1 + o32*na2 + o33*na3;
+    let mut next_best = nq0;
+    if nq1 > next_best { next_best = nq1; }
+    if nq2 > next_best { next_best = nq2; }
+    if nq3 > next_best { next_best = nq3; }
+
+    let mut q_sel = q0;
+    if action >= 0.5 {
+      if action < 1.5 { q_sel = q1; }
+    }
+    if action >= 1.5 {
+      if action < 2.5 { q_sel = q2; } else { q_sel = q3; }
+    }
+
+    let td = rew + gamma * next_best - q_sel;
+    if action < 0.5 {
+      o00 = o00 + lr * td * a0; o01 = o01 + lr * td * a1; o02 = o02 + lr * td * a2; o03 = o03 + lr * td * a3;
+    } else {
+      if action < 1.5 {
+        o10 = o10 + lr * td * a0; o11 = o11 + lr * td * a1; o12 = o12 + lr * td * a2; o13 = o13 + lr * td * a3;
+      } else {
+        if action < 2.5 {
+          o20 = o20 + lr * td * a0; o21 = o21 + lr * td * a1; o22 = o22 + lr * td * a2; o23 = o23 + lr * td * a3;
+        } else {
+          o30 = o30 + lr * td * a0; o31 = o31 + lr * td * a1; o32 = o32 + lr * td * a2; o33 = o33 + lr * td * a3;
+        }
+      }
+    }
+
+    score = score + workers * 0.003 + food * 0.0008 + heat * 0.002 - threat * 0.01;
+
+    if (t % 8) == 0 {
+      println("frame", &t, "winter", &is_winter, "W", &workers, "S", &soldiers, "Sc", &scouts, "food", &food, "wood", &wood, "heat", &heat, "threat", &threat, "action", &action, "score", &score);
+    }
+
+    if workers < 14.0 {
+      println("colony collapsed", "score", &score);
+      break;
+    }
+  }
+
+  println("winter campaign finished", "score", &score, "ants", &(workers + soldiers + scouts), "food", &food, "heat", &heat);
+}

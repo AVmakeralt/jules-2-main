@@ -1,0 +1,48 @@
+// Jules-native ML chess toy environment.
+
+fn main() {
+  let mut w0 = 0.03;
+  let mut w1 = 0.10;
+  let mut w2 = -0.07;
+  let mut checksum = 0.0;
+
+  for ep in 0..5000 {
+    let mut white_pawns = 8.0;
+    let mut black_pawns = 8.0;
+    let mut white_adv = 0.0;
+    let mut black_adv = 0.0;
+
+    for step in 0..64 {
+      let f0 = 1.0;
+      let f1 = white_pawns - black_pawns;
+      let f2 = white_adv - black_adv;
+
+      let score = w0 * f0 + w1 * f1 + w2 * f2;
+      let mut rew = 0.0;
+
+      if score >= 0.0 {
+        if black_pawns > 0.0 {
+          black_pawns = black_pawns - 1.0;
+          rew = rew + 0.25;
+        }
+        white_adv = white_adv + 1.0;
+      } else {
+        if white_pawns > 0.0 {
+          white_pawns = white_pawns - 1.0;
+          rew = rew - 0.20;
+        }
+        black_adv = black_adv + 1.0;
+      }
+
+      let eta = 0.005;
+      w0 = w0 + eta * rew * f0;
+      w1 = w1 + eta * rew * f1;
+      w2 = w2 + eta * rew * f2;
+
+      checksum = checksum + score * 0.001 + rew;
+    }
+  }
+
+  println("ml_chess checksum:", checksum);
+  println("weights:", w0, w1, w2);
+}

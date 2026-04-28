@@ -1,0 +1,33 @@
+fn main() {
+  let mut py = 3;
+  let mut by = 3;
+  let mut bx = 3;
+  let mut vx = 1;
+  let mut vy = 1;
+  let mut score = 0;
+  let mut miss = 0;
+  let mut t = 0;
+  while t < 14 {
+    let ty = (t * 13 + 1) % 6;
+    if py < ty { py = py + 1; }
+    if py > ty { py = py - 1; }
+    bx = bx + vx;
+    by = by + vy;
+    if by <= 0 { by = 0; vy = 1; }
+    if by >= 6 { by = 6; vy = -1; }
+    if bx <= 0 { bx = 0; vx = 1; score = score + 1; }
+    if bx >= 6 {
+      bx = 6;
+      vx = -1;
+      if by == py || by + 1 == py || by == py + 1 {
+        let mut lane = 0;
+        if by == 3 { lane = 1; }
+        if by == 0 || by == 6 { lane = -1; }
+        score = score + 4 + lane;
+      }
+      if by != py && by + 1 != py && by != py + 1 { miss = miss + 1; }
+    }
+    t = t + 1;
+  }
+  println("pong", "end", "score", score * 3 - miss * 7);
+}

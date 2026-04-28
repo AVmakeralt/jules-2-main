@@ -1,0 +1,23 @@
+fn main() {
+  let mut sx = 0;
+  let mut hx = 10;
+  let mut score = 0;
+  let mut t = 0;
+  while t < 10 {
+    let sm = ((t * 11) % 3) - 1;
+    let hm = ((t * 29 + 5) % 3) - 1;
+    sx = sx + sm + 1;
+    if sx < 0 { sx = 0; }
+    if sx > 10 { sx = 10; }
+    hx = hx + hm;
+    if hx < 0 { hx = 0; }
+    if hx > 10 { hx = 10; }
+    let dist = if sx > hx { sx - hx } else { hx - sx };
+    if dist <= 1 { println("hide_seek", "caught", "score", score + 95 - t * 2); return; }
+    if hx == 2 || hx == 5 || hx == 8 { score = score - 2; }
+    if ((t * 17) % 10) < 3 { score = score - 1; }
+    score = score - 1;
+    t = t + 1;
+  }
+  println("hide_seek", "escaped", "score", score - 30);
+}

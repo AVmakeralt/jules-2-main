@@ -1,0 +1,24 @@
+fn main() {
+  let player = game::make_object("sprite", "player", 1.0, 0.2, 0.8, 1.0, 1.0);
+  let enemy = game::make_object("sprite", "enemy", 1.0, 1.0, 0.2, 0.2, 1.0);
+
+  let map = game::build_map(4, 4, [
+    player, 0, 0, 0,
+    0, 0, enemy, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0
+  ]);
+
+  let frames = game::run_loop(map, 30, 0.016);
+
+  // Tiny NN decisions (single-neuron logistic policies)
+  let dodge_prob = ml::nn_binary(0.25, 0.90, 1.4, -0.8, 0.1);
+  let attack_prob = ml::nn_binary(0.80, 0.30, 1.1, 0.6, -0.2);
+
+  let model_mb_1byte = ml::estimate_one_byte_model_mb(2000000);
+
+  println("game frames rendered:", frames);
+  println("dodge probability:", dodge_prob);
+  println("attack probability:", attack_prob);
+  println("2M-param model @ 1 byte/param (MiB):", model_mb_1byte);
+}

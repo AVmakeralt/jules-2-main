@@ -1,0 +1,77 @@
+// Jules-native ant colony simulation (scalar/loop based).
+// Run with:
+//   cargo run --release --bin bench-jules-ml-chess -- ant_colony.jules
+
+fn main() {
+  let mut ants = 200.0;
+  let mut food = 1200.0;
+  let mut pheromone = 1.0;
+  let mut brood = 40.0;
+  let mut energy = 600.0;
+  let mut checksum = 0.0;
+
+  let days = 365;
+  let micro_steps = 64;
+
+  for day in 0..days {
+    // Slightly heavier seasonal preprocessing (Jules-side enhancement).
+    let mut x = (day as f32) * 17.0;
+    let mut acc = 0.0;
+    for _k in 0..32 {
+      x = (x * 1.00013 + 0.031) / (1.0 + x * 0.00001);
+      acc = acc + x * x;
+    }
+    let base = if (day % 90) < 45 { 0.8 } else { 0.3 };
+    let seasonal = base + acc * 0.00000002;
+
+    for _step in 0..micro_steps {
+      // Foraging pressure grows with ants and pheromone quality.
+      let forage_eff = 0.004 * ants * (1.0 + 0.3 * pheromone);
+      let mut gathered = forage_eff;
+      if gathered > food {
+        gathered = gathered - (gathered - food);
+      }
+
+      food = food - gathered;
+      energy = energy + gathered * 0.9;
+
+      // Metabolic burn.
+      let burn = ants * 0.0016;
+      energy = energy - burn;
+
+      // Pheromone dynamics: deposit from successful foraging, natural decay.
+      pheromone = pheromone * 0.992 + gathered * 0.0009;
+      if pheromone < 0.01 {
+        pheromone = 0.01;
+      }
+
+      // Queen lays brood when energy reserve is healthy.
+      if energy > 250.0 {
+        brood = brood + 0.06 * (1.0 + 0.1 * pheromone);
+        energy = energy - 0.02;
+      }
+
+      // Brood maturation into workers.
+      let hatch = brood * 0.012;
+      brood = brood - hatch;
+      ants = ants + hatch;
+
+      // Mortality rises with starvation.
+      let starvation = if energy < 150.0 { (150.0 - energy) * 0.0005 } else { 0.0 };
+      let deaths = ants * (0.0008 + starvation);
+      ants = ants - deaths;
+      if ants < 0.0 {
+        ants = 0.0;
+      }
+
+      food = food + seasonal;
+      checksum = checksum + ants * 0.00001 + pheromone * 0.0001 + energy * 0.000001;
+    }
+  }
+
+  println("ant_colony final ants:", ants);
+  println("ant_colony final food:", food);
+  println("ant_colony final pheromone:", pheromone);
+  println("ant_colony final energy:", energy);
+  println("ant_colony checksum:", checksum);
+}

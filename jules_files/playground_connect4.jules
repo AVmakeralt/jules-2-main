@@ -1,0 +1,39 @@
+fn main() {
+  // Full board map by column heights (7x6 board).
+  let mut h0 = 0;
+  let mut h1 = 1; // pre-filled map cells
+  let mut h2 = 0;
+  let mut h3 = 0;
+  let mut h4 = 1; // pre-filled map cells
+  let mut h5 = 0;
+  let mut h6 = 0;
+  let mut my = 1;
+  let mut opp = 1;
+  let mut center = 0;
+  let mut t = 0;
+  while t < 14 {
+    let c1 = (t * 19 + 3) % 7;
+    let c2 = (t * 23 + 5) % 7;
+    if c1 == 3 { center = center + 1; }
+    if c2 == 3 { center = center - 1; }
+    if c1 == c2 || c1 == c2 + 1 || c1 + 1 == c2 {
+      if c1 == 0 { h0 = h0 + 1; if h0 > 6 { h0 = 6; } }
+      if c1 == 1 { h1 = h1 + 1; if h1 > 6 { h1 = 6; } }
+      if c1 == 2 { h2 = h2 + 1; if h2 > 6 { h2 = 6; } }
+      if c1 == 3 { h3 = h3 + 1; if h3 > 6 { h3 = 6; } }
+      if c1 == 4 { h4 = h4 + 1; if h4 > 6 { h4 = 6; } }
+      if c1 == 5 { h5 = h5 + 1; if h5 > 6 { h5 = 6; } }
+      if c1 == 6 { h6 = h6 + 1; if h6 > 6 { h6 = 6; } }
+      my = my + 1;
+      if my > 4 { my = 4; }
+    }
+    if c1 != c2 && c1 != c2 + 1 && c1 + 1 != c2 {
+      opp = opp + 1;
+      if opp > 4 { opp = 4; }
+    }
+    if my >= 4 { println("connect4", "win", "score", 100 - t + center * 2); return; }
+    if opp >= 4 { println("connect4", "lose", "score", -80 + center); return; }
+    t = t + 1;
+  }
+  println("connect4", "draw", "score", center * 2 + (my - opp) * 5);
+}

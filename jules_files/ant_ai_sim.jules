@@ -1,0 +1,182 @@
+// Ant colony simulation with online RL-style linear Q learning.
+// Run:
+//   cargo run --offline --bin jules -- run ant_ai_sim.jules
+
+fn main() {
+  // Q(s, a) = w_a dot f(s)
+  let mut w00 = 0.02; let mut w01 = 0.10; let mut w02 = 0.03; let mut w03 = 0.02; let mut w04 = 0.04; let mut w05 = 0.01;
+  let mut w10 = 0.01; let mut w11 = 0.07; let mut w12 = 0.12; let mut w13 = 0.06; let mut w14 = 0.05; let mut w15 = 0.03;
+  let mut w20 = 0.00; let mut w21 = 0.01; let mut w22 = 0.04; let mut w23 = 0.09; let mut w24 = 0.02; let mut w25 = 0.08;
+
+  let gamma = 0.96;
+  let lr = 0.015;
+  let episodes = 120;
+  let steps = 220;
+
+  // local deterministic PRNG state
+  let mut rng = 1337;
+  let mut checksum = 0.0;
+
+  for ep in 0..episodes {
+    let mut ants = 120.0;
+    let mut local_food = 140.0;
+    let mut store_food = 220.0;
+    let mut pheromone = 0.60;
+    let mut energy = 210.0;
+    let mut ep_reward = 0.0;
+
+    for _step in 0..steps {
+      let f0 = 1.0;
+      let f1 = local_food * 0.004;
+      let f2 = store_food * 0.003;
+      let f3 = energy * 0.004;
+      let f4 = pheromone;
+      let f5 = ants * 0.004;
+
+      let q0 = w00*f0 + w01*f1 + w02*f2 + w03*f3 + w04*f4 + w05*f5;
+      let q1 = w10*f0 + w11*f1 + w12*f2 + w13*f3 + w14*f4 + w15*f5;
+      let q2 = w20*f0 + w21*f1 + w22*f2 + w23*f3 + w24*f4 + w25*f5;
+
+      // greedy action
+      let mut action = 0.0;
+      let mut best = q0;
+      if q1 > best { best = q1; action = 1.0; }
+      if q2 > best { best = q2; action = 2.0; }
+
+      // simple deterministic epsilon-greedy using local PRNG
+      let mut eps = 0.18 - (ep as f32) * 0.001;
+      if eps < 0.02 { eps = 0.02; }
+      rng = (rng * 1664525 + 1013904223) % 2147483647;
+      let r0 = (rng as f32) / 2147483647.0;
+      if r0 < eps {
+        rng = (rng * 1664525 + 1013904223) % 2147483647;
+        let r1 = (rng as f32) / 2147483647.0;
+        if r1 < 0.3333333 {
+          action = 0.0;
+        } else {
+          if r1 < 0.6666666 {
+            action = 1.0;
+          } else {
+            action = 2.0;
+          }
+        }
+      }
+
+      let prev_store = store_food;
+      let prev_ants = ants;
+      let prev_energy = energy;
+
+      // explore
+      if action < 0.5 {
+        rng = (rng * 1664525 + 1013904223) % 2147483647;
+        let rr = (rng as f32) / 2147483647.0;
+        let found = (0.8 + 1.2 * pheromone) * (0.4 + rr);
+        local_food = local_food + found;
+        pheromone = pheromone * 0.995 + 0.015;
+        energy = energy - (0.50 + ants * 0.0010);
+      }
+
+      // harvest
+      if action >= 0.5 {
+        if action < 1.5 {
+          let gather_cap = ants * (0.030 + 0.020 * pheromone);
+          let lf = local_food + 0.0;
+          let mut gathered = gather_cap;
+          let over = gathered - lf;
+          if over > 0.0 { gathered = gathered - over; }
+          local_food = local_food - gathered;
+          store_food = store_food + gathered * 0.92;
+          pheromone = pheromone * 0.997 + gathered * 0.0007;
+          energy = energy - (0.35 + ants * 0.0012);
+        }
+      }
+
+      // rest
+      if action >= 1.5 {
+        energy = energy + 0.75;
+        store_food = store_food - 0.12;
+        pheromone = pheromone * 0.992;
+      }
+
+      store_food = store_food - ants * 0.0018;
+      if store_food < 0.0 { store_food = 0.0; }
+
+      let mut births = 0.0;
+      if store_food > 140.0 {
+        births = 0.015 * (store_food - 140.0) * 0.01;
+      }
+      let starvation = if store_food < 70.0 { (70.0 - store_food) * 0.00045 } else { 0.0 };
+      let fatigue = if energy < 90.0 { (90.0 - energy) * 0.00035 } else { 0.0 };
+      let deaths = ants * (0.0009 + starvation + fatigue);
+      ants = ants + births - deaths;
+      if ants < 20.0 { ants = 20.0; }
+
+      if energy < 0.0 { energy = 0.0; }
+      if pheromone < 0.01 { pheromone = 0.01; }
+      if pheromone > 4.0 { pheromone = 4.0; }
+
+      let rew =
+        (store_food - prev_store) * 0.040
+        + (ants - prev_ants) * 0.35
+        + (energy - prev_energy) * 0.020
+        - starvation * 140.0
+        - fatigue * 110.0;
+      ep_reward = ep_reward + rew;
+
+      // next-state bootstrap
+      let nf0 = 1.0;
+      let nf1 = local_food * 0.004;
+      let nf2 = store_food * 0.003;
+      let nf3 = energy * 0.004;
+      let nf4 = pheromone;
+      let nf5 = ants * 0.004;
+
+      let nq0 = w00*nf0 + w01*nf1 + w02*nf2 + w03*nf3 + w04*nf4 + w05*nf5;
+      let nq1 = w10*nf0 + w11*nf1 + w12*nf2 + w13*nf3 + w14*nf4 + w15*nf5;
+      let nq2 = w20*nf0 + w21*nf1 + w22*nf2 + w23*nf3 + w24*nf4 + w25*nf5;
+      let nq1c = nq1 + 0.0;
+      let nq2c = nq2 + 0.0;
+      let mut next_best = nq0;
+      let d1 = nq1c - next_best;
+      if d1 > 0.0 { next_best = next_best + d1; }
+      let d2 = nq2c - next_best;
+      if d2 > 0.0 { next_best = next_best + d2; }
+
+      let mut q_sel = q0;
+      if action >= 0.5 {
+        if action < 1.5 { q_sel = q1; }
+      }
+      if action >= 1.5 { q_sel = q2; }
+
+      let td_target = rew + gamma * next_best;
+      let td_err = td_target - q_sel;
+
+      if action < 0.5 {
+        w00 = w00 + lr * td_err * f0; w01 = w01 + lr * td_err * f1; w02 = w02 + lr * td_err * f2;
+        w03 = w03 + lr * td_err * f3; w04 = w04 + lr * td_err * f4; w05 = w05 + lr * td_err * f5;
+      }
+      if action >= 0.5 {
+        if action < 1.5 {
+          w10 = w10 + lr * td_err * f0; w11 = w11 + lr * td_err * f1; w12 = w12 + lr * td_err * f2;
+          w13 = w13 + lr * td_err * f3; w14 = w14 + lr * td_err * f4; w15 = w15 + lr * td_err * f5;
+        }
+      }
+      if action >= 1.5 {
+        w20 = w20 + lr * td_err * f0; w21 = w21 + lr * td_err * f1; w22 = w22 + lr * td_err * f2;
+        w23 = w23 + lr * td_err * f3; w24 = w24 + lr * td_err * f4; w25 = w25 + lr * td_err * f5;
+      }
+
+      checksum = checksum + ants * 0.00002 + store_food * 0.00001 + td_err * 0.001;
+      if ants < 25.0 { break; }
+    }
+
+    if (ep % 20) == 0 {
+      println("ep", ep, "reward", ep_reward, "ants", ants, "store", store_food, "energy", energy);
+    }
+  }
+
+  println("ant_ai checksum", checksum);
+  println("policy explore", w00, w01, w02, w03, w04, w05);
+  println("policy harvest", w10, w11, w12, w13, w14, w15);
+  println("policy rest", w20, w21, w22, w23, w24, w25);
+}
