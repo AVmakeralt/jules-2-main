@@ -45,7 +45,7 @@
 use std::cell::RefCell;
 use std::ptr::NonNull;
 
-use libc::{mmap, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
+use libc::{mmap, mprotect, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
 use crate::ast::BinOpKind;
 use crate::interp::{CompiledFn, Instr, RuntimeError, Value};
@@ -82,12 +82,14 @@ impl ExecArena {
 
     fn try_new() -> Option<Self> {
         // Try huge-page backed mapping first (Linux only).
+        // Allocate with RW only; pages will be flipped to RX via mprotect
+        // before execution (W^X compliance for modern Linux/macOS).
         #[cfg(target_os = "linux")]
         let ptr = unsafe {
             mmap(
                 std::ptr::null_mut(),
                 Self::DEFAULT_LEN,
-                PROT_READ | PROT_WRITE | PROT_EXEC,
+                PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANON | libc::MAP_HUGETLB,
                 -1,
                 0,
@@ -101,7 +103,7 @@ impl ExecArena {
                 mmap(
                     std::ptr::null_mut(),
                     Self::DEFAULT_LEN,
-                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANON,
                     -1,
                     0,
@@ -137,7 +139,7 @@ impl ExecArena {
                 mmap(
                     std::ptr::null_mut(),
                     new_len,
-                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANON,
                     -1,
                     0,
@@ -183,6 +185,15 @@ impl ExecMem {
             let arena = arena.as_mut()?;
             let ptr = arena.alloc(code.len().max(1))?;
             unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len()) };
+            // Flip the page(s) covering this allocation to RX for W^X compliance.
+            // Page-align the range conservatively: round ptr down, end up.
+            let page = 4096usize;
+            let base = (ptr as usize) & !(page - 1);
+            let end = ((ptr as usize + code.len().max(1)) + page - 1) & !(page - 1);
+            let ok = unsafe { mprotect(base as *mut libc::c_void, end - base, PROT_READ | PROT_EXEC) };
+            if ok != 0 {
+                return None; // fall through to per-function mmap
+            }
             Some(Self {
                 ptr,
                 len: code.len().max(1),
@@ -198,7 +209,7 @@ impl ExecMem {
             mmap(
                 std::ptr::null_mut(),
                 len,
-                PROT_READ | PROT_WRITE | PROT_EXEC,
+                PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANON,
                 -1,
                 0,
@@ -208,6 +219,12 @@ impl ExecMem {
             return None;
         }
         unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), ptr.cast::<u8>(), code.len()) };
+        // Flip to RX now that writing is complete.
+        let ok = unsafe { mprotect(ptr, len, PROT_READ | PROT_EXEC) };
+        if ok != 0 {
+            unsafe { munmap(ptr, len) };
+            return None;
+        }
         Some(Self {
             ptr: ptr.cast::<u8>(),
             len,
@@ -1218,20 +1235,28 @@ struct Fixup {
 
 /// Patch all branch displacements.  Returns None if any target is unreachable
 /// or any displacement overflows i32.
+///
+/// Short-branch shrinking: we convert rel32 → rel8 by overwriting the
+/// opcode+disp bytes and padding the leftover bytes with NOPs.  Because the
+/// instruction *length is unchanged* (we pad with NOPs), all `pc_to_off`
+/// entries remain valid and no downstream offsets shift.  The key subtlety is
+/// that the rel8 displacement must be measured from the IP *after the 2-byte
+/// short instruction*, not after the 5/6-byte long instruction.
 fn patch_fixups(buf: &mut Vec<u8>, fixups: &[Fixup], pc_to_off: &[usize]) -> Option<()> {
     for fx in fixups {
         let target_off = *pc_to_off.get(fx.target_pc)? as isize;
-        let next_ip = (fx.disp_pos + 4) as isize;
-        let rel = i32::try_from(target_off - next_ip).ok()?;
 
-        // Attempt to shrink to rel8 (saves 3-4 bytes per branch).
-        if let Ok(rel8) = i8::try_from(rel) {
-            // The rel32 form sits at disp_pos-1 (or disp_pos-2 for 0F 8x).
-            // Overwrite with rel8 opcode + 1-byte disp + NOPs for remainder.
-            let opcode_start = match fx.kind {
-                BranchKind::Jmp => fx.disp_pos - 1,                  // E9 [d32]
-                BranchKind::Jz | BranchKind::Jnz => fx.disp_pos - 2, // 0F 84/85 [d32]
-            };
+        let opcode_start = match fx.kind {
+            BranchKind::Jmp => fx.disp_pos - 1,                  // E9 [d32]
+            BranchKind::Jz | BranchKind::Jnz => fx.disp_pos - 2, // 0F 84/85 [d32]
+        };
+
+        // IP after the short (2-byte) encoding.
+        let short_next_ip = (opcode_start + 2) as isize;
+        let short_rel = target_off - short_next_ip;
+
+        if let Ok(rel8) = i8::try_from(short_rel) {
+            // Shrink to rel8 + NOPs.  Instruction boundaries don't move.
             let short_op: u8 = match fx.kind {
                 BranchKind::Jmp => 0xEB,
                 BranchKind::Jz => 0x74,
@@ -1239,13 +1264,16 @@ fn patch_fixups(buf: &mut Vec<u8>, fixups: &[Fixup], pc_to_off: &[usize]) -> Opt
             };
             buf[opcode_start] = short_op;
             buf[opcode_start + 1] = rel8 as u8;
-            // Overwrite remaining bytes with NOPs.
+            // Overwrite remaining bytes with NOPs to preserve instruction length.
             let nop_start = opcode_start + 2;
             let nop_end = fx.disp_pos + 4;
             for b in &mut buf[nop_start..nop_end] {
                 *b = 0x90;
             }
         } else {
+            // Keep rel32 form; IP after the long encoding.
+            let long_next_ip = (fx.disp_pos + 4) as isize;
+            let rel = i32::try_from(target_off - long_next_ip).ok()?;
             buf[fx.disp_pos..fx.disp_pos + 4].copy_from_slice(&rel.to_le_bytes());
         }
     }
@@ -1266,15 +1294,20 @@ fn peephole_optimize(instrs: &mut Vec<Instr>) {
     for _pass in 0..MAX_PASSES {
         let mut i = 0;
         while i + 1 < instrs.len() {
-            // Pattern 1: Load(x) + Store(x) → eliminate both (dead store)
+            // Pattern 1: Load(x, y) + Store(x, z) where x==z → Move(x, y) + Store(x, x)
+            // SAFETY: We cannot simply delete both instructions because `x` may be
+            // read later.  Instead, replace the Load with a Move that keeps `x` live,
+            // then let downstream constant-propagation or dead-def elimination clean up.
+            // Concretely: Load(d1, s) + Store(d2, s2) where d1==s2 and s==d2
+            //   → replace the Store with Nop (the Load already wrote d1=x; storing x
+            //     back to d2==s is a no-op because the value was already there).
             if let (Instr::Load(d1, s), Instr::Store(d2, s2)) =
                 (&instrs[i], &instrs[i + 1])
             {
                 if *d1 == *s2 && *s == *d2 {
-                    // Load into tmp then immediately store back to same slot = no-op
-                    instrs.remove(i + 1);
-                    instrs.remove(i);
-                    // Don't advance i; re-check at same position.
+                    // Replace only the redundant Store; keep the Load so `d1` stays defined.
+                    instrs[i + 1] = Instr::Nop;
+                    i += 1;
                     continue;
                 }
             }
@@ -1891,21 +1924,28 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 }
 
 pub fn execute(native: &NativeCode, args: &[Value]) -> Result<Value, RuntimeError> {
-    thread_local! {
-        static EXEC_REGS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
-    }
+    // Stack-allocate the slot array to avoid the RefCell borrow overhead and
+    // the per-call memset that were strangling JIT throughput in tight loops.
+    // 256 slots covers virtually all real functions; fall back to a heap Vec
+    // only when slot_count is unusually large.
+    const STACK_SLOTS: usize = 256;
     let needed = native.slot_count as usize + 32;
-    EXEC_REGS.with(|cell| -> Result<Value, RuntimeError> {
-        let mut regs = cell.borrow_mut();
-        if regs.len() < needed {
-            regs.resize(needed, 0);
-        }
-        // Only zero the portion we'll use.
-        for r in &mut regs[..needed] {
+
+    // Inner helper to avoid code duplication between stack and heap paths.
+    #[inline(always)]
+    fn run(
+        native: &NativeCode,
+        args: &[Value],
+        regs: &mut [i64],
+    ) -> Result<Value, RuntimeError> {
+        // Only zero the slots we will actually hand to the JITted function;
+        // the register allocator guarantees all locals are written before read,
+        // so zeroing is only needed for argument slots to avoid UB on partial args.
+        for r in regs[args.len()..native.slot_count as usize + 32].iter_mut() {
             *r = 0;
         }
         for (i, arg) in args.iter().enumerate() {
-            if i >= needed {
+            if i >= regs.len() {
                 break;
             }
             regs[i] = match arg {
@@ -1928,5 +1968,15 @@ pub fn execute(native: &NativeCode, args: &[Value]) -> Result<Value, RuntimeErro
         let f = native.mem.entry();
         let out = unsafe { f(regs.as_mut_ptr()) };
         Ok(Value::I64(out))
-    })
+    }
+
+    if needed <= STACK_SLOTS {
+        // Hot path: zero-overhead, no heap allocation, no atomic borrow check.
+        let mut regs = [0i64; STACK_SLOTS];
+        run(native, args, &mut regs[..needed])
+    } else {
+        // Cold path: function has an unusually large slot count.
+        let mut regs = vec![0i64; needed];
+        run(native, args, &mut regs)
+    }
 }

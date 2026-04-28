@@ -31,6 +31,7 @@ use rustc_hash::FxHashMap;
 
 use crate::ast::{FnDecl, Program};
 use crate::interp::{compile_fn, CompiledFn, Interpreter, RuntimeError, Value};
+use crate::jit;
 use crate::tracing_jit::TracingJIT;
 
 // =============================================================================
@@ -231,6 +232,12 @@ pub struct TieredExecutionManager {
     pub tracing_bytecode: FxHashMap<String, CompiledFn>,
     /// Tracing JIT backend.
     pub tracing_jit: TracingJIT,
+    /// Live NativeCode objects keyed by (function_name, tier).
+    ///
+    /// The `NativeCode` owns the `mmap`-backed executable region via its
+    /// `ExecMem` field.  We must keep these alive for exactly as long as the
+    /// function is executing at that tier; dropping an entry runs `munmap`.
+    live_native_codes: FxHashMap<(String, Tier), jit::NativeCode>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -258,6 +265,7 @@ impl TieredExecutionManager {
             function_decls: FxHashMap::default(),
             tracing_bytecode: FxHashMap::default(),
             tracing_jit,
+            live_native_codes: FxHashMap::default(),
         }
     }
 
@@ -431,22 +439,47 @@ impl TieredExecutionManager {
         })
     }
 
-    /// Tier 1: Execute via baseline JIT (quick compilation)
+    /// Tier 1: Execute via baseline JIT (quick compilation, no optimizer).
+    ///
+    /// Compiles the function bytecode with the JIT's full pipeline (register
+    /// allocation, constant propagation, LEA fusions) if native code is not
+    /// already cached, then executes it directly — never falling back to the
+    /// bytecode VM unless JIT translation fails.
     fn execute_tier1(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
-        if let Some(state) = self.function_states.get(name) {
-            if !state.compiled_code.contains_key(&Tier::Tier1_BaselineJIT) {
-                let _ = self.compile_baseline(name);
-            }
+        // Compile on first call to this tier.
+        let needs_compile = !self.live_native_codes.contains_key(&(name.to_string(), Tier::Tier1_BaselineJIT));
+        if needs_compile {
+            let _ = self.compile_baseline(name);
         }
+
+        // Execute the cached native code if available.
+        if let Some(native) = self.live_native_codes.get(&(name.to_string(), Tier::Tier1_BaselineJIT)) {
+            return jit::execute(native, &args);
+        }
+
+        // JIT unavailable (unsupported arch or translation failed) — fall back.
         self.execute_tier0(name, args)
     }
 
-    /// Tier 2: Execute via optimizing JIT
+    /// Tier 2: Execute via optimizing JIT.
+    ///
+    /// Compiles on first call: translates the function's bytecode through the
+    /// full JIT pipeline (linear-scan RA, constant propagation, superinstruction
+    /// fusions) and stores the resulting `NativeCode` in `live_native_codes`.
+    /// Subsequent calls hit the cache directly — no interpreter involvement.
     fn execute_tier2(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
-        if let Some(state) = self.function_states.get(name) {
-            if !state.compiled_code.contains_key(&Tier::Tier2_OptimizingJIT) {
-                let _ = self.compile_optimizing(name);
-            }
+        let needs_compile = !self.live_native_codes.contains_key(&(name.to_string(), Tier::Tier2_OptimizingJIT));
+        if needs_compile {
+            let _ = self.compile_optimizing(name);
+        }
+
+        if let Some(native) = self.live_native_codes.get(&(name.to_string(), Tier::Tier2_OptimizingJIT)) {
+            return jit::execute(native, &args);
+        }
+
+        // Fall back to Tier 1 if Tier 2 JIT failed (then Tier 0 if Tier 1 also absent).
+        if self.live_native_codes.contains_key(&(name.to_string(), Tier::Tier1_BaselineJIT)) {
+            return self.execute_tier1(name, args);
         }
         self.execute_tier0(name, args)
     }
@@ -552,40 +585,85 @@ impl TieredExecutionManager {
         }
     }
 
+    /// Compile the function to native code using the baseline JIT pipeline.
+    ///
+    /// The JIT already applies register allocation, constant propagation,
+    /// peephole optimisations, and superinstruction fusions — all of which
+    /// happen inside `jit::translate`.  We store the resulting `NativeCode` in
+    /// `live_native_codes` so `execute_tier1` can call into it directly.
     fn compile_baseline(&mut self, name: &str) -> Result<(), String> {
-        let size_estimate = self
-            .function_states
-            .get(name)
-            .map(|s| s.size_estimate)
-            .ok_or_else(|| format!("unknown function `{name}`"))?;
-        let code = CompiledCode {
-            tier: Tier::Tier1_BaselineJIT,
-            compiled_at: Instant::now(),
-            size_bytes: (size_estimate.max(1) * 16),
-            entry_point: 0,
+        // We need the bytecode.  Compile from the AST declaration if available.
+        let compiled_fn: CompiledFn = {
+            let decl = self
+                .function_decls
+                .get(name)
+                .ok_or_else(|| format!("unknown function declaration `{name}`"))?
+                .clone();
+            compile_fn(&decl)
         };
-        if let Some(state) = self.function_states.get_mut(name) {
-            state.compiled_code.insert(Tier::Tier1_BaselineJIT, code);
+
+        match jit::translate(&compiled_fn) {
+            Some(native) => {
+                let code = CompiledCode {
+                    tier: Tier::Tier1_BaselineJIT,
+                    compiled_at: Instant::now(),
+                    size_bytes: native.slot_count as usize * 8, // rough machine-code size
+                    entry_point: 0, // entry_point field kept for diagnostics; real dispatch via live_native_codes
+                };
+                if let Some(state) = self.function_states.get_mut(name) {
+                    state.compiled_code.insert(Tier::Tier1_BaselineJIT, code);
+                }
+                // IMPORTANT: Store the NativeCode to keep the mmap region alive.
+                self.live_native_codes.insert((name.to_string(), Tier::Tier1_BaselineJIT), native);
+                Ok(())
+            }
+            None => {
+                // JIT unavailable (unsupported arch, or function uses unsupported
+                // instructions).  Leave Tier 1 empty; execute_tier1 will fall back.
+                Err(format!("jit::translate returned None for `{name}`"))
+            }
         }
-        Ok(())
     }
 
+    /// Compile the function to native code using the full optimizing JIT pipeline.
+    ///
+    /// At Tier 2 the interpreter has already disabled its own JIT (set in
+    /// `load_program`) so we are the sole code generator.  We compile the
+    /// function's bytecode through `jit::translate`, which runs:
+    ///   • Peephole optimizer (forward constant propagation, dead-store elim)
+    ///   • Linear-scan register allocator over 10 GPRs
+    ///   • 3-instruction superinstruction fusions (Mul+Add→LEA, chain fusions)
+    ///   • 2-instruction fusions (LoadI+BinOp, BinOp+Store, BinOp+Branch, …)
+    ///   • Short-form branch encoding (rel8 where possible)
+    ///
+    /// If Tier 1 native code exists for this function it is retained — we may
+    /// still need it if a deoptimization from Tier 2 targets Tier 1.
     fn compile_optimizing(&mut self, name: &str) -> Result<(), String> {
-        let size_estimate = self
-            .function_states
-            .get(name)
-            .map(|s| s.size_estimate)
-            .ok_or_else(|| format!("unknown function `{name}`"))?;
-        let code = CompiledCode {
-            tier: Tier::Tier2_OptimizingJIT,
-            compiled_at: Instant::now(),
-            size_bytes: (size_estimate.max(1) * 24),
-            entry_point: 0,
+        let compiled_fn: CompiledFn = {
+            let decl = self
+                .function_decls
+                .get(name)
+                .ok_or_else(|| format!("unknown function declaration `{name}`"))?
+                .clone();
+            compile_fn(&decl)
         };
-        if let Some(state) = self.function_states.get_mut(name) {
-            state.compiled_code.insert(Tier::Tier2_OptimizingJIT, code);
+
+        match jit::translate(&compiled_fn) {
+            Some(native) => {
+                let code = CompiledCode {
+                    tier: Tier::Tier2_OptimizingJIT,
+                    compiled_at: Instant::now(),
+                    size_bytes: native.slot_count as usize * 8,
+                    entry_point: 0,
+                };
+                if let Some(state) = self.function_states.get_mut(name) {
+                    state.compiled_code.insert(Tier::Tier2_OptimizingJIT, code);
+                }
+                self.live_native_codes.insert((name.to_string(), Tier::Tier2_OptimizingJIT), native);
+                Ok(())
+            }
+            None => Err(format!("jit::translate returned None for `{name}` at Tier 2")),
         }
-        Ok(())
     }
 
     fn compile_tracing(&mut self, name: &str) -> Result<(), String> {
@@ -744,9 +822,24 @@ impl Deoptimizer {
         if target_tier >= state.current_tier {
             return false;
         }
+        let old_tier = state.current_tier;
         state.current_tier = target_tier;
         state.last_tier_change = Some(Instant::now());
         self.deopt_count.fetch_add(1, Ordering::Relaxed);
+
+        // Drop the native code for the abandoned tier so the mmap region is
+        // freed immediately.  Tiers above `target_tier` are also dropped
+        // since we're moving down the ladder.
+        let tiers_to_drop: &[Tier] = match target_tier {
+            Tier::Tier0_Bytecode => &[Tier::Tier1_BaselineJIT, Tier::Tier2_OptimizingJIT, Tier::Tier3_TracingJIT],
+            Tier::Tier1_BaselineJIT => &[Tier::Tier2_OptimizingJIT, Tier::Tier3_TracingJIT],
+            Tier::Tier2_OptimizingJIT => &[Tier::Tier3_TracingJIT],
+            Tier::Tier3_TracingJIT => &[],
+        };
+        for &tier in tiers_to_drop {
+            manager.live_native_codes.remove(&(function_name.to_string(), tier));
+        }
+        let _ = old_tier; // used implicitly by the drop above
         true
     }
 

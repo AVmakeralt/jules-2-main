@@ -199,7 +199,6 @@ pub struct NativeCodeGenerator {
     patch_sites: Vec<PatchSite>,
     reg_map: HashMap<Reg, RegState>,
     slot_reg: HashMap<u16, Reg>,
-    spill_offset: usize,
     next_label_id: usize,
 }
 
@@ -207,20 +206,25 @@ impl NativeCodeGenerator {
     pub fn new() -> Self {
         Self {
             code: Vec::with_capacity(4096), labels: HashMap::new(), patch_sites: Vec::new(),
-            reg_map: HashMap::new(), slot_reg: HashMap::new(), spill_offset: 16,
+            reg_map: HashMap::new(), slot_reg: HashMap::new(),
             next_label_id: 0,
         }
     }
 
-    pub fn compile_trace(&mut self, trace: &Trace, deopt_addr: usize) -> Result<CompiledTrace, String> {
+    pub fn compile_trace(&mut self, trace: &Trace) -> Result<CompiledTrace, String> {
         self.code.clear(); self.labels.clear(); self.patch_sites.clear();
-        self.reg_map.clear(); self.slot_reg.clear(); self.spill_offset = 16;
+        self.reg_map.clear(); self.slot_reg.clear();
+
+        // The deopt stub is emitted after all trace code.  All guards jump to
+        // this single label, which is resolved during backpatch_jumps once we
+        // know the stub's byte offset.
+        let deopt_label = trace.next_label_id;
 
         // 1. ABI Prologue
         self.emit_prologue();
 
         // 2. Hoist invariant guards to entry & emit
-        self.emit_hoisted_guards(&trace.guards, deopt_addr)?;
+        self.emit_hoisted_guards(&trace.guards, deopt_label)?;
 
         // 3. Optimization Pass: Constant Folding & Dead Store Elimination
         let optimized = self.optimize_trace(&trace.instructions);
@@ -234,14 +238,16 @@ impl NativeCodeGenerator {
         self.writeback_all_dirty()?;
         self.emit_ret();
 
-        // 6. Emit Deopt Stub
-        self.labels.insert(trace.next_label_id, self.code.len());
+        // 6. Emit Deopt Stub — must come after the normal epilogue so guards
+        //    can jump forward to it.  Record the label so backpatch_jumps can
+        //    resolve all the jne/jz instructions that target it.
+        self.labels.insert(deopt_label, self.code.len());
         self.emit_deopt_stub();
 
         // 7. Backpatch Jumps
         self.backpatch_jumps()?;
 
-        // 8. Allocate Memory
+        // 8. Allocate executable memory (W^X: mmap RW then mprotect RX)
         let exec_mem = ExecutableMemory::new(&self.code)?;
 
         // 9. Side Exit Table
@@ -304,14 +310,18 @@ impl NativeCodeGenerator {
     }
 
     // --- Guard Hoisting & Emission ---
-    fn emit_hoisted_guards(&mut self, guards: &[Guard], deopt_addr: usize) -> Result<(), String> {
+    //
+    // All guards jump to the same inline deopt stub label (trace.next_label_id).
+    // The stub is emitted at the end of compile_trace, so all guard jumps point
+    // to a label that is resolved during backpatch_jumps.  We never jump to an
+    // external Rust function address — doing so would leave the trace's pushed
+    // callee-saved registers on the stack, desynchronizing RSP.
+    fn emit_hoisted_guards(&mut self, guards: &[Guard], deopt_label: usize) -> Result<(), String> {
         for g in guards {
             self.b(0x0F); self.b(0xB6);          // movzx eax, byte [rsi + slot]
             self.modrm(0, 0, 6); self.b(g.slot as u8);
-            self.bb(0x3C, g.expected_type as u8); // cmp al, type
-            let lbl = self.next_label();
-            self.jne_label(lbl);
-            self.labels.insert(lbl, deopt_addr);
+            self.bb(0x3C, g.expected_type as u8); // cmp al, expected_type
+            self.jne_label(deopt_label);           // on mismatch → inline deopt stub
         }
         Ok(())
     }
@@ -398,17 +408,33 @@ impl NativeCodeGenerator {
 
     fn spill_slot(&mut self, slot: u16, reg: Reg) -> Result<(), String> {
         let reg_code = reg as u8;
-        self.bb(0x48, 0x89); self.modrm(2, reg_code & 7, 5); // [rbp - disp32]
-        self.i32(-(self.spill_offset as i32));
+        // Spill the register back to the caller's slot array at [rdi + slot*8].
+        // This is the only correct spill destination: the slot array (rdi) is
+        // the source of truth, and the caller allocated it.  Spilling to
+        // [rbp - offset] would write into unallocated stack space because the
+        // prologue never issued `sub rsp, N` to reserve spill area.
+        //
+        // REX.W (0x48) — 64-bit operand.  REX.R (0x04) — extends ModRM.reg
+        // to select R8–R11.  The rm field is always 7 (rdi), which fits in
+        // 3 bits and never needs REX.B.
+        let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
+        self.b(rex);
+        self.b(0x89);                      // MOV r/m64, r64
+        self.modrm(2, reg_code & 7, 7);    // mod=10 (disp32), reg=reg, rm=7 (rdi)
+        self.i32((slot as i32) * 8);
         self.reg_map.insert(reg, RegState::Empty);
         self.slot_reg.remove(&slot);
-        self.spill_offset += 8;
         Ok(())
     }
 
     fn load_slot_to_reg(&mut self, slot: u16, reg: Reg) -> Result<(), String> {
         let reg_code = reg as u8;
-        self.bb(0x48, 0x8B); self.modrm(2, reg_code & 7, 7); // [rdi + disp32]
+        // REX.W (0x48) is always needed for 64-bit operand size.
+        // REX.R (0x04) extends the ModRM.reg field for registers R8-R11.
+        let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
+        self.b(rex);
+        self.b(0x8B);                      // MOV r64, r/m64
+        self.modrm(2, reg_code & 7, 7);    // mod=10 (disp32), reg=reg, rm=7 (rdi)
         self.i32((slot as i32) * 8);
         Ok(())
     }
@@ -431,9 +457,43 @@ impl NativeCodeGenerator {
         self.bb(0x41, 0x5F); self.bb(0x41, 0x5E); self.bb(0x41, 0x5D); self.bb(0x41, 0x5C);
         self.bbb(0x48, 0x89, 0xEC); self.b(0x5D); self.b(0xC3);
     }
-    fn emit_deopt_stub(&mut self) { self.b(0xB8); self.i32(-1); self.b(0xC3); }
+    fn emit_deopt_stub(&mut self) {
+        // Signal deoptimization by returning -1 in rax/eax.
+        // MOV EAX, -1 (sign-extends to RAX; 5 bytes, no REX needed)
+        self.b(0xB8); self.i32(-1);
+        // Restore the stack to exactly the state it was in when the caller
+        // entered this trace.  The prologue sequence was:
+        //   push rbp          (1 byte)
+        //   mov rbp, rsp      (3 bytes)
+        //   push r12          (2 bytes: 41 54)
+        //   push r13          (2 bytes: 41 55)
+        //   push r14          (2 bytes: 41 56)
+        //   push r15          (2 bytes: 41 57)
+        //   and rsp, -16      (4 bytes)
+        //
+        // To unwind: restore rsp from rbp (undoes the `and`), then pop in
+        // reverse push order, then pop rbp, then ret.
+        self.bbb(0x48, 0x89, 0xEC); // mov rsp, rbp  — undo `and rsp, -16`
+        self.bb(0x41, 0x5F);         // pop r15
+        self.bb(0x41, 0x5E);         // pop r14
+        self.bb(0x41, 0x5D);         // pop r13
+        self.bb(0x41, 0x5C);         // pop r12
+        self.b(0x5D);                // pop rbp
+        self.b(0xC3);                // ret
+    }
 
-    fn mov_reg_reg(&mut self, src: Reg, dst: Reg) { self.bb(0x48, 0x89); self.modrm(3, src as u8, dst as u8); }
+    fn mov_reg_reg(&mut self, src: Reg, dst: Reg) {
+        let s = src as u8;
+        let d = dst as u8;
+        // MOV r/m64, r64 (opcode 0x89): ModRM.reg = source, ModRM.rm = destination.
+        // REX.W = 1 always (64-bit).  REX.R extends ModRM.reg (src >= 8).
+        // REX.B extends ModRM.rm (dst >= 8).
+        let rex = 0x48 | if s >= 8 { 0x04 } else { 0x00 }
+                       | if d >= 8 { 0x01 } else { 0x00 };
+        self.b(rex);
+        self.b(0x89);
+        self.modrm(3, s & 7, d & 7);  // mod=11 (register-to-register)
+    }
     fn mov_eax_imm32(&mut self, v: i32) { self.b(0xB8); self.i32(v); }
     fn mov_rax_imm64(&mut self, v: i64) { self.bb(0x48, 0xB8); self.i64(v); }
     fn add_rax_rcx(&mut self) { self.bbb(0x48, 0x01, 0xC8); }
@@ -518,7 +578,7 @@ impl TracingJIT {
         if let Some(tid) = self.recorder.find_trace(entry_pc) {
             if let Some(trace) = self.recorder.get_trace(tid) {
                 if self.should_compile(trace) && !trace.instructions.is_empty() {
-                    match self.codegen.compile_trace(trace, jit_deopt_trampoline as usize) {
+                    match self.codegen.compile_trace(trace) {
                         Ok(ct) => {
                             self.traces_compiled += 1;
                             let res = unsafe { ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr()) };
@@ -535,6 +595,3 @@ impl TracingJIT {
         Err(RuntimeError::new("Interpreter fallback: JIT trace hot but not compiled, or guard failed"))
     }
 }
-
-#[no_mangle]
-pub unsafe extern "C" fn jit_deopt_trampoline() -> i64 { -1 }

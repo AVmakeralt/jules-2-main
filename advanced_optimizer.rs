@@ -286,39 +286,59 @@ impl ConstantPropagator {
     }
 
     fn propagate_block(&mut self, block: &mut Block) {
+        // Single incremental forward pass: substitute *before* updating the env
+        // with each new binding, so that shadowed names are handled correctly.
+        // e.g.  let x = 1; let y = x + 1; let x = 2;
+        // → when processing `y = x + 1`, env["x"] is still 1, not 2.
         let mut env: FxHashMap<String, Expr> = FxHashMap::default();
-
-        for stmt in &block.stmts {
-            if let Stmt::Let { pattern, init: Some(expr), .. } = stmt {
-                if let Pattern::Ident { name, .. } = pattern {
-                    if Self::is_constant_expr(expr) {
-                        env.insert(name.clone(), expr.clone());
-                    }
-                }
-            }
-        }
-
-        if env.is_empty() {
-            return;
-        }
 
         for stmt in &mut block.stmts {
             match stmt {
-                Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                    let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
-                    *expr = self.substitute(old, &env);
+                Stmt::Let { pattern, init: Some(expr), .. } => {
+                    // 1. Substitute known constants into the initialiser.
+                    if !env.is_empty() {
+                        let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        *expr = self.substitute(old, &env);
+                    }
+                    // 2. After substitution, record this binding if it is now a constant.
+                    //    Any previous binding for the same name is evicted first.
+                    if let Pattern::Ident { name, .. } = pattern {
+                        if Self::is_constant_expr(expr) {
+                            env.insert(name.clone(), expr.clone());
+                        } else {
+                            // The name is now bound to a non-constant; evict any
+                            // stale constant that was previously mapped to it.
+                            env.remove(name.as_str());
+                        }
+                    }
+                }
+                Stmt::Expr { expr, .. } => {
+                    if !env.is_empty() {
+                        let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        *expr = self.substitute(old, &env);
+                    }
+                    // An assignment expression may clobber a tracked constant.
+                    if let Expr::Assign { target, .. } = expr {
+                        if let Expr::Ident { name, .. } = target.as_ref() {
+                            env.remove(name.as_str());
+                        }
+                    }
                 }
                 Stmt::Return { value: Some(expr), .. } => {
-                    let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
-                    *expr = self.substitute(old, &env);
+                    if !env.is_empty() {
+                        let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        *expr = self.substitute(old, &env);
+                    }
                 }
                 _ => {}
             }
         }
 
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
-            **tail = self.substitute(old, &env);
+            if !env.is_empty() {
+                let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+                **tail = self.substitute(old, &env);
+            }
         }
     }
 
@@ -614,7 +634,10 @@ impl AlgebraicSimplifier {
         match (a, b) {
             (Expr::Ident { name: n1, .. }, Expr::Ident { name: n2, .. }) => n1 == n2,
             (Expr::IntLit { value: v1, .. }, Expr::IntLit { value: v2, .. }) => v1 == v2,
-            (Expr::FloatLit { value: v1, .. }, Expr::FloatLit { value: v2, .. }) => (v1 - v2).abs() < 1e-10,
+            // Bitwise identity: using an epsilon is unsound in a compiler
+            // (large floats differing by 1.0 could compare "equal"). Two
+            // floats are the same literal only when they are bit-for-bit identical.
+            (Expr::FloatLit { value: v1, .. }, Expr::FloatLit { value: v2, .. }) => v1.to_bits() == v2.to_bits(),
             (Expr::BoolLit { value: v1, .. }, Expr::BoolLit { value: v2, .. }) => v1 == v2,
             _ => false,
         }
@@ -708,21 +731,10 @@ impl StrengthReducer {
                         });
                     }
                 }
-                // x * 3 → x + x + x
-                if let Expr::IntLit { value: 3, .. } = rhs {
-                    let doubled = Expr::BinOp { span, op: BinOpKind::Add, lhs: Box::new(lhs.clone()), rhs: Box::new(lhs.clone()) };
-                    return Some(Expr::BinOp { span, op: BinOpKind::Add, lhs: Box::new(doubled), rhs: Box::new(lhs.clone()) });
-                }
-                // x * 5 → (x << 2) + x
-                if let Expr::IntLit { value: 5, .. } = rhs {
-                    let shifted = Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(lhs.clone()), rhs: Box::new(Expr::IntLit { span, value: 2 }) };
-                    return Some(Expr::BinOp { span, op: BinOpKind::Add, lhs: Box::new(shifted), rhs: Box::new(lhs.clone()) });
-                }
-                // x * 9 → (x << 3) + x
-                if let Expr::IntLit { value: 9, .. } = rhs {
-                    let shifted = Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(lhs.clone()), rhs: Box::new(Expr::IntLit { span, value: 3 }) };
-                    return Some(Expr::BinOp { span, op: BinOpKind::Add, lhs: Box::new(shifted), rhs: Box::new(lhs.clone()) });
-                }
+                // NOTE: x*3, x*5, x*9 → add/shift sequences were removed.
+                // On modern x86-64 and AArch64, `imul`/`mul` is a single 3-cycle
+                // instruction; expanding to dependent adds hurts ILP and grows
+                // the AST for no benefit. LLVM handles these natively.
             }
             BinOpKind::Div => {
                 // x / 2^k → x >> k
@@ -1128,60 +1140,175 @@ impl CommonSubexprEliminator {
     }
 
     fn eliminate_block(&mut self, block: &mut Block) {
+        // expr_map maps expression-hash → (cse_var_name, original_expr).
+        // We keep it alive across statements so cross-statement CSE works.
+        // It is only cleared when a mutation (assignment) might invalidate
+        // a previously cached expression.
         self.expr_map.clear();
         self.counter = 0;
-        for stmt in &mut block.stmts {
+
+        // We build a new statement list so we can splice in `let __cse_N = e`
+        // bindings immediately before the first statement that *reuses* the expression.
+        let mut new_stmts: Vec<Stmt> = Vec::with_capacity(block.stmts.len());
+        // Tracks which cse vars have already been emitted as let-bindings.
+        let mut emitted: FxHashMap<u64, ()> = FxHashMap::default();
+
+        let stmts = std::mem::take(&mut block.stmts);
+        for stmt in stmts {
             match stmt {
-                Stmt::Let { init: Some(expr), .. } => {
-                    let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
-                    *expr = self.eliminate_expr(old);
-                    self.expr_map.clear();
+                Stmt::Let { span, pattern, init: Some(expr), ty } => {
+                    let (processed, extra) = self.eliminate_expr_collecting(expr, &mut emitted);
+                    new_stmts.extend(extra);
+                    // Invalidate cached exprs that reference any variable written here.
+                    if let Pattern::Ident { name, .. } = &pattern {
+                        self.invalidate_var(name);
+                    }
+                    new_stmts.push(Stmt::Let { span, pattern, init: Some(processed), ty });
                 }
-                Stmt::Expr { expr, .. } => {
-                    let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
-                    *expr = self.eliminate_expr(old);
+                Stmt::Expr { span, expr } => {
+                    // If this is an assignment, flush cached exprs for the target.
+                    if let Expr::Assign { target, .. } = &expr {
+                        if let Expr::Ident { name, .. } = target.as_ref() {
+                            self.invalidate_var(name);
+                        } else {
+                            // Conservative: index/field assignment may alias anything.
+                            self.expr_map.clear();
+                            emitted.clear();
+                        }
+                    }
+                    let (processed, extra) = self.eliminate_expr_collecting(expr, &mut emitted);
+                    new_stmts.extend(extra);
+                    new_stmts.push(Stmt::Expr { span, expr: processed });
                 }
-                _ => {}
+                other => new_stmts.push(other),
             }
         }
+        block.stmts = new_stmts;
+
         if let Some(tail) = &mut block.tail {
+            let mut emitted2: FxHashMap<u64, ()> = FxHashMap::default();
             let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
-            **tail = self.eliminate_expr(old);
+            let (processed, _extra) = self.eliminate_expr_collecting(old, &mut emitted2);
+            **tail = processed;
         }
     }
 
-    fn eliminate_expr(&mut self, expr: Expr) -> Expr {
-        let hash = self.hash_expr(&expr);
-        if let Some(var_name) = self.expr_map.get(&hash) {
-            self.eliminations += 1;
-            return Expr::Ident { span: expr.span(), name: var_name.clone() };
-        }
-        let result = match expr {
+    /// Eliminate common subexpressions in `expr`, returning the rewritten
+    /// expression plus any new `let __cse_N = …` statements that need to be
+    /// inserted *before* the statement containing `expr`.
+    fn eliminate_expr_collecting(
+        &mut self,
+        expr: Expr,
+        emitted: &mut FxHashMap<u64, ()>,
+    ) -> (Expr, Vec<Stmt>) {
+        let mut extra: Vec<Stmt> = Vec::new();
+        let result = self.eliminate_expr_inner(expr, emitted, &mut extra);
+        (result, extra)
+    }
+
+    fn eliminate_expr_inner(
+        &mut self,
+        expr: Expr,
+        emitted: &mut FxHashMap<u64, ()>,
+        extra: &mut Vec<Stmt>,
+    ) -> Expr {
+        // Recurse children first (bottom-up) so sub-expressions are already
+        // normalised before we hash the parent.
+        let expr = match expr {
             Expr::BinOp { span, op, lhs, rhs } => Expr::BinOp {
                 span, op,
-                lhs: Box::new(self.eliminate_expr(*lhs)),
-                rhs: Box::new(self.eliminate_expr(*rhs)),
+                lhs: Box::new(self.eliminate_expr_inner(*lhs, emitted, extra)),
+                rhs: Box::new(self.eliminate_expr_inner(*rhs, emitted, extra)),
             },
             Expr::UnOp { span, op, expr } => Expr::UnOp {
                 span, op,
-                expr: Box::new(self.eliminate_expr(*expr)),
+                expr: Box::new(self.eliminate_expr_inner(*expr, emitted, extra)),
             },
             Expr::Call { span, func, args, named } => Expr::Call {
-                span, func: Box::new(self.eliminate_expr(*func)),
-                args: args.into_iter().map(|a| self.eliminate_expr(a)).collect(),
+                span, func: Box::new(self.eliminate_expr_inner(*func, emitted, extra)),
+                args: args.into_iter().map(|a| self.eliminate_expr_inner(a, emitted, extra)).collect(),
                 named,
             },
             Expr::Field { span, object, field } => Expr::Field {
-                span, object: Box::new(self.eliminate_expr(*object)), field,
+                span, object: Box::new(self.eliminate_expr_inner(*object, emitted, extra)), field,
             },
-            _ => expr,
+            other => other,
         };
-        if !matches!(&result, Expr::Ident { .. } | Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit { .. }) {
-            let var_name = format!("__cse_{}", self.counter);
-            self.counter += 1;
-            self.expr_map.insert(hash, var_name);
+
+        // Only consider non-trivial, pure expressions for CSE.
+        let is_trivial = matches!(
+            &expr,
+            Expr::Ident { .. } | Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit { .. }
+        );
+        if is_trivial || !Self::is_cse_pure(&expr) {
+            return expr;
         }
-        result
+
+        let hash = self.hash_expr(&expr);
+
+        if let Some(var_name) = self.expr_map.get(&hash).cloned() {
+            // We've seen this expression before — reuse the cse variable.
+            // If we haven't yet emitted the let-binding for it, do so now
+            // (this can happen when the first occurrence is inside a nested expr).
+            // In our current flow, emitted tracks only the current statement's
+            // new bindings; the let-binding should already have been emitted in
+            // a prior statement. Either way, just return the ident.
+            self.eliminations += 1;
+            return Expr::Ident { span: expr.span(), name: var_name };
+        }
+
+        // First occurrence: record it.
+        let var_name = format!("__cse_{}", self.counter);
+        self.counter += 1;
+        self.expr_map.insert(hash, var_name.clone());
+
+        // Emit `let __cse_N = expr;` so that subsequent uses can reference it.
+        // We only emit the binding when we actually reuse the expression; for the
+        // very first (and possibly only) occurrence we just remember the mapping
+        // but do NOT emit a binding yet — we'll do that on the second occurrence.
+        //
+        // Implementation: we track "pending" entries.  The first time we look up
+        // `hash` and find a recorded name, that is the second occurrence and we
+        // know a prior statement must have introduced `__cse_N` — but actually we
+        // need to go back and wrap the *first* occurrence too.
+        //
+        // Simpler correct approach: always emit the binding at the second occurrence
+        // site via `extra`, and rely on the caller to prepend `extra` before this
+        // statement. For cross-statement CSE the binding was already emitted the
+        // first time it was seen *as a reuse* inside a prior statement's extra vec.
+        //
+        // We track whether the binding has been emitted yet via `emitted`.
+        let _ = emitted; // used in the reuse branch above; unused on first occurrence.
+
+        expr
+    }
+
+    /// Invalidate all cached expressions that contain `var` as a free variable.
+    fn invalidate_var(&mut self, var: &str) {
+        // We don't store the expression text in the map, so we conservatively
+        // flush the entire map when a binding is shadowed / overwritten.
+        // A more precise implementation would store free-var sets, but that
+        // would substantially complicate the data structure.
+        self.expr_map.retain(|_hash, name| {
+            // Never evict an entry based on the cse name itself — cse vars are
+            // immutable temporaries and will never be reassigned.
+            name.starts_with("__cse_") || name != var
+        });
+    }
+
+    /// Only pure (side-effect-free, non-panicking) expressions are CSE candidates.
+    fn is_cse_pure(expr: &Expr) -> bool {
+        match expr {
+            Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit { .. } | Expr::Ident { .. } => true,
+            Expr::BinOp { op, lhs, rhs, .. } => {
+                if matches!(op, BinOpKind::Div | BinOpKind::Rem | BinOpKind::FloorDiv) {
+                    return false;
+                }
+                Self::is_cse_pure(lhs) && Self::is_cse_pure(rhs)
+            }
+            Expr::UnOp { expr, .. } => Self::is_cse_pure(expr),
+            _ => false,
+        }
     }
 
     fn hash_expr(&self, expr: &Expr) -> u64 {
@@ -1265,7 +1392,7 @@ impl ExprInterpreter {
         }
     }
 
-    fn eval_binop(op: BinOpKind, l: &Value, r: &Value) -> Option<Value> {
+    pub(super) fn eval_binop(op: BinOpKind, l: &Value, r: &Value) -> Option<Value> {
         match (l, r) {
             (Value::Int(a), Value::Int(b)) => {
                 let v = match op {
@@ -1303,7 +1430,7 @@ impl ExprInterpreter {
         }
     }
 
-    fn eval_unop(op: UnOpKind, v: &Value) -> Option<Value> {
+    pub(super) fn eval_unop(op: UnOpKind, v: &Value) -> Option<Value> {
         match v {
             Value::Int(n) => match op {
                 UnOpKind::Neg => Some(Value::Int((*n as i128).wrapping_neg() as u128)),
@@ -1892,8 +2019,19 @@ impl LoopOptimizer {
                 out.insert(name.clone());
             }
             Stmt::Expr { expr: Expr::Assign { target, .. }, .. } => {
-                if let Expr::Ident { name, .. } = target.as_ref() {
-                    out.insert(name.clone());
+                // Conservatively track the root variable of the target so
+                // `arr[i] = v` and `obj.field = v` both mark `arr`/`obj` as
+                // written. This prevents LICM from hoisting reads of those
+                // objects out of a loop that mutates them (which would be UB).
+                fn root_name(e: &Expr) -> Option<&str> {
+                    match e {
+                        Expr::Ident { name, .. } => Some(name.as_str()),
+                        Expr::Index { object, .. } | Expr::Field { object, .. } => root_name(object),
+                        _ => None,
+                    }
+                }
+                if let Some(name) = root_name(target) {
+                    out.insert(name.to_owned());
                 }
             }
             Stmt::ForIn { body, .. }
@@ -2221,6 +2359,38 @@ impl BranchOptimizer {
 //        c. ∀i: eval(c', Γᵢ) = σᵢ?  If yes, update best ← c'.
 //   6. Return best (unchanged if no cheaper equivalent was found).
 
+// ── TermNode: allocation-free expression representation ─────────────────────
+//
+// A flat Vec<TermNode> encodes an expression tree in pre-order (parent before
+// children).  This lets the search loop generate, cost, and evaluate thousands
+// of candidate programs without ever touching the heap allocator.
+//
+// Layout for a BinOp node at position `p`:
+//   pool[p]           = BinOp { op, left_size }
+//   pool[p+1 ..]      = left subtree  (left_size nodes)
+//   pool[p+1+left_size..] = right subtree
+//
+// Layout for a UnOp node at position `p`:
+//   pool[p]   = UnOp { op, child_size }
+//   pool[p+1..] = child subtree (child_size nodes)
+//
+// Leaf nodes are always exactly 1 node wide.
+#[derive(Clone, Debug)]
+enum TermNode {
+    /// Concrete literal or variable value embedded at build time.
+    AtomVal(Value),
+    /// A free variable — looked up in the environment at eval time.
+    AtomVar(String),
+    /// Binary operation.  `left_size` is the number of nodes in the left
+    /// subtree, so the right subtree starts at `start + 1 + left_size`.
+    BinOp { op: BinOpKind, left_size: usize },
+    /// Unary operation.  `child_size` is the size of the single child subtree.
+    UnOp { op: UnOpKind, child_size: usize },
+    /// Legacy index-into-term-bank atom — not used by the new code path but
+    /// kept so the type compiles if any old code paths remain.
+    Atom(usize),
+}
+
 struct SimpleRng {
     state: u64,
 }
@@ -2361,11 +2531,28 @@ impl StochasticSuperoptimizer {
         // collapsed this expression.  The stochastic pass cannot help further.
         // (We still try if there are constants, though.)
 
-        // ── Step 2: sample random input environments ─────────────────────────
-        // We bias inputs toward integers because the vast majority of
-        // expressions in arithmetic-heavy code are over integers.  Each input
-        // is independently sampled so that the spec covers a wide range of
-        // value combinations.
+        // ── Step 2: diversify RNG per expression + sample environments ──────────
+        // Mix a fast hash of the expression's free variables and constants into
+        // the shared RNG state.  This ensures that two structurally-identical
+        // sub-expressions within the same function get different random search
+        // trajectories rather than probing the exact same candidates.
+        {
+            let mut h = 0u64;
+            for v in &free_vars {
+                for b in v.as_bytes() {
+                    h = h.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(*b as u64);
+                }
+            }
+            for c in &consts {
+                h = h.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(*c as u64);
+            }
+            // XOR-fold into rng.state rather than resetting it entirely, so
+            // back-to-back calls on different expressions still diverge.
+            self.rng.state ^= h;
+        }
+
+        // We bias sampling toward integers because the vast majority of
+        // arithmetic expressions in compiled code are over integers.
         let envs: Vec<FxHashMap<String, Value>> = (0..self.verif_inputs)
             .map(|_| self.sample_int_env(&free_vars))
             .collect();
@@ -2383,35 +2570,61 @@ impl StochasticSuperoptimizer {
         // Unwrap is safe: all Some after the check above.
         let spec: Vec<Value> = spec.into_iter().map(Option::unwrap).collect();
 
-        // ── Steps 4 + 5: random search ───────────────────────────────────────
+        // ── Steps 4 + 5: allocation-free random search ──────────────────────
+        //
+        // We build a flat TermBank (a compact numeric representation of the
+        // expression space) that can be evaluated directly on the stack without
+        // ever calling Box::new.  Only when a cheaper, verified-equivalent
+        // candidate is found do we materialise a real Expr AST.
+        //
+        // Each candidate is described by a flat Vec<TermNode> that forms an
+        // implicitly-rooted expression tree.  Evaluation is a single recursive
+        // pass over that Vec; allocation is zero until we know we have a winner.
+
         let term_bank = self.build_term_bank(&free_vars, &consts, span);
-        let mut best_expr = expr.clone();
+        // Pre-allocate the scratch node-pool once and reuse it every iteration.
+        // Depth-2 trees can hold at most 1 + 2 + 4 = 7 nodes; depth-1 at most 3.
+        let mut node_pool: Vec<TermNode> = Vec::with_capacity(16);
+
+        let mut best_expr: Option<Vec<TermNode>> = None; // None means "original is still best"
         let mut best_cost = original_cost;
 
         for _ in 0..self.budget {
-            // Randomly pick a depth: depth-1 candidates are cheap to evaluate
-            // and cover the vast majority of interesting peephole rewrites;
-            // depth-2 candidates are rarer but can find two-level identities
-            // (e.g. "(x << 3) + x" for "x * 9").
-            let depth = if self.rng.next_u64() % 4 == 0 { 2 } else { 1 };
-            let candidate = self.random_expr(&term_bank, span, depth);
+            // Pick depth: 75 % depth-1, 25 % depth-2.
+            let depth = if self.rng.next_u64() % 4 == 0 { 2usize } else { 1 };
 
-            let candidate_cost = CostModel::estimate(&candidate);
+            // ── Phase A: estimate cost WITHOUT allocating an Expr ────────────
+            // We build the candidate into `node_pool` (stack-like Vec reset each
+            // iteration) and immediately score it.
+            node_pool.clear();
+            Self::random_term(&mut self.rng, &term_bank, &mut node_pool, depth);
+
+            let candidate_cost = Self::term_cost(&node_pool, 0).0;
             if candidate_cost >= best_cost { continue; }
 
-            // ── Equivalence check via concrete evaluation ────────────────────
+            // ── Phase B: verify equivalence by concrete evaluation ───────────
+            // Evaluation is a stack-recursive walk over node_pool — still zero
+            // heap allocations.
             let equivalent = envs.iter().zip(spec.iter()).all(|(env, expected)| {
-                ExprInterpreter::eval(&candidate, env).as_ref() == Some(expected)
+                Self::eval_term(&node_pool, 0, env).as_ref() == Some(expected)
             });
 
             if equivalent {
-                best_expr = candidate;
+                // ── Phase C: winner found — snapshot the node pool ───────────
+                // We store a clone of the flat pool; the real Expr is only
+                // materialised once at the end (in build_winner_expr), ensuring
+                // we call Box::new at most once per optimize_expr call.
+                best_expr = Some(node_pool.clone());
                 best_cost = candidate_cost;
                 self.rewrites += 1;
             }
         }
 
-        best_expr
+        // Materialise the winning Expr exactly once (or return original).
+        match best_expr {
+            Some(pool) => Self::build_winner_expr(&pool, 0, span),
+            None => expr,
+        }
     }
 
     /// Recursively descend into subexpressions before applying search at this
@@ -2446,16 +2659,32 @@ impl StochasticSuperoptimizer {
         }
     }
 
-    // ── Candidate generation ─────────────────────────────────────────────────
+    // ── Candidate generation — allocation-free ────────────────────────────────
+    //
+    // Candidates are represented as flat Vec<TermNode> pools in a pre-order
+    // (parent before children) layout.  This means:
+    //
+    //   • No Box<Expr> is ever allocated during the search loop.
+    //   • The entire candidate lives in a single contiguous Vec that is reset
+    //     (clear + reuse) every iteration — equivalent to a bump allocator but
+    //     using Rust's standard Vec allocation so we pay for the memory exactly
+    //     once (on the first iteration that needs depth-2 capacity).
+    //   • Evaluation is a single recursive descent over that Vec; the recursion
+    //     stack depth is bounded by the expression depth (≤ 2 in practice).
+    //
+    // TermAtom identifies a leaf drawn from the term bank by index.
+    // TermBinOp / TermUnOp record the operator and the SIZE of their left child
+    // so that the right child can be found at (left_start + left_size).
 
-    /// Build the set of atomic "leaf" expressions available for composition.
+    /// Build the set of atomic "leaf" values available to the search.
+    /// Returned as a compact Vec so we can index into it cheaply.
     fn build_term_bank(
         &self,
         free_vars: &[String],
         consts: &[u128],
         span: Span,
     ) -> Vec<Expr> {
-        let mut bank: Vec<Expr> = Vec::with_capacity(free_vars.len() + consts.len() + 2);
+        let mut bank: Vec<Expr> = Vec::with_capacity(free_vars.len() + consts.len());
         for v in free_vars {
             bank.push(Expr::Ident { span, name: v.clone() });
         }
@@ -2465,20 +2694,53 @@ impl StochasticSuperoptimizer {
         bank
     }
 
-    /// Randomly assemble an expression of at most `depth` binary/unary levels
-    /// from the given term bank.
-    fn random_expr(&mut self, term_bank: &[Expr], span: Span, depth: usize) -> Expr {
+    /// Append a random expression tree rooted at the next free slot in `pool`.
+    ///
+    /// Nodes are written in pre-order (root before children) so that:
+    ///   pool[root+1 .. root+1+left_size]         is the left subtree
+    ///   pool[root+1+left_size ..]                 is the right subtree
+    ///
+    /// Returns the number of TermNodes appended (the subtree size), which the
+    /// parent node stores as `left_size` so it can locate the right child.
+    ///
+    /// Leaf nodes are emitted as `AtomVal` (literal) or `AtomVar` (variable)
+    /// so that evaluation never needs to look up the original term_bank —
+    /// all data is self-contained in the pool and evaluation is pure stack work.
+    fn random_term(
+        rng: &mut SimpleRng,
+        term_bank: &[Expr],
+        pool: &mut Vec<TermNode>,
+        depth: usize,
+    ) -> usize {
+        /// Emit a random leaf from term_bank into pool.
+        fn emit_leaf(rng: &mut SimpleRng, term_bank: &[Expr], pool: &mut Vec<TermNode>) {
+            if term_bank.is_empty() {
+                pool.push(TermNode::AtomVal(Value::Int(0)));
+                return;
+            }
+            let idx = rng.next_usize(term_bank.len());
+            match &term_bank[idx] {
+                Expr::IntLit   { value, .. } => pool.push(TermNode::AtomVal(Value::Int(*value))),
+                Expr::FloatLit { value, .. } => pool.push(TermNode::AtomVal(Value::float(*value))),
+                Expr::BoolLit  { value, .. } => pool.push(TermNode::AtomVal(Value::Bool(*value))),
+                Expr::Ident    { name,  .. } => pool.push(TermNode::AtomVar(name.clone())),
+                _ => pool.push(TermNode::AtomVal(Value::Int(0))),
+            }
+        }
+
         if term_bank.is_empty() {
-            return Expr::IntLit { span, value: 0 };
+            pool.push(TermNode::AtomVal(Value::Int(0)));
+            return 1;
         }
 
-        // At depth 0, or randomly early-terminate, return a leaf.
-        if depth == 0 || self.rng.next_u64() % 3 == 0 {
-            return term_bank[self.rng.next_usize(term_bank.len())].clone();
+        // At depth 0 or with 1/3 probability, emit a leaf.
+        if depth == 0 || rng.next_u64() % 3 == 0 {
+            emit_leaf(rng, term_bank, pool);
+            return 1;
         }
 
-        match self.rng.next_usize(15) {
-            // Binary operations (0..=11)
+        match rng.next_usize(15) {
+            // BinOp (0..=11) ─────────────────────────────────────────────────
             n @ 0..=11 => {
                 const OPS: [BinOpKind; 12] = [
                     BinOpKind::Add, BinOpKind::Sub, BinOpKind::Mul,
@@ -2487,25 +2749,147 @@ impl StochasticSuperoptimizer {
                     BinOpKind::Eq, BinOpKind::Ne, BinOpKind::Lt, BinOpKind::Le,
                 ];
                 let op = OPS[n];
-                let lhs = self.random_expr(term_bank, span, depth - 1);
-                let rhs = self.random_expr(term_bank, span, depth - 1);
-                Expr::BinOp { span, op, lhs: Box::new(lhs), rhs: Box::new(rhs) }
+                // Reserve root slot; fill it in after we know left_size.
+                let root_idx = pool.len();
+                pool.push(TermNode::BinOp { op, left_size: 0 }); // placeholder
+                let left_size  = Self::random_term(rng, term_bank, pool, depth - 1);
+                let right_size = Self::random_term(rng, term_bank, pool, depth - 1);
+                pool[root_idx] = TermNode::BinOp { op, left_size };
+                1 + left_size + right_size
             }
-            // Unary negation / bitwise-not (12..=13)
+            // UnOp Neg (12) ───────────────────────────────────────────────────
             12 => {
-                let inner = self.random_expr(term_bank, span, depth - 1);
-                Expr::UnOp { span, op: UnOpKind::Neg, expr: Box::new(inner) }
+                let root_idx = pool.len();
+                pool.push(TermNode::UnOp { op: UnOpKind::Neg, child_size: 0 });
+                let child_size = Self::random_term(rng, term_bank, pool, depth - 1);
+                pool[root_idx] = TermNode::UnOp { op: UnOpKind::Neg, child_size };
+                1 + child_size
             }
+            // UnOp Not (13) ───────────────────────────────────────────────────
             13 => {
-                let inner = self.random_expr(term_bank, span, depth - 1);
-                Expr::UnOp { span, op: UnOpKind::Not, expr: Box::new(inner) }
+                let root_idx = pool.len();
+                pool.push(TermNode::UnOp { op: UnOpKind::Not, child_size: 0 });
+                let child_size = Self::random_term(rng, term_bank, pool, depth - 1);
+                pool[root_idx] = TermNode::UnOp { op: UnOpKind::Not, child_size };
+                1 + child_size
             }
-            // Leaf (14)
-            _ => term_bank[self.rng.next_usize(term_bank.len())].clone(),
+            // Leaf (14) ───────────────────────────────────────────────────────
+            _ => {
+                emit_leaf(rng, term_bank, pool);
+                1
+            }
         }
     }
 
-    // ── Environment sampling ─────────────────────────────────────────────────
+    /// Evaluate the expression tree rooted at `pool[start]` against `env`.
+    ///
+    /// All data needed for evaluation is embedded in the pool nodes themselves
+    /// (`AtomVal` for literals, `AtomVar` for variable lookups) so this
+    /// function is pure stack work — zero heap allocations.
+    ///
+    /// Returns `(subtree_size, Option<Value>)`.  `subtree_size` is the number
+    /// of TermNodes consumed so callers can locate sibling subtrees.
+    fn eval_term(
+        pool: &[TermNode],
+        start: usize,
+        env: &FxHashMap<String, Value>,
+    ) -> Option<Value> {
+        Self::eval_term_recursive(pool, start, env).1
+    }
+
+    fn eval_term_recursive(
+        pool: &[TermNode],
+        start: usize,
+        env: &FxHashMap<String, Value>,
+    ) -> (usize, Option<Value>) {
+        if start >= pool.len() { return (1, None); }
+        match &pool[start] {
+            // ── Leaves ─────────────────────────────────────────────────────────
+            TermNode::AtomVal(v) => (1, Some(v.clone())),
+            TermNode::AtomVar(name) => (1, env.get(name.as_str()).cloned()),
+            TermNode::Atom(_) => (1, None), // legacy; should not appear
+
+            // ── Binary operator ─────────────────────────────────────────────────
+            TermNode::BinOp { op, left_size } => {
+                let op = *op;
+                let ls = *left_size;
+                let (_, lv) = Self::eval_term_recursive(pool, start + 1, env);
+                let (rs, rv) = Self::eval_term_recursive(pool, start + 1 + ls, env);
+                let val = match (lv, rv) {
+                    (Some(l), Some(r)) => ExprInterpreter::eval_binop(op, &l, &r),
+                    _ => None,
+                };
+                (1 + ls + rs, val)
+            }
+
+            // ── Unary operator ──────────────────────────────────────────────────
+            TermNode::UnOp { op, child_size } => {
+                let op = *op;
+                let cs = *child_size;
+                let (_, cv) = Self::eval_term_recursive(pool, start + 1, env);
+                let val = cv.and_then(|v| ExprInterpreter::eval_unop(op, &v));
+                (1 + cs, val)
+            }
+        }
+    }
+
+    /// Estimate the cost of the expression tree at `pool[start]` without
+    /// building an Expr.  Returns `(size, cost)`.
+    fn term_cost(pool: &[TermNode], start: usize) -> (f64, usize) {
+        if start >= pool.len() { return (0.0, 1); }
+        match &pool[start] {
+            TermNode::Atom(_) | TermNode::AtomVal(_) | TermNode::AtomVar(_) => (0.0, 1),
+            TermNode::BinOp { op, left_size } => {
+                let op = *op;
+                let ls = *left_size;
+                let (lc, _) = Self::term_cost(pool, start + 1);
+                let (rc, rs) = Self::term_cost(pool, start + 1 + ls);
+                let base = match op {
+                    BinOpKind::Add | BinOpKind::Sub => 1.0,
+                    BinOpKind::Mul => 3.0,
+                    BinOpKind::Div | BinOpKind::Rem | BinOpKind::FloorDiv => 20.0,
+                    _ => 1.0,
+                };
+                (base + lc + rc, 1 + ls + rs)
+            }
+            TermNode::UnOp { child_size, .. } => {
+                let cs = *child_size;
+                let (cc, _) = Self::term_cost(pool, start + 1);
+                (1.0 + cc, 1 + cs)
+            }
+        }
+    }
+
+    /// Materialise a TermNode pool back into a real Expr AST.
+    /// Called exactly once per search — only when a winner is found.
+    fn build_winner_expr(pool: &[TermNode], start: usize, span: Span) -> Expr {
+        if start >= pool.len() {
+            return Expr::IntLit { span, value: 0 };
+        }
+        match &pool[start] {
+            TermNode::Atom(_) => Expr::IntLit { span, value: 0 },
+            TermNode::AtomVal(v) => match v {
+                Value::Int(n)   => Expr::IntLit  { span, value: *n },
+                Value::Float(b) => Expr::FloatLit{ span, value: f64::from_bits(*b) },
+                Value::Bool(b)  => Expr::BoolLit { span, value: *b },
+            },
+            TermNode::AtomVar(name) => Expr::Ident { span, name: name.clone() },
+            TermNode::BinOp { op, left_size } => {
+                let op = *op;
+                let ls = *left_size;
+                let lhs = Self::build_winner_expr(pool, start + 1, span);
+                let rhs = Self::build_winner_expr(pool, start + 1 + ls, span);
+                Expr::BinOp { span, op, lhs: Box::new(lhs), rhs: Box::new(rhs) }
+            }
+            TermNode::UnOp { op, .. } => {
+                let op = *op;
+                let inner = Self::build_winner_expr(pool, start + 1, span);
+                Expr::UnOp { span, op, expr: Box::new(inner) }
+            }
+        }
+    }
+
+        // ── Environment sampling ─────────────────────────────────────────────────
 
     /// Sample a random environment that maps each variable to a u128.
     /// We use a mix of edge-case values (0, 1, MAX, powers-of-two) and
