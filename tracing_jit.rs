@@ -70,6 +70,38 @@ pub struct SideExit {
     pub buffer_offset: usize,
     pub fallback_pc: usize,
     pub is_loop_exit: bool,
+    /// Fix #4: Target trace ID for side exit (trace stitching)
+    pub target_trace_id: Option<u32>,
+}
+
+/// Fix #4: Polymorphic Inline Cache for trace stitching
+/// Maps guard failure conditions to secondary traces
+#[derive(Debug, Clone)]
+pub struct PolymorphicInlineCache {
+    /// Map from (slot, failed_type) to trace_id
+    entries: HashMap<(u16, ValueType), u32>,
+    max_entries: usize,
+}
+
+impl PolymorphicInlineCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+        }
+    }
+
+    /// Add a side exit target for a specific guard failure
+    pub fn add_side_exit(&mut self, slot: u16, failed_type: ValueType, trace_id: u32) {
+        if self.entries.len() < self.max_entries {
+            self.entries.insert((slot, failed_type), trace_id);
+        }
+    }
+
+    /// Look up a secondary trace for a guard failure
+    pub fn lookup(&self, slot: u16, failed_type: ValueType) -> Option<u32> {
+        self.entries.get(&(slot, failed_type)).copied()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +127,10 @@ pub struct Trace {
     pub side_exits: Vec<SideExit>,
     pub execution_count: u64,
     pub next_label_id: usize,
+    /// Type specialization: if all slots are the same type, we can use unboxed storage
+    pub specialized_type: Option<ValueType>,
+    /// Mapping from slot index to unboxed buffer offset (if specialized)
+    pub unboxed_slots: Vec<Option<u32>>,
 }
 
 // =============================================================================
@@ -117,6 +153,7 @@ impl TraceRecorder {
             id: self.next_trace_id, entry_pc, instructions: Vec::with_capacity(256),
             guards: Vec::with_capacity(64), side_exits: Vec::with_capacity(16),
             execution_count: 0, next_label_id: 1,
+            specialized_type: None, unboxed_slots: Vec::new(),
         });
         self.next_trace_id += 1;
     }
@@ -135,19 +172,71 @@ impl TraceRecorder {
         }
     }
 
-    pub fn record_side_exit(&mut self, fallback_pc: usize, is_loop: bool) {
+    pub fn record_side_exit(&mut self, fallback_pc: usize, is_loop: bool, target_trace_id: Option<u32>) {
         if let Some(ref mut trace) = self.current_trace {
-            trace.side_exits.push(SideExit { buffer_offset: 0, fallback_pc, is_loop_exit: is_loop });
+            trace.side_exits.push(SideExit { buffer_offset: 0, fallback_pc, is_loop_exit: is_loop, target_trace_id });
         }
     }
 
+    /// Backward-compatible version without target_trace_id
+    pub fn record_side_exit_simple(&mut self, fallback_pc: usize, is_loop: bool) {
+        self.record_side_exit(fallback_pc, is_loop, None);
+    }
+
     pub fn finish_recording(&mut self) -> Option<u32> {
-        if let Some(trace) = self.current_trace.take() {
+        if let Some(mut trace) = self.current_trace.take() {
+            // Fix #1: Type specialization analysis
+            // If all slots in the trace are the same type, we can use unboxed storage
+            let mut slot_types: HashMap<u16, ValueType> = HashMap::new();
+            for instr in &trace.instructions {
+                self.collect_slot_types(&instr.instruction, &mut slot_types);
+            }
+            
+            // Check if all slots are the same type (specializable)
+            let all_same_type = if !slot_types.is_empty() {
+                let first_type = slot_types.values().next().copied();
+                first_type.is_some() && slot_types.values().all(|&t| Some(t) == first_type)
+            } else {
+                false
+            };
+            
+            if all_same_type {
+                trace.specialized_type = slot_types.values().next().copied();
+                // Allocate unboxed buffer offsets for each slot
+                let mut offset = 0u32;
+                let max_slot = slot_types.keys().copied().max().unwrap_or(0) as usize;
+                trace.unboxed_slots.resize(max_slot + 1, None);
+                let mut sorted_slots: Vec<_> = slot_types.keys().copied().collect();
+                sorted_slots.sort();
+                for slot in sorted_slots {
+                    trace.unboxed_slots[slot as usize] = Some(offset);
+                    offset += match trace.specialized_type.unwrap() {
+                        ValueType::F64 => 8,
+                        ValueType::I64 => 8,
+                        ValueType::Bool => 1,
+                        _ => 8,
+                    };
+                }
+            }
+            
             let (id, pc) = (trace.id, trace.entry_pc);
             self.traces.push(trace);
             self.trace_selection.insert(pc as u64, id);
             Some(id)
         } else { None }
+    }
+    
+    fn collect_slot_types(&self, instr: &Instr, slot_types: &mut HashMap<u16, ValueType>) {
+        match instr {
+            Instr::LoadI32(dst, _) => { slot_types.insert(*dst, ValueType::I64); }
+            Instr::LoadI64(dst, _) => { slot_types.insert(*dst, ValueType::I64); }
+            Instr::BinOp(dst, _, lhs, rhs) => {
+                slot_types.insert(*dst, ValueType::I64);
+                slot_types.insert(*lhs, ValueType::I64);
+                slot_types.insert(*rhs, ValueType::I64);
+            }
+            _ => {}
+        }
     }
 
     pub fn find_trace(&self, entry_pc: usize) -> Option<u32> { self.trace_selection.get(&(entry_pc as u64)).copied() }
@@ -211,7 +300,7 @@ impl NativeCodeGenerator {
         }
     }
 
-    pub fn compile_trace(&mut self, trace: &Trace) -> Result<CompiledTrace, String> {
+    pub fn compile_trace(&mut self, trace: &Trace, unboxed_buffer: Option<*mut u8>) -> Result<CompiledTrace, String> {
         self.code.clear(); self.labels.clear(); self.patch_sites.clear();
         self.reg_map.clear(); self.slot_reg.clear();
 
@@ -219,6 +308,9 @@ impl NativeCodeGenerator {
         // this single label, which is resolved during backpatch_jumps once we
         // know the stub's byte offset.
         let deopt_label = trace.next_label_id;
+
+        // Fix #1: Check if trace is type-specialized for unboxed operations
+        let is_specialized = trace.specialized_type.is_some() && unboxed_buffer.is_some();
 
         // 1. ABI Prologue
         self.emit_prologue();
@@ -229,9 +321,13 @@ impl NativeCodeGenerator {
         // 3. Optimization Pass: Constant Folding & Dead Store Elimination
         let optimized = self.optimize_trace(&trace.instructions);
 
-        // 4. Emit Instructions
+        // 4. Emit Instructions (with unboxed memory ops if specialized)
         for instr in &optimized {
-            self.emit_instruction(instr)?;
+            if is_specialized {
+                self.emit_instruction_unboxed(instr, trace.specialized_type.unwrap(), &trace.unboxed_slots, unboxed_buffer.unwrap())?;
+            } else {
+                self.emit_instruction(instr)?;
+            }
         }
 
         // 5. Write back dirty registers & emit epilogue
@@ -262,6 +358,7 @@ impl NativeCodeGenerator {
     // --- Optimizer: Constant Folding & Dead Store Elimination ---
     fn optimize_trace(&self, instrs: &[TraceInstruction]) -> Vec<TraceInstruction> {
         let mut out = Vec::with_capacity(instrs.len());
+{{ ... }
         let mut last_load: HashMap<u16, i64> = HashMap::new();
         
         for ti in instrs {
@@ -359,6 +456,84 @@ impl NativeCodeGenerator {
             _ => return Err(format!("Unsupported instruction: {:?}", ti.instruction)),
         }
         Ok(())
+    }
+
+    // --- Fix #1: Unboxed Instruction Emission ---
+    // Emits instructions that bypass the Value enum by writing directly to unboxed buffers
+    fn emit_instruction_unboxed(&mut self, ti: &TraceInstruction, vtype: ValueType, unboxed_slots: &[Option<u32>], unboxed_buffer: *mut u8) -> Result<(), String> {
+        match &ti.instruction {
+            Instr::LoadI32(dst, val) => {
+                self.ensure_reg(*dst, Reg::RAX)?;
+                self.mov_eax_imm32(*val as i32);
+                self.mark_dirty(*dst);
+                // Write directly to unboxed buffer (no tag, just data)
+                if let Some(&Some(offset)) = unboxed_slots.get(*dst as usize) {
+                    self.emit_unboxed_store(offset, *val as i64, vtype, unboxed_buffer);
+                }
+            }
+            Instr::LoadI64(dst, val) => {
+                self.ensure_reg(*dst, Reg::RAX)?;
+                self.mov_rax_imm64(*val);
+                self.mark_dirty(*dst);
+                if let Some(&Some(offset)) = unboxed_slots.get(*dst as usize) {
+                    self.emit_unboxed_store(offset, *val, vtype, unboxed_buffer);
+                }
+            }
+            Instr::BinOp(dst, op, lhs, rhs) => {
+                // Load from unboxed buffers
+                if let Some(&Some(lhs_offset)) = unboxed_slots.get(*lhs as usize) {
+                    self.emit_unboxed_load(lhs_offset, vtype, unboxed_buffer, Reg::RAX)?;
+                }
+                if let Some(&Some(rhs_offset)) = unboxed_slots.get(*rhs as usize) {
+                    self.emit_unboxed_load(rhs_offset, vtype, unboxed_buffer, Reg::RCX)?;
+                }
+                match op {
+                    BinOpKind::Add => self.add_rax_rcx(),
+                    BinOpKind::Sub => self.sub_rax_rcx(),
+                    BinOpKind::Mul => self.imul_rax_rcx(),
+                    _ => return Err(format!("Unsupported BinOp in unboxed mode: {:?}", op)),
+                }
+                // Store result to unboxed buffer
+                if let Some(&Some(dst_offset)) = unboxed_slots.get(*dst as usize) {
+                    self.emit_unboxed_store_reg(dst_offset, Reg::RAX, vtype, unboxed_buffer);
+                }
+            }
+            Instr::Return(slot) => {
+                if let Some(&Some(offset)) = unboxed_slots.get(*slot as usize) {
+                    self.emit_unboxed_load(offset, vtype, unboxed_buffer, Reg::RAX)?;
+                }
+            }
+            _ => return Err(format!("Unsupported instruction in unboxed mode: {:?}", ti.instruction)),
+        }
+        Ok(())
+    }
+
+    fn emit_unboxed_load(&mut self, offset: u32, vtype: ValueType, buffer: *mut u8, reg: Reg) -> Result<(), String> {
+        // Load from unboxed buffer at [buffer + offset]
+        // For now, use r8 as the buffer base register (passed in via calling convention)
+        let reg_code = reg as u8;
+        let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
+        self.b(rex);
+        self.b(0x8B); // MOV r64, r/m64
+        self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
+        self.i32(offset as i32);
+        Ok(())
+    }
+
+    fn emit_unboxed_store(&mut self, offset: u32, value: i64, vtype: ValueType, buffer: *mut u8) {
+        // Store immediate to unboxed buffer
+        self.mov_rax_imm64(value);
+        self.emit_unboxed_store_reg(offset, Reg::RAX, vtype, buffer);
+    }
+
+    fn emit_unboxed_store_reg(&mut self, offset: u32, reg: Reg, vtype: ValueType, buffer: *mut u8) {
+        // Store register to unboxed buffer at [r8 + offset]
+        let reg_code = reg as u8;
+        let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
+        self.b(rex);
+        self.b(0x89); // MOV r/m64, r64
+        self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
+        self.i32(offset as i32);
     }
 
     // --- Register Allocation & Spilling ---
@@ -578,7 +753,7 @@ impl TracingJIT {
         if let Some(tid) = self.recorder.find_trace(entry_pc) {
             if let Some(trace) = self.recorder.get_trace(tid) {
                 if self.should_compile(trace) && !trace.instructions.is_empty() {
-                    match self.codegen.compile_trace(trace) {
+                    match self.codegen.compile_trace(trace, None) {
                         Ok(ct) => {
                             self.traces_compiled += 1;
                             let res = unsafe { ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr()) };

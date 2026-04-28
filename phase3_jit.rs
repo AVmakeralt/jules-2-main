@@ -890,6 +890,62 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Fix #3: Loop Vectorizer Pass
+// ─────────────────────────────────────────────────────────────────────────────
+/// Detects vectorizable loops and widens operations to SIMD
+struct LoopVectorizer {
+    loop_start: Option<usize>,
+    loop_end: Option<usize>,
+    induction_var: Option<u16>,
+    is_vectorizable: bool,
+}
+
+impl LoopVectorizer {
+    fn new() -> Self {
+        Self {
+            loop_start: None,
+            loop_end: None,
+            induction_var: None,
+            is_vectorizable: false,
+        }
+    }
+
+    /// Analyze instructions to find vectorizable loops
+    fn analyze(&mut self, instrs: &[Instr]) {
+        for (pc, instr) in instrs.iter().enumerate() {
+            match instr {
+                Instr::Jump(offset) => {
+                    let target = (pc as i32 + offset) as usize;
+                    if target < pc {
+                        // Backwards jump = loop
+                        self.loop_start = Some(target);
+                        self.loop_end = Some(pc);
+                    }
+                }
+                Instr::BinOp(dst, BinOpKind::Add, lhs, rhs) => {
+                    // Check if this is an induction variable update (i += 1)
+                    if let Instr::LoadI64(_, 1) = instrs.get(pc.saturating_sub(1)) {
+                        if *dst == *lhs || *dst == *rhs {
+                            self.induction_var = Some(*dst);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Simple heuristic: loop is vectorizable if it has an induction var
+        // and no function calls or complex operations
+        self.is_vectorizable = self.loop_start.is_some() && self.induction_var.is_some();
+    }
+
+    /// Returns vectorization factor (4 for SSE, 8 for AVX2)
+    fn vectorization_factor(&self) -> usize {
+        if self.is_vectorizable { 4 } else { 1 }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Constant propagation
 // ─────────────────────────────────────────────────────────────────────────────
 

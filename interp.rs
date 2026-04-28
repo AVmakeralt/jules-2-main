@@ -816,6 +816,47 @@ pub struct EcsWorld {
     events: FxHashMap<String, Vec<EntityId>>,
     vec3_plan_cache: FxHashMap<String, Vec3PlanCache>,
     fused_plan_cache: FxHashMap<String, FusedPlanCache>,
+    /// Fix #2: Archetype-based SoA storage
+    archetypes: FxHashMap<ArchetypeId, Archetype>,
+    archetype_entity_map: FxHashMap<EntityId, ArchetypeId>,
+    next_archetype_id: ArchetypeId,
+}
+
+/// Unique identifier for an archetype (set of component types)
+type ArchetypeId = u32;
+
+/// Archetype: Struct-of-Arrays storage for efficient cache utilization
+/// Stores all entities with the same component set in SoA format
+#[derive(Debug, Default)]
+struct Archetype {
+    /// Component name → column (SoA storage)
+    columns: FxHashMap<String, ArchetypeColumn>,
+    /// Entity IDs in this archetype (for reverse lookup)
+    entity_ids: Vec<EntityId>,
+    /// Entity index → position in columns
+    entity_index: FxHashMap<EntityId, usize>,
+}
+
+/// Single column in an archetype (SoA storage for one component type)
+#[derive(Debug)]
+struct ArchetypeColumn {
+    /// Raw unboxed data (no Value enum overhead)
+    data: Vec<u8>,
+    /// Type of data in this column
+    value_type: ValueType,
+    /// Stride in bytes per element
+    stride: usize,
+}
+
+/// ValueType for unboxed storage
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueType {
+    F32,
+    F64,
+    I32,
+    I64,
+    Vec3,  // 3x f32
+    Unknown,
 }
 
 /// Sparse-set component storage.
@@ -894,6 +935,20 @@ impl SparseSet {
 }
 
 impl EcsWorld {
+    pub fn new() -> Self {
+        Self {
+            next_id: 0,
+            alive: std::collections::HashSet::new(),
+            components: FxHashMap::default(),
+            events: FxHashMap::default(),
+            vec3_plan_cache: FxHashMap::default(),
+            fused_plan_cache: FxHashMap::default(),
+            archetypes: FxHashMap::default(),
+            archetype_entity_map: FxHashMap::default(),
+            next_archetype_id: 0,
+        }
+    }
+
     #[inline]
     fn plan_key2(a: &str, b: &str) -> String {
         format!("{a}|{b}")
@@ -901,6 +956,130 @@ impl EcsWorld {
     #[inline]
     fn plan_key4(a: &str, b: &str, c: &str, d: &str) -> String {
         format!("{a}|{b}|{c}|{d}")
+    }
+
+    /// Fix #2: Get or create archetype for a set of component types
+    fn get_or_create_archetype(&mut self, component_types: &[&str]) -> ArchetypeId {
+        // Simple hash-based archetype ID (in production, use proper hashing)
+        let mut hash: u32 = 0;
+        for comp in component_types {
+            hash = hash.wrapping_add(comp.len() as u32);
+            hash = hash.wrapping_mul(31);
+        }
+        
+        if !self.archetypes.contains_key(&hash) {
+            let mut archetype = Archetype::default();
+            for comp in component_types {
+                let vtype = self.infer_component_type(comp);
+                let stride = match vtype {
+                    ValueType::F32 => 4,
+                    ValueType::F64 => 8,
+                    ValueType::I32 => 4,
+                    ValueType::I64 => 8,
+                    ValueType::Vec3 => 12,
+                    ValueType::Unknown => 16,
+                };
+                archetype.columns.insert(
+                    comp.to_string(),
+                    ArchetypeColumn {
+                        data: Vec::new(),
+                        value_type: vtype,
+                        stride,
+                    },
+                );
+            }
+            self.archetypes.insert(hash, archetype);
+        }
+        hash
+    }
+
+    /// Infer ValueType from component name (heuristic)
+    fn infer_component_type(&self, comp_name: &str) -> ValueType {
+        if comp_name.contains("pos") || comp_name.contains("vel") {
+            ValueType::Vec3
+        } else if comp_name.contains("health") {
+            ValueType::F32
+        } else {
+            ValueType::Unknown
+        }
+    }
+
+    /// Fix #2: SoA-optimized integration for Vec3 components
+    pub fn integrate_vec3_soa(&mut self, pos_comp: &str, vel_comp: &str, dt: f32) -> usize {
+        let archetype_id = self.get_or_create_archetype(&[pos_comp, vel_comp]);
+        let archetype = self.archetypes.get_mut(&archetype_id);
+        
+        if let Some(arch) = archetype {
+            let pos_col = arch.columns.get_mut(pos_comp);
+            let vel_col = arch.columns.get_mut(vel_comp);
+            
+            if let (Some(pos_data), Some(vel_data)) = (pos_col, vel_col) {
+                let count = pos_data.data.len() / 12; // Vec3 = 12 bytes
+                let mut updated = 0;
+                
+                // Direct SoA iteration: process all positions and velocities in parallel
+                for i in 0..count {
+                    let pos_offset = i * 12;
+                    let vel_offset = i * 12;
+                    
+                    if pos_offset + 12 <= pos_data.data.len() && vel_offset + 12 <= vel_data.data.len() {
+                        // Load position
+                        let px = f32::from_le_bytes([
+                            pos_data.data[pos_offset],
+                            pos_data.data[pos_offset + 1],
+                            pos_data.data[pos_offset + 2],
+                            pos_data.data[pos_offset + 3],
+                        ]);
+                        let py = f32::from_le_bytes([
+                            pos_data.data[pos_offset + 4],
+                            pos_data.data[pos_offset + 5],
+                            pos_data.data[pos_offset + 6],
+                            pos_data.data[pos_offset + 7],
+                        ]);
+                        let pz = f32::from_le_bytes([
+                            pos_data.data[pos_offset + 8],
+                            pos_data.data[pos_offset + 9],
+                            pos_data.data[pos_offset + 10],
+                            pos_data.data[pos_offset + 11],
+                        ]);
+                        
+                        // Load velocity
+                        let vx = f32::from_le_bytes([
+                            vel_data.data[vel_offset],
+                            vel_data.data[vel_offset + 1],
+                            vel_data.data[vel_offset + 2],
+                            vel_data.data[vel_offset + 3],
+                        ]);
+                        let vy = f32::from_le_bytes([
+                            vel_data.data[vel_offset + 4],
+                            vel_data.data[vel_offset + 5],
+                            vel_data.data[vel_offset + 6],
+                            vel_data.data[vel_offset + 7],
+                        ]);
+                        let vz = f32::from_le_bytes([
+                            vel_data.data[vel_offset + 8],
+                            vel_data.data[vel_offset + 9],
+                            vel_data.data[vel_offset + 10],
+                            vel_data.data[vel_offset + 11],
+                        ]);
+                        
+                        // Update: pos += vel * dt
+                        let new_px = px + vx * dt;
+                        let new_py = py + vy * dt;
+                        let new_pz = pz + vz * dt;
+                        
+                        // Store back
+                        pos_data.data[pos_offset..pos_offset + 4].copy_from_slice(&new_px.to_le_bytes());
+                        pos_data.data[pos_offset + 4..pos_offset + 8].copy_from_slice(&new_py.to_le_bytes());
+                        pos_data.data[pos_offset + 8..pos_offset + 12].copy_from_slice(&new_pz.to_le_bytes());
+                        
+                        updated += 1;
+                    }
+                }
+                return updated;
+            }
+        }
+        0
     }
 
     pub fn spawn(&mut self) -> EntityId {
