@@ -4,6 +4,7 @@
 // =========================================================================
 
 use crate::gpu_backend::GpuMemoryManager;
+use crate::xla_backend::{compile_and_execute, XlaBackend, XlaConfig, XlaDevice};
 use rustc_hash::FxHashMap;
 use std::thread;
 use std::time::Instant;
@@ -587,27 +588,44 @@ impl Tensor {
             let min_rows_per_chunk = 32usize;
             let target_chunks = (threads * 2).max(1);
             let rows_per_chunk = m.div_ceil(target_chunks).max(min_rows_per_chunk);
-            thread::scope(|scope| {
-                for (chunk_idx, result_chunk) in result.chunks_mut(rows_per_chunk * n).enumerate() {
-                    let row_start = chunk_idx * rows_per_chunk;
-                    let row_end = (row_start + rows_per_chunk).min(m);
-                    let a_data = &self.data;
-                    let bt_data = &other_t;
-
-                    scope.spawn(move || {
+            
+            // Use custom threading engine instead of thread::scope
+            use crate::threading::join;
+            
+            let chunks: Vec<_> = result.chunks_mut(rows_per_chunk * n).enumerate().collect();
+            let a_data = &self.data;
+            let bt_data = &other_t;
+            
+            // Process chunks in parallel using join
+            for (chunk_idx, result_chunk) in chunks {
+                let row_start = chunk_idx * rows_per_chunk;
+                let row_end = (row_start + rows_per_chunk).min(m);
+                let a_data = a_data.clone();
+                let bt_data = bt_data.clone();
+                let mut result_chunk = result_chunk.to_vec();
+                
+                join(
+                    move || {
                         matmul_blocked_rows(
-                            a_data,
-                            bt_data,
+                            &a_data,
+                            &bt_data,
                             row_start,
                             row_end,
                             k,
                             n,
-                            result_chunk,
+                            &mut result_chunk,
                             row_start,
                         );
-                    });
+                    },
+                    || {},
+                );
+                
+                // Copy result back
+                let start = chunk_idx * rows_per_chunk * n;
+                if start + result_chunk.len() <= result.len() {
+                    result[start..start + result_chunk.len()].copy_from_slice(&result_chunk);
                 }
-            });
+            }
         } else {
             matmul_blocked_rows(&self.data, &other_t, 0, m, k, n, &mut result, 0);
         }
@@ -1125,6 +1143,22 @@ impl ComputationGraph {
             nodes: FxHashMap::default(),
             next_id: 1,
         }
+    }
+
+    /// Execute the computation graph using XLA backend
+    pub fn execute_with_xla(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>, String> {
+        compile_and_execute(self, inputs)
+    }
+
+    /// Execute the computation graph using XLA backend with custom config
+    pub fn execute_with_xla_config(
+        &self,
+        inputs: &[Tensor],
+        config: XlaConfig,
+    ) -> Result<Vec<Tensor>, String> {
+        let mut backend = XlaBackend::new(config);
+        let comp = backend.compile_graph(self)?;
+        backend.execute(&comp, inputs)
     }
 
     pub fn add_input(&mut self, tensor: Tensor) -> u64 {

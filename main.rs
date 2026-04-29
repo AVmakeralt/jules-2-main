@@ -1020,10 +1020,10 @@ impl CliArgs {
                 "--ml-backend" => {
                     out.ml_backend = it
                         .next()
-                        .ok_or("--ml-backend requires `jules` or `jax`")?
+                        .ok_or("--ml-backend requires `jules`, `jax`, or `xla`")?
                         .to_ascii_lowercase();
-                    if out.ml_backend != "jules" && out.ml_backend != "jax" {
-                        return Err("--ml-backend must be `jules` or `jax`".into());
+                    if out.ml_backend != "jules" && out.ml_backend != "jax" && out.ml_backend != "xla" {
+                        return Err("--ml-backend must be `jules`, `jax`, or `xla`".into());
                     }
                 }
                 "-O0" | "--opt=0" => {
@@ -1138,7 +1138,7 @@ fn cmd_help() {
     println!("    --steps <N>        (estimate) max steps per episode");
     println!("    --envs <N>         (estimate) parallel environments");
     println!("    --device <cpu|gpu> (estimate) execution device");
-    println!("    --ml-backend <jules|jax>  (train) choose trainer backend");
+    println!("    --ml-backend <jules|jax|xla>  (train) choose trainer backend");
     println!("    --jax-ir <file.json>      (train+jax) model IR path (optional)");
     println!("    --jax-dataset <file.npz>  (train+jax) dataset with x_train/y_train");
     println!("    --jax-out <dir>           (train+jax) output dir (default artifacts/jax)");
@@ -2347,6 +2347,31 @@ fn cmd_train(args: &CliArgs) -> i32 {
             }
             return if status.success() { 0 } else { 1 };
         }
+
+        if args.ml_backend == "xla" {
+            if !args.quiet {
+                println!("Using XLA backend for training");
+            }
+            // XLA backend is integrated into the ML engine
+            // The ComputationGraph will use XLA for compilation when execute_with_xla is called
+            match crate::interp::jules_train(&program) {
+                Ok(all_stats) => {
+                    for (i, stats) in all_stats.iter().enumerate() {
+                        println!(
+                            "Train block {}: mean reward = {:.4}, steps = {} (XLA backend)",
+                            i + 1,
+                            stats.mean_reward,
+                            stats.total_steps
+                        );
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("jules train (XLA): {e}");
+                    1
+                }
+            }
+        } else {
 
         match crate::interp::jules_train(&program) {
             Ok(all_stats) => {

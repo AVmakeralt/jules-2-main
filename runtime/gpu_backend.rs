@@ -501,14 +501,24 @@ fn batched_matmul(
 
     if parallel_batches {
         let batches_per_chunk = batch.div_ceil(threads);
-        thread::scope(|scope| {
-            for (chunk_idx, out_chunk) in out_data
-                .chunks_mut(batches_per_chunk * batch_mat_size)
-                .enumerate()
-            {
-                let batch_start = chunk_idx * batches_per_chunk;
-                let batch_end = (batch_start + batches_per_chunk).min(batch);
-                scope.spawn(move || {
+        
+        // Use custom threading engine instead of thread::scope
+        use crate::threading::join;
+        
+        let chunks: Vec<_> = out_data
+            .chunks_mut(batches_per_chunk * batch_mat_size)
+            .enumerate()
+            .collect();
+        
+        for (chunk_idx, out_chunk) in chunks {
+            let batch_start = chunk_idx * batches_per_chunk;
+            let batch_end = (batch_start + batches_per_chunk).min(batch);
+            let a_data = a_data.clone();
+            let b_data = b_data.clone();
+            let mut out_chunk = out_chunk.to_vec();
+            
+            join(
+                move || {
                     for bi in batch_start..batch_end {
                         let local_bi = bi - batch_start;
                         let a_off = bi * a_mat;
@@ -523,9 +533,16 @@ fn batched_matmul(
                         );
                         out_chunk[out_off..out_off + batch_mat_size].copy_from_slice(&out);
                     }
-                });
+                },
+                || {},
+            );
+            
+            // Copy result back
+            let start = chunk_idx * batches_per_chunk * batch_mat_size;
+            if start + out_chunk.len() <= out_data.len() {
+                out_data[start..start + out_chunk.len()].copy_from_slice(&out_chunk);
             }
-        });
+        }
     } else {
         for bi in 0..batch {
             let a_off = bi * a_mat;

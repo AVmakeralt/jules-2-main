@@ -49,7 +49,7 @@ clap = { version = "4", features = ["derive"] }
 colored = "2"
 rustyline = "12"
 rustc-hash = "2"
-rayon = "1"
+# rayon = "1"  # Replaced by custom threading engine
 bumpalo = "3.14"
 smallvec = { version = "1", features = ["union", "const_generics"] }
 ahash = "0.8"
@@ -59,6 +59,15 @@ cranelift-module = { version = "0.110", optional = true }
 cranelift-jit = { version = "0.110", optional = true }
 region = "3.0"
 
+# XLA FFI bindings (optional, requires XLA library)
+xla-ffi = { version = "0.1", optional = true }
+
+# Threading engine dependencies
+libc = "0.2"
+nix = { version = "0.28", features = ["sched"], optional = true }
+num_cpus = "1.16"
+windows = { version = "0.52", features = ["Win32_System_Threading"], optional = true }
+
 [features]
 default = ["ffi-c", "phase1", "phase2", "phase3-jit"]
 python = ["pyo3", "numpy"]
@@ -66,12 +75,14 @@ ffi-c = []
 nightly = []
 phase1 = []
 phase2 = []
-phase3-jit = ["cranelift-codegen", "cranelift-module", "cranelift-jit"]
+phase3-jit = , "libc", "windows"["cranelift-codegen", "cranelift-module", "cranelift-jit"]
+numa = ["nix"]
 phase4-llvm = []
-phase5-cow = []
+phase5-cow = []a", "num
 phase6-simd = []
+xla = ["xla-ffi"]
 ultra-fast = ["phase3-jit", "phase6-simd"]
-full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd"]
+full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd", "xla"]
 
 [lints.rust]
 dead_code = "allow"
