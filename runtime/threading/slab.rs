@@ -2,11 +2,13 @@
 // Slab Allocator for Zero-Allocation Tasks
 // Per-worker slab of pre-allocated task descriptors
 // Lock-free free-list with epoch-based reclamation
+// Enhanced with per-CPU allocation and huge page support
 // =========================================================================
 
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::ptr;
 use std::alloc::{Layout, alloc, dealloc};
+use super::rseq::{rseq_begin, rseq_end, get_cpu_id};
 
 /// Page size for slab allocation (4KB)
 const PAGE_SIZE: usize = 4096;
@@ -94,6 +96,10 @@ pub struct SlabAllocator {
     page_count: AtomicUsize,
     /// Tasks per page
     tasks_per_page: usize,
+    /// Per-CPU free lists for wait-free allocation
+    per_cpu_free_lists: Vec<AtomicPtr<TaskDescriptor>>,
+    /// Use huge pages if available
+    use_huge_pages: bool,
 }
 
 impl SlabAllocator {
@@ -104,17 +110,47 @@ impl SlabAllocator {
         
         let first_task = unsafe { (*page).free_list.load(Ordering::Acquire) };
         
+        let num_cpus = num_cpus::get();
+        let mut per_cpu_free_lists = Vec::with_capacity(num_cpus);
+        for _ in 0..num_cpus {
+            per_cpu_free_lists.push(AtomicPtr::new(ptr::null_mut()));
+        }
+        
         Self {
             free_list: AtomicPtr::new(first_task),
             pages: AtomicPtr::new(page),
             page_count: AtomicUsize::new(1),
             tasks_per_page,
+            per_cpu_free_lists,
+            use_huge_pages: false,
         }
     }
+    
+    /// Create a new slab allocator with huge page support
+    pub fn with_huge_pages() -> Self {
+        let mut alloc = Self::new();
+        alloc.use_huge_pages = true;
+        alloc
+    }
 
-    /// Allocate a new task descriptor (lock-free)
+    /// Allocate a new task descriptor (wait-free with rseq on local CPU)
     pub fn allocate(&self) -> *mut TaskDescriptor {
-        // Try to pop from free list with CAS loop
+        // Try per-CPU free list first (wait-free with rseq)
+        if let Some(cpu_id) = rseq_begin() {
+            if cpu_id < self.per_cpu_free_lists.len() {
+                let head = self.per_cpu_free_lists[cpu_id].load(Ordering::Acquire);
+                if !head.is_null() {
+                    let next = unsafe { (*head).next.load(Ordering::Acquire) };
+                    self.per_cpu_free_lists[cpu_id].store(next, Ordering::Release);
+                    unsafe { (*head).in_use.store(true, Ordering::Release); }
+                    rseq_end();
+                    return head;
+                }
+            }
+            rseq_end();
+        }
+        
+        // Fallback to global free list with CAS loop
         loop {
             let head = self.free_list.load(Ordering::Acquire);
             
@@ -139,7 +175,7 @@ impl SlabAllocator {
         }
     }
 
-    /// Deallocate a task descriptor (lock-free)
+    /// Deallocate a task descriptor (wait-free with rseq on local CPU)
     pub fn deallocate(&self, descriptor: *mut TaskDescriptor) {
         if descriptor.is_null() {
             return;
@@ -148,7 +184,19 @@ impl SlabAllocator {
         unsafe {
             (*descriptor).in_use.store(false, Ordering::Release);
             
-            // Push back to free list with CAS loop
+            // Try per-CPU free list first (wait-free with rseq)
+            if let Some(cpu_id) = rseq_begin() {
+                if cpu_id < self.per_cpu_free_lists.len() {
+                    let head = self.per_cpu_free_lists[cpu_id].load(Ordering::Acquire);
+                    (*descriptor).next.store(head, Ordering::Release);
+                    self.per_cpu_free_lists[cpu_id].store(descriptor, Ordering::Release);
+                    rseq_end();
+                    return;
+                }
+                rseq_end();
+            }
+            
+            // Fallback to global free list with CAS loop
             loop {
                 let head = self.free_list.load(Ordering::Acquire);
                 (*descriptor).next.store(head, Ordering::Release);

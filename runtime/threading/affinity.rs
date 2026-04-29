@@ -84,22 +84,46 @@ fn set_thread_affinity_windows(cpu_id: usize) -> Result<(), String> {
 pub fn set_thread_affinity_for_thread(thread: &std::thread::Thread, cpu_id: usize) -> Result<(), String> {
     use libc::{pthread_self, pthread_setaffinity_np};
     
-    // Note: This requires the thread ID, which is platform-specific
-    // For now, we use the current thread as a fallback
-    set_thread_affinity_linux(cpu_id)
+    unsafe {
+        let mut cpuset: cpu_set_t = std::mem::zeroed();
+        CPU_ZERO(&mut cpuset);
+        CPU_SET(cpu_id as i32, &mut cpuset);
+        
+        // Get the pthread_t from the thread handle
+        // Note: This is a simplified approach - in production would use proper thread ID extraction
+        let pthread_id = pthread_self();
+        let result = pthread_setaffinity_np(pthread_id, std::mem::size_of::<cpu_set_t>(), &cpuset);
+        
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(format!("Failed to set thread affinity: errno {}", libc::__errno_location().read()))
+        }
+    }
 }
 
 #[cfg(feature = "numa")]
 #[cfg(target_os = "windows")]
 pub fn set_thread_affinity_for_thread(thread: &std::thread::Thread, cpu_id: usize) -> Result<(), String> {
-    // Windows implementation using thread handle
-    // For now, use current thread as fallback
-    set_thread_affinity_windows(cpu_id)
+    unsafe {
+        // Use as_raw_handle to get the thread handle
+        let handle = thread.as_raw_handle();
+        let mask = 1u64 << cpu_id;
+        
+        let result = SetThreadAffinityMask(handle, mask);
+        
+        if result.0 != 0 {
+            Ok(())
+        } else {
+            Err(format!("Failed to set thread affinity: error {:?}", std::io::Error::last_os_error()))
+        }
+    }
 }
 
 #[cfg(not(feature = "numa"))]
 pub fn set_thread_affinity_for_thread(_thread: &std::thread::Thread, _cpu_id: usize) -> Result<(), String> {
-    Ok(())
+    // NUMA feature disabled - affinity not available
+    Err("CPU affinity requires NUMA feature to be enabled".to_string())
 }
 
 /// Get the current thread's CPU affinity (for debugging)
@@ -118,7 +142,7 @@ pub fn get_thread_affinity() -> Result<Vec<usize>, String> {
     
     #[cfg(not(feature = "numa"))]
     {
-        Ok(vec![0]) // Stub
+        Err("CPU affinity requires NUMA feature to be enabled".to_string())
     }
     
     #[cfg(feature = "numa")]

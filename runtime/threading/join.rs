@@ -195,10 +195,29 @@ where
     FA: FnOnce() -> A + Send,
     FB: FnOnce() -> B + Send,
 {
-    // For now, execute sequentially as a safe fallback
-    // The full implementation would use stack-allocated tasks with vtable
-    let result_a = a();
-    let result_b = b();
+    // Use std::thread for true parallel execution
+    // In production, would use the custom thread pool with stack-allocated tasks
+    use std::sync::mpsc;
+    
+    let (tx_a, rx_a) = mpsc::channel();
+    let (tx_b, rx_b) = mpsc::channel();
+    
+    let handle_a = std::thread::spawn(move || {
+        let result = a();
+        tx_a.send(result).unwrap();
+    });
+    
+    let handle_b = std::thread::spawn(move || {
+        let result = b();
+        tx_b.send(result).unwrap();
+    });
+    
+    handle_a.join().unwrap();
+    handle_b.join().unwrap();
+    
+    let result_a = rx_a.recv().unwrap();
+    let result_b = rx_b.recv().unwrap();
+    
     (result_a, result_b)
 }
 

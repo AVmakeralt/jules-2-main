@@ -13,6 +13,8 @@ use super::affinity::set_thread_affinity;
 use super::deque::WorkStealingDeque;
 use super::epoch::{Guard, Participant};
 use super::numa::{NumaTopology, num_cores};
+use super::percpu_deque::PerCpuDeque;
+use super::rseq::register_rseq;
 
 /// Number of worker threads (one per CPU core)
 fn num_workers() -> usize {
@@ -172,9 +174,12 @@ pub struct Worker {
     /// Worker ID
     id: usize,
     _pad1: [u8; 128 - std::mem::size_of::<usize>()],
-    /// Local work-stealing deque
+    /// Local work-stealing deque (fallback)
     deque: WorkStealingDeque,
     _pad2: [u8; 128 - std::mem::size_of::<WorkStealingDeque>()],
+    /// Per-CPU deque (wait-fast with rseq)
+    percpu_deque: Arc<PerCpuDeque>,
+    _pad3: [u8; 128 - std::mem::size_of::<PerCpuDeque>()],
     /// Reference to global injector
     injector: Arc<Injector>,
     /// Reference to all workers (for stealing)
@@ -199,12 +204,15 @@ impl Worker {
         participant: Arc<Participant>,
         shutdown: Arc<AtomicBool>,
         numa_node: Option<usize>,
+        percpu_deque: Arc<PerCpuDeque>,
     ) -> Self {
         Self {
             id,
             _pad1: [0; 128 - std::mem::size_of::<usize>()],
             deque: WorkStealingDeque::new(participant.clone()),
             _pad2: [0; 128 - std::mem::size_of::<WorkStealingDeque>()],
+            percpu_deque,
+            _pad3: [0; 128 - std::mem::size_of::<PerCpuDeque>()],
             injector,
             workers,
             participant,
@@ -217,12 +225,22 @@ impl Worker {
 
     /// Main worker loop with exponential backoff for idle periods
     fn run(&self) {
+        // Register rseq for this thread
+        let _ = register_rseq();
+        
         let mut idle_iterations = 0;
         
         while !self.shutdown.load(Ordering::Acquire) {
             let guard = self.participant.pin();
             
-            // Try to pop from local deque (fast path)
+            // Try to pop from per-CPU deque first (wait-free with rseq)
+            if let Some(task) = self.percpu_deque.pop(&guard) {
+                self.execute_task(task);
+                idle_iterations = 0;
+                continue;
+            }
+            
+            // Try to pop from local deque (fallback)
             if let Some(task) = self.deque.pop(&guard) {
                 self.execute_task(task);
                 idle_iterations = 0;
@@ -270,6 +288,14 @@ impl Worker {
                 let target = &self.workers[target_id];
                 
                 if target.numa_node == Some(my_node) {
+                    // Try per-CPU deque first
+                    if let Some(task) = target.percpu_deque.steal_half(target_id, guard) {
+                        if !task.is_null() {
+                            self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                            return Some(task);
+                        }
+                    }
+                    // Fallback to regular deque
                     if let Some(task) = target.deque.steal_half(guard) {
                         if !task.is_null() {
                             self.steals_performed.fetch_add(1, Ordering::Relaxed);
@@ -285,6 +311,12 @@ impl Worker {
                 let target = &self.workers[target_id];
                 
                 if target.numa_node != Some(my_node) {
+                    if let Some(task) = target.percpu_deque.steal_half(target_id, guard) {
+                        if !task.is_null() {
+                            self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                            return Some(task);
+                        }
+                    }
                     if let Some(task) = target.deque.steal_half(guard) {
                         if !task.is_null() {
                             self.steals_performed.fetch_add(1, Ordering::Relaxed);
@@ -299,6 +331,12 @@ impl Worker {
                 let target_id = (self.id + offset) % num_workers;
                 let target = &self.workers[target_id];
                 
+                if let Some(task) = target.percpu_deque.steal_half(target_id, guard) {
+                    if !task.is_null() {
+                        self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                        return Some(task);
+                    }
+                }
                 if let Some(task) = target.deque.steal_half(guard) {
                     if !task.is_null() {
                         self.steals_performed.fetch_add(1, Ordering::Relaxed);
@@ -324,7 +362,8 @@ impl Worker {
     /// Push a task to this worker's deque
     pub fn push(&self, task: *mut ()) {
         let guard = self.participant.pin();
-        self.deque.push(task, &guard);
+        // Try per-CPU deque first (wait-free with rseq)
+        self.percpu_deque.push(task, &guard);
     }
 
     /// Get worker statistics
@@ -363,6 +402,9 @@ impl ThreadPool {
         let injector = Arc::new(Injector::new());
         let shutdown = Arc::new(AtomicBool::new(false));
         
+        // Create per-CPU deque
+        let percpu_deque = Arc::new(PerCpuDeque::new(participant.clone()));
+        
         // Detect NUMA topology
         let topology = NumaTopology::detect();
         
@@ -380,6 +422,7 @@ impl ThreadPool {
                 participant.clone(),
                 shutdown.clone(),
                 numa_node,
+                percpu_deque.clone(),
             ));
             workers.push(worker);
         }
@@ -394,6 +437,7 @@ impl ThreadPool {
                 participant.clone(),
                 shutdown.clone(),
                 numa_node,
+                percpu_deque.clone(),
             ))
         }).collect());
         
