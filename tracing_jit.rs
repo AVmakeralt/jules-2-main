@@ -1,7 +1,7 @@
 // =============================================================================
 // jules/src/tracing_jit.rs
 //
-// TRACING JIT COMPILER (COMPLETE & HEAVILY OPTIMIZED)
+// TRACING JIT COMPILER
 //
 // Optimizations Implemented:
 // - Fast linear register allocation with dirty-bit spilling
