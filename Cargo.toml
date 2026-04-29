@@ -9,12 +9,12 @@ autobenches = false
 
 [lib]
 name = "jules"
-path = "lib.rs"
+path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "jules"
-path = "main.rs"
+path = "src/main.rs"
 
 [[bin]]
 name = "bench-ecs"
@@ -22,7 +22,7 @@ path = "benches/bench_ecs.rs"
 
 [[bin]]
 name = "micro-benchmark"
-path = "micro-benchmark.rs"
+path = "src/micro-benchmark.rs"
 
 [[bin]]
 name = "bench-chess-ml"
@@ -58,10 +58,8 @@ cranelift-codegen = { version = "0.110", optional = true }
 cranelift-module = { version = "0.110", optional = true }
 cranelift-jit = { version = "0.110", optional = true }
 region = "3.0"
-
 # XLA FFI bindings (optional, requires XLA library)
 xla-ffi = { version = "0.1", optional = true }
-
 # Threading engine dependencies
 nix = { version = "0.28", features = ["sched"], optional = true }
 num_cpus = "1.16"
