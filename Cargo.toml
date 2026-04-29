@@ -63,7 +63,6 @@ region = "3.0"
 xla-ffi = { version = "0.1", optional = true }
 
 # Threading engine dependencies
-libc = "0.2"
 nix = { version = "0.28", features = ["sched"], optional = true }
 num_cpus = "1.16"
 windows = { version = "0.52", features = ["Win32_System_Threading"], optional = true }
@@ -75,10 +74,10 @@ ffi-c = []
 nightly = []
 phase1 = []
 phase2 = []
-phase3-jit = , "libc", "windows"["cranelift-codegen", "cranelift-module", "cranelift-jit"]
+phase3-jit = ["dep:cranelift-codegen", "dep:cranelift-module", "dep:cranelift-jit", "dep:windows"]
 numa = ["nix"]
 phase4-llvm = []
-phase5-cow = []a", "num
+phase5-cow = []
 phase6-simd = []
 xla = ["xla-ffi"]
 ultra-fast = ["phase3-jit", "phase6-simd"]
