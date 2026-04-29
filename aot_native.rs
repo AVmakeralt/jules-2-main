@@ -631,7 +631,7 @@ impl LowerCtx {
     }
 
     fn lower_for_in(&mut self, pattern: &Pattern, iter: &Expr, body: &Block) {
-        // Translate `for i in lo..hi` → equivalent while loop
+        // Translate `for i in lo..hi` → equivalent while loop with proper SSA Phi
         if let Expr::Range { lo, hi, .. } = iter {
             let start = lo.as_ref().map(|e| self.lower_expr(e))
                 .unwrap_or_else(|| {
@@ -642,27 +642,38 @@ impl LowerCtx {
             let end = hi.as_ref().map(|e| self.lower_expr(e))
                 .unwrap_or_else(|| panic!("for..in requires upper bound"));
 
-            // loop_var = start  (use Move for proper SSA copy)
-            let loop_var = self.fresh_var();
-            self.emit(IRInstr::Move { dst: loop_var, src: start });
-            if let Pattern::Ident { name, .. } = pattern {
-                self.var_env.insert(name.to_string(), loop_var);
-            }
-
             let header    = self.fresh_block();
             let body_b    = self.fresh_block();
             let incr_b    = self.fresh_block();
             let exit      = self.fresh_block();
 
+            // The loop variable is a Phi at the header:
+            //   phi_var = [ start (from pre-header) | incremented (from incr_b) ]
+            let phi_var = self.fresh_var();
+
             let prev = self.cur;
             self.emit(IRInstr::Br { target: header });
             self.set_successors(prev, vec![header]);
 
-            // Header: if loop_var < end → body, else exit
+            // Header: Phi node + condition check
             self.switch_to(header);
+            // Phi incoming: pre-header supplies `start`, incr_b will supply `new_var`
+            // (incr_b not yet known for `new_var`; we fill incr_b block id and
+            //  new_var after we create them, but we need a placeholder var now)
+            let new_var = self.fresh_var(); // will be defined in incr_b
+            self.emit(IRInstr::Phi {
+                dst: phi_var,
+                incoming: vec![(prev, start), (incr_b, new_var)],
+            });
+
+            // Bind the pattern name to phi_var so the body sees the right variable
+            if let Pattern::Ident { name, .. } = pattern {
+                self.var_env.insert(name.to_string(), phi_var);
+            }
+
             let cmp = self.fresh_var();
             self.emit(IRInstr::ICmp { dst: cmp, cond: ICmpCond::SLt,
-                                      lhs: loop_var, rhs: end });
+                                      lhs: phi_var, rhs: end });
             self.emit(IRInstr::CondBr { cond: cmp, if_true: body_b, if_false: exit });
             self.set_successors(header, vec![body_b, exit]);
 
@@ -679,13 +690,11 @@ impl LowerCtx {
             self.break_targets.pop();
             self.continue_targets.pop();
 
-            // Increment: loop_var += 1
+            // Increment: new_var = phi_var + 1  (new_var is the Phi's back-edge value)
             self.switch_to(incr_b);
-            let one     = self.fresh_var();
-            let new_var = self.fresh_var();
+            let one = self.fresh_var();
             self.emit(IRInstr::Const { dst: one, value: 1 });
-            self.emit(IRInstr::Add   { dst: new_var, lhs: loop_var, rhs: one });
-            self.emit(IRInstr::Move  { dst: loop_var, src: new_var });
+            self.emit(IRInstr::Add   { dst: new_var, lhs: phi_var, rhs: one });
             self.emit(IRInstr::Br { target: header });
             self.set_successors(incr_b, vec![header]);
 
@@ -812,9 +821,20 @@ impl LatticeVal {
     }
 }
 
-fn eval_instr_sccp(instr: &IRInstr, vals: &HashMap<VarId, LatticeVal>) -> LatticeVal {
+fn eval_instr_sccp(instr: &IRInstr, vals: &HashMap<VarId, LatticeVal>,
+                   executable: &HashSet<BlockId>) -> LatticeVal {
     let get = |v: VarId| vals.get(&v).copied().unwrap_or(LatticeVal::Undefined);
     match instr {
+        // ── Phi: meet only the incoming values from executable predecessors ──
+        IRInstr::Phi { incoming, .. } => {
+            let mut result = LatticeVal::Undefined;
+            for &(pred_block, var) in incoming {
+                if executable.contains(&pred_block) {
+                    result = LatticeVal::meet(result, get(var));
+                }
+            }
+            result
+        }
         IRInstr::Const  { value, .. }    => LatticeVal::Constant(*value),
         IRInstr::Move   { src, .. }      => get(*src),
         IRInstr::Add  { lhs, rhs, .. }   =>
@@ -870,28 +890,32 @@ pub fn run_sccp(func: &mut IRFunction) {
     executable.insert(func.entry_block);
     cfg_work.push_back(func.entry_block);
 
-    // BFS over reachable blocks first
-    while let Some(bid) = cfg_work.pop_front() {
-        if let Some(block) = func.blocks.get(&bid) {
-            let succs = block.successors.clone();
-            for (idx, _) in block.instrs.iter().enumerate() {
-                ssa_work.push_back((bid, idx));
-            }
-            for s in succs {
-                if executable.insert(s) { cfg_work.push_back(s); }
-            }
+    // Seed the SSA worklist with the entry block's instructions only.
+    // Additional blocks are added as they become reachable via CondBr evaluation.
+    if let Some(entry_blk) = func.blocks.get(&func.entry_block) {
+        for (idx, _) in entry_blk.instrs.iter().enumerate() {
+            ssa_work.push_back((func.entry_block, idx));
         }
     }
 
     // Main SSA worklist
     while let Some((bid, idx)) = ssa_work.pop_front() {
+        // Process any newly-reachable blocks from the cfg worklist first
+        while let Some(new_bid) = cfg_work.pop_front() {
+            if let Some(block) = func.blocks.get(&new_bid) {
+                for (i, _) in block.instrs.iter().enumerate() {
+                    ssa_work.push_back((new_bid, i));
+                }
+            }
+        }
+
         let instr = match func.blocks.get(&bid).and_then(|b| b.instrs.get(idx)) {
             Some(i) => i.clone(),
             None    => continue,
         };
         if let Some(dst) = instr_def(&instr) {
             let old = vals.get(&dst).copied().unwrap_or(LatticeVal::Undefined);
-            let new = eval_instr_sccp(&instr, &vals);
+            let new = eval_instr_sccp(&instr, &vals, &executable);
             let merged = LatticeVal::meet(old, new);
             if merged != old {
                 vals.insert(dst, merged);
@@ -1001,15 +1025,27 @@ pub fn run_gvn(func: &mut IRFunction) {
 // =============================================================================
 
 pub fn run_copy_prop(func: &mut IRFunction) {
-    // Build copy map: if dst = Move { src }, substitute all uses of dst with src
+    // Build copy map: if dst = Move { src }, substitute all uses of dst with canonical src
     let mut copies: HashMap<VarId, VarId> = HashMap::new();
     for block in func.blocks.values() {
         for instr in &block.instrs {
             if let IRInstr::Move { dst, src } = instr {
-                let canonical = *copies.get(src).unwrap_or(src);
+                // Resolve transitively: walk the chain to find the true root
+                let mut canonical = *src;
+                while let Some(&next) = copies.get(&canonical) {
+                    canonical = next;
+                }
                 copies.insert(*dst, canonical);
             }
         }
+    }
+    // Second pass: make sure any entry whose value still chains further is flattened
+    // (handles the case where b←c was inserted after a←b was already recorded)
+    let keys: Vec<VarId> = copies.keys().copied().collect();
+    for k in keys {
+        let mut cur = copies[&k];
+        while let Some(&next) = copies.get(&cur) { cur = next; }
+        copies.insert(k, cur);
     }
     if copies.is_empty() { return; }
 
@@ -1391,6 +1427,21 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
             pb.successors = vec![lp.header];
         }
 
+        // Fix up Phi nodes in the loop header: any incoming edge that referred to
+        // an outside predecessor must now point to pre_header instead.
+        let outside_preds_set: HashSet<BlockId> = outside_preds.iter().copied().collect();
+        if let Some(hdr) = func.blocks.get_mut(&lp.header) {
+            for instr in &mut hdr.instrs {
+                if let IRInstr::Phi { incoming, .. } = instr {
+                    for (pred, _) in incoming.iter_mut() {
+                        if outside_preds_set.contains(pred) {
+                            *pred = pre_header;
+                        }
+                    }
+                }
+            }
+        }
+
         // Remove hoisted instructions from their original blocks
         let mut hoisted_by_block: HashMap<BlockId, HashSet<usize>> = HashMap::new();
         for (bid, idx) in hoisted {
@@ -1489,16 +1540,15 @@ fn find_const_def(func: &IRFunction, var: VarId, _loop_body: &HashSet<BlockId>) 
 // =============================================================================
 
 pub fn run_peephole(func: &mut IRFunction) {
-    // Build a const-value map for the function
-    let const_map: HashMap<VarId, i64> = func.blocks.values()
-        .flat_map(|b| b.instrs.iter())
-        .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
-        .collect();
-
     for block in func.blocks.values_mut() {
         let mut changed = true;
         while changed {
             changed = false;
+            // Rebuild const_map each iteration so newly-introduced Const instructions
+            // are visible to subsequent pattern matches within the same pass.
+            let const_map: HashMap<VarId, i64> = block.instrs.iter()
+                .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
+                .collect();
             let mut new: Vec<IRInstr> = Vec::with_capacity(block.instrs.len());
             let mut i = 0;
             while i < block.instrs.len() {
@@ -1987,8 +2037,19 @@ fn instr_latency(i: &IRInstr) -> usize {
 
 pub fn run_sched(func: &mut IRFunction) {
     for block in func.blocks.values_mut() {
+        // Split terminators from the schedulable body.
+        // Terminators (Br, CondBr, Ret, TailCall) must stay at the end.
+        let term_start = block.instrs.iter().rposition(|i| matches!(i,
+            IRInstr::Br {..} | IRInstr::CondBr {..} |
+            IRInstr::Ret {..} | IRInstr::TailCall {..}
+        )).map(|p| p).unwrap_or(block.instrs.len());
+
+        let terminators: Vec<IRInstr> = block.instrs.drain(term_start..).collect();
         let n = block.instrs.len();
-        if n < 4 { continue; } // not worth scheduling tiny blocks
+        if n < 4 {
+            block.instrs.extend(terminators);
+            continue;
+        }
 
         // Build use-def dependency edges
         let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -2032,6 +2093,7 @@ pub fn run_sched(func: &mut IRFunction) {
             }
         }
         block.instrs = result;
+        block.instrs.extend(terminators);
     }
 }
 
@@ -2230,16 +2292,32 @@ impl AsmEmitter {
         self.code[patch_site..patch_site+4].copy_from_slice(&bytes);
     }
 
-    // ── Prologue / Epilogue ───────────────────────────────────────────────
     fn prologue(&mut self, frame: u32, saved: &[u8]) {
         for &r in saved { self.push_r(r); }
         self.push_r(RBP);
         // mov rbp, rsp
         self.b(0x48); self.b(0x89); self.b(0xE5);
-        if frame > 0 { self.sub_rsp(frame); }
+        // After call the stack is misaligned by 8 (return address).
+        // Each push is 8 bytes.  Total pushed = saved.len() + 1 (rbp).
+        // We need (total_pushed * 8 + frame) to be a multiple of 16.
+        // If (saved.len() + 1) is even, RSP is aligned; if odd, we need +8.
+        let push_bytes = (saved.len() + 1) * 8;
+        let frame_adj = if push_bytes % 16 != 0 {
+            (frame + 8 + 15) & !15
+        } else {
+            (frame + 15) & !15
+        };
+        if frame_adj > 0 { self.sub_rsp(frame_adj); }
     }
     fn epilogue(&mut self, frame: u32, saved: &[u8]) {
-        if frame > 0 { self.add_rsp(frame); }
+        // Recompute the same adjusted frame as prologue
+        let push_bytes = (saved.len() + 1) * 8;
+        let frame_adj = if push_bytes % 16 != 0 {
+            (frame + 8 + 15) & !15
+        } else {
+            (frame + 15) & !15
+        };
+        if frame_adj > 0 { self.add_rsp(frame_adj); }
         // mov rsp, rbp (restore rsp from rbp — correct epilogue)
         self.b(0x48); self.b(0x89); self.b(0xEC);
         self.pop_r(RBP);
@@ -2256,11 +2334,15 @@ pub struct NativeCodeGen {
     pub emit:   AsmEmitter,
     labels:     HashMap<String, usize>,        // label name → code offset
     fixups:     Vec<(usize, String)>,          // (patch site, label)
+    // Epilogue state — set at the start of compile_function, used by every Ret
+    cur_frame:  u32,
+    cur_saved:  Vec<u8>,
 }
 
 impl NativeCodeGen {
     pub fn new() -> Self {
-        Self { emit: AsmEmitter::new(), labels: HashMap::new(), fixups: Vec::new() }
+        Self { emit: AsmEmitter::new(), labels: HashMap::new(), fixups: Vec::new(),
+               cur_frame: 0, cur_saved: Vec::new() }
     }
 
     pub fn compile_function(&mut self, func: &IRFunction) -> Result<(), String> {
@@ -2275,6 +2357,9 @@ impl NativeCodeGen {
 
         // Record function label
         self.labels.insert(func.name.clone(), self.emit.pos());
+        // Store epilogue info so every Ret can restore the frame correctly
+        self.cur_frame = frame;
+        self.cur_saved = saved.clone();
         self.emit.prologue(frame, &saved);
 
         // Move arguments from ABI regs to their allocated locations
@@ -2365,21 +2450,54 @@ impl NativeCodeGen {
                 self.put_from_reg(*dst, S0, alloc);
             }
             IRInstr::SDiv { dst, lhs, rhs } => {
+                // idiv implicitly uses rax (dividend) and rdx (sign extension),
+                // clobbering both.  Save them if they hold live values other than
+                // the operands / destination we are about to produce.
                 let lr = self.get_in_reg(*lhs, S0, alloc)?;
                 let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                // Push rax / rdx only when they are not the scratch regs we
+                // already hold the operands in, to avoid double-saves.
+                let save_rax = lr != RET_REG && rr != RET_REG;
+                let save_rdx = lr != 2       && rr != 2;
+                if save_rax { self.emit.push_r(RET_REG); }
+                if save_rdx { self.emit.push_r(2); }
                 self.emit.mov_rr(RET_REG, lr); // rax = lhs
-                self.emit.cqo();               // sign-extend to rdx:rax
-                self.emit.idiv_r(rr);           // rax = quotient, rdx = remainder
+                self.emit.cqo();               // sign-extend rax → rdx:rax
+                self.emit.idiv_r(rr);           // quotient in rax
+                // Write result before restoring (the result IS rax)
                 self.put_from_reg(*dst, RET_REG, alloc);
+                if save_rdx { self.emit.pop_r(2); }
+                if save_rax {
+                    // Only pop rax back if dst wasn't rax itself
+                    if !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == RET_REG) {
+                        self.emit.pop_r(RET_REG);
+                    } else {
+                        self.emit.add_rsp(8); // discard saved value; dst owns rax now
+                    }
+                }
             }
             IRInstr::SRem { dst, lhs, rhs } => {
-                // v1 bug fix: remainder is in rdx, not rax
+                // v1 bug fix: remainder is in rdx, not rax.
+                // Also save rax/rdx around the idiv for the same reasons as SDiv.
                 let lr = self.get_in_reg(*lhs, S0, alloc)?;
                 let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                let save_rax = lr != RET_REG && rr != RET_REG;
+                let save_rdx = lr != 2       && rr != 2;
+                if save_rax { self.emit.push_r(RET_REG); }
+                if save_rdx { self.emit.push_r(2); }
                 self.emit.mov_rr(RET_REG, lr);
                 self.emit.cqo();
                 self.emit.idiv_r(rr);
-                self.put_from_reg(*dst, 2 /*rdx*/, alloc); // rdx = remainder
+                // remainder in rdx — write before restoring
+                self.put_from_reg(*dst, 2 /*rdx*/, alloc);
+                if save_rdx {
+                    if !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 2) {
+                        self.emit.pop_r(2);
+                    } else {
+                        self.emit.add_rsp(8);
+                    }
+                }
+                if save_rax { self.emit.pop_r(RET_REG); }
             }
             IRInstr::Neg { dst, src } => {
                 let sr = self.get_in_reg(*src, S0, alloc)?;
@@ -2412,26 +2530,39 @@ impl NativeCodeGen {
                 let lr = self.get_in_reg(*lhs, S0, alloc)?;
                 let rr = self.get_in_reg(*rhs, S1, alloc)?;
                 self.emit.mov_rr(S0, lr);
-                // Shift count must be in cl (rcx = reg 1)
+                // shl uses cl (rcx=1).  Save rcx if it holds a live value that is
+                // neither the count operand nor the destination.
+                let save_rcx = rr != 1 && lr != 1
+                    && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
+                if save_rcx { self.emit.push_r(1); }
                 self.emit.mov_rr(1 /*rcx*/, rr);
                 self.emit.shl_cl(S0);
                 self.put_from_reg(*dst, S0, alloc);
+                if save_rcx { self.emit.pop_r(1); }
             }
             IRInstr::AShr { dst, lhs, rhs } => {
                 let lr = self.get_in_reg(*lhs, S0, alloc)?;
                 let rr = self.get_in_reg(*rhs, S1, alloc)?;
                 self.emit.mov_rr(S0, lr);
+                let save_rcx = rr != 1 && lr != 1
+                    && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
+                if save_rcx { self.emit.push_r(1); }
                 self.emit.mov_rr(1 /*rcx*/, rr);
                 self.emit.sar_cl(S0);
                 self.put_from_reg(*dst, S0, alloc);
+                if save_rcx { self.emit.pop_r(1); }
             }
             IRInstr::LShr { dst, lhs, rhs } => {
                 let lr = self.get_in_reg(*lhs, S0, alloc)?;
                 let rr = self.get_in_reg(*rhs, S1, alloc)?;
                 self.emit.mov_rr(S0, lr);
+                let save_rcx = rr != 1 && lr != 1
+                    && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
+                if save_rcx { self.emit.push_r(1); }
                 self.emit.mov_rr(1 /*rcx*/, rr);
                 self.emit.shr_cl(S0);
                 self.put_from_reg(*dst, S0, alloc);
+                if save_rcx { self.emit.pop_r(1); }
             }
             IRInstr::Not { dst, src } => {
                 let sr = self.get_in_reg(*src, S0, alloc)?;
@@ -2490,16 +2621,40 @@ impl NativeCodeGen {
                 } else {
                     self.emit.mov_r_imm(RET_REG, 0);
                 }
-                // Epilogue inline (frame/saved computed by compile_function and stored
-                // externally — here we emit a ret; the caller manages epilogue at the
-                // end of compile_function instead for compactness)
-                self.emit.ret();
+                // Emit a full epilogue (frame restore + callee-saved pop + ret)
+                // cur_frame / cur_saved are set by compile_function before code emission.
+                let frame = self.cur_frame;
+                let saved = self.cur_saved.clone();
+                self.emit.epilogue(frame, &saved);
             }
             IRInstr::Call { dst, func: fname, args } => {
-                // Marshal arguments per System V AMD64 ABI
+                // Spill every caller-saved register that holds a live variable
+                // across this call (x86-64 SysV ABI: caller must save rax,rcx,rdx,
+                // rsi,rdi,r8-r11).  We push them all and pop after.
+                let caller_saved_set: &[u8] = CALLER_SAVED;
+                let mut pushed: Vec<u8> = Vec::new();
+                for &r in caller_saved_set {
+                    // Don't bother saving scratch regs S0/S1=r10/r11; they are
+                    // already in caller-saved and will be repopulated as needed.
+                    // Also skip rax=0 (return reg) — we write to it after the call.
+                    if r == RET_REG { continue; }
+                    // Only save if some variable is actually allocated there.
+                    let in_use = alloc.map.values().any(|a| matches!(a, Alloc::Reg(x) if *x == r));
+                    if in_use {
+                        self.emit.push_r(r);
+                        pushed.push(r);
+                    }
+                }
+                // Marshal up to 6 arguments into arg registers
                 for (i, &a) in args.iter().enumerate().take(6) {
                     let ar = self.get_in_reg(a, S0, alloc)?;
                     self.emit.mov_rr(ARG_REGS[i], ar);
+                }
+                // Stack arguments (args 7+) pushed right-to-left
+                let stack_arg_count = args.len().saturating_sub(6);
+                for &a in args.iter().skip(6).rev() {
+                    let ar = self.get_in_reg(a, S0, alloc)?;
+                    self.emit.push_r(ar);
                 }
                 let lbl = fname.clone();
                 if let Some(&tgt) = self.labels.get(&lbl) {
@@ -2510,13 +2665,37 @@ impl NativeCodeGen {
                     let p = self.emit.call_rel32();
                     self.fixups.push((p, lbl));
                 }
+                // Clean up stack args
+                if stack_arg_count > 0 {
+                    self.emit.add_rsp((stack_arg_count as u32) * 8);
+                }
+                // Capture return value before restoring regs
                 self.put_from_reg(*dst, RET_REG, alloc);
+                // Restore caller-saved regs in reverse push order
+                for &r in pushed.iter().rev() {
+                    self.emit.pop_r(r);
+                }
             }
             IRInstr::TailCall { func: fname, args } => {
                 for (i, &a) in args.iter().enumerate().take(6) {
                     let ar = self.get_in_reg(a, S0, alloc)?;
                     self.emit.mov_rr(ARG_REGS[i], ar);
                 }
+                // Stack arguments (args 7+) pushed right-to-left
+                for &a in args.iter().skip(6).rev() {
+                    let ar = self.get_in_reg(a, S0, alloc)?;
+                    self.emit.push_r(ar);
+                }
+                // Emit epilogue before the tail jmp (restores callee-saved regs)
+                let frame = self.cur_frame;
+                let saved = self.cur_saved.clone();
+                // Restore frame but not ret — the jmp replaces ret
+                let push_bytes = (saved.len() + 1) * 8;
+                let frame_adj = if push_bytes % 16 != 0 { (frame + 8 + 15) & !15 } else { (frame + 15) & !15 };
+                if frame_adj > 0 { self.emit.add_rsp(frame_adj); }
+                self.emit.b(0x48); self.emit.b(0x89); self.emit.b(0xEC); // mov rsp, rbp
+                self.emit.pop_r(RBP);
+                for &r in saved.iter().rev() { self.emit.pop_r(r); }
                 // Emit jmp instead of call for tail call
                 let lbl = fname.clone();
                 if let Some(&tgt) = self.labels.get(&lbl) {
@@ -2624,8 +2803,12 @@ fn emit_elf(code: &[u8], symbols: &[(String, usize)], output_path: &str) -> Resu
         h[16..18].copy_from_slice(&2u16.to_le_bytes());  // ET_EXEC
         h[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
         h[20..24].copy_from_slice(&1u32.to_le_bytes());  // EV_CURRENT
-        // e_entry = virtual address of code start
-        let entry_vaddr = LOAD_BASE + code_off as u64;
+        // e_entry = virtual address of `main` (not LOAD_BASE + code_off which double-offsets)
+        let main_offset = symbols.iter()
+            .find(|(name, _)| name == "main")
+            .map(|(_, off)| *off)
+            .unwrap_or(0);
+        let entry_vaddr = LOAD_BASE + main_offset as u64;
         h[24..32].copy_from_slice(&entry_vaddr.to_le_bytes());
         h[32..40].copy_from_slice(&(ehdr_size as u64).to_le_bytes()); // e_phoff
         h[40..48].copy_from_slice(&(shdr_off as u64).to_le_bytes());  // e_shoff
@@ -2691,7 +2874,7 @@ fn emit_elf(code: &[u8], symbols: &[(String, usize)], output_path: &str) -> Resu
     // §1: .text  (SHT_PROGBITS=1, SHF_ALLOC|SHF_EXECINSTR=6)
     write_shdr(&mut out, shdr_off, 1,
                sh_text_name as u32, 1, 6,
-               LOAD_BASE + code_off as u64,
+               LOAD_BASE,           // vaddr of .text = base of PT_LOAD segment
                code_off as u64, code.len() as u64,
                0, 0, 16, 0);
     // §2: .symtab (SHT_SYMTAB=2)
