@@ -4,44 +4,45 @@
 #[allow(unused_variables)]
 #[allow(unused_macros)]
 #[allow(clippy::drop_ref)]
-mod advanced_optimizer;
-mod advanced_self_repair;
-mod aot_native;
-mod ast;
-mod borrowck;
-mod bytecode_vm;
-mod ffi;
-mod game_systems;
-mod gpu_backend;
-pub mod interp;
-mod lexer;
-mod ml_engine;
-mod memory_management;
+// Compiler modules
+mod compiler;
+
+// ML/AI modules
+mod ml;
+
+// Optimizer modules
 mod optimizer;
-mod parser;
-mod self_repair;
-mod sema;
-mod string_intern;
+
+// JIT/Compilation modules
+mod jit;
+
+// Runtime modules
+mod runtime;
+
+// Game modules
+mod game;
+
+// Tool modules
+mod tools;
+
+// Re-export commonly used modules for compatibility
+pub use runtime::interp;
 #[cfg(feature = "phase3-jit")]
-pub mod tiered_compilation;
+pub use optimizer::tiered_compilation;
 #[cfg(feature = "phase3-jit")]
-pub mod tracing_jit;
-mod typeck;
-// Optional, phase-gated modules (added per performance phase protocol)
-#[cfg(feature = "phase3-jit")]
-mod phase3_jit;
+pub use jit::tracing_jit;
 #[cfg(feature = "phase6-simd")]
-pub mod phase6_simd;
+pub use jit::phase6_simd;
 
 // Game-dev tooling modules used by the runtime and editor workflows.
-pub mod asset_importer;
-pub mod chess_ml;
-pub mod frame_debugger;
-pub mod hot_reload;
-pub mod networking;
-pub mod profiling_tools;
-pub mod scene_editor;
-pub mod shader_tooling;
+pub use tools::asset_importer;
+pub use ml::chess_ml;
+pub use tools::frame_debugger;
+pub use tools::hot_reload;
+pub use runtime::networking;
+pub use tools::profiling_tools;
+pub use game::scene_editor;
+pub use tools::shader_tooling;
 
 // Standard library — game dev, ML, simulation.
 #[allow(clippy::manual_retain)]

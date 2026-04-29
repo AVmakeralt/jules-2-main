@@ -195,13 +195,17 @@ impl DataLoader {
     pub fn reset(&mut self) {
         self.index = 0;
         if self.shuffle {
-            // deterministic shuffle so tests remain stable
-            let mut seed = 4211_u64;
+            // Deterministic Fisher-Yates shuffle.
+            // Seed derived from sample count so different-sized datasets get
+            // different permutations, while remaining reproducible across resets.
+            let mut seed: u64 = 4211_u64
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(self.samples.len() as u64 | 1);
             for i in (1..self.samples.len()).rev() {
                 seed = seed
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
-                let j = (seed % (i as u64 + 1)) as usize;
+                let j = (seed >> 33) as usize % (i + 1);
                 self.samples.swap(i, j);
             }
         }
@@ -459,16 +463,16 @@ impl Tensor {
     }
 
     /// Matrix multiply  C = A @ B.
-    /// A: [M, K], B: [K, N] → C: [M, N].
-    /// Uses cache-blocked (tiled) 32×32 GEMM for CPU performance.
+    /// A: [..., M, K], B: [..., K, N] → C: [..., M, N].
+    ///
+    /// Batch dimensions are broadcast following NumPy rules, so shapes like
+    /// [B, M, K] @ [K, N] and [M, K] @ [B, K, N] both work correctly.
+    /// Uses `matrixmultiply::sgemm` for large matrices and a cache-tiled
+    /// scalar kernel for smaller ones.
     #[inline]
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor, RuntimeError> {
         if self.shape.len() < 2 || rhs.shape.len() < 2 {
             return Err(RuntimeError::new("matmul requires ≥2-D tensors"));
-        }
-
-        if self.shape.len() != rhs.shape.len() {
-            return Err(RuntimeError::new("matmul requires matching tensor rank"));
         }
 
         let (m, k) = (
@@ -481,32 +485,36 @@ impl Tensor {
         );
         if k != k2 {
             return Err(RuntimeError::new(format!(
-                "matmul shape mismatch: [{m}, {k}] @ [{k2}, {n}]"
+                "matmul shape mismatch: inner dims {k} vs {k2}"
             )));
         }
 
-        let batch_shape = &self.shape[..self.shape.len() - 2];
-        let rhs_batch_shape = &rhs.shape[..rhs.shape.len() - 2];
-        if batch_shape != rhs_batch_shape {
-            return Err(RuntimeError::new(format!(
+        // Broadcast batch dimensions (everything except the last two axes).
+        let a_batch = &self.shape[..self.shape.len() - 2];
+        let b_batch = &rhs.shape[..rhs.shape.len() - 2];
+        let out_batch = broadcast_shape(a_batch, b_batch).ok_or_else(|| {
+            RuntimeError::new(format!(
                 "matmul batch shape mismatch: {:?} vs {:?}",
-                batch_shape, rhs_batch_shape
-            )));
-        }
+                a_batch, b_batch
+            ))
+        })?;
 
-        let batch_count = batch_shape.iter().product::<usize>().max(1);
+        let batch_count: usize = out_batch.iter().product::<usize>().max(1);
         let a = self.cpu_data();
         let b = rhs.cpu_data();
         let mut c = vec![0.0_f32; batch_count * m * n];
 
-        // Hybrid GEMM strategy:
-        // - matrixmultiply::sgemm for large dense workloads (near-BLAS path)
-        // - cache-tiled scalar kernel for smaller matrices
         const TILE: usize = 32;
         let use_sgemm = m >= 64 && n >= 64 && k >= 64;
+
         for batch in 0..batch_count {
-            let a_offset = batch * m * k;
-            let b_offset = batch * k * n;
+            // Map the output batch index back into each operand's batch dims,
+            // respecting broadcast (a dim of size 1 always maps to slice 0).
+            let a_batch_idx = broadcast_index(batch, &out_batch, a_batch);
+            let b_batch_idx = broadcast_index(batch, &out_batch, b_batch);
+
+            let a_offset = a_batch_idx * m * k;
+            let b_offset = b_batch_idx * k * n;
             let c_offset = batch * m * n;
 
             if use_sgemm {
@@ -517,8 +525,8 @@ impl Tensor {
                         n,
                         1.0,
                         a[a_offset..].as_ptr(),
-                        k as isize,
-                        1,
+                        k as isize, // row stride
+                        1,          // col stride
                         b[b_offset..].as_ptr(),
                         n as isize,
                         1,
@@ -531,6 +539,7 @@ impl Tensor {
                 continue;
             }
 
+            // Cache-tiled scalar GEMM.
             for ii in (0..m).step_by(TILE) {
                 for jj in (0..n).step_by(TILE) {
                     for kk in (0..k).step_by(TILE) {
@@ -550,7 +559,7 @@ impl Tensor {
             }
         }
 
-        let mut out_shape = batch_shape.to_vec();
+        let mut out_shape = out_batch.clone();
         out_shape.push(m);
         out_shape.push(n);
         Ok(Tensor::from_data(out_shape, c))
@@ -631,11 +640,12 @@ impl Tensor {
 
         let n: usize = result_shape.iter().product();
         let mut c = vec![0.0_f32; n];
+        // Hoist data slice lookups out of the inner loop.
+        let a = self.cpu_data();
+        let b = rhs.cpu_data();
         for idx in 0..n {
             let ai = broadcast_index(idx, &result_shape, &self.shape);
             let bi = broadcast_index(idx, &result_shape, &rhs.shape);
-            let a = self.cpu_data();
-            let b = rhs.cpu_data();
             c[idx] = op(a[ai], b[bi]);
         }
         Ok(Tensor::from_data(result_shape, c))
@@ -754,12 +764,12 @@ impl Tensor {
         if self.shape != rhs.shape {
             return Err(RuntimeError::new("tensor += shape mismatch"));
         }
-        // Avoid intermediate allocation: zip directly over slices.
-        let b_ptr = rhs.cpu_data().as_ptr();
+        let b = rhs.cpu_data();
         let a = self.cpu_data_mut();
-        for (i, x) in a.iter_mut().enumerate() {
-            // SAFETY: shapes are equal so b has the same length as a.
-            *x += unsafe { *b_ptr.add(i) };
+        // Shapes are equal so lengths match; zip is bounds-check-free after
+        // the compiler fuses the two iterators over the same length.
+        for (x, &y) in a.iter_mut().zip(b) {
+            *x += y;
         }
         Ok(())
     }
@@ -892,6 +902,9 @@ impl SparseSet {
     fn insert(&mut self, id: EntityId, val: Value) {
         if let Some(&idx) = self.sparse.get(&id) {
             self.dense_vals[idx] = val;
+            // Bump version on updates too: a value change can affect cached
+            // join plans that embed dense-index assumptions.
+            self.version = self.version.wrapping_add(1);
         } else {
             let idx = self.dense_ids.len();
             self.sparse.insert(id, idx);
@@ -958,18 +971,50 @@ impl EcsWorld {
         format!("{a}|{b}|{c}|{d}")
     }
 
-    /// Fix #2: Get or create archetype for a set of component types
+    /// Get or create an archetype for a set of component types.
+    ///
+    /// The archetype ID is derived by sorting component names and hashing their
+    /// bytes — this avoids the collision-prone length-only sum that the previous
+    /// version used and makes the ID independent of argument order.
     fn get_or_create_archetype(&mut self, component_types: &[&str]) -> ArchetypeId {
-        // Simple hash-based archetype ID (in production, use proper hashing)
-        let mut hash: u32 = 0;
-        for comp in component_types {
-            hash = hash.wrapping_add(comp.len() as u32);
-            hash = hash.wrapping_mul(31);
+        use std::hash::{Hash, Hasher};
+        use rustc_hash::FxHasher;
+
+        // Sort so that the ID is order-independent.
+        let mut sorted: Vec<&str> = component_types.to_vec();
+        sorted.sort_unstable();
+
+        let mut hasher = FxHasher::default();
+        for comp in &sorted {
+            comp.hash(&mut hasher);
         }
-        
-        if !self.archetypes.contains_key(&hash) {
+        let hash = hasher.finish() as u32;
+
+        // Handle (rare) 32-bit collision by probing with a different seed.
+        let id = if self.archetypes.contains_key(&hash) {
+            // Verify this is actually the same component set, not a collision.
+            let existing = &self.archetypes[&hash];
+            let existing_comps: Vec<&str> = existing.columns.keys().map(String::as_str).collect();
+            let mut existing_sorted = existing_comps.clone();
+            existing_sorted.sort_unstable();
+            if existing_sorted == sorted {
+                hash
+            } else {
+                // True collision — use a secondary hash.
+                let mut hasher2 = FxHasher::default();
+                0u64.hash(&mut hasher2); // salt
+                for comp in &sorted {
+                    comp.hash(&mut hasher2);
+                }
+                hasher2.finish() as u32
+            }
+        } else {
+            hash
+        };
+
+        if !self.archetypes.contains_key(&id) {
             let mut archetype = Archetype::default();
-            for comp in component_types {
+            for comp in &sorted {
                 let vtype = self.infer_component_type(comp);
                 let stride = match vtype {
                     ValueType::F32 => 4,
@@ -977,7 +1022,7 @@ impl EcsWorld {
                     ValueType::I32 => 4,
                     ValueType::I64 => 8,
                     ValueType::Vec3 => 12,
-                    ValueType::Unknown => 16,
+                    ValueType::Unknown => 0, // unknown — raw byte storage not used
                 };
                 archetype.columns.insert(
                     comp.to_string(),
@@ -988,9 +1033,9 @@ impl EcsWorld {
                     },
                 );
             }
-            self.archetypes.insert(hash, archetype);
+            self.archetypes.insert(id, archetype);
         }
-        hash
+        id
     }
 
     /// Infer ValueType from component name (heuristic)
@@ -1004,82 +1049,17 @@ impl EcsWorld {
         }
     }
 
-    /// Fix #2: SoA-optimized integration for Vec3 components
+    /// SoA-style integration for Vec3 components (pos += vel * dt).
+    ///
+    /// The archetype-based SoA storage is maintained lazily; until entities are
+    /// migrated into it this correctly falls through to the well-tested linear
+    /// sparse-set path.  The archetype is registered so future entity operations
+    /// can migrate into it for even better cache locality.
     pub fn integrate_vec3_soa(&mut self, pos_comp: &str, vel_comp: &str, dt: f32) -> usize {
-        let archetype_id = self.get_or_create_archetype(&[pos_comp, vel_comp]);
-        let archetype = self.archetypes.get_mut(&archetype_id);
-        
-        if let Some(arch) = archetype {
-            let pos_col = arch.columns.get_mut(pos_comp);
-            let vel_col = arch.columns.get_mut(vel_comp);
-            
-            if let (Some(pos_data), Some(vel_data)) = (pos_col, vel_col) {
-                let count = pos_data.data.len() / 12; // Vec3 = 12 bytes
-                let mut updated = 0;
-                
-                // Direct SoA iteration: process all positions and velocities in parallel
-                for i in 0..count {
-                    let pos_offset = i * 12;
-                    let vel_offset = i * 12;
-                    
-                    if pos_offset + 12 <= pos_data.data.len() && vel_offset + 12 <= vel_data.data.len() {
-                        // Load position
-                        let px = f32::from_le_bytes([
-                            pos_data.data[pos_offset],
-                            pos_data.data[pos_offset + 1],
-                            pos_data.data[pos_offset + 2],
-                            pos_data.data[pos_offset + 3],
-                        ]);
-                        let py = f32::from_le_bytes([
-                            pos_data.data[pos_offset + 4],
-                            pos_data.data[pos_offset + 5],
-                            pos_data.data[pos_offset + 6],
-                            pos_data.data[pos_offset + 7],
-                        ]);
-                        let pz = f32::from_le_bytes([
-                            pos_data.data[pos_offset + 8],
-                            pos_data.data[pos_offset + 9],
-                            pos_data.data[pos_offset + 10],
-                            pos_data.data[pos_offset + 11],
-                        ]);
-                        
-                        // Load velocity
-                        let vx = f32::from_le_bytes([
-                            vel_data.data[vel_offset],
-                            vel_data.data[vel_offset + 1],
-                            vel_data.data[vel_offset + 2],
-                            vel_data.data[vel_offset + 3],
-                        ]);
-                        let vy = f32::from_le_bytes([
-                            vel_data.data[vel_offset + 4],
-                            vel_data.data[vel_offset + 5],
-                            vel_data.data[vel_offset + 6],
-                            vel_data.data[vel_offset + 7],
-                        ]);
-                        let vz = f32::from_le_bytes([
-                            vel_data.data[vel_offset + 8],
-                            vel_data.data[vel_offset + 9],
-                            vel_data.data[vel_offset + 10],
-                            vel_data.data[vel_offset + 11],
-                        ]);
-                        
-                        // Update: pos += vel * dt
-                        let new_px = px + vx * dt;
-                        let new_py = py + vy * dt;
-                        let new_pz = pz + vz * dt;
-                        
-                        // Store back
-                        pos_data.data[pos_offset..pos_offset + 4].copy_from_slice(&new_px.to_le_bytes());
-                        pos_data.data[pos_offset + 4..pos_offset + 8].copy_from_slice(&new_py.to_le_bytes());
-                        pos_data.data[pos_offset + 8..pos_offset + 12].copy_from_slice(&new_pz.to_le_bytes());
-                        
-                        updated += 1;
-                    }
-                }
-                return updated;
-            }
-        }
-        0
+        // Register the archetype so it is available for future migration.
+        let _ = self.get_or_create_archetype(&[pos_comp, vel_comp]);
+        // Delegate to the correct, battle-tested implementation.
+        self.integrate_vec3_linear(pos_comp, vel_comp, dt)
     }
 
     pub fn spawn(&mut self) -> EntityId {
@@ -1462,13 +1442,35 @@ impl EcsWorld {
         slots: [(usize, usize); 4],
         dt: f32,
     ) -> bool {
+        let [(pi0, vi0), (pi1, vi1), (pi2, vi2), (pi3, vi3)] = slots;
+
+        // Guard: all four pos indices must be distinct (no aliasing) and in bounds.
+        // Also all vel indices must be in bounds.
+        let plen = pos_set.dense_vals.len();
+        let vlen = vel_set.dense_vals.len();
+        if pi0 >= plen || pi1 >= plen || pi2 >= plen || pi3 >= plen
+            || vi0 >= vlen || vi1 >= vlen || vi2 >= vlen || vi3 >= vlen
+        {
+            return false;
+        }
+        // Reject if any two position slots alias — writing through two &mut refs
+        // to the same index is undefined behaviour.
+        if pi0 == pi1 || pi0 == pi2 || pi0 == pi3
+            || pi1 == pi2 || pi1 == pi3
+            || pi2 == pi3
+        {
+            return false;
+        }
+
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
             use std::arch::x86_64::*;
 
-            let [(pi0, vi0), (pi1, vi1), (pi2, vi2), (pi3, vi3)] = slots;
             let pos_ptr = pos_set.dense_vals.as_mut_ptr();
             let vel_ptr = vel_set.dense_vals.as_ptr();
+
+            // SAFETY: indices are distinct (checked above), in-bounds (checked above),
+            // and pos_ptr/vel_ptr are non-overlapping (different fields).
             let p0 = &mut *pos_ptr.add(pi0);
             let p1 = &mut *pos_ptr.add(pi1);
             let p2 = &mut *pos_ptr.add(pi2);
@@ -1477,6 +1479,7 @@ impl EcsWorld {
             let v1 = &*vel_ptr.add(vi1);
             let v2 = &*vel_ptr.add(vi2);
             let v3 = &*vel_ptr.add(vi3);
+
             let (
                 Value::Vec3(p0),
                 Value::Vec3(v0),
@@ -1510,18 +1513,9 @@ impl EcsWorld {
             _mm_storeu_ps(out_y.as_mut_ptr(), oy);
             _mm_storeu_ps(out_z.as_mut_ptr(), oz);
 
-            p0[0] = out_x[0];
-            p1[0] = out_x[1];
-            p2[0] = out_x[2];
-            p3[0] = out_x[3];
-            p0[1] = out_y[0];
-            p1[1] = out_y[1];
-            p2[1] = out_y[2];
-            p3[1] = out_y[3];
-            p0[2] = out_z[0];
-            p1[2] = out_z[1];
-            p2[2] = out_z[2];
-            p3[2] = out_z[3];
+            p0[0] = out_x[0]; p1[0] = out_x[1]; p2[0] = out_x[2]; p3[0] = out_x[3];
+            p0[1] = out_y[0]; p1[1] = out_y[1]; p2[1] = out_y[2]; p3[1] = out_y[3];
+            p0[2] = out_z[0]; p1[2] = out_z[1]; p2[2] = out_z[2]; p3[2] = out_z[3];
             return true;
         }
 
@@ -2115,8 +2109,30 @@ impl Scheduler {
 // Frame = Vec<(name, old_slot)>  where old_slot = None means the name was
 // not present before this frame introduced it.
 
-/// A single scope frame's undo log.
-type FrameLog = Vec<(Box<str>, Option<u32>)>;
+// Keep type alias for closure capture maps (used by FnClosure).
+type Frame = FxHashMap<String, Value>;
+
+// =============================================================================
+// §6  ENVIRONMENT (variable store)  —  optimized flat-slab implementation
+// =============================================================================
+//
+// Design: instead of allocating a new HashMap per scope frame, we maintain:
+//   • A single FxHashMap<name → slot_index> — updated in O(1).
+//   • A flat Vec<Value> (the "slab") — each slot is one variable.
+//   • A frame stack that records (slab_watermark, undo_log) so that pop()
+//     can truncate the slab in O(1) and undo name bindings in O(frame_vars).
+//
+// Compared with Vec<HashMap>:
+//   • get()       : 1 hash lookup (was N frame scans + N lookups)
+//   • set_local() : 1 push + 1 hash insert  (was 1 HashMap alloc + 1 insert)
+//   • push()      : push (watermark, vec![])  (was alloc new HashMap)
+//   • pop()       : truncate slab + undo log  (was dealloc HashMap)
+//
+// Frame = (slab_len_at_push, Vec<(name, old_slot)>)
+// old_slot = None means the name was not present before this frame.
+
+/// A single scope frame: slab watermark + undo log for name→slot mapping.
+type FrameLog = (u32, Vec<(Box<str>, Option<u32>)>);
 
 /// The call-stack / environment for the interpreter.
 #[derive(Default)]
@@ -2135,20 +2151,24 @@ impl Env {
         Env {
             values: Vec::with_capacity(16),
             name_to_slot: FxHashMap::default(),
-            frames: vec![Vec::new()],
+            frames: vec![(0, Vec::new())],
         }
     }
 
     /// Enter a new lexical scope.
     #[inline]
     pub fn push(&mut self) {
-        self.frames.push(Vec::new());
+        let watermark = self.values.len() as u32;
+        self.frames.push((watermark, Vec::new()));
     }
 
     /// Exit the current lexical scope, removing all bindings introduced in it.
+    ///
+    /// O(vars_in_frame): undo name bindings then truncate the slab to the
+    /// watermark recorded when `push()` was called — no full-map scan needed.
     #[inline]
     pub fn pop(&mut self) {
-        if let Some(log) = self.frames.pop() {
+        if let Some((watermark, log)) = self.frames.pop() {
             for (name, old_slot) in log {
                 match old_slot {
                     Some(slot) => {
@@ -2159,16 +2179,8 @@ impl Env {
                     }
                 }
             }
-            // Recompute highest reachable slot after undo, then truncate.
-            // This is O(bindings) but correct for shadow/rebind patterns.
-            let next_len = self
-                .name_to_slot
-                .values()
-                .copied()
-                .max()
-                .map(|v| v as usize + 1)
-                .unwrap_or(0);
-            self.values.truncate(next_len);
+            // Truncate to the slab size at the time of push — O(1).
+            self.values.truncate(watermark as usize);
         }
     }
 
@@ -2193,8 +2205,8 @@ impl Env {
         let boxed: Box<str> = name.into();
         // Record the old slot (for pop undo) before overwriting.
         let old_slot = self.name_to_slot.insert(boxed.clone(), slot);
-        if let Some(frame) = self.frames.last_mut() {
-            frame.push((boxed, old_slot));
+        if let Some((_, log)) = self.frames.last_mut() {
+            log.push((boxed, old_slot));
         }
     }
 
@@ -2206,7 +2218,9 @@ impl Env {
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.name_to_slot.get(name).map(|&slot| {
             // SAFETY: every slot inserted by `set_local` is a valid index into
-            // `self.values`; we never remove elements from the slab.
+            // `self.values`; truncation in pop() only removes slots ≥ watermark
+            // which are no longer reachable via name_to_slot after the undo log
+            // has been replayed.
             #[cfg(not(debug_assertions))]
             unsafe {
                 self.values.get_unchecked(slot as usize)
@@ -2224,9 +2238,6 @@ impl Env {
             .map(|(name, &slot)| (name.as_ref(), &self.values[slot as usize]))
     }
 }
-
-// Keep type alias for closure capture maps (used by FnClosure).
-type Frame = FxHashMap<String, Value>;
 
 // =============================================================================
 // §6b  BYTECODE COMPILER + REGISTER VM
@@ -3644,8 +3655,10 @@ fn vm_unop(op: UnOpKind, v: Value) -> Result<Value, RuntimeError> {
             Value::I64(x) => Ok(Value::I64(-x)),
             Value::Vec3(v) => Ok(Value::Vec3([-v[0], -v[1], -v[2]])),
             Value::Tensor(t) => {
-                let data: Vec<f32> = t.read().unwrap().cpu_data().iter().map(|x| -x).collect();
-                let shape = t.read().unwrap().shape.clone();
+                let tt = t.read().unwrap();
+                let data: Vec<f32> = tt.cpu_data().iter().map(|x| -x).collect();
+                let shape = tt.shape.clone();
+                drop(tt);
                 Ok(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(
                     shape, data,
                 )))))
@@ -4180,6 +4193,12 @@ impl Interpreter {
             env.pop();
             let out = match result {
                 Value::Return(v) => Ok(*v),
+                Value::Break(_) => Err(RuntimeError::new(format!(
+                    "`break` outside of a loop in function `{name}`"
+                ))),
+                Value::Continue => Err(RuntimeError::new(format!(
+                    "`continue` outside of a loop in function `{name}`"
+                ))),
                 other => Ok(other),
             };
             self.record_runtime_profile(name, started.elapsed());
@@ -4211,9 +4230,19 @@ impl Interpreter {
         }
         // Bind the world handle.
         env.set_local("world", Value::World(world.clone()));
-        self.eval_block(&sys.body, &mut env)?;
+        let result = self.eval_block(&sys.body, &mut env)?;
         env.pop();
-        Ok(())
+        // Systems do not return values; a bare `return` is fine, Break/Continue are errors.
+        match result {
+            Value::Unit | Value::Return(_) => Ok(()),
+            Value::Break(_) => Err(RuntimeError::new(format!(
+                "`break` outside of a loop in system `{}`", sys.name
+            ))),
+            Value::Continue => Err(RuntimeError::new(format!(
+                "`continue` outside of a loop in system `{}`", sys.name
+            ))),
+            _ => Ok(()),
+        }
     }
 
     // =========================================================================
@@ -8885,31 +8914,38 @@ pub(crate) fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
 
 /// Map a flat linear index in `result_shape` back to a flat index in `src_shape`,
 /// respecting broadcast rules (dimensions of size 1 always map to index 0).
+///
+/// Algorithm:
+///   1. Decompose `flat` into per-dimension indices using `result_shape`.
+///   2. For each dimension of `src_shape` (right-aligned), clamp to 0 when
+///      the source dimension is 1 (broadcast), otherwise use the result index.
+///   3. Re-compose into a flat index using `src_shape` strides.
 pub(crate) fn broadcast_index(flat: usize, result_shape: &[usize], src_shape: &[usize]) -> usize {
-    let len = result_shape.len();
-    let off = len - src_shape.len();
-    let mut src_idx = 0usize;
-    let mut stride = 1usize;
-    let mut rem = flat;
+    let rlen = result_shape.len();
+    let slen = src_shape.len();
+    // Offset: src is right-aligned in result.
+    let off = rlen - slen;
 
-    // Decompose flat index into multi-dim, then re-compose for src.
-    let mut multi = vec![0usize; len];
-    for i in (0..len).rev() {
+    // Step 1: decompose flat → per-dim indices in result_shape (right-to-left).
+    let mut multi = vec![0usize; rlen];
+    let mut rem = flat;
+    for i in (0..rlen).rev() {
         multi[i] = rem % result_shape[i];
         rem /= result_shape[i];
     }
 
-    let mut src_strides = vec![1usize; src_shape.len()];
-    for i in (0..src_shape.len().saturating_sub(1)).rev() {
+    // Step 2: pre-compute row-major strides for src_shape.
+    let mut src_strides = vec![1usize; slen];
+    for i in (0..slen.saturating_sub(1)).rev() {
         src_strides[i] = src_strides[i + 1] * src_shape[i + 1];
     }
 
-    for i in 0..src_shape.len() {
+    // Step 3: accumulate src flat index.
+    let mut src_idx = 0usize;
+    for i in 0..slen {
         let ri = i + off;
         let idx = if src_shape[i] == 1 { 0 } else { multi[ri] };
         src_idx += idx * src_strides[i];
-        let _ = stride;
-        stride = 1;
     }
     src_idx
 }
