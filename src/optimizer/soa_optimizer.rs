@@ -155,7 +155,7 @@ impl ArrayMetadata {
     pub fn new(name: String, structure: StructureMetadata, num_elements: usize) -> Self {
         Self {
             name,
-            structure,
+            structure: structure.clone(),
             num_elements,
             layout: LayoutStrategy::AoS,
             access_stats: AccessStats::new(structure.fields.len()),
@@ -466,7 +466,7 @@ impl CacheLineAnalyzer {
         let aos_util = self.aos_utilization(structure, num_elements);
         let soa_util = self.soa_utilization(structure.field_sizes[field_index], num_elements);
         
-        if aos_util > 0 {
+        if aos_util > 0.0 {
             soa_util / aos_util
         } else {
             1.0

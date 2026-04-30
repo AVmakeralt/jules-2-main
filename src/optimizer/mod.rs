@@ -1,6 +1,15 @@
+pub mod abstraction_verify;
 pub mod advanced_optimizer;
 pub mod advanced_self_repair;
+pub mod autovec;
+pub mod hardware_cost_model;
+pub mod inline_cache;
+pub mod mcts_superoptimizer;
+pub mod memory_optimizer;
+pub mod multi_tier_jit;
 pub mod optimizer;
+pub mod profile_guided;
 pub mod self_repair;
+pub mod soa_optimizer;
 #[cfg(feature = "phase3-jit")]
 pub mod tiered_compilation;

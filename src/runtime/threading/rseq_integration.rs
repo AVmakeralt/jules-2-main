@@ -10,8 +10,9 @@
 // - Perfect for per-CPU data structures and counters
 // =============================================================================
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::rseq::{PerCpu, PerCpuCounter, Rseq};
 
@@ -64,11 +65,11 @@ impl RseqManager {
 }
 
 /// Global rseq manager instance
-static GLOBAL_RSEQ_MANAGER: RseqManager = RseqManager::new();
+static GLOBAL_RSEQ_MANAGER: OnceLock<RseqManager> = OnceLock::new();
 
 /// Get the global rseq manager
 pub fn global_rseq_manager() -> &'static RseqManager {
-    &GLOBAL_RSEQ_MANAGER
+    GLOBAL_RSEQ_MANAGER.get_or_init(RseqManager::new)
 }
 
 /// Initialize rseq for the current thread (call from thread entry point)
@@ -237,7 +238,7 @@ pub struct RseqRingBuffer<T> {
 }
 
 struct RingBufferSegment<T> {
-    data: Vec<Option<T>>,
+    data: UnsafeCell<Vec<Option<T>>>,
     head: AtomicUsize,
     tail: AtomicUsize,
 }
@@ -249,7 +250,7 @@ impl<T> RseqRingBuffer<T> {
     {
         Self {
             buffers: PerCpu::new(|| RingBufferSegment {
-                data: vec![None; segment_size],
+                data: UnsafeCell::new(vec![None; segment_size]),
                 head: AtomicUsize::new(0),
                 tail: AtomicUsize::new(0),
             }),
@@ -267,7 +268,8 @@ impl<T> RseqRingBuffer<T> {
 
                 if next_head != tail {
                     // Space available
-                    segment.data[head] = Some(item);
+                    // SAFETY: rseq guarantees we're on the same CPU, so no data race
+                    unsafe { (&mut *segment.data.get())[head] = Some(item); }
                     segment.head.store(next_head, Ordering::Release);
                     super::rseq::rseq_end();
                     return true;
@@ -287,7 +289,8 @@ impl<T> RseqRingBuffer<T> {
 
                 if tail != head {
                     // Item available
-                    let item = segment.data[tail].take();
+                    // SAFETY: rseq guarantees we're on the same CPU, so no data race
+                    let item = unsafe { (&mut *segment.data.get())[tail].take() };
                     segment.tail.store((tail + 1) % self.segment_size, Ordering::Release);
                     super::rseq::rseq_end();
                     return item;

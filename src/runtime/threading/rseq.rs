@@ -258,7 +258,7 @@ impl<T> PerCpu<T> {
 /// Per-CPU counter (wait-free increment with rseq)
 pub struct PerCpuCounter {
     /// Per-CPU counters
-    counters: PerCpu<AtomicUsize>,
+    pub counters: PerCpu<AtomicUsize>,
 }
 
 impl PerCpuCounter {

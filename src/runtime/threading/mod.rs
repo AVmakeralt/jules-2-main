@@ -22,7 +22,6 @@ pub mod kernel_bypass;
 pub mod lossy_computation;
 pub mod rseq;
 pub mod rseq_integration;
-pub mod worker;
 pub mod superopt_integration;
 pub mod slab;
 pub mod percpu_deque;

@@ -300,10 +300,10 @@ pub struct CallSite {
 impl CallSite {
     pub fn new(location: String) -> Self {
         Self {
-            location,
+            location: location.clone(),
             inline_cache: PolymorphicInlineCache::new(4), // Cache 4 types
             type_distribution: TypeDistribution::new(),
-            speculative_devirt: SpeculativeDevirt::new(location.clone()),
+            speculative_devirt: SpeculativeDevirt::new(location),
             is_hot: false,
         }
     }

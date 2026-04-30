@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Compilation tier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JitTier {
     /// Interpreter - no compilation, direct execution
     Interpreter = 0,
@@ -466,6 +466,6 @@ mod tests {
         let tier_after = jit.get_tier("test_func");
         
         // Should have fallen back
-        assert!(tier_after < tier_before.unwrap());
+        assert!(tier_after < tier_before);
     }
 }

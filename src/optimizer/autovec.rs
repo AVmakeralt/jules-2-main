@@ -448,7 +448,7 @@ impl AutoVectorizer {
         VectorizationStats {
             total_candidates: self.candidates.len(),
             safe,
-            unsafe: unsafe_count,
+            unsafe_ops: unsafe_count,
             unknown,
             avg_speedup: if self.candidates.is_empty() {
                 0.0
@@ -464,7 +464,7 @@ impl AutoVectorizer {
 pub struct VectorizationStats {
     pub total_candidates: usize,
     pub safe: usize,
-    pub unsafe: usize,
+    pub unsafe_ops: usize,
     pub unknown: usize,
     pub avg_speedup: f64,
 }

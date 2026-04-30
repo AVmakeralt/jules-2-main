@@ -13,11 +13,8 @@ use rustc_hash::FxHashMap;
 use crate::compiler::ast::*;
 use crate::Span;
 
-mod hardware_cost_model;
-use hardware_cost_model::{HardwareCostModel, Microarchitecture};
-
-mod profile_guided;
-use profile_guided::{ProfileDatabase, ProfileWeightedCostModel, SharedProfileDatabase};
+use crate::optimizer::hardware_cost_model::{HardwareCostModel, Microarchitecture};
+use crate::optimizer::profile_guided::{ProfileDatabase, ProfileWeightedCostModel, SharedProfileDatabase};
 
 // §1  CONFIGURATION
 
@@ -3153,7 +3150,7 @@ impl EUnionFind {
 
 /// A pattern that can match against e-nodes, with variable binding.
 #[derive(Clone, Debug)]
-enum Pattern {
+enum EPattern {
     /// Match any e-node and bind to this variable name
     Var(String),
     /// Match a specific literal
@@ -3161,43 +3158,43 @@ enum Pattern {
     FloatBits(u64),
     Bool(bool),
     /// Match a binary operation with pattern children
-    BinOp(BinOpKind, Box<Pattern>, Box<Pattern>),
+    BinOp(BinOpKind, Box<EPattern>, Box<EPattern>),
     /// Match a unary operation with pattern child
-    UnOp(UnOpKind, Box<Pattern>),
+    UnOp(UnOpKind, Box<EPattern>),
     /// Match if-then-else
-    IfThenElse(Box<Pattern>, Box<Pattern>, Option<Box<Pattern>>),
+    IfThenElse(Box<EPattern>, Box<EPattern>, Option<Box<EPattern>>),
 }
 
 /// A variable binding from pattern matching
 type Bindings = FxHashMap<String, EClassId>;
 
-impl Pattern {
+impl EPattern {
     /// Match this pattern against an e-class, returning bindings if successful.
     fn match_class(&self, egraph: &EGraph, class: EClassId, bindings: &mut Bindings) -> bool {
         let canon = egraph.uf.find_imm(class);
         match self {
-            Pattern::Var(name) => {
+            EPattern::Var(name) => {
                 // Bind this variable to the class
                 bindings.insert(name.clone(), canon);
                 true
             }
-            Pattern::IntLit(v) => {
+            EPattern::IntLit(v) => {
                 egraph.int_lit_in(canon) == Some(*v)
             }
-            Pattern::FloatBits(b) => {
+            EPattern::FloatBits(b) => {
                 egraph.float_bits_in(canon) == Some(*b)
             }
-            Pattern::Bool(b) => {
+            EPattern::Bool(b) => {
                 egraph.bool_lit_in(canon) == Some(*b)
             }
-            Pattern::BinOp(op, lhs_pat, rhs_pat) => {
+            EPattern::BinOp(op, lhs_pat, rhs_pat) => {
                 if let Some((l, r)) = egraph.binop_in_class(canon, *op) {
                     lhs_pat.match_class(egraph, l, bindings) && rhs_pat.match_class(egraph, r, bindings)
                 } else {
                     false
                 }
             }
-            Pattern::UnOp(op, child_pat) => {
+            EPattern::UnOp(op, child_pat) => {
                 if let Some((actual_op, child)) = egraph.unop_in_class(canon) {
                     if actual_op == *op {
                         child_pat.match_class(egraph, child, bindings)
@@ -3208,7 +3205,7 @@ impl Pattern {
                     false
                 }
             }
-            Pattern::IfThenElse(cond_pat, then_pat, else_pat) => {
+            EPattern::IfThenElse(cond_pat, then_pat, else_pat) => {
                 // Check if this class contains an IfThenElse node
                 let c = egraph.uf.find_imm(canon);
                 if let Some(nids) = egraph.classes.get(&c) {
@@ -3232,7 +3229,7 @@ impl Pattern {
     /// Uses the egraph to get representative nodes from bound classes.
     fn instantiate(&self, egraph: &EGraph, bindings: &Bindings) -> Option<ENode> {
         match self {
-            Pattern::Var(name) => {
+            EPattern::Var(name) => {
                 // Look up the bound class and pick a representative node
                 bindings.get(name).and_then(|&class| {
                     let canon = egraph.uf.find_imm(class);
@@ -3242,14 +3239,14 @@ impl Pattern {
                     })
                 })
             }
-            Pattern::IntLit(v) => Some(ENode::IntLit(*v)),
-            Pattern::FloatBits(b) => Some(ENode::FloatBits(*b)),
-            Pattern::Bool(b) => Some(ENode::Bool(*b)),
-            Pattern::BinOp(op, lhs, rhs) => {
+            EPattern::IntLit(v) => Some(ENode::IntLit(*v)),
+            EPattern::FloatBits(b) => Some(ENode::FloatBits(*b)),
+            EPattern::Bool(b) => Some(ENode::Bool(*b)),
+            EPattern::BinOp(op, lhs, rhs) => {
                 // For binary ops, we need to get the class IDs from bindings
                 // and construct a new BinOp node with those class IDs
                 match (lhs.as_ref(), rhs.as_ref()) {
-                    (Pattern::Var(lname), Pattern::Var(rname)) => {
+                    (EPattern::Var(lname), EPattern::Var(rname)) => {
                         let l_class = bindings.get(lname).copied()?;
                         let r_class = bindings.get(rname).copied()?;
                         Some(ENode::BinOp(*op, l_class, r_class))
@@ -3261,24 +3258,28 @@ impl Pattern {
                     }
                 }
             }
-            Pattern::UnOp(op, child) => {
+            EPattern::UnOp(op, child) => {
                 match child.as_ref() {
-                    Pattern::Var(cname) => {
+                    EPattern::Var(cname) => {
                         let c_class = bindings.get(cname).copied()?;
                         Some(ENode::UnOp(*op, c_class))
                     }
                     _ => None
                 }
             }
-            Pattern::IfThenElse(cond, then, else_) => {
+            EPattern::IfThenElse(cond, then, else_) => {
                 match (cond.as_ref(), then.as_ref(), else_.as_ref()) {
-                    (Pattern::Var(cname), Pattern::Var(tname), Some(Pattern::Var(ename))) => {
-                        let c_class = bindings.get(cname).copied()?;
-                        let t_class = bindings.get(tname).copied()?;
-                        let e_class = bindings.get(ename).copied()?;
-                        Some(ENode::IfThenElse(c_class, t_class, Some(e_class)))
+                    (EPattern::Var(cname), EPattern::Var(tname), Some(ref ename_box)) => {
+                        if let EPattern::Var(ename) = ename_box.as_ref() {
+                            let c_class = bindings.get(cname).copied()?;
+                            let t_class = bindings.get(tname).copied()?;
+                            let e_class = bindings.get(ename).copied()?;
+                            Some(ENode::IfThenElse(c_class, t_class, Some(e_class)))
+                        } else {
+                            None
+                        }
                     }
-                    (Pattern::Var(cname), Pattern::Var(tname), None) => {
+                    (EPattern::Var(cname), EPattern::Var(tname), None) => {
                         let c_class = bindings.get(cname).copied()?;
                         let t_class = bindings.get(tname).copied()?;
                         Some(ENode::IfThenElse(c_class, t_class, None))
@@ -3293,36 +3294,36 @@ impl Pattern {
 /// A rewrite rule with pattern-based matching
 struct PatternRewrite {
     name: &'static str,
-    pattern: Pattern,
-    replacement: Pattern,
+    pattern: EPattern,
+    replacement: EPattern,
 }
 
 impl PatternRewrite {
     /// Create a new pattern rewrite rule
-    fn new(name: &'static str, pattern: Pattern, replacement: Pattern) -> Self {
+    fn new(name: &'static str, pattern: EPattern, replacement: EPattern) -> Self {
         Self { name, pattern, replacement }
     }
 }
 
 /// Helper functions to create patterns
-fn var(name: &str) -> Pattern {
-    Pattern::Var(name.to_string())
+fn var(name: &str) -> EPattern {
+    EPattern::Var(name.to_string())
 }
 
-fn int_lit(v: u128) -> Pattern {
-    Pattern::IntLit(v)
+fn int_lit(v: u128) -> EPattern {
+    EPattern::IntLit(v)
 }
 
-fn bool_lit(b: bool) -> Pattern {
-    Pattern::Bool(b)
+fn bool_lit(b: bool) -> EPattern {
+    EPattern::Bool(b)
 }
 
-fn binop(op: BinOpKind, lhs: Pattern, rhs: Pattern) -> Pattern {
-    Pattern::BinOp(op, Box::new(lhs), Box::new(rhs))
+fn binop(op: BinOpKind, lhs: EPattern, rhs: EPattern) -> EPattern {
+    EPattern::BinOp(op, Box::new(lhs), Box::new(rhs))
 }
 
-fn unop(op: UnOpKind, child: Pattern) -> Pattern {
-    Pattern::UnOp(op, Box::new(child))
+fn unop(op: UnOpKind, child: EPattern) -> EPattern {
+    EPattern::UnOp(op, Box::new(child))
 }
 
 // ── Pending rewrite ───────────────────────────────────────────────────────────
@@ -3647,8 +3648,8 @@ impl EGraph {
             }
             Expr::IfExpr { cond, then, else_, .. } => {
                 let c = self.build_expr(cond);
-                let t = self.build_expr(then);
-                let e = else_.as_ref().map(|e| self.build_expr(e));
+                let t = self.build_block(then);
+                let e = else_.as_ref().map(|b| self.build_block(b));
                 self.add(ENode::IfThenElse(c, t, e))
             }
             // Anything structurally opaque (calls, field access, …) becomes a
@@ -3658,6 +3659,17 @@ impl EGraph {
                 let tag = format!("__ego_opaque_{}", self.nodes.len());
                 self.add(ENode::Var(tag))
             }
+        }
+    }
+
+    /// Build a Block into the e-graph by building its tail expression
+    /// (or a placeholder if no tail).
+    fn build_block(&mut self, block: &Block) -> EClassId {
+        if let Some(ref tail) = block.tail {
+            self.build_expr(tail)
+        } else {
+            let tag = format!("__ego_unit_{}", self.nodes.len());
+            self.add(ENode::Var(tag))
         }
     }
 
@@ -4171,7 +4183,13 @@ impl EGraph {
                     Expr::Block(b) => b,
                     _ => Box::new(Block { span, stmts: Vec::new(), tail: Some(Box::new(then_block)) }),
                 };
-                Expr::IfExpr { span, cond: Box::new(cond), then: then_block, else_: else_expr.map(Box::new) }
+                let else_block = else_expr.map(|e| {
+                    match e {
+                        Expr::Block(b) => b,
+                        _ => Box::new(Block { span, stmts: Vec::new(), tail: Some(Box::new(e)) }),
+                    }
+                });
+                Expr::IfExpr { span, cond: Box::new(cond), then: then_block, else_: else_block }
             }
         }
     }
@@ -4264,25 +4282,25 @@ impl EGraphOptimizer {
         // Use shared e-graph for cross-expression memoization
         // If shared e-graph exists, add this expression to it and saturate
         // Otherwise, create a fresh e-graph for this expression only
-        let (root, egraph) = if let Some(ref mut shared) = self.shared_egraph {
+        let (best_expr, rewrites) = if let Some(ref mut shared) = self.shared_egraph {
             let root = shared.build_expr(&expr);
             shared.saturate(self.max_iters);
-            (root, shared)
+            let best_nodes = shared.extract_best();
+            let best_expr = shared.materialize(root, &best_nodes, span, 64);
+            (best_expr, shared.rewrites)
         } else {
             let mut egraph = EGraph::new();
             let root = egraph.build_expr(&expr);
             egraph.saturate(self.max_iters);
-            (root, &mut egraph)
+            let best_nodes = egraph.extract_best();
+            let best_expr = egraph.materialize(root, &best_nodes, span, 64);
+            (best_expr, egraph.rewrites)
         };
 
-        let best_nodes = egraph.extract_best();
-        // Use a depth limit of 64 — deep enough for any realistic expression tree,
-        // shallow enough to prevent runaway recursion from degenerate EGraph states.
-        let best_expr = egraph.materialize(root, &best_nodes, span, 64);
         let best_cost = CostModel::estimate(&best_expr);
 
         if best_cost < original_cost - 1e-9 {
-            self.rewrites += egraph.rewrites;
+            self.rewrites += rewrites;
             best_expr
         } else {
             expr
@@ -4337,8 +4355,8 @@ impl EGraphOptimizer {
             | Expr::Ident { .. } => true,
             Expr::BinOp { lhs, rhs, .. } => Self::is_eligible(lhs) && Self::is_eligible(rhs),
             Expr::UnOp { expr, .. } => Self::is_eligible(expr),
-            Expr::IfExpr { cond, then, else_ } => {
-                Self::is_eligible(cond) && Self::is_eligible_block(then) && else_.as_ref().map_or(true, |e| Self::is_eligible(e))
+            Expr::IfExpr { cond, then, else_, .. } => {
+                Self::is_eligible(cond) && Self::is_eligible_block(then) && else_.as_ref().map_or(true, |b| Self::is_eligible_block(b))
             }
             // Everything else (calls, field access, indexing, …) is ineligible.
             _ => false,
