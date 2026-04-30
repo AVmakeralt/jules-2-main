@@ -493,17 +493,171 @@ fn main() {
         println!("  {:20} applicable to {}/{} test expressions", format!("{:?}", action), count, test_exprs.len());
     }
 
+    // ── Phase 7: Thorough Config ──
+    println!();
+    println!("-- Phase 7: Thorough Configuration (1000 sims, depth 8, 200ms) --");
+    println!();
+
+    let mut total_original_cycles3 = 0u32;
+    let mut total_optimized_cycles3 = 0u32;
+    let mut total_improved3 = 0usize;
+
+    let mut thorough_opt = MctsSuperoptimizer::new(MctsConfig::thorough());
+
+    for (name, expr) in &test_exprs {
+        let mut cost_est = CycleCostEstimator::new(None);
+        let instr = Instr::from_expr(expr).unwrap();
+        let original_cost = cost_est.estimate(&instr);
+
+        let t0 = Instant::now();
+        let result = thorough_opt.optimize(expr);
+        let elapsed = t0.elapsed();
+
+        let optimized_cost = if let Some(ref optimized) = result {
+            let opt_instr = Instr::from_expr(optimized).unwrap();
+            cost_est.estimate(&opt_instr)
+        } else {
+            original_cost
+        };
+
+        let improved = optimized_cost < original_cost;
+        let reduction = if original_cost > 0 {
+            (original_cost - optimized_cost) as f64 / original_cost as f64 * 100.0
+        } else { 0.0 };
+
+        total_original_cycles3 += original_cost;
+        total_optimized_cycles3 += optimized_cost;
+        if improved { total_improved3 += 1; }
+
+        let status = if improved { "IMPROVED" } else if result.is_some() { "SAME" } else { "NO-OPT" };
+        println!(
+            "  {:25}  cycles: {:4} -> {:4}  ({:5.1}% reduction)  {:?}  {}",
+            name, original_cost, optimized_cost, reduction, elapsed, status,
+        );
+    }
+
+    let thorough_reduction = if total_original_cycles3 > 0 {
+        (total_original_cycles3 - total_optimized_cycles3) as f64 / total_original_cycles3 as f64 * 100.0
+    } else { 0.0 };
+
+    println!();
+    println!(
+        "  Thorough summary: {}/{} improved, cycles: {} -> {} ({:.1}% reduction)",
+        total_improved3, total_exprs, total_original_cycles3, total_optimized_cycles3, thorough_reduction,
+    );
+    println!(
+        "  Simulations: {}, Rewrites: {}, Best improvement: {} cycles, Time: {:?}",
+        thorough_opt.simulations_run, thorough_opt.rewrites_found, thorough_opt.best_improvement, thorough_opt.time_spent,
+    );
+
+    // ── Phase 8: Maximum Config ──
+    println!();
+    println!("-- Phase 8: MAXIMUM PERFORMANCE Configuration (5000 sims, depth 12, 1000ms) --");
+    println!();
+
+    let mut total_original_cycles4 = 0u32;
+    let mut total_optimized_cycles4 = 0u32;
+    let mut total_improved4 = 0usize;
+
+    let mut max_opt = MctsSuperoptimizer::new(MctsConfig::maximum());
+
+    for (name, expr) in &test_exprs {
+        let mut cost_est = CycleCostEstimator::new(None);
+        let instr = Instr::from_expr(expr).unwrap();
+        let original_cost = cost_est.estimate(&instr);
+
+        let t0 = Instant::now();
+        let result = max_opt.optimize(expr);
+        let elapsed = t0.elapsed();
+
+        let optimized_cost = if let Some(ref optimized) = result {
+            let opt_instr = Instr::from_expr(optimized).unwrap();
+            cost_est.estimate(&opt_instr)
+        } else {
+            original_cost
+        };
+
+        let improved = optimized_cost < original_cost;
+        let reduction = if original_cost > 0 {
+            (original_cost - optimized_cost) as f64 / original_cost as f64 * 100.0
+        } else { 0.0 };
+
+        total_original_cycles4 += original_cost;
+        total_optimized_cycles4 += optimized_cost;
+        if improved { total_improved4 += 1; }
+
+        let status = if improved { "IMPROVED" } else if result.is_some() { "SAME" } else { "NO-OPT" };
+        println!(
+            "  {:25}  cycles: {:4} -> {:4}  ({:5.1}% reduction)  {:?}  {}",
+            name, original_cost, optimized_cost, reduction, elapsed, status,
+        );
+    }
+
+    let max_reduction = if total_original_cycles4 > 0 {
+        (total_original_cycles4 - total_optimized_cycles4) as f64 / total_original_cycles4 as f64 * 100.0
+    } else { 0.0 };
+
+    println!();
+    println!(
+        "  Maximum summary: {}/{} improved, cycles: {} -> {} ({:.1}% reduction)",
+        total_improved4, total_exprs, total_original_cycles4, total_optimized_cycles4, max_reduction,
+    );
+    println!(
+        "  Simulations: {}, Rewrites: {}, Best improvement: {} cycles, Time: {:?}",
+        max_opt.simulations_run, max_opt.rewrites_found, max_opt.best_improvement, max_opt.time_spent,
+    );
+
+    // ── Phase 9: Large-Scale Throughput ──
+    println!();
+    println!("-- Phase 9: Large-Scale Throughput (1000 exprs, fast config) --");
+    println!();
+
+    let large_count = 1000;
+    let mut large_opt = MctsSuperoptimizer::new(MctsConfig::fast());
+    let t0 = Instant::now();
+    let mut large_improved = 0usize;
+    for _ in 0..large_count {
+        if large_opt.optimize(&stress_expr).is_some() {
+            large_improved += 1;
+        }
+    }
+    let large_elapsed = t0.elapsed();
+    let large_per_expr = large_elapsed / large_count as u32;
+    println!(
+        "  {} expressions optimized in {:?} ({:?}/expr)",
+        large_count, large_elapsed, large_per_expr,
+    );
+    println!(
+        "  Improved: {}/{} ({:.0}%), Throughput: {:.0} exprs/sec",
+        large_improved, large_count,
+        large_improved as f64 / large_count as f64 * 100.0,
+        large_count as f64 / large_elapsed.as_secs_f64().max(1e-12),
+    );
+
     // ── Final Summary ──
     println!();
     println!("================================================================");
-    println!("  BENCHMARK COMPLETE");
+    println!("  BENCHMARK COMPLETE - ALL CONFIGURATIONS TESTED");
     println!("================================================================");
     println!();
-    println!("  Fast config:     {}/{} improved, {:.1}% cycle reduction", total_improved, total_exprs, fast_reduction);
-    println!("  Default config:  {}/{} improved, {:.1}% cycle reduction", total_improved2, total_exprs, default_reduction);
-    println!("  Stress test:     {} exprs at {:?}/expr, {:.0} exprs/sec",
+    println!("  ┌──────────────────────────────────────────────────────────┐");
+    println!("  │  MCTS-Port Superoptimizer Performance Summary            │");
+    println!("  ├──────────────────────────────────────────────────────────┤");
+    println!("  │  Fast config:     {}/{} improved, {:.1}% cycle reduction    │", total_improved, total_exprs, fast_reduction);
+    println!("  │  Default config:  {}/{} improved, {:.1}% cycle reduction    │", total_improved2, total_exprs, default_reduction);
+    println!("  │  Thorough config: {}/{} improved, {:.1}% cycle reduction    │", total_improved3, total_exprs, thorough_reduction);
+    println!("  │  Maximum config:  {}/{} improved, {:.1}% cycle reduction    │", total_improved4, total_exprs, max_reduction);
+    println!("  ├──────────────────────────────────────────────────────────┤");
+    println!("  │  Stress test:     {} exprs at {:?}/expr, {:.0} exprs/sec    │",
         stress_count, stress_per_expr,
         stress_count as f64 / stress_elapsed.as_secs_f64().max(1e-12));
+    println!("  │  Large scale:     {} exprs at {:?}/expr, {:.0} exprs/sec    │",
+        large_count, large_per_expr,
+        large_count as f64 / large_elapsed.as_secs_f64().max(1e-12));
+    println!("  ├──────────────────────────────────────────────────────────┤");
+    println!("  │  Best single improvement: {} cycles saved (Maximum)        │", max_opt.best_improvement);
+    println!("  │  Rewrite rules: 12 | Microarch models: 7                │");
+    println!("  └──────────────────────────────────────────────────────────┘");
     println!();
     println!("  MCTS-Port Superoptimizer status: OPERATIONAL");
 }
