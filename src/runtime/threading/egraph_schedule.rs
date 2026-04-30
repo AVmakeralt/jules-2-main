@@ -47,10 +47,11 @@ impl EGraph {
     /// Add a node to the e-graph
     pub fn add_node(&mut self, node: EGraphNode) {
         let id = node.id;
+        let has_no_deps = node.dependencies.is_empty();
         self.nodes.push(node);
         
         // Update entry/exit nodes
-        if node.dependencies.is_empty() {
+        if has_no_deps {
             self.entry_nodes.push(id);
         }
     }

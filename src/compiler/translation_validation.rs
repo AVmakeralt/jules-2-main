@@ -500,13 +500,13 @@ impl TranslationValidator {
 
     /// Collect all variables in CFG
     fn collect_variables(&self, cfg: &ControlFlowGraph) -> HashSet<VarId> {
-        let mut vars = HashSet::new();
+        let mut vars_map: HashMap<VarId, AbstractValue> = HashMap::new();
         for block in cfg.blocks.values() {
             for instr in &block.instructions {
-                self.collect_instr_vars(instr, &mut vars);
+                self.collect_instr_vars(instr, &mut vars_map);
             }
         }
-        vars
+        vars_map.into_keys().collect()
     }
 
     /// Compute live variables for each block

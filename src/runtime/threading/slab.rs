@@ -5,7 +5,7 @@
 // Enhanced with per-CPU allocation and huge page support
 // =========================================================================
 
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::ptr;
 use std::alloc::{Layout, alloc, dealloc};
 use super::rseq::{rseq_begin, rseq_end, get_cpu_id};
@@ -36,7 +36,7 @@ struct SlabPage {
 
 /// Task descriptor header
 #[repr(C)]
-struct TaskDescriptor {
+pub struct TaskDescriptor {
     /// Next free descriptor in page
     next: AtomicPtr<TaskDescriptor>,
     /// In-use flag

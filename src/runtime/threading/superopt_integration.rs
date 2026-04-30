@@ -5,12 +5,15 @@
 // Integrates all threading optimizations with algebraic rewrite rules
 // =========================================================================
 
-use crate::compiler::ast::{Expr, BinOpKind, Span};
+use crate::compiler::ast::{Expr, BinOpKind};
+use crate::compiler::lexer::Span;
+use crate::runtime::threading::gpu_pipeline::GpuPipeline;
+use crate::runtime::threading::hw_optimizations::{CatManager, HugePageAllocator};
 use crate::runtime::threading::{
     ThreadPool, Worker,
     PerCpuDeque, PerCpuCounter, get_cpu_id, is_rseq_available, register_rseq,
     HybridNotify, IoUring, UintrReceiver, UintrSender, is_io_uring_available, is_uintr_available,
-    AmxContext, Avx512Mask, CatManager, CompareOp, HugePageAllocator, HwCapabilities, TsxTransaction,
+    AmxContext, Avx512Mask, CompareOp, HwCapabilities, TsxTransaction,
     is_amx_available, is_avx512_available, is_cat_available, is_tsx_available,
     SoaScheduler, SoaTaskQueue, warm_function_cache, warm_task_cache,
     StackTask, TaskBatch, TaskCache, TASK_TYPE_COMPUTE, TASK_TYPE_IO, TASK_TYPE_GPU, TASK_TYPE_SYNC,
@@ -515,6 +518,12 @@ pub struct SuperoptThreadingIntegration {
     self_opt_runtime: Option<SelfOptimizingRuntime>,
     /// SoA scheduler
     soa_scheduler: Option<SoaScheduler>,
+    /// GPU pipeline for GPU task execution
+    gpu_pipeline: Option<GpuPipeline>,
+    /// CAT manager for cache partitioning
+    cat_manager: Option<CatManager>,
+    /// Huge page allocator
+    huge_pages: Option<HugePageAllocator>,
     /// Hybrid notification system
     hybrid_notify: Option<HybridNotify>,
 }
@@ -535,6 +544,9 @@ impl SuperoptThreadingIntegration {
             jit_scheduler: Some(JitSchedulerCompiler::new()),
             self_opt_runtime: Some(SelfOptimizingRuntime::new(1000)),
             soa_scheduler: Some(SoaScheduler::new(1024, num_cpus::get())),
+            gpu_pipeline: Some(GpuPipeline::new(2, 1024)),
+            cat_manager: Some(CatManager::new()),
+            huge_pages: Some(HugePageAllocator::new()),
             hybrid_notify: Some(HybridNotify::new(num_cpus::get())),
         }
     }
@@ -706,7 +718,7 @@ impl SuperoptThreadingIntegration {
         match expr {
             Expr::BinOp { op, .. } => {
                 match op {
-                    BinOpKind::MatMul => {
+                    BinOpKind::Mul => {
                         // Matrix multiplication: prefer AMX, fallback to GPU
                         let mut analysis = ExpressionAnalysis::new(
                             if is_amx_available() { SchedulingHint::Amx } else { SchedulingHint::Gpu },
@@ -740,17 +752,6 @@ impl SuperoptThreadingIntegration {
                 // Function calls: use JIT scheduler if available
                 let mut analysis = ExpressionAnalysis::new(SchedulingHint::JitScheduler, 500);
                 analysis.parallelism = 2;
-                analysis
-            }
-            Expr::Array { elements, .. } => {
-                // Array operations: use SoA layout and AVX-512 if available
-                let mut analysis = ExpressionAnalysis::new(
-                    if is_avx512_available() { SchedulingHint::Avx512 } else { SchedulingHint::SoA },
-                    elements.len() as u64 * 10
-                );
-                analysis.parallelism = elements.len().min(8);
-                analysis.hw_requirements.requires_avx512 = is_avx512_available();
-                analysis.locality = DataLocality::SameCacheLine;
                 analysis
             }
             _ => {
@@ -883,11 +884,7 @@ impl SuperoptThreadingIntegration {
                     }
                 }
                 SchedulingHint::HugePages => {
-                    // Use huge pages for memory allocation
-                    // Allocate with huge page allocator if available
-                    if let Some(ref huge_pages) = self.huge_pages {
-                        let _ = huge_pages.allocate(4096);
-                    }
+                    // Use huge pages for memory allocation - skip allocation in execute_task
                     f();
                 }
                 SchedulingHint::SoA => {

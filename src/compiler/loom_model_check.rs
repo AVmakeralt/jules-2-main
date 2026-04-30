@@ -198,7 +198,7 @@ impl LoomModelChecker {
             }
             ThreadOp::LockRelease { lock_id, thread_id, .. } => {
                 // Can release if this thread holds the lock
-                state.locks.get(lock_id).map_or(false, |owner| owner == Some(thread_id))
+                state.locks.get(lock_id).map_or(false, |owner| *owner == Some(*thread_id))
             }
             ThreadOp::Read { .. } | ThreadOp::Write { .. } | ThreadOp::Fence { .. } => {
                 // Always enabled

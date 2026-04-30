@@ -4,10 +4,11 @@
 // Integration with wgpu for compute shader dispatch
 // =========================================================================
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// GPU task handle with result
+#[derive(Debug)]
 pub struct GpuTaskHandle {
     /// Task ID
     id: u64,
@@ -100,7 +101,12 @@ impl GpuBuffer {
     }
 
     fn get_state(&self) -> BufferState {
-        unsafe { std::mem::transmute(self.state.load(Ordering::Acquire)) }
+        match self.state.load(Ordering::Acquire) {
+            0 => BufferState::Filling,
+            1 => BufferState::Processing,
+            2 => BufferState::Ready,
+            _ => BufferState::Filling,
+        }
     }
 
     fn set_state(&self, state: BufferState) {
@@ -153,8 +159,8 @@ impl GpuPipeline {
         
         // Copy data to buffer
         if data.len() <= self.buffer_capacity {
+            let data_ptr = buffer.data.as_ptr() as *mut f32;
             unsafe {
-                let data_ptr = buffer.data.as_ptr() as *mut f32;
                 std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
             }
         }
@@ -164,7 +170,7 @@ impl GpuPipeline {
         
         // Add to pending
         let mut pending = self.pending.lock().unwrap();
-        pending.push((*handle).clone());
+        pending.push(GpuTaskHandle::new(id));
         
         // Swap buffers
         let next_idx = (buffer_idx + 1) % self.buffers.len();
@@ -247,6 +253,13 @@ impl GpuPipeline {
 impl Default for GpuPipeline {
     fn default() -> Self {
         Self::new(2, 1024)
+    }
+}
+
+impl GpuPipeline {
+    /// Submit a task to the GPU pipeline (stub)
+    pub fn submit_task(&self, _task: *mut ()) -> Result<(), String> {
+        Ok(())
     }
 }
 

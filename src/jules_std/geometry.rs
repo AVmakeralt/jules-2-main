@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
-use crate::lexer::Span;
+use crate::compiler::lexer::Span;
 
 macro_rules! rt_err {
     ($msg:expr) => {

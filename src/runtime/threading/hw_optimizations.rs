@@ -5,7 +5,6 @@
 // Huge pages for TLB optimization
 // =========================================================================
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::ptr;
 
 /// Check if Intel AMX is available
@@ -13,25 +12,8 @@ pub fn is_amx_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         // Check CPUID leaf 07H, sub-leaf 0, ECX bit 17 (AMX-BF16) or bit 18 (AMX-INT8)
-        unsafe {
-            let mut eax: u32 = 0;
-            let mut ebx: u32 = 0;
-            let mut ecx: u32 = 0;
-            let mut edx: u32 = 0;
-            
-            std::arch::asm!(
-                "cpuid",
-                in("eax") 0x7,
-                in("ecx") 0x0,
-                lateout("eax") eax,
-                lateout("ebx") ebx,
-                lateout("ecx") ecx,
-                lateout("edx") edx,
-            );
-            
-            // Check bit 17 (AMX-BF16) or bit 18 (AMX-INT8) in ECX
-            (ecx & (1 << 17)) != 0 || (ecx & (1 << 18)) != 0
-        }
+        let result = std::arch::x86_64::__cpuid_count(0x7, 0x0);
+        (result.ecx & (1 << 17)) != 0 || (result.ecx & (1 << 18)) != 0
     }
     
     #[cfg(not(target_arch = "x86_64"))]
@@ -45,25 +27,9 @@ pub fn is_tsx_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         // Check CPUID leaf 07H, sub-leaf 0, EBX bit 11 (RTM) or bit 8 (HLE)
-        unsafe {
-            let mut eax: u32 = 0;
-            let mut ebx: u32 = 0;
-            let mut ecx: u32 = 0;
-            let mut edx: u32 = 0;
-            
-            std::arch::asm!(
-                "cpuid",
-                in("eax") 0x7,
-                in("ecx") 0x0,
-                lateout("eax") eax,
-                lateout("ebx") ebx,
-                lateout("ecx") ecx,
-                lateout("edx") edx,
-            );
-            
-            // Check bit 11 (RTM) or bit 8 (HLE) in EBX
-            (ebx & (1 << 11)) != 0 || (ebx & (1 << 8)) != 0
-        }
+        let result = std::arch::x86_64::__cpuid_count(0x7, 0x0);
+        // Check bit 11 (RTM) or bit 8 (HLE) in EBX
+        (result.ebx & (1 << 11)) != 0 || (result.ebx & (1 << 8)) != 0
     }
     
     #[cfg(not(target_arch = "x86_64"))]
@@ -77,25 +43,9 @@ pub fn is_cat_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         // Check CPUID leaf 10H for CAT support
-        unsafe {
-            let mut eax: u32 = 0;
-            let mut ebx: u32 = 0;
-            let mut ecx: u32 = 0;
-            let mut edx: u32 = 0;
-            
-            std::arch::asm!(
-                "cpuid",
-                in("eax") 0x10,
-                in("ecx") 0x0,
-                lateout("eax") eax,
-                lateout("ebx") ebx,
-                lateout("ecx") ecx,
-                lateout("edx") edx,
-            );
-            
-            // Check bit 1 (CAT) in EBX
-            (ebx & (1 << 1)) != 0
-        }
+        let result = std::arch::x86_64::__cpuid_count(0x10, 0x0);
+        // Check bit 1 (CAT) in EBX
+        (result.ebx & (1 << 1)) != 0
     }
     
     #[cfg(not(target_arch = "x86_64"))]
@@ -109,25 +59,9 @@ pub fn is_avx512_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         // Check CPUID leaf 07H, sub-leaf 0, EBX bit 16 (AVX512F)
-        unsafe {
-            let mut eax: u32 = 0;
-            let mut ebx: u32 = 0;
-            let mut ecx: u32 = 0;
-            let mut edx: u32 = 0;
-            
-            std::arch::asm!(
-                "cpuid",
-                in("eax") 0x7,
-                in("ecx") 0x0,
-                lateout("eax") eax,
-                lateout("ebx") ebx,
-                lateout("ecx") ecx,
-                lateout("edx") edx,
-            );
-            
-            // Check bit 16 (AVX512F) in EBX
-            (ebx & (1 << 16)) != 0
-        }
+        let result = std::arch::x86_64::__cpuid_count(0x7, 0x0);
+        // Check bit 16 (AVX512F) in EBX
+        (result.ebx & (1 << 16)) != 0
     }
     
     #[cfg(not(target_arch = "x86_64"))]
@@ -193,28 +127,26 @@ impl AmxTile {
                 for j in 0..16 {
                     let mut sum: f32 = 0.0;
                     for k in 0..16 {
-                        let a_val = unsafe { f32::from_bits(u32::from_le_bytes([
+                        let a_val = f32::from_bits(u32::from_le_bytes([
                             a.data[i * 16 * 4 + k * 4],
                             a.data[i * 16 * 4 + k * 4 + 1],
                             a.data[i * 16 * 4 + k * 4 + 2],
                             a.data[i * 16 * 4 + k * 4 + 3],
-                        ])) };
-                        let b_val = unsafe { f32::from_bits(u32::from_le_bytes([
+                        ]));
+                        let b_val = f32::from_bits(u32::from_le_bytes([
                             b.data[k * 16 * 4 + j * 4],
                             b.data[k * 16 * 4 + j * 4 + 1],
                             b.data[k * 16 * 4 + j * 4 + 2],
                             b.data[k * 16 * 4 + j * 4 + 3],
-                        ])) };
+                        ]));
                         sum += a_val * b_val;
                     }
                     let sum_bytes = sum.to_le_bytes();
-                    unsafe {
-                        let base = i * 16 * 4 + j * 4;
-                        self.data[base] = sum_bytes[0];
-                        self.data[base + 1] = sum_bytes[1];
-                        self.data[base + 2] = sum_bytes[2];
-                        self.data[base + 3] = sum_bytes[3];
-                    }
+                    let base = i * 16 * 4 + j * 4;
+                    self.data[base] = sum_bytes[0];
+                    self.data[base + 1] = sum_bytes[1];
+                    self.data[base + 2] = sum_bytes[2];
+                    self.data[base + 3] = sum_bytes[3];
                 }
             }
             self.dirty = true;
@@ -354,7 +286,7 @@ impl CatManager {
     }
     
     /// Assign a Class of Service to a CPU
-    pub fn assign_cos(&mut self, cpu_id: usize, cos_id: usize, cbm: u64) -> Result<(), String> {
+    pub fn assign_cos(&mut self, _cpu_id: usize, cos_id: usize, cbm: u64) -> Result<(), String> {
         if !self.available {
             return Err("CAT not available".to_string());
         }
@@ -375,6 +307,15 @@ impl CatManager {
         {
             Err("CAT only available on x86_64".to_string())
         }
+    }
+    
+    /// Set cache partition for a specific COS and CBM
+    pub fn set_cache_partition(&self, _cos_id: u32, _cbm: u64) -> Result<(), String> {
+        if !self.available {
+            return Err("CAT not available".to_string());
+        }
+        // In production, would write to IA32_L3_MASK_n MSR
+        Ok(())
     }
     
     /// Get the number of cache ways

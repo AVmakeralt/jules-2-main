@@ -80,7 +80,7 @@ impl TaskPriority {
 }
 
 /// Hardware counter feedback for adaptive precision
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HwCounterFeedback {
     /// Cache miss rate (per million instructions)
     cache_miss_rate: AtomicU64,

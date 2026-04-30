@@ -7,43 +7,71 @@ use crate::ml::ml_engine::{ComputationGraph, Operation};
 
 /// Bridge between superoptimizer and XLA backend
 pub struct SuperoptXlaBridge {
-   :
-#[cfg(feature = "xla")]
-    pub fn new(config: SuperoptimizerConfig) -> Self {
-        Self {
-            superopt_config: config,
-        }
-    }
-
+    #[cfg(feature = "xla")]
+    superopt_config: SuperoptimizerConfig,
     #[cfg(not(feature = "xla"))]
-    pub fn new(_config: ()) -> Self {
-        Self {
-            _phantom: std::marker::PhantomData,
+    _phantom: std::marker::PhantomData<()>,
+}
+
+#[cfg(feature = "xla")]
+struct SuperoptimizerConfig {
+    enable_superopt: bool,
+}
+
+#[cfg(feature = "xla")]
+impl Default for SuperoptimizerConfig {
+    fn default() -> Self {
+        Self { enable_superopt: true }
+    }
+}
+
+#[cfg(feature = "xla")]
+impl SuperoptimizerConfig {
+    fn maximum() -> Self {
+        Self { enable_superopt: true }
+    }
+    fn balanced() -> Self {
+        Self { enable_superopt: true }
+    }
+}
+
+impl SuperoptXlaBridge {
+    pub fn new() -> Self {
+        #[cfg(feature = "xla")]
+        {
+            Self {
+                superopt_config: SuperoptimizerConfig::default(),
+            }
+        }
+        #[cfg(not(feature = "xla"))]
+        {
+            Self {
+                _phantom: std::marker::PhantomData,
+            }
         }
     }
 
     pub fn with_max_optimization() -> Self {
-        #[cfg(feature = "xla")]
-        return Self::new(SuperoptimizerConfig::maximum());
-        #[cfg(not(feature = "xla"))]
-        return Self::new(());
+        // Currently equivalent to new(); future: pass SuperoptimizerConfig::maximum()
+        Self::new()
     }
 
     pub fn with_balanced_optimization() -> Self {
-        #[cfg(feature = "xla")]
-        #[cfg(feature = "xla")]
-        return Self::new(SuperoptimizerConfig::balanced());
-        #[cfg(not(feature = "xla"))]
-        return Self::new(());
+        // Currently equivalent to new(); future: pass SuperoptimizerConfig::balanced()
+        Self::new()
     }
 
     /// Apply superoptimizer optimizations to HLO IR
     /// This takes the HLO IR generated from a ComputationGraph and applies
     /// superoptimizer-discovered optimizations before XLA compilation
     pub fn optimize_hlo_ir(&self, hlo_ir: &str) -> Result<String, String> {
-        if !self.superopt_config.enable_superopt {
-            return Ok(hlo_ir.to_string());
+        #[cfg(feature = "xla")]
+        {
+            if !self.superopt_config.enable_superopt {
+                return Ok(hlo_ir.to_string());
+            }
         }
+        let _ = hlo_ir;
 
         // Parse HLO IR into an intermediate representation
         let mut hlo_ops = self.parse_hlo_ir(hlo_ir)?;
@@ -190,7 +218,7 @@ pub struct SuperoptXlaBridge {
 
     /// Apply common subexpression elimination
     fn apply_cse(&self, ops: Vec<HloOperation>) -> Vec<HloOperation> {
-        let mut seen = std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut optimized = Vec::new();
         
         for op in ops {

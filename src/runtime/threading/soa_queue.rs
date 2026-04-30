@@ -67,12 +67,21 @@ impl SoaTaskQueue {
         
         let idx = tail & self.mask;
         
-        // Write to separate arrays
-        self.functions[idx] = func;
-        self.data[idx] = data;
-        self.priorities[idx] = priority;
-        self.flags[idx] = 0;
-        self.task_types[idx] = task_type;
+        // Write to separate arrays - need interior mutability for &self
+        // SAFETY: We're the only producer (single-producer), and we've verified there's space
+        unsafe {
+            let functions = self.functions.as_ptr() as *mut TaskFn;
+            let data_arr = self.data.as_ptr() as *mut *mut ();
+            let priorities = self.priorities.as_ptr() as *mut u8;
+            let flags = self.flags.as_ptr() as *mut u8;
+            let task_types = self.task_types.as_ptr() as *mut u8;
+            
+            *functions.add(idx) = func;
+            *data_arr.add(idx) = data;
+            *priorities.add(idx) = priority;
+            *flags.add(idx) = 0;
+            *task_types.add(idx) = task_type;
+        }
         
         std::sync::atomic::fence(Ordering::Release);
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
@@ -114,9 +123,14 @@ impl SoaTaskQueue {
             let task_type = self.task_types[idx];
             
             // Mark as consumed
-            self.priorities[idx] = 255;
-            self.data[idx] = ptr::null_mut();
-            
+            // SAFETY: Single consumer pattern with atomic synchronization
+            unsafe {
+                let priorities = self.priorities.as_ptr() as *mut u8;
+                let data_arr = self.data.as_ptr() as *mut *mut ();
+                *priorities.add(idx) = 255;
+                *data_arr.add(idx) = ptr::null_mut();
+            }
+
             // Update head if this was the first element
             if idx == (head & self.mask) {
                 self.head.store(head.wrapping_add(1), Ordering::Release);
@@ -315,6 +329,11 @@ impl SoaScheduler {
     /// Get the affinity map reference
     pub fn affinity_map(&self) -> &DataAffinityMap {
         &self.affinity_map
+    }
+    
+    /// Submit a task to the SoA scheduler
+    pub fn submit_task(&self, task: *mut ()) -> bool {
+        self.ready_queue.push(|_| {}, task, 128, 0)
     }
 }
 

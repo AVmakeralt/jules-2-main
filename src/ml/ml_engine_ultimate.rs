@@ -846,7 +846,7 @@ impl Metrics {
     pub fn accuracy(pred: &Tensor, target: &Tensor) -> f32 {
         let correct = pred.data.iter()
             .zip(&target.data)
-            .filter(|(p, t)| (p.round() - t).abs() < 0.5)
+            .filter(|(p, t)| (p.round() - *t).abs() < 0.5)
             .count();
         correct as f32 / pred.numel() as f32
     }

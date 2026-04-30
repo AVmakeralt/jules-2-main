@@ -13,7 +13,7 @@ use super::epoch::{Guard, Participant};
 pub type EntityId = u64;
 
 /// Component storage trait
-pub trait ComponentStorage: Send + Sync {
+pub trait ComponentStorageTrait: Send + Sync {
     fn insert(&self, entity: EntityId, data: &[u8]);
     fn get(&self, entity: EntityId) -> Option<Vec<u8>>;
     fn remove(&self, entity: EntityId) -> bool;
@@ -125,6 +125,62 @@ impl SparseSet {
     }
 }
 
+/// Thread-safe component storage data (the struct, not the trait)
+/// Renamed from ComponentStorage to avoid collision with the trait
+pub struct ComponentStorageData {
+    inner: std::sync::RwLock<SparseSet>,
+}
+
+impl ComponentStorageData {
+    /// Create a new component storage with given stride
+    pub fn new(stride: usize, participant: Arc<Participant>) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(SparseSet::new(stride, participant)),
+        }
+    }
+
+    /// Get component data for an entity
+    pub fn get(&self, entity: EntityId) -> Option<Vec<u8>> {
+        let guard = self.inner.read().unwrap();
+        guard.get(entity).map(|s| s.to_vec())
+    }
+
+    /// Zero-copy iteration: acquires read lock, calls f for each component
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(EntityId, &[u8]),
+    {
+        let guard = self.inner.read().unwrap();
+        for (entity, data) in guard.iter() {
+            f(entity, data);
+        }
+    }
+
+    /// Insert a component for an entity
+    pub fn insert(&self, entity: EntityId, data: &[u8]) {
+        let mut guard = self.inner.write().unwrap();
+        guard.insert(entity, data);
+    }
+
+    /// Remove component for an entity
+    pub fn remove(&self, entity: EntityId) -> bool {
+        let mut guard = self.inner.write().unwrap();
+        guard.remove(entity)
+    }
+
+    /// Check if entity has this component
+    pub fn has(&self, entity: EntityId) -> bool {
+        let guard = self.inner.read().unwrap();
+        guard.has(entity)
+    }
+
+    /// Get the number of entities with this component
+    pub fn len(&self) -> usize {
+        let guard = self.inner.read().unwrap();
+        guard.len()
+    }
+}
+
 /// Thread-safe component storage wrapper using RwLock (not Mutex!)
 /// Fixed: RwLock for multi-threaded, better for read-heavy ECS
 pub struct ComponentStorageWrapper {
@@ -183,13 +239,13 @@ impl ComponentStorageWrapper {
 
 /// Legacy LockFreeComponentStorage for backward compatibility
 pub struct LockFreeComponentStorage {
-    inner: ComponentStorage,
+    inner: ComponentStorageData,
 }
 
 impl LockFreeComponentStorage {
     pub fn new(capacity: usize, participant: Arc<Participant>) -> Self {
         Self {
-            inner: ComponentStorage::new(capacity, participant),
+            inner: ComponentStorageData::new(capacity, participant),
         }
     }
 
@@ -220,7 +276,7 @@ impl LockFreeComponentStorage {
     }
 }
 
-impl ComponentStorage for LockFreeComponentStorage {
+impl ComponentStorageTrait for LockFreeComponentStorage {
     fn insert(&self, entity: EntityId, data: &[u8]) {
         self.insert(entity, data.to_vec());
     }
@@ -309,7 +365,7 @@ mod tests {
     #[test]
     fn test_component_storage() {
         let participant = Arc::new(Participant::new());
-        let storage = ComponentStorage::new(3, participant);
+        let storage = ComponentStorageData::new(3, participant);
         
         storage.insert(1, &[1, 2, 3]);
         assert_eq!(storage.get(1), Some(vec![1, 2, 3]));

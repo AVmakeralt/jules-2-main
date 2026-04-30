@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Bit segment for hyper-sparse representation
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BitSegment {
     /// Segment ID
     pub id: usize,
@@ -300,7 +300,7 @@ impl HyperSparseSoA {
     
     /// Remove a coordinate
     pub fn remove(&mut self, coord: usize) -> Option<f64> {
-        if let Some(&idx) = self.coord_to_index.remove(&coord) {
+        if let Some(idx) = self.coord_to_index.remove(&coord) {
             let value = self.values[idx];
             
             // Swap with last element

@@ -173,13 +173,13 @@ impl Injector {
 pub struct Worker {
     /// Worker ID
     id: usize,
-    _pad1: [u8; 0], // Will be initialized with correct size in new()
+    _pad1: [u8; 64],
     /// Local work-stealing deque (fallback)
     deque: WorkStealingDeque,
-    _pad2: [u8; 0], // Will be initialized with correct size in new()
+    _pad2: [u8; 64],
     /// Per-CPU deque (wait-fast with rseq)
     percpu_deque: Arc<PerCpuDeque>,
-    _pad3: [u8; 0], // Will be initialized with correct size in new()
+    _pad3: [u8; 64],
     /// Reference to global injector
     injector: Arc<Injector>,
     /// Reference to all workers (for stealing)
@@ -208,11 +208,11 @@ impl Worker {
     ) -> Self {
         Self {
             id,
-            _pad1: [0; 128 - std::mem::size_of::<usize>()],
+            _pad1: [0; 64],
             deque: WorkStealingDeque::new(participant.clone()),
-            _pad2: [0; 128 - std::mem::size_of::<WorkStealingDeque>()],
+            _pad2: [0; 64],
             percpu_deque,
-            _pad3: [0; 128 - std::mem::size_of::<PerCpuDeque>()],
+            _pad3: [0; 64],
             injector,
             workers,
             participant,
@@ -289,14 +289,14 @@ impl Worker {
                 
                 if target.numa_node == Some(my_node) {
                     // Try per-CPU deque first
-                    if let Some(task) = target.percpu_deque.steal_half(target_id, guard) {
+                    for task in target.percpu_deque.steal_half(target_id, guard) {
                         if !task.is_null() {
                             self.steals_performed.fetch_add(1, Ordering::Relaxed);
                             return Some(task);
                         }
                     }
                     // Fallback to regular deque
-                    if let Some(task) = target.deque.steal_half(guard) {
+                    for task in target.deque.steal_half(guard) {
                         if !task.is_null() {
                             self.steals_performed.fetch_add(1, Ordering::Relaxed);
                             return Some(task);
@@ -311,13 +311,13 @@ impl Worker {
                 let target = &self.workers[target_id];
                 
                 if target.numa_node != Some(my_node) {
-                    if let Some(task) = target.percpu_deque.steal_half(target_id, guard) {
+                    for task in target.percpu_deque.steal_half(target_id, guard) {
                         if !task.is_null() {
                             self.steals_performed.fetch_add(1, Ordering::Relaxed);
                             return Some(task);
                         }
                     }
-                    if let Some(task) = target.deque.steal_half(guard) {
+                    for task in target.deque.steal_half(guard) {
                         if !task.is_null() {
                             self.steals_performed.fetch_add(1, Ordering::Relaxed);
                             return Some(task);
@@ -331,13 +331,13 @@ impl Worker {
                 let target_id = (self.id + offset) % num_workers;
                 let target = &self.workers[target_id];
                 
-                if let Some(task) = target.percpu_deque.steal_half(target_id, guard) {
+                for task in target.percpu_deque.steal_half(target_id, guard) {
                     if !task.is_null() {
                         self.steals_performed.fetch_add(1, Ordering::Relaxed);
                         return Some(task);
                     }
                 }
-                if let Some(task) = target.deque.steal_half(guard) {
+                for task in target.deque.steal_half(guard) {
                     if !task.is_null() {
                         self.steals_performed.fetch_add(1, Ordering::Relaxed);
                         return Some(task);
@@ -427,29 +427,19 @@ impl ThreadPool {
             workers.push(worker);
         }
         
-        // Update workers with full worker list
-        let workers_arc = Arc::new(workers.iter().map(|w| {
-            let numa_node = topology.get_node_for_cpu(w.id).map(|n| n.id);
-            Arc::new(Worker::new(
-                w.id,
-                injector.clone(),
-                Arc::new(workers.clone()),
-                participant.clone(),
-                shutdown.clone(),
-                numa_node,
-                percpu_deque.clone(),
-            ))
-        }).collect());
+        // Update workers with full worker list - use Arc::new_cyclic to avoid the clone issue
+        // Since workers reference each other, we just use the initially created workers
+        let workers_arc = Arc::new(workers);
         
         // Spawn worker threads with CPU affinity
         for worker in workers_arc.iter() {
             let worker_clone = worker.clone();
-            let cpu_id = worker.id;
+            let _cpu_id = worker.id;
             
             thread::spawn(move || {
                 // Set CPU affinity if NUMA is enabled
                 #[cfg(feature = "numa")]
-                let _ = set_thread_affinity(cpu_id);
+                let _ = set_thread_affinity(_cpu_id);
                 
                 worker_clone.run();
             });

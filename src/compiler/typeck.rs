@@ -345,8 +345,8 @@ impl InferCtx {
     /// Returns `true` on success, `false` on mismatch.
     /// Fixed: only clone when inserting into substitution map
     pub fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
-        let a_resolved = self.resolve(a);
-        let b_resolved = self.resolve(b);
+        let a_resolved = self.resolve(a).clone();
+        let b_resolved = self.resolve(b).clone();
         match (a_resolved, b_resolved) {
             (Ty::Infer(id), other) | (other, Ty::Infer(id)) => {
                 // Occurs check: don't bind a var to itself.
@@ -354,7 +354,7 @@ impl InferCtx {
                     return true;
                 }
                 // Only clone ONCE when actually inserting
-                self.subst.insert(*id, other.clone());
+                self.subst.insert(id, other.clone());
                 true
             }
             // Tensors unify if elem matches and ranks match.
@@ -370,7 +370,7 @@ impl InferCtx {
             ) => {
                 ea == eb
                     && sa.len() == sb.len()
-                    && sa.iter().zip(sb).all(|(a, b)| match (a, b) {
+                    && sa.iter().zip(sb.iter()).all(|(a, b)| match (a, b) {
                         (Dim::Lit(x), Dim::Lit(y)) => x == y,
                         (Dim::Dynamic, _) | (_, Dim::Dynamic) => true,
                         (Dim::Named(x), Dim::Named(y)) => x == y,
@@ -379,7 +379,7 @@ impl InferCtx {
             }
             // Tuples unify element-wise.
             (Ty::Tuple(ts_a), Ty::Tuple(ts_b)) => {
-                ts_a.len() == ts_b.len() && ts_a.iter().zip(ts_b).all(|(a, b)| self.unify(a, b))
+                ts_a.len() == ts_b.len() && ts_a.iter().zip(ts_b.iter()).all(|(a, b)| self.unify(a, b))
             }
             // Everything else must be structurally equal.
             _ => a == b,

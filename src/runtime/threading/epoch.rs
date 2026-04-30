@@ -17,7 +17,7 @@ const NUM_EPOCHS: usize = 3;
 #[derive(Debug)]
 pub struct Participant {
     local_epoch: AtomicU64,
-    garbage_bags: [GarbageBag; NUM_EPOCHS],
+    garbage_bags: [std::sync::Mutex<GarbageBag>; NUM_EPOCHS],
 }
 
 impl Participant {
@@ -25,9 +25,9 @@ impl Participant {
         Self {
             local_epoch: AtomicU64::new(0),
             garbage_bags: [
-                GarbageBag::new(),
-                GarbageBag::new(),
-                GarbageBag::new(),
+                std::sync::Mutex::new(GarbageBag::new()),
+                std::sync::Mutex::new(GarbageBag::new()),
+                std::sync::Mutex::new(GarbageBag::new()),
             ],
         }
     }
@@ -51,13 +51,13 @@ impl Participant {
         let old_epoch_idx = ((current_epoch as usize).wrapping_sub(1)) % NUM_EPOCHS;
         
         // Collect from two epochs ago
-        self.garbage_bags[old_epoch_idx].collect();
+        self.garbage_bags[old_epoch_idx].lock().unwrap().collect();
     }
 
     /// Add garbage to the current epoch's bag
-    pub fn add_garbage(&self, epoch: u64, garbage: Box<dyn Send>) {
+    pub fn add_garbage(&self, epoch: u64, garbage: Box<dyn Send + std::fmt::Debug>) {
         let idx = (epoch as usize) % NUM_EPOCHS;
-        self.garbage_bags[idx].add(garbage);
+        self.garbage_bags[idx].lock().unwrap().add(garbage);
     }
 }
 
@@ -80,7 +80,7 @@ impl<'a> Guard<'a> {
     }
 
     /// Add garbage to be reclaimed
-    pub fn defer(&self, garbage: Box<dyn Send>) {
+    pub fn defer(&self, garbage: Box<dyn Send + std::fmt::Debug>) {
         let epoch = self.epoch();
         self.participant.add_garbage(epoch, garbage);
     }
@@ -95,7 +95,7 @@ impl<'a> Drop for Guard<'a> {
 /// Garbage bag for a single epoch
 #[derive(Debug)]
 struct GarbageBag {
-    items: Vec<Box<dyn Send>>,
+    items: Vec<Box<dyn Send + std::fmt::Debug>>,
 }
 
 impl GarbageBag {
@@ -105,7 +105,7 @@ impl GarbageBag {
         }
     }
 
-    fn add(&mut self, item: Box<dyn Send>) {
+    fn add(&mut self, item: Box<dyn Send + std::fmt::Debug>) {
         self.items.push(item);
         
         // Try to collect when bag is full

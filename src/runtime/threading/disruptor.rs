@@ -5,7 +5,7 @@
 // Ownership transfer without data movement
 // =========================================================================
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::ptr;
 
@@ -26,7 +26,7 @@ pub struct RingEntry<T> {
     /// Data pointer (zero-copy ownership transfer)
     data: AtomicPtr<T>,
     /// Padding to prevent false sharing
-    _pad: [u8; 0], // Will be initialized with correct size in new()
+    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicU64>() - std::mem::size_of::<usize>() * 2],
 }
 
 impl<T> RingEntry<T> {
@@ -34,7 +34,7 @@ impl<T> RingEntry<T> {
         Self {
             sequence: AtomicU64::new(0),
             data: AtomicPtr::new(ptr::null_mut()),
-            _pad: [0; CACHE_LINE_SIZE - std::mem::size_of::<AtomicU64>() - std::mem::size_of::<AtomicPtr<T>>()],
+            _pad: [0; CACHE_LINE_SIZE - std::mem::size_of::<AtomicU64>() - std::mem::size_of::<usize>() * 2],
         }
     }
 }
@@ -57,7 +57,7 @@ impl<T> DisruptorRing<T> {
     /// Create a new disruptor ring
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.next_power_of_two();
-        let mut entries = Vec::with_capacity(capacity);
+        let mut entries: Vec<RingEntry<T>> = Vec::with_capacity(capacity);
         
         for _ in 0..capacity {
             entries.push(RingEntry::new());
@@ -181,12 +181,12 @@ impl<T> DisruptorRing<T> {
         let consumer = self.consumer_sequence.load(Ordering::Acquire);
         (producer.wrapping_sub(consumer)) as usize
     }
-    
+
     /// Check if the ring is empty
     pub fn is_empty(&self) -> bool {
         self.available() == 0
     }
-    
+
     /// Check if the ring is full
     pub fn is_full(&self) -> bool {
         self.available() >= self.capacity
@@ -211,7 +211,7 @@ impl<T> WorkerDisruptor<T> {
     /// Create a new worker disruptor
     pub fn new(worker_id: usize, capacity: usize) -> Self {
         Self {
-            ring: DisruptorRing::new(capacity),
+            ring: DisruptorRing::<T>::new(capacity),
             worker_id,
         }
     }
@@ -251,7 +251,7 @@ impl<T> ZeroCopyMessaging<T> {
         let mut worker_rings = Vec::with_capacity(num_workers);
         
         for worker_id in 0..num_workers {
-            worker_rings.push(Arc::new(WorkerDisruptor::new(worker_id, ring_capacity)));
+            worker_rings.push(Arc::new(WorkerDisruptor::<T>::new(worker_id, ring_capacity)));
         }
         
         Self {

@@ -138,7 +138,7 @@ impl CrossBoundaryOptimizer {
             lossy_context,
             sparse_map: HyperSparseMap::new(total_coordinates, segment_size),
             sparse_soa: HyperSparseSoA::new(),
-            cat_manager: CatManager::new().ok(),
+            cat_manager: Some(CatManager::new()),
             fused_ops: Vec::new(),
             cache_partition_id: 0,
         }
@@ -244,7 +244,7 @@ impl CrossBoundaryOptimizer {
         // Rebuild SoA with sorted order for optimal cache access
         let mut new_soa = HyperSparseSoA::new();
         for (coord, value) in sorted_coords {
-            new_soa.insert(*coord, *value);
+            new_soa.insert(coord, value);
         }
         self.sparse_soa = new_soa;
     }

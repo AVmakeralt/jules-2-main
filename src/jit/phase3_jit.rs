@@ -211,6 +211,7 @@ impl ExecMem {
             }
             Some(Self {
                 offset,
+                ptr: std::ptr::null_mut(),
                 len: code.len().max(1),
                 arena_backed: true,
             })
@@ -953,7 +954,7 @@ impl LoopVectorizer {
                 }
                 Instr::BinOp(dst, BinOpKind::Add, lhs, rhs) => {
                     // Check if this is an induction variable update (i += 1)
-                    if let Instr::LoadI64(_, 1) = instrs.get(pc.saturating_sub(1)) {
+                    if let Some(Instr::LoadI64(_, 1)) = instrs.get(pc.saturating_sub(1)) {
                         if *dst == *lhs || *dst == *rhs {
                             self.induction_var = Some(*dst);
                         }

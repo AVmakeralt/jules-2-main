@@ -58,7 +58,7 @@ impl PerCpuDequeBuffer {
         }
         
         Self {
-            entries,
+            entries: unsafe { alloc(layout) as *mut PerCpuDequeEntry },
             capacity,
             mask: capacity - 1,
         }

@@ -586,22 +586,30 @@ impl NativeCodeGenerator {
                 target
             } else {
                 // Find any occupant
-                for (reg, state) in &self.reg_map {
-                    if let RegState::Occupied(s) = state {
-                        let evicted_slot = *s;
-                        self.spill_slot(evicted_slot, *reg)?;
-                        self.reg_map.insert(*reg, RegState::Empty);
-                        self.slot_reg.remove(&evicted_slot);
-                        self.load_slot_to_reg(wanted_slot, target)?;
-                        self.bind_slot_reg(wanted_slot, target);
-                        return Ok(());
-                    }
+                let evicted = self.reg_map.iter()
+                    .find_map(|(reg, state)| match state {
+                        RegState::Occupied(s) => Some((*reg, *s)),
+                        _ => None,
+                    });
+                if let Some((reg, evicted_slot)) = evicted {
+                    self.spill_slot(evicted_slot, reg)?;
+                    self.reg_map.insert(reg, RegState::Empty);
+                    self.slot_reg.remove(&evicted_slot);
+                    self.load_slot_to_reg(wanted_slot, target)?;
+                    self.bind_slot_reg(wanted_slot, target);
+                    return Ok(());
                 }
                 return Err("No registers available".into());
             }
         };
         // Spill the evicted slot to memory
-        let evicted_slot = self.slot_reg.get(&evict_reg).copied().unwrap_or(wanted_slot);
+        // Find the slot currently occupying evict_reg by scanning reg_map
+        let evicted_slot = self.reg_map.iter()
+            .find_map(|(r, s)| match s {
+                RegState::Occupied(s) | RegState::Dirty(s) if *r == evict_reg => Some(*s),
+                _ => None,
+            })
+            .unwrap_or(wanted_slot);
         self.spill_slot(evicted_slot, evict_reg)?;
         self.reg_map.insert(evict_reg, RegState::Empty);
         self.slot_reg.remove(&evicted_slot);

@@ -41,19 +41,21 @@ pub fn is_uintr_available() -> bool {
         // Check CPUID for UINTR support (requires Sapphire Rapids+)
         // CPUID leaf 0x7, subleaf 0x0, bit 18
         unsafe {
-            let mut eax: u32 = 0;
-            let mut ebx: u32 = 0;
+            let mut _eax: u32 = 0;
+            let mut _ebx: u32 = 0;
             let mut ecx: u32 = 0;
-            let mut edx: u32 = 0;
+            let mut _edx: u32 = 0;
             
             std::arch::asm!(
+                "xchg {tmp}, rbx",
                 "cpuid",
+                "xchg {tmp}, rbx",
+                tmp = out(reg) _,
                 in("eax") 0x7,
                 in("ecx") 0x0,
-                lateout("eax") eax,
-                lateout("ebx") ebx,
+                lateout("eax") _eax,
                 lateout("ecx") ecx,
-                lateout("edx") edx,
+                out("edx") _edx,
             );
             
             // Check bit 18 in ECX for UINTR support
@@ -132,9 +134,24 @@ impl IoUring {
         #[cfg(target_os = "linux")]
         {
             // Use io_uring_setup syscall
-            let mut params: libc::io_uring_params = unsafe { std::mem::zeroed() };
+            // Define io_uring_params locally since libc may not expose it
+            #[repr(C)]
+            #[derive(Default)]
+            struct IoUringParams {
+                sq_entries: u32,
+                cq_entries: u32,
+                flags: u32,
+                sq_thread_cpu: u32,
+                sq_thread_idle: u32,
+                features: u32,
+                wq_fd: u32,
+                resv: [u32; 3],
+                sq_off: [u64; 6],
+                cq_off: [u64; 5],
+            }
+            let mut params = IoUringParams::default();
             if sqpoll {
-                params.flags |= libc::IORING_SETUP_SQPOLL;
+                params.flags |= 1u32; // IORING_SETUP_SQPOLL
                 params.sq_thread_idle = 1000; // 1 second idle timeout
             }
             
@@ -142,7 +159,7 @@ impl IoUring {
                 libc::syscall(
                     libc::SYS_io_uring_setup,
                     entries as libc::c_ulong,
-                    &params as *const libc::io_uring_params,
+                    &params as *const _,
                 )
             };
             
@@ -177,7 +194,7 @@ impl IoUring {
                 let result = unsafe {
                     libc::ioctl(
                         fd,
-                        libc::IORING_REGISTER_FILES,
+                        2u64, // IORING_REGISTER_FILES opcode
                         files.as_ptr() as *const libc::c_void,
                     )
                 };

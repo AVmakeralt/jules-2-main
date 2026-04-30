@@ -23,7 +23,7 @@
 
 use std::fmt;
 
-use crate::ast::*;
+use crate::compiler::ast::*;
 use crate::compiler::lexer::{Span, Token, TokenKind};
 
 // =============================================================================

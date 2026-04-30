@@ -37,11 +37,25 @@ pub struct WorkStealingDeque {
 /// Circular buffer for task storage
 struct Buffer {
     /// Array of task pointers
-    data: Vec<TaskPtr>,
+    data: std::cell::UnsafeCell<Vec<TaskPtr>>,
     /// Capacity (must be power of 2)
     capacity: usize,
     /// Epoch when this buffer was retired
     retired_epoch: u64,
+}
+
+// SAFETY: Buffer is only accessed by the owner thread for push/pop,
+// and thieves only read through atomic operations with proper synchronization.
+unsafe impl Send for Buffer {}
+unsafe impl Sync for Buffer {}
+
+impl std::fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Buffer")
+            .field("capacity", &self.capacity)
+            .field("retired_epoch", &self.retired_epoch)
+            .finish()
+    }
 }
 
 impl WorkStealingDeque {
@@ -77,9 +91,7 @@ impl WorkStealingDeque {
         let buffer = self.load_buffer();
         let idx = bottom & (buffer.capacity - 1);
         
-        unsafe {
-            buffer.data[idx] = task;
-        }
+        buffer.data_mut()[idx] = task;
         
         std::sync::atomic::fence(Ordering::Release);
         self.bottom.store(bottom.wrapping_add(1), Ordering::Release);
@@ -109,11 +121,11 @@ impl WorkStealingDeque {
         }
         
         let idx = bottom & (buffer.capacity - 1);
-        let task = unsafe { buffer.data[idx] };
+        let task = buffer.data()[idx];
         
         if bottom > top {
             // Successfully popped
-            unsafe { buffer.data[idx] = ptr::null_mut(); }
+            buffer.data_mut()[idx] = ptr::null_mut();
             return Some(task);
         }
         
@@ -122,7 +134,7 @@ impl WorkStealingDeque {
         if self.top.compare_exchange(top, top.wrapping_add(1), Ordering::SeqCst, Ordering::Acquire).is_ok() {
             // Successfully stole the last element
             self.bottom.store(top.wrapping_add(1), Ordering::Release);
-            unsafe { buffer.data[idx] = ptr::null_mut(); }
+            buffer.data_mut()[idx] = ptr::null_mut();
             Some(task)
         } else {
             // Someone else stole it
@@ -146,7 +158,7 @@ impl WorkStealingDeque {
         }
         
         let idx = top & (buffer.capacity - 1);
-        let task = unsafe { buffer.data[idx] };
+        let task = buffer.data()[idx];
         
         // Try to claim the task with SeqCst ordering
         if self.top.compare_exchange(top, top.wrapping_add(1), Ordering::SeqCst, Ordering::Acquire).is_ok() {
@@ -179,10 +191,10 @@ impl WorkStealingDeque {
             let mut tasks = Vec::with_capacity(half);
             for i in 0..half {
                 let idx = (top.wrapping_add(i)) & (buffer.capacity - 1);
-                let task = unsafe { buffer.data[idx] };
+                let task = buffer.data()[idx];
                 if !task.is_null() {
                     tasks.push(task);
-                    unsafe { buffer.data[idx] = ptr::null_mut(); }
+                    buffer.data_mut()[idx] = ptr::null_mut();
                 }
             }
             tasks
@@ -219,7 +231,7 @@ impl WorkStealingDeque {
         for i in 0..size {
             let old_idx = (top.wrapping_add(i)) & (old_buffer.capacity - 1);
             let new_idx = (top.wrapping_add(i)) & (new_capacity - 1);
-            new_buffer.data[new_idx] = unsafe { old_buffer.data[old_idx] };
+            new_buffer.data_mut()[new_idx] = old_buffer.data()[old_idx];
         }
         
         let new_buffer_ptr = Box::into_raw(Box::new(new_buffer));
@@ -230,7 +242,7 @@ impl WorkStealingDeque {
         // Retire old buffer for epoch-based reclamation
         // This ensures no thief is still reading the old buffer
         let old_buffer = unsafe { Box::from_raw(old_ptr) };
-        guard.defer(Box::new(old_buffer));
+        guard.defer(Box::new(old_buffer) as Box<dyn Send + std::fmt::Debug>);
     }
 }
 
@@ -240,10 +252,22 @@ impl Buffer {
         data.resize(capacity, ptr::null_mut());
         
         Self {
-            data,
+            data: std::cell::UnsafeCell::new(data),
             capacity,
             retired_epoch: 0,
         }
+    }
+    
+    /// Get a reference to the data vector
+    fn data(&self) -> &Vec<TaskPtr> {
+        // SAFETY: Access is synchronized through atomic operations on bottom/top
+        unsafe { &*self.data.get() }
+    }
+    
+    /// Get a mutable reference to the data vector
+    fn data_mut(&self) -> &mut Vec<TaskPtr> {
+        // SAFETY: Access is synchronized through atomic operations on bottom/top
+        unsafe { &mut *self.data.get() }
     }
 }
 

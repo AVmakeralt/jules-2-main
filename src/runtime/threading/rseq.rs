@@ -4,7 +4,7 @@
 // Mainlined in kernel 4.18+, glibc 2.35+ auto-registration
 // =========================================================================
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::ptr;
 
 /// rseq ABI version (from Linux kernel)
@@ -204,11 +204,14 @@ pub struct PerCpu<T> {
     num_cpus: usize,
 }
 
-impl<T: Clone> PerCpu<T> {
+impl<T> PerCpu<T> {
     /// Create a new per-CPU data structure
-    pub fn new(default_value: T) -> Self {
+    pub fn new<F>(init: F) -> Self
+    where
+        F: Fn() -> T,
+    {
         let num_cpus = num_cpus::get();
-        let data = vec![default_value; num_cpus];
+        let data: Vec<T> = (0..num_cpus).map(|_| init()).collect();
         
         Self {
             data,
@@ -218,26 +221,14 @@ impl<T: Clone> PerCpu<T> {
     
     /// Get the value for the current CPU (wait-free with rseq)
     pub fn get(&self) -> &T {
-        if let Some(cpu_id) = get_cpu_id() {
-            if cpu_id < self.num_cpus {
-                return &self.data[cpu_id];
-            }
-        }
-        
-        // Fallback to CPU 0
-        &self.data[0]
+        let cpu_id = get_cpu_id().filter(|&id| id < self.num_cpus).unwrap_or(0);
+        &self.data[cpu_id]
     }
     
     /// Get mutable reference for the current CPU (wait-free with rseq)
     pub fn get_mut(&mut self) -> &mut T {
-        if let Some(cpu_id) = get_cpu_id() {
-            if cpu_id < self.num_cpus {
-                return &mut self.data[cpu_id];
-            }
-        }
-        
-        // Fallback to CPU 0
-        &mut self.data[0]
+        let cpu_id = get_cpu_id().filter(|&id| id < self.num_cpus).unwrap_or(0);
+        &mut self.data[cpu_id]
     }
     
     /// Get value for a specific CPU
@@ -274,7 +265,7 @@ impl PerCpuCounter {
     /// Create a new per-CPU counter
     pub fn new() -> Self {
         Self {
-            counters: PerCpu::new(AtomicUsize::new(0)),
+            counters: PerCpu::new(|| AtomicUsize::new(0)),
         }
     }
     
@@ -343,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_per_cpu() {
-        let per_cpu: PerCpu<usize> = PerCpu::new(42);
+        let per_cpu: PerCpu<usize> = PerCpu::new(|| 42);
         let value = per_cpu.get();
         assert_eq!(*value, 42);
     }

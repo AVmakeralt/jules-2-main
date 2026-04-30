@@ -266,7 +266,8 @@ impl MemoryPool {
     #[inline(always)]
     pub fn reset(&mut self) {
         self.bump.reset();
-        for slot in self.slots[..=self.max_slot_used.min(self.slots.len().saturating_sub(1))].iter_mut() {
+        let end = self.max_slot_used.min(self.slots.len().saturating_sub(1));
+        for slot in self.slots[..=end].iter_mut() {
             *slot = Value::Unit;
         }
         self.max_slot_used = 0;
@@ -949,7 +950,7 @@ impl BytecodeVM {
                     // expected_type is a discriminant index matching Value's order.
                     // We record the result in dst as a Bool so callers can branch on it.
                     // TODO: expand when the type tag encoding is finalised.
-                    let actual_tag = slots[*src as usize].type_tag();
+                    let actual_tag = slots[*src as usize].type_tag() as u32;
                     if actual_tag != *expected_type {
                         return Err(RuntimeError::new(format!(
                             "TypeCheck failed at pc={pc}: expected tag {expected_type}, got {actual_tag}"

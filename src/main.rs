@@ -100,9 +100,9 @@ pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
 
 // Pull in the compiler passes.  In a real crate these would be separate modules.
 use crate::compiler::lexer::{LexError, Lexer, Span};
-// use crate::parser::Parser;   // parser wired through `Pipeline`
-// use crate::typeck::TypeCk;
-// use crate::sema::SemaCtx;
+// use crate::compiler::parser::Parser;   // parser wired through `Pipeline`
+// use crate::compiler::typeck::TypeCk;
+// use crate::compiler::sema::SemaCtx;
 // use crate::interp::Interpreter;
 
 // =============================================================================
@@ -543,7 +543,7 @@ impl Pipeline {
         }
 
         // ── Pass 2: Parse ─────────────────────────────────────────────────────
-        let mut parser = crate::parser::Parser::new(tokens);
+        let mut parser = crate::compiler::parser::Parser::new(tokens);
         let mut program = parser.parse_program();
 
         for e in parser.errors {
@@ -555,7 +555,7 @@ impl Pipeline {
         }
 
         // ── Pass 3: Type-check ────────────────────────────────────────────────
-        let mut typeck = crate::typeck::TypeCk::new();
+        let mut typeck = crate::compiler::typeck::TypeCk::new();
         typeck.check_program(&program);
         for d in typeck.diag.items {
             unit.diags.push(adapt_typeck_diag(d));
@@ -565,7 +565,7 @@ impl Pipeline {
         }
 
         // ── Pass 4: Semantic analysis ─────────────────────────────────────────
-        let mut sema = crate::sema::SemaCtx::new();
+        let mut sema = crate::compiler::sema::SemaCtx::new();
         sema.analyse(&program);
         for d in sema.diag.items {
             unit.diags.push(adapt_sema_diag(d));
@@ -575,7 +575,7 @@ impl Pipeline {
         }
 
         // ── Pass 5: Borrow-check (lexical aliasing safety) ───────────────────
-        let borrow_diags = crate::borrowck::jules_borrowck(&program);
+        let borrow_diags = crate::compiler::borrowck::jules_borrowck(&program);
         for d in borrow_diags.items {
             unit.diags.push(adapt_borrowck_diag(d));
         }
@@ -590,11 +590,11 @@ impl Pipeline {
         // invariant code motion, function inlining, branch optimization.
         if self.opt_level >= 1 {
             let config = match self.opt_level {
-                1 => crate::advanced_optimizer::SuperoptimizerConfig::fast_compile(),
-                2 => crate::advanced_optimizer::SuperoptimizerConfig::balanced(),
-                _ => crate::advanced_optimizer::SuperoptimizerConfig::maximum(),
+                1 => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::fast_compile(),
+                2 => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::balanced(),
+                _ => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::maximum(),
             };
-            let mut superopt = crate::advanced_optimizer::Superoptimizer::new(config);
+            let mut superopt = crate::optimizer::advanced_optimizer::Superoptimizer::new(config);
             superopt.optimize_program(&mut program);
             if self.print_opt_stats && self.opt_level >= 2 {
                 eprintln!("[opt] const_folds={} cse={} dce={} inline={} unroll={} dead_fn={} licm={}",
@@ -658,7 +658,7 @@ pub enum PassName {
 
 // ── Diagnostic adapters (one per pass module) ──────────────────────────────
 
-fn parse_error_to_diag(e: crate::parser::ParseError) -> Diag {
+fn parse_error_to_diag(e: crate::compiler::parser::ParseError) -> Diag {
     let mut d = Diag::error(e.span, e.message).with_code("E0002");
     if let Some(h) = e.hint {
         d = d.with_hint(h);
@@ -666,11 +666,11 @@ fn parse_error_to_diag(e: crate::parser::ParseError) -> Diag {
     d
 }
 
-fn adapt_typeck_diag(d: crate::typeck::Diagnostic) -> Diag {
+fn adapt_typeck_diag(d: crate::compiler::typeck::Diagnostic) -> Diag {
     let sev = match d.severity {
-        crate::typeck::Severity::Error => DiagSeverity::Error,
-        crate::typeck::Severity::Warning => DiagSeverity::Warning,
-        crate::typeck::Severity::Note => DiagSeverity::Note,
+        crate::compiler::typeck::Severity::Error => DiagSeverity::Error,
+        crate::compiler::typeck::Severity::Warning => DiagSeverity::Warning,
+        crate::compiler::typeck::Severity::Note => DiagSeverity::Note,
     };
     let mut out = Diag {
         severity: sev,
@@ -686,11 +686,11 @@ fn adapt_typeck_diag(d: crate::typeck::Diagnostic) -> Diag {
     out
 }
 
-fn adapt_sema_diag(d: crate::sema::Diagnostic) -> Diag {
+fn adapt_sema_diag(d: crate::compiler::sema::Diagnostic) -> Diag {
     let sev = match d.severity {
-        crate::sema::Severity::Error => DiagSeverity::Error,
-        crate::sema::Severity::Warning => DiagSeverity::Warning,
-        crate::sema::Severity::Note => DiagSeverity::Note,
+        crate::compiler::sema::Severity::Error => DiagSeverity::Error,
+        crate::compiler::sema::Severity::Warning => DiagSeverity::Warning,
+        crate::compiler::sema::Severity::Note => DiagSeverity::Note,
     };
     let mut out = Diag {
         severity: sev,
@@ -706,11 +706,11 @@ fn adapt_sema_diag(d: crate::sema::Diagnostic) -> Diag {
     out
 }
 
-fn adapt_borrowck_diag(d: crate::borrowck::Diagnostic) -> Diag {
+fn adapt_borrowck_diag(d: crate::compiler::borrowck::Diagnostic) -> Diag {
     let sev = match d.severity {
-        crate::borrowck::Severity::Error => DiagSeverity::Error,
-        crate::borrowck::Severity::Warning => DiagSeverity::Warning,
-        crate::borrowck::Severity::Note => DiagSeverity::Note,
+        crate::compiler::borrowck::Severity::Error => DiagSeverity::Error,
+        crate::compiler::borrowck::Severity::Warning => DiagSeverity::Warning,
+        crate::compiler::borrowck::Severity::Note => DiagSeverity::Note,
     };
     let mut out = Diag {
         severity: sev,
@@ -2230,7 +2230,7 @@ fn cmd_compile(args: &CliArgs) -> i32 {
 
     // AOT compile to native ELF binary
     let start = std::time::Instant::now();
-    match crate::aot_native::compile_to_native(&program, &output_path, args.opt_level) {
+    match crate::jit::aot_native::compile_to_native(&program, &output_path, args.opt_level) {
         Ok(()) => {
             let elapsed = start.elapsed();
             if !args.quiet {
@@ -2391,6 +2391,7 @@ fn cmd_train(args: &CliArgs) -> i32 {
                 return 1;
             }
         }
+    }
     }
     0
 }

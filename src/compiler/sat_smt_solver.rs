@@ -146,7 +146,7 @@ pub enum Constraint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolverResult {
     /// Satisfiable with assignment
-    Sat(HashMap<VarId, i64>),
+    Sat(HashMap<VarId, bool>),
     /// Unsatisfiable
     Unsat,
     /// Unknown
@@ -223,8 +223,8 @@ impl SatSmtSolver {
             changed = false;
             iteration += 1;
 
-            for constraint in &self.constraints {
-                if let Some(new_ranges) = self.propagate_constraint(constraint) {
+            for constraint in self.constraints.clone() {
+                if let Some(new_ranges) = self.propagate_constraint(&constraint) {
                     for (var, new_range) in new_ranges {
                         let old_range = self.get_range(var);
                         let merged = old_range.intersect(&new_range);

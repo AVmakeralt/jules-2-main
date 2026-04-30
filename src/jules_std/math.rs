@@ -20,7 +20,7 @@ pub fn dispatch(
     macro_rules! rt_err {
         ($msg:expr) => {
             Some(Err(crate::interp::RuntimeError {
-                span: Some(crate::lexer::Span::dummy()),
+                span: Some(crate::compiler::lexer::Span::dummy()),
                 message: $msg.to_string(),
             }))
         };
@@ -635,7 +635,7 @@ fn dispatch_scalar(
     macro_rules! rt_err {
         ($msg:expr) => {
             Some(Err(crate::interp::RuntimeError {
-                span: Some(crate::lexer::Span::dummy()),
+                span: Some(crate::compiler::lexer::Span::dummy()),
                 message: $msg.to_string(),
             }))
         };

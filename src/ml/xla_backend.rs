@@ -124,7 +124,7 @@ impl XlaBackend {
         let native_handle = self.compile_native_xla(&optimized_hlo)?;
 
         #[cfg(not(feature = "xla"))]
-        let native_handle = None;
+        let native_handle: Option<*mut std::ffi::c_void> = None;
 
         let computation = XlaComputation {
             id,

@@ -961,7 +961,7 @@ pub fn run_sccp(func: &mut IRFunction) {
                 }
             }
             IRInstr::Br { target } => {
-                if executable.insert(*target) { cfg_work.push_back(target); }
+                if executable.insert(*target) { cfg_work.push_back(*target); }
             }
             _ => {}
         }
@@ -2360,7 +2360,7 @@ impl NativeCodeGen {
                cur_frame: 0, cur_saved: Vec::new() }
     }
 
-    pub fn compile_function(&mut self, func: &IRFunction) -> Result<(), String> {
+    pub fn compile_function(&mut self, func: &mut IRFunction) -> Result<(), String> {
         let alloc    = allocate_registers(func);
         let frame    = alloc.frame_size as u32;
         let used_regs: HashSet<u8> = alloc.map.values()
@@ -2428,7 +2428,7 @@ impl NativeCodeGen {
     }
 
     fn emit_instr(&mut self, instr: &IRInstr, alloc: &RegAlloc,
-                  func: &IRFunction) -> Result<(), String>
+                  func: &mut IRFunction) -> Result<(), String>
     {
         // Scratch registers: r10=10, r11=11 (caller-saved, safe as temporaries)
         const S0: u8 = 10; // r10
@@ -2978,7 +2978,7 @@ pub fn compile_to_native(
     // ── Phase 18: Code generation ─────────────────────────────────────────
     let mut codegen = NativeCodeGen::new();
     // Compile all functions (so cross-function calls can be resolved)
-    for func in &ir_fns {
+    for func in &mut ir_fns {
         codegen.compile_function(func)?;
     }
 

@@ -3937,7 +3937,7 @@ pub struct Interpreter {
     /// Maps function name → compiled bytecode (compiled once, reused forever).
     compiled_fns: FxHashMap<String, Arc<CompiledFn>>,
     #[cfg(feature = "phase3-jit")]
-    native_fns: FxHashMap<String, Arc<crate::phase3_jit::NativeCode>>,
+    native_fns: FxHashMap<String, Arc<crate::jit::phase3_jit::NativeCode>>,
     #[cfg(feature = "phase3-jit")]
     pgo_started_at: Instant,
     #[cfg(feature = "phase3-jit")]
@@ -4177,7 +4177,7 @@ impl Interpreter {
                         .map(|(k, v)| (k.clone(), *v))
                     {
                         if let Some(hot_compiled) = self.compiled_fns.get(&hot_name).cloned() {
-                            if let Some(native) = crate::phase3_jit::translate(&hot_compiled) {
+                            if let Some(native) = crate::jit::phase3_jit::translate(&hot_compiled) {
                                 self.native_fns.insert(hot_name, Arc::new(native));
                             }
                         }
@@ -4190,15 +4190,15 @@ impl Interpreter {
                 #[cfg(feature = "phase3-jit")]
                 if self.native_jit_enabled {
                     if let Some(native) = self.native_fns.get(name).cloned() {
-                        if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                        if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
                             self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
                         }
-                    } else if let Some(native) = crate::phase3_jit::translate(&compiled) {
+                    } else if let Some(native) = crate::jit::phase3_jit::translate(&compiled) {
                         let native = Arc::new(native);
                         self.native_fns.insert(name.to_owned(), native.clone());
-                        if let Ok(v) = crate::phase3_jit::execute(&native, &args) {
+                        if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
                             self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
@@ -8516,13 +8516,13 @@ pub enum GpuOp {
 
 /// Jules-native GPU backend adapter used by the interpreter runtime.
 struct JulesGpuAdapter {
-    backend: crate::gpu_backend::GpuBackend,
+    backend: crate::runtime::gpu_backend::GpuBackend,
 }
 
 impl JulesGpuAdapter {
     fn new() -> Self {
         JulesGpuAdapter {
-            backend: crate::gpu_backend::GpuBackend::auto_select(),
+            backend: crate::runtime::gpu_backend::GpuBackend::auto_select(),
         }
     }
 }
@@ -8535,7 +8535,7 @@ impl GpuBackend for JulesGpuAdapter {
 
     fn download(&self, handle: &GpuBufferHandle) -> Vec<f32> {
         self.backend
-            .download(&crate::gpu_backend::GpuBufferHandle { id: handle.0 })
+            .download(&crate::runtime::gpu_backend::GpuBufferHandle { id: handle.0 })
     }
 
     fn matmul(
@@ -8548,9 +8548,9 @@ impl GpuBackend for JulesGpuAdapter {
         let m = shape_a[shape_a.len() - 2];
         let n = shape_b[shape_b.len() - 1];
         let out = self.backend.upload(&vec![0.0; m * n], vec![m, n]);
-        let ga = crate::gpu_backend::GpuBufferHandle { id: a.0 };
-        let gb = crate::gpu_backend::GpuBufferHandle { id: b.0 };
-        let go = crate::gpu_backend::GpuBufferHandle { id: out.id };
+        let ga = crate::runtime::gpu_backend::GpuBufferHandle { id: a.0 };
+        let gb = crate::runtime::gpu_backend::GpuBufferHandle { id: b.0 };
+        let go = crate::runtime::gpu_backend::GpuBufferHandle { id: out.id };
         let _ = self.backend.matmul(&ga, &gb, &go);
         GpuBufferHandle(out.id)
     }
@@ -8560,14 +8560,14 @@ impl GpuBackend for JulesGpuAdapter {
         let out = self
             .backend
             .upload(&vec![0.0; a_data.len()], vec![a_data.len()]);
-        let ga = crate::gpu_backend::GpuBufferHandle { id: a.0 };
-        let gb = crate::gpu_backend::GpuBufferHandle { id: b.0 };
-        let go = crate::gpu_backend::GpuBufferHandle { id: out.id };
+        let ga = crate::runtime::gpu_backend::GpuBufferHandle { id: a.0 };
+        let gb = crate::runtime::gpu_backend::GpuBufferHandle { id: b.0 };
+        let go = crate::runtime::gpu_backend::GpuBufferHandle { id: out.id };
         let mapped = match op {
-            GpuOp::Add => crate::gpu_backend::GpuOp::Add,
-            GpuOp::Sub => crate::gpu_backend::GpuOp::Sub,
-            GpuOp::Mul | GpuOp::HadamardMul => crate::gpu_backend::GpuOp::Mul,
-            GpuOp::Div | GpuOp::HadamardDiv => crate::gpu_backend::GpuOp::Div,
+            GpuOp::Add => crate::runtime::gpu_backend::GpuOp::Add,
+            GpuOp::Sub => crate::runtime::gpu_backend::GpuOp::Sub,
+            GpuOp::Mul | GpuOp::HadamardMul => crate::runtime::gpu_backend::GpuOp::Mul,
+            GpuOp::Div | GpuOp::HadamardDiv => crate::runtime::gpu_backend::GpuOp::Div,
         };
         let _ = self.backend.elementwise(&ga, &gb, mapped, &go);
         GpuBufferHandle(out.id)

@@ -590,40 +590,45 @@ impl Tensor {
             let rows_per_chunk = m.div_ceil(target_chunks).max(min_rows_per_chunk);
             
             // Use custom threading engine instead of thread::scope
-            use crate::threading::join;
-            
-            let chunks: Vec<_> = result.chunks_mut(rows_per_chunk * n).enumerate().collect();
+            use crate::runtime::threading::join;
+
             let a_data = &self.data;
             let bt_data = &other_t;
-            
+
+            let num_chunks = m.div_ceil(rows_per_chunk);
+
             // Process chunks in parallel using join
-            for (chunk_idx, result_chunk) in chunks {
+            for chunk_idx in 0..num_chunks {
                 let row_start = chunk_idx * rows_per_chunk;
                 let row_end = (row_start + rows_per_chunk).min(m);
                 let a_data = a_data.clone();
                 let bt_data = bt_data.clone();
-                let mut result_chunk = result_chunk.to_vec();
-                
-                join(
-                    move || {
-                        matmul_blocked_rows(
-                            &a_data,
-                            &bt_data,
-                            row_start,
-                            row_end,
-                            k,
-                            n,
-                            &mut result_chunk,
-                            row_start,
-                        );
-                    },
-                    || {},
-                );
-                
+                let chunk_len = (row_end - row_start) * n;
+                let local_out_len = chunk_len;
+                let local_out = {
+                    let mut local_out = vec![0.0f32; chunk_len];
+                    join::<Vec<f32>, (), _, _>(
+                        move || {
+                            matmul_blocked_rows(
+                                &a_data,
+                                &bt_data,
+                                row_start,
+                                row_end,
+                                k,
+                                n,
+                                &mut local_out,
+                                row_start,
+                            );
+                            local_out
+                        },
+                        || (),
+                    ).0
+                };
+
                 // Copy result back
                 let start = chunk_idx * rows_per_chunk * n;
-                if start + result_chunk.len() <= result.len() {
-                    result[start..start + result_chunk.len()].copy_from_slice(&result_chunk);
+                if start + local_out_len <= result.len() {
+                    result[start..start + local_out_len].copy_from_slice(&local_out);
                 }
             }
         } else {

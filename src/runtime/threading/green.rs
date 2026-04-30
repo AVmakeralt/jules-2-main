@@ -40,7 +40,7 @@ impl GreenContext {
     /// Create a new green thread context
     pub fn new(id: GreenThreadId, stack_size: usize, func: fn()) -> Self {
         let stack = vec![0u8; stack_size];
-        let stack_base = Box::into_raw(stack.into_boxed_slice()) as usize;
+        let stack_base = Box::into_raw(stack.into_boxed_slice()) as *mut u8 as usize;
         
         // Align stack pointer
         let sp = (stack_base + stack_size) & !(STACK_ALIGN - 1);
@@ -288,14 +288,19 @@ impl GreenScheduler {
 
     /// Wait for a green thread to complete
     pub fn join(&self, id: GreenThreadId) {
-        let contexts = self.contexts.lock().unwrap();
-        if let Some(context) = contexts.get(&id) {
-            while !context.is_completed() {
-                // Yield and help with other work
-                drop(contexts);
-                self.yield_now();
+        loop {
+            {
                 let contexts = self.contexts.lock().unwrap();
+                if let Some(context) = contexts.get(&id) {
+                    if context.is_completed() {
+                        return;
+                    }
+                } else {
+                    return;
+                }
             }
+            // Yield and help with other work
+            self.yield_now();
         }
     }
 

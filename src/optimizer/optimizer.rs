@@ -2486,11 +2486,10 @@ pub fn build_optimizer(
     grad_clip: Option<GradClip>,
     schedule: Option<Box<dyn LrSchedule>>,
 ) -> Box<dyn Optimizer> {
-    use crate::compiler::ast::OptimizerKind::*;
     let clip = grad_clip;
     match kind {
-        Adam => {
-            let mut opt = crate::optimizer::Adam::new(lr).with_weight_decay(weight_decay);
+        crate::compiler::ast::OptimizerKind::Adam => {
+            let mut opt = Adam::new(lr).with_weight_decay(weight_decay);
             if let Some(c) = clip {
                 opt = opt.with_grad_clip(c);
             }
@@ -2499,8 +2498,8 @@ pub fn build_optimizer(
             }
             Box::new(opt)
         }
-        AdamW => {
-            let mut opt = crate::optimizer::AdamW::new(lr).with_weight_decay(weight_decay);
+        crate::compiler::ast::OptimizerKind::AdamW => {
+            let mut opt = AdamW::new(lr).with_weight_decay(weight_decay);
             if let Some(c) = clip {
                 opt = opt.with_grad_clip(c);
             }
@@ -2509,8 +2508,8 @@ pub fn build_optimizer(
             }
             Box::new(opt)
         }
-        Sgd => {
-            let mut opt = crate::optimizer::Sgd::new(lr, 0.9).with_weight_decay(weight_decay);
+        crate::compiler::ast::OptimizerKind::Sgd => {
+            let mut opt = Sgd::new(lr, 0.9).with_weight_decay(weight_decay);
             if let Some(c) = clip {
                 opt = opt.with_grad_clip(c);
             }
@@ -2519,22 +2518,24 @@ pub fn build_optimizer(
             }
             Box::new(opt)
         }
-        Rmsprop => {
-            let mut opt = crate::optimizer::RmsProp::new(lr).with_weight_decay(weight_decay);
+        crate::compiler::ast::OptimizerKind::Rmsprop => {
+            let mut opt = RmsProp::new(lr).with_weight_decay(weight_decay);
             if let Some(s) = schedule {
                 opt = opt.with_schedule_boxed(s);
             }
             Box::new(opt)
         }
-        Adagrad => {
-            let mut opt = crate::optimizer::AdaGrad::new(lr).with_weight_decay(weight_decay);
+        crate::compiler::ast::OptimizerKind::Adagrad => {
+            let mut opt = AdaGrad::new(lr).with_weight_decay(weight_decay);
             if let Some(s) = schedule {
                 opt = opt.with_schedule_boxed(s);
             }
             Box::new(opt)
         }
-        Lion | Sophia | Prodigy => {
-            let mut opt = crate::optimizer::AdamW::new(lr).with_weight_decay(weight_decay);
+        crate::compiler::ast::OptimizerKind::Lion
+        | crate::compiler::ast::OptimizerKind::Sophia
+        | crate::compiler::ast::OptimizerKind::Prodigy => {
+            let mut opt = AdamW::new(lr).with_weight_decay(weight_decay);
             if let Some(c) = clip {
                 opt = opt.with_grad_clip(c);
             }

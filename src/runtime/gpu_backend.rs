@@ -504,21 +504,19 @@ fn batched_matmul(
         
         // Use custom threading engine instead of thread::scope
         use crate::runtime::threading::join;
-        
-        let chunks: Vec<_> = out_data
-            .chunks_mut(batches_per_chunk * batch_mat_size)
-            .enumerate()
-            .collect();
-        
-        for (chunk_idx, out_chunk) in chunks {
+
+        let num_chunks = batch.div_ceil(batches_per_chunk);
+
+        for chunk_idx in 0..num_chunks {
             let batch_start = chunk_idx * batches_per_chunk;
             let batch_end = (batch_start + batches_per_chunk).min(batch);
             let a_data = a_data.clone();
             let b_data = b_data.clone();
-            let mut out_chunk = out_chunk.to_vec();
-            
-            join(
+            let chunk_len = (batch_end - batch_start) * batch_mat_size;
+
+            let local_out = join(
                 move || {
+                    let mut local_out = vec![0.0f32; chunk_len];
                     for bi in batch_start..batch_end {
                         let local_bi = bi - batch_start;
                         let a_off = bi * a_mat;
@@ -531,16 +529,17 @@ fn batched_matmul(
                             k,
                             n,
                         );
-                        out_chunk[out_off..out_off + batch_mat_size].copy_from_slice(&out);
+                        local_out[out_off..out_off + batch_mat_size].copy_from_slice(&out);
                     }
+                    local_out
                 },
                 || {},
-            );
-            
+            ).0;
+
             // Copy result back
             let start = chunk_idx * batches_per_chunk * batch_mat_size;
-            if start + out_chunk.len() <= out_data.len() {
-                out_data[start..start + out_chunk.len()].copy_from_slice(&out_chunk);
+            if start + local_out.len() <= out_data.len() {
+                out_data[start..start + local_out.len()].copy_from_slice(&local_out);
             }
         }
     } else {

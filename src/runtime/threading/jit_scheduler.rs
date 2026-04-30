@@ -13,7 +13,7 @@ use std::collections::HashMap;
 type TaskFn = fn(*mut ());
 
 /// Hardware performance counter types
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HwCounter {
     /// Cache misses
     CacheMisses,

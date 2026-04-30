@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::mem::ManuallyDrop;
 
 use super::epoch::{Guard, Participant};
+use crate::runtime::threading::ThreadResult;
 use super::slab::SlabAllocator;
 use super::worker::ThreadPool;
 
@@ -55,7 +56,6 @@ fn get_participant() -> &'static Participant {
 }
 
 /// Vtable for task execution
-#[repr(C)]
 struct TaskVtable {
     /// Run the task
     run: unsafe fn(*mut ()),
@@ -171,7 +171,7 @@ impl<T> JoinHandle<T> {
             }
 
             let result = Box::from_raw(result_ptr as *mut ManuallyDrop<T>);
-            Ok(result.into_inner())
+            Ok(ManuallyDrop::into_inner(*result))
         }
     }
 }
@@ -226,7 +226,7 @@ where
     T: Send + 'static,
 {
     // Create vtable for this closure type - moved inside the function to avoid generic static
-    extern "C" fn run_task<T, F>(ptr: *mut ())
+    extern "Rust" fn run_task<T, F>(ptr: *mut ())
     where
         F: FnOnce() -> T,
     {
@@ -246,7 +246,7 @@ where
         task.result_ptr.store(Box::into_raw(result_box) as *mut (), Ordering::Release);
     }
 
-    extern "C" fn drop_task<T, F>(ptr: *mut ()) {
+    extern "Rust" fn drop_task<T, F>(ptr: *mut ()) {
         unsafe {
             let task = &mut *(ptr as *mut SlabTask);
             // Drop closure if it was stored

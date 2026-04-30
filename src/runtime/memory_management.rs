@@ -102,7 +102,7 @@ impl CpuTopology {
     #[cfg(target_arch = "x86_64")]
     fn detect_x86() -> Self {
         // Cache line size from CPUID leaf 1, EBX[15:8] × 8.
-        let cache_line_bytes = unsafe {
+        let cache_line_bytes = {
             let r = core::arch::x86_64::__cpuid(1);
             let sz = ((r.ebx >> 8) & 0xFF) as usize * 8;
             if sz > 0 { sz } else { 64 }
@@ -112,7 +112,7 @@ impl CpuTopology {
 
         // CPUID leaf 4: Intel Deterministic Cache Parameters.
         // AMD mirrors this in leaf 0x8000001D; leaf 4 works on both.
-        unsafe {
+        {
             for sub in 0u32..16 {
                 let r = core::arch::x86_64::__cpuid_count(4, sub);
                 let cache_type = r.eax & 0x1F;
@@ -142,7 +142,7 @@ impl CpuTopology {
     #[cfg(target_arch = "x86_64")]
     fn x86_mshr_estimate() -> usize {
         // Max basic CPUID leaf >= 0x16 implies a recent micro-arch with more MSHRs.
-        let max_leaf = unsafe { core::arch::x86_64::__cpuid(0).eax };
+        let max_leaf = core::arch::x86_64::__cpuid(0).eax;
         if max_leaf >= 0x16 { 16 } else { 10 }
     }
 

@@ -32,7 +32,7 @@ pub use affinity::{set_thread_affinity, set_thread_affinity_for_thread};
 pub use cross_boundary::{CrossBoundaryOptimizer, FusedOperation, FusedOperationBuilder, OptimizationResult, ZeroCopyTransfer};
 pub use deque::WorkStealingDeque;
 pub use disruptor::{DisruptorRing, OwnedData, WorkerDisruptor, ZeroCopyMessaging};
-pub use ecs_lockfree::{ComponentStorage, EntityId, LockFreeComponentStorage, SparseSet};
+pub use ecs_lockfree::{ComponentStorageData, ComponentStorageTrait, EntityId, LockFreeComponentStorage, SparseSet};
 pub use egraph_schedule::{AotScheduler, EGraph, EGraphBuilder, EGraphExtractor, EGraphNode, PrecomputedSchedule};
 pub use green::{GreenContext, GreenScheduler, GreenThreadId};
 pub use gpu_pipeline::{GpuPipeline, GpuTaskHandle};
