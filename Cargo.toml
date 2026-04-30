@@ -36,6 +36,10 @@ path = "src/tools/bench_interp_vs_rust.rs"
 name = "bench-prime-race"
 path = "src/tools/bench_prime_race.rs"
 
+[[bin]]
+name = "bench-mcts-superopt"
+path = "src/tools/bench_mcts_superopt.rs"
+
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }

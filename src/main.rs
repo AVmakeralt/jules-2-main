@@ -5,25 +5,25 @@
 #[allow(unused_macros)]
 #[allow(clippy::drop_ref)]
 // Compiler modules
-mod compiler;
+pub mod compiler;
 
 // ML/AI modules
-mod ml;
+pub mod ml;
 
 // Optimizer modules
-mod optimizer;
+pub mod optimizer;
 
 // JIT/Compilation modules
-mod jit;
+pub mod jit;
 
 // Runtime modules
-mod runtime;
+pub mod runtime;
 
 // Game modules
-mod game;
+pub mod game;
 
 // Tool modules
-mod tools;
+pub mod tools;
 
 // Re-export commonly used modules for compatibility
 pub use runtime::interp;
