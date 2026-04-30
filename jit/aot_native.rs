@@ -880,11 +880,27 @@ fn eval_instr_sccp(instr: &IRInstr, vals: &HashMap<VarId, LatticeVal>,
 // §5a  SPARSE CONDITIONAL CONSTANT PROPAGATION (Wegman-Zadeck)
 // =============================================================================
 
+/// Build def-to-use map once for O(1) user lookup (fixes O(V*B*I) to O(V+E))
+fn build_use_map(func: &IRFunction) -> HashMap<VarId, Vec<(BlockId, usize)>> {
+    let mut use_map: HashMap<VarId, Vec<(BlockId, usize)>> = HashMap::new();
+    for (&block_id, block) in &func.blocks {
+        for (instr_idx, instr) in block.instrs.iter().enumerate() {
+            for var in instr_uses(instr) {
+                use_map.entry(var).or_default().push((block_id, instr_idx));
+            }
+        }
+    }
+    use_map
+}
+
 pub fn run_sccp(func: &mut IRFunction) {
     let mut vals:       HashMap<VarId, LatticeVal> = HashMap::new();
     let mut executable: HashSet<BlockId>            = HashSet::new();
     let mut cfg_work:   VecDeque<BlockId>           = VecDeque::new();
     let mut ssa_work:   VecDeque<(BlockId, usize)>  = VecDeque::new();
+
+    // Fix: Build def-use map once for O(1) user lookup
+    let use_map = build_use_map(func);
 
     for &p in &func.params { vals.insert(p, LatticeVal::Overdefined); }
     executable.insert(func.entry_block);
@@ -919,12 +935,11 @@ pub fn run_sccp(func: &mut IRFunction) {
             let merged = LatticeVal::meet(old, new);
             if merged != old {
                 vals.insert(dst, merged);
-                // Re-add all users
-                for (&ub, ublk) in &func.blocks {
-                    if !executable.contains(&ub) { continue; }
-                    for (ui, ui_instr) in ublk.instrs.iter().enumerate() {
-                        if instr_uses(ui_instr).contains(&dst) {
-                            ssa_work.push_back((ub, ui));
+                // Fix: O(1) lookup using pre-built use map instead of O(B*I) scan
+                if let Some(users) = use_map.get(&dst) {
+                    for &(block_id, instr_idx) in users {
+                        if executable.contains(&block_id) {
+                            ssa_work.push_back((block_id, instr_idx));
                         }
                     }
                 }
@@ -946,7 +961,7 @@ pub fn run_sccp(func: &mut IRFunction) {
                 }
             }
             IRInstr::Br { target } => {
-                if executable.insert(*target) { cfg_work.push_back(*target); }
+                if executable.insert(*target) { cfg_work.push_back(target); }
             }
             _ => {}
         }

@@ -548,10 +548,10 @@ impl NativeCodeGenerator {
             return Ok(());
         }
         // Evict
-        let victim = if let Some(RegState::Dirty(v)) = self.reg_map.get(&preferred) { *v } else { 
+        let victim = if let Some(RegState::Dirty(v)) = self.reg_map.get(&preferred) { *v } else {
             // Find any occupant
             for (reg, state) in &self.reg_map {
-                if let RegState::Occupied(s) = state { return self.spill_and_evict(*reg, *s, preferred); }
+                if let RegState::Occupied(s) = state { return self.spill_and_evict(slot, preferred); }
             }
             return Err("No registers available".into());
         };
@@ -561,12 +561,38 @@ impl NativeCodeGenerator {
         Ok(())
     }
 
-    fn spill_and_evict(&mut self, reg: Reg, slot: u16, target: Reg) -> Result<(), String> {
-        self.spill_slot(slot, reg)?;
-        self.load_slot_to_reg(slot, target)?; // Wait, we want target empty
-        // Actually, just evict
-        self.reg_map.insert(reg, RegState::Empty);
-        self.slot_reg.remove(&slot);
+    fn spill_and_evict(&mut self, wanted_slot: u16, target: Reg) -> Result<(), String> {
+        // Find which register holds wanted_slot, or pick a register to evict
+        let evict_reg = if let Some(&reg) = self.slot_reg.get(&wanted_slot) {
+            reg
+        } else {
+            // Pick a victim register
+            if let Some(RegState::Dirty(v)) = self.reg_map.get(&target) {
+                target
+            } else {
+                // Find any occupant
+                for (reg, state) in &self.reg_map {
+                    if let RegState::Occupied(s) = state {
+                        let evicted_slot = *s;
+                        self.spill_slot(evicted_slot, *reg)?;
+                        self.reg_map.insert(*reg, RegState::Empty);
+                        self.slot_reg.remove(&evicted_slot);
+                        self.load_slot_to_reg(wanted_slot, target)?;
+                        self.bind_slot_reg(wanted_slot, target);
+                        return Ok(());
+                    }
+                }
+                return Err("No registers available".into());
+            }
+        };
+        // Spill the evicted slot to memory
+        let evicted_slot = self.slot_reg.get(&evict_reg).copied().unwrap_or(wanted_slot);
+        self.spill_slot(evicted_slot, evict_reg)?;
+        self.reg_map.insert(evict_reg, RegState::Empty);
+        self.slot_reg.remove(&evicted_slot);
+        // Load the WANTED slot into the now-free register
+        self.load_slot_to_reg(wanted_slot, target)?;
+        self.bind_slot_reg(wanted_slot, target);
         Ok(())
     }
 

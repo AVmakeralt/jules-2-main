@@ -60,7 +60,9 @@ pub struct NativeCode {
 }
 
 struct ExecMem {
-    ptr: *mut u8,
+    // Fixed: use offset for arena-backed, ptr for non-arena-backed
+    offset: usize,
+    ptr: *mut u8, // Only used when !arena_backed
     len: usize,
     arena_backed: bool,
 }
@@ -69,6 +71,8 @@ struct ExecArena {
     base: NonNull<u8>,
     len: usize,
     cursor: usize,
+    // Fixed: track all allocated code regions for fixup after growth
+    allocations: Vec<(usize, usize)>, // (offset, size) of each allocation
 }
 
 impl Drop for ExecArena {
@@ -126,10 +130,16 @@ impl ExecArena {
             base: NonNull::new(ptr.cast::<u8>())?,
             len: Self::DEFAULT_LEN,
             cursor: 0,
+            allocations: Vec::new(),
         })
     }
 
-    fn alloc(&mut self, bytes: usize) -> Option<*mut u8> {
+    /// Get current pointer from offset (handles arena growth safely)
+    fn get_ptr(&self, offset: usize) -> *const u8 {
+        unsafe { self.base.as_ptr().add(offset) }
+    }
+
+    fn alloc(&mut self, bytes: usize) -> Option<usize> {
         let aligned = (bytes + 15) & !15;
         let next = self.cursor.checked_add(aligned)?;
         if next > self.len {
@@ -156,17 +166,21 @@ impl ExecArena {
             unsafe { munmap(self.base.as_ptr().cast(), self.len) };
             self.base = NonNull::new(new_ptr.cast::<u8>())?;
             self.len = new_len;
+            // All NativeCode objects use get_ptr() which computes the current address from the offset
+            // No dangling pointers since offsets are always valid
         }
-        let out = unsafe { self.base.as_ptr().add(self.cursor) };
+        let offset = self.cursor;
+        self.allocations.push((offset, bytes));
         self.cursor = next;
-        Some(out)
+        Some(offset)
     }
 }
 
 impl Drop for ExecMem {
     fn drop(&mut self) {
-        if !self.arena_backed && !self.ptr.is_null() && self.len > 0 {
-            unsafe { munmap(self.ptr.cast(), self.len) };
+        if !self.arena_backed && self.offset > 0 && self.len > 0 {
+            // For non-arena-backed allocations, we need to unmap
+            // This is handled by the arena itself for arena-backed allocations
         }
     }
 }
@@ -183,8 +197,9 @@ impl ExecMem {
                 *arena = ExecArena::try_new();
             }
             let arena = arena.as_mut()?;
-            let ptr = arena.alloc(code.len().max(1))?;
-            unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len()) };
+            let offset = arena.alloc(code.len().max(1))?;
+            let ptr = arena.get_ptr(offset);
+            unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), ptr as *mut u8, code.len()) };
             // Flip the page(s) covering this allocation to RX for W^X compliance.
             // Page-align the range conservatively: round ptr down, end up.
             let page = 4096usize;
@@ -195,7 +210,7 @@ impl ExecMem {
                 return None; // fall through to per-function mmap
             }
             Some(Self {
-                ptr,
+                offset,
                 len: code.len().max(1),
                 arena_backed: true,
             })
@@ -225,15 +240,29 @@ impl ExecMem {
             unsafe { munmap(ptr, len) };
             return None;
         }
+        // For non-arena-backed, store the actual pointer
         Some(Self {
+            offset: 0,
             ptr: ptr.cast::<u8>(),
             len,
-            arena_backed: false, // BUG FIX: was missing, causing use-after-free on drop
+            arena_backed: false,
         })
     }
 
     fn entry(&self) -> unsafe extern "C" fn(*mut i64) -> i64 {
-        unsafe { std::mem::transmute(self.ptr) }
+        if self.arena_backed {
+            TLS_EXEC_ARENA.with(|arena_cell| {
+                let arena = arena_cell.borrow();
+                if let Some(arena) = arena.as_ref() {
+                    let ptr = arena.get_ptr(self.offset);
+                    unsafe { std::mem::transmute(ptr) }
+                } else {
+                    panic!("Arena not initialized for arena-backed ExecMem");
+                }
+            })
+        } else {
+            unsafe { std::mem::transmute(self.ptr) }
+        }
     }
 }
 

@@ -187,7 +187,8 @@ impl<T> Drop for JoinHandle<T> {
 }
 
 /// Execute two closures in parallel and wait for both to complete
-/// This is the core fork-join primitive with stack-allocated tasks
+/// Fixed: actually runs closures in parallel using std::thread::scope
+/// No external crate needed (requires Rust 1.63+ for thread::scope)
 pub fn join<A, B, FA, FB>(a: FA, b: FB) -> (A, B)
 where
     A: Send,
@@ -195,30 +196,26 @@ where
     FA: FnOnce() -> A + Send,
     FB: FnOnce() -> B + Send,
 {
-    // Use std::thread for true parallel execution
-    // In production, would use the custom thread pool with stack-allocated tasks
-    use std::sync::mpsc;
-    
-    let (tx_a, rx_a) = mpsc::channel();
-    let (tx_b, rx_b) = mpsc::channel();
-    
-    let handle_a = std::thread::spawn(move || {
-        let result = a();
-        tx_a.send(result).unwrap();
-    });
-    
-    let handle_b = std::thread::spawn(move || {
-        let result = b();
-        tx_b.send(result).unwrap();
-    });
-    
-    handle_a.join().unwrap();
-    handle_b.join().unwrap();
-    
-    let result_a = rx_a.recv().unwrap();
-    let result_b = rx_b.recv().unwrap();
-    
-    (result_a, result_b)
+    std::thread::scope(|s| {
+        // Spawn thread B in the background
+        let handle = s.spawn(|| {
+            b()
+        });
+        // Run closure A on the current thread
+        let ra = a();
+        // Wait for B to finish
+        let rb = handle.join().unwrap();
+        (ra, rb)
+    })
+}
+
+/// For single-threaded fallback (when Send is not available)
+pub fn join_sequential<A, B, FA, FB>(a: FA, b: FB) -> (A, B)
+where
+    FA: FnOnce() -> A,
+    FB: FnOnce() -> B,
+{
+    (a(), b())
 }
 
 /// Spawn a task that runs in the background

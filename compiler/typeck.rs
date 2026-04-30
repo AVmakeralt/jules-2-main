@@ -330,27 +330,30 @@ impl InferCtx {
 
     /// Walk the substitution chain until we reach a non-variable type (or an
     /// unresolved variable).
-    pub fn resolve(&self, ty: &Ty) -> Ty {
+    /// Fixed: returns reference instead of cloning (zero allocation)
+    pub fn resolve<'a>(&'a self, ty: &'a Ty) -> &'a Ty {
         match ty {
             Ty::Infer(id) => match self.subst.get(id) {
                 Some(t) => self.resolve(t),
-                None => ty.clone(),
+                None => ty,
             },
-            _ => ty.clone(),
+            _ => ty,
         }
     }
 
     /// Attempt to unify `a` and `b`, recording the binding.
     /// Returns `true` on success, `false` on mismatch.
+    /// Fixed: only clone when inserting into substitution map
     pub fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
-        let a = self.resolve(a);
-        let b = self.resolve(b);
-        match (&a, &b) {
+        let a_resolved = self.resolve(a);
+        let b_resolved = self.resolve(b);
+        match (a_resolved, b_resolved) {
             (Ty::Infer(id), other) | (other, Ty::Infer(id)) => {
                 // Occurs check: don't bind a var to itself.
                 if matches!(other, Ty::Infer(oid) if oid == id) {
                     return true;
                 }
+                // Only clone ONCE when actually inserting
                 self.subst.insert(*id, other.clone());
                 true
             }
