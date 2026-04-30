@@ -708,6 +708,6 @@ mod tests {
 
         let result = validator.validate();
         // Should be valid or unknown (depends on constant folding proof)
-        assert!(result != ValidationResult::Invalid { .. });
+        assert!(!matches!(result, ValidationResult::Invalid { .. }));
     }
 }

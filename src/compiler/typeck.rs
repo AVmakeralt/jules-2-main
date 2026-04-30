@@ -3956,7 +3956,7 @@ mod tests {
         let v = ctx.fresh();
         let concrete = Ty::Scalar(ElemType::F64);
         assert!(ctx.unify(&v, &concrete));
-        assert_eq!(ctx.resolve(&v), concrete);
+        assert_eq!(ctx.resolve(&v), &concrete);
     }
 
     #[test]

@@ -296,13 +296,14 @@ where
 /// Adaptive splitting based on workload characteristics
 pub fn par_for<F>(range: std::ops::Range<usize>, f: F)
 where
-    F: Fn(usize) + Send + Sync,
+    F: FnMut(usize) + Send + Sync,
 {
     let pool = get_pool();
     let num_workers = pool.num_workers();
     
     if num_workers <= 1 || range.len() <= 1 {
         // Sequential execution for small workloads
+        let mut f = f;
         for i in range {
             f(i);
         }
@@ -311,14 +312,16 @@ where
 
     // Adaptive chunking
     let chunk_size = (range.len() / num_workers).max(1);
+    let f = std::sync::Arc::new(std::sync::Mutex::new(f));
     
     for chunk_start in (range.start..range.end).step_by(chunk_size) {
         let chunk_end = (chunk_start + chunk_size).min(range.end);
-        let f_clone = &f;
+        let f_clone = f.clone();
         
         let task = Box::new(move || {
+            let mut guard = f_clone.lock().unwrap();
             for i in chunk_start..chunk_end {
-                f_clone(i);
+                guard(i);
             }
         });
         

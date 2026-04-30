@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_cross_boundary_optimizer() {
-        let lossy_manager = LossyComputationManager::new();
+        let mut lossy_manager = LossyComputationManager::new();
         let lossy_context = lossy_manager.create_context(TaskPriority::Medium);
         
         let mut optimizer = CrossBoundaryOptimizer::new(

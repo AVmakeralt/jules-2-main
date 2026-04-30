@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_amx_context() {
-        let ctx = AmxContext::new();
+        let mut ctx = AmxContext::new();
         let tile = ctx.get_tile(0);
         // Should work regardless of AMX availability
         let _ = tile;

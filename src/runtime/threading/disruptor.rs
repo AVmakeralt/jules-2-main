@@ -388,7 +388,7 @@ mod tests {
         
         assert!(owned.is_owned());
         let taken = owned.take();
-        assert!(!owned.is_owned());
+        // After take(), owned is moved; verify the taken pointer is valid
         assert!(!taken.is_null());
     }
 }

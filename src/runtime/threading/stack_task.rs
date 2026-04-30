@@ -244,16 +244,21 @@ mod tests {
     #[test]
     fn test_task_cache() {
         let mut cache = TaskCache::new(10);
-        
+
         assert_eq!(cache.available(), 10);
-        
-        let task = cache.allocate();
-        assert!(task.is_some());
+
+        // Allocate a task - the returned &mut StackTask borrows cache mutably.
+        // Convert to raw pointer to release the borrow so we can call other methods.
+        let task_ptr = cache.allocate().map(|t| t as *const StackTask);
+        assert!(task_ptr.is_some());
+
         assert_eq!(cache.available(), 9);
-        
-        if let Some(task) = task {
-            cache.deallocate(task);
-            assert_eq!(cache.available(), 10);
+
+        // Deallocate using the raw pointer (safe because the task is still in cache.pool)
+        if let Some(ptr) = task_ptr {
+            cache.deallocate(unsafe { &*ptr });
         }
+
+        assert_eq!(cache.available(), 10);
     }
 }

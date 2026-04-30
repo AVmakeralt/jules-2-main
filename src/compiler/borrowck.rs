@@ -732,7 +732,7 @@ pub fn jules_borrowck(program: &Program) -> Diagnostics {
 mod tests {
     use super::*;
     use crate::compiler::lexer::Lexer;
-    use crate::parser::Parser;
+    use crate::compiler::parser::Parser;
 
     fn borrow_errors(source: &str) -> usize {
         let mut lx = Lexer::new(source);

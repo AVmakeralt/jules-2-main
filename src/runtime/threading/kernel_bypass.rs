@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_uintr_sender() {
-        let sender = UintrSender::new(4);
+        let mut sender = UintrSender::new(4);
         let result = sender.register_target(0, 0x1000, 1);
         // Should work regardless of hardware support
         let _ = result;

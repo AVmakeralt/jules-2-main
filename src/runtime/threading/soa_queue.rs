@@ -184,28 +184,28 @@ impl SoaTaskQueue {
 pub fn prefetch_t0(addr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        std::arch::asm!("prefetcht0 ({0})", in(reg) addr, options(nostack));
+        std::arch::asm!("prefetcht0 byte ptr [{0}]", in(reg) addr, options(nostack));
     }
 }
 
 pub fn prefetch_t1(addr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        std::arch::asm!("prefetcht1 ({0})", in(reg) addr, options(nostack));
+        std::arch::asm!("prefetcht1 byte ptr [{0}]", in(reg) addr, options(nostack));
     }
 }
 
 pub fn prefetch_t2(addr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        std::arch::asm!("prefetcht2 ({0})", in(reg) addr, options(nostack));
+        std::arch::asm!("prefetcht2 byte ptr [{0}]", in(reg) addr, options(nostack));
     }
 }
 
 pub fn prefetch_w(addr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        std::arch::asm!("prefetchw ({0})", in(reg) addr, options(nostack));
+        std::arch::asm!("prefetchw byte ptr [{0}]", in(reg) addr, options(nostack));
     }
 }
 
