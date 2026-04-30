@@ -2364,11 +2364,11 @@ fn cmd_train(args: &CliArgs) -> i32 {
                             stats.total_steps
                         );
                     }
-                    0
+                    return 0;
                 }
                 Err(e) => {
                     eprintln!("jules train (XLA): {e}");
-                    1
+                    return 1;
                 }
             }
         } else {
@@ -2383,6 +2383,7 @@ fn cmd_train(args: &CliArgs) -> i32 {
                         stats.total_steps
                     );
                 }
+                return 0;
             }
             Err(e) => {
                 let diag = adapt_runtime_error(e);

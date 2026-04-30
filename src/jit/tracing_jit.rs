@@ -358,7 +358,7 @@ impl NativeCodeGenerator {
     // --- Optimizer: Constant Folding & Dead Store Elimination ---
     fn optimize_trace(&self, instrs: &[TraceInstruction]) -> Vec<TraceInstruction> {
         let mut out = Vec::with_capacity(instrs.len());
-{{ ... }
+        {
         let mut last_load: HashMap<u16, i64> = HashMap::new();
         
         for ti in instrs {
@@ -402,6 +402,7 @@ impl NativeCodeGenerator {
                 }
                 _ => out.push(ti.clone()),
             }
+        }
         }
         out
     }

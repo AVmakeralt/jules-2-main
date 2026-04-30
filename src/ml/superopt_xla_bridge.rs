@@ -339,6 +339,3 @@ mod tests {
         assert_eq!(optimized[1].opcode, "copy");
     }
 }
-        assert_eq!(optimized[1].opcode, "copy");
-    }
-}
