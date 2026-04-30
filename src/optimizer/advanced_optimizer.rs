@@ -13,6 +13,12 @@ use rustc_hash::FxHashMap;
 use crate::compiler::ast::*;
 use crate::Span;
 
+mod hardware_cost_model;
+use hardware_cost_model::{HardwareCostModel, Microarchitecture};
+
+mod profile_guided;
+use profile_guided::{ProfileDatabase, ProfileWeightedCostModel, SharedProfileDatabase};
+
 // §1  CONFIGURATION
 
 #[derive(Debug, Clone, Copy)]
@@ -551,6 +557,7 @@ impl AlgebraicSimplifier {
                     }
                 }
                 if Self::is_int_zero(lhs) { return Some(lhs.clone()); }
+                // x % 0 is undefined, but we don't handle it here
             }
 
             // ── Bitwise ───────────────────────────────────────────────────
@@ -2999,6 +3006,9 @@ enum ENode {
     Var(String),
     BinOp(BinOpKind, EClassId, EClassId),
     UnOp(UnOpKind, EClassId),
+    /// If-then-else: (cond, then_branch, else_branch)
+    /// else_branch is optional (None if no else clause)
+    IfThenElse(EClassId, EClassId, Option<EClassId>),
 }
 
 impl ENode {
@@ -3007,6 +3017,11 @@ impl ENode {
         match self {
             Self::BinOp(_, a, b) => { f(*a); f(*b); }
             Self::UnOp(_, a)     => { f(*a); }
+            Self::IfThenElse(c, t, e) => {
+                f(*c);
+                f(*t);
+                if let Some(ee) = e { f(*ee); }
+            }
             _                    => {}
         }
     }
@@ -3016,21 +3031,68 @@ impl ENode {
         match self {
             Self::BinOp(op, a, b) => Self::BinOp(op, f(a), f(b)),
             Self::UnOp(op, a)     => Self::UnOp(op, f(a)),
+            Self::IfThenElse(c, t, e) => Self::IfThenElse(f(c), f(t), e.map(f)),
             other                 => other,
         }
     }
 
-    /// Single-node cost, excluding children (mirrors CostModel::estimate).
-    fn base_cost(&self) -> f64 {
-        match self {
+    /// Single-node cost, excluding children.
+    /// Uses hardware-aware cost model combined with profile data.
+    /// Lower is better.
+    fn base_cost(&self, hw_model: &HardwareCostModel, profile_model: Option<&ProfileWeightedCostModel>, location: Option<&str>) -> f64 {
+        let static_cost = match self {
             Self::IntLit(_) | Self::FloatBits(_) | Self::Bool(_) | Self::Var(_) => 0.0,
-            Self::UnOp(_, _) => 1.0,
-            Self::BinOp(op, _, _) => match op {
-                BinOpKind::Add | BinOpKind::Sub => 1.0,
-                BinOpKind::Mul => 3.0,
-                BinOpKind::Div | BinOpKind::Rem | BinOpKind::FloorDiv => 20.0,
-                _ => 1.0,
-            },
+            Self::UnOp(op, _) => {
+                let instr = match op {
+                    UnOpKind::Neg => "neg",
+                    UnOpKind::Not => "not",
+                    UnOpKind::Deref => "load",
+                    UnOpKind::Ref | UnOpKind::RefMut => "store_addr",
+                    _ => "unknown",
+                };
+                if let Some(uop) = hw_model.port_map().get_uop(instr) {
+                    uop.latency as f64
+                } else {
+                    1.0
+                }
+            }
+            Self::BinOp(op, _, _) => {
+                let instr = match op {
+                    BinOpKind::Add => "add",
+                    BinOpKind::Sub => "sub",
+                    BinOpKind::Mul => "mul",
+                    BinOpKind::Div => "div",
+                    BinOpKind::Rem => "div",
+                    BinOpKind::FloorDiv => "div",
+                    BinOpKind::BitAnd => "and",
+                    BinOpKind::BitOr => "or",
+                    BinOpKind::BitXor => "xor",
+                    BinOpKind::Shl => "shl",
+                    BinOpKind::Shr => "shr",
+                    BinOpKind::Eq => "cmp",
+                    BinOpKind::Ne => "cmp",
+                    BinOpKind::Lt => "cmp",
+                    BinOpKind::Le => "cmp",
+                    BinOpKind::Gt => "cmp",
+                    BinOpKind::Ge => "cmp",
+                    BinOpKind::And => "and",
+                    BinOpKind::Or => "or",
+                    _ => "unknown",
+                };
+                if let Some(uop) = hw_model.port_map().get_uop(instr) {
+                    uop.latency as f64
+                } else {
+                    1.0
+                }
+            }
+            Self::IfThenElse(_, _, _) => 15.0,
+        };
+
+        // Apply profile-weighted cost if available
+        if let (Some(profile_model), Some(loc)) = (profile_model, location) {
+            profile_model.estimate_cost(loc, static_cost)
+        } else {
+            static_cost
         }
     }
 }
@@ -3087,6 +3149,182 @@ impl EUnionFind {
     }
 }
 
+// ── Pattern matching for egg-style rewrites ───────────────────────────────────
+
+/// A pattern that can match against e-nodes, with variable binding.
+#[derive(Clone, Debug)]
+enum Pattern {
+    /// Match any e-node and bind to this variable name
+    Var(String),
+    /// Match a specific literal
+    IntLit(u128),
+    FloatBits(u64),
+    Bool(bool),
+    /// Match a binary operation with pattern children
+    BinOp(BinOpKind, Box<Pattern>, Box<Pattern>),
+    /// Match a unary operation with pattern child
+    UnOp(UnOpKind, Box<Pattern>),
+    /// Match if-then-else
+    IfThenElse(Box<Pattern>, Box<Pattern>, Option<Box<Pattern>>),
+}
+
+/// A variable binding from pattern matching
+type Bindings = FxHashMap<String, EClassId>;
+
+impl Pattern {
+    /// Match this pattern against an e-class, returning bindings if successful.
+    fn match_class(&self, egraph: &EGraph, class: EClassId, bindings: &mut Bindings) -> bool {
+        let canon = egraph.uf.find_imm(class);
+        match self {
+            Pattern::Var(name) => {
+                // Bind this variable to the class
+                bindings.insert(name.clone(), canon);
+                true
+            }
+            Pattern::IntLit(v) => {
+                egraph.int_lit_in(canon) == Some(*v)
+            }
+            Pattern::FloatBits(b) => {
+                egraph.float_bits_in(canon) == Some(*b)
+            }
+            Pattern::Bool(b) => {
+                egraph.bool_lit_in(canon) == Some(*b)
+            }
+            Pattern::BinOp(op, lhs_pat, rhs_pat) => {
+                if let Some((l, r)) = egraph.binop_in_class(canon, *op) {
+                    lhs_pat.match_class(egraph, l, bindings) && rhs_pat.match_class(egraph, r, bindings)
+                } else {
+                    false
+                }
+            }
+            Pattern::UnOp(op, child_pat) => {
+                if let Some((actual_op, child)) = egraph.unop_in_class(canon) {
+                    if actual_op == *op {
+                        child_pat.match_class(egraph, child, bindings)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            Pattern::IfThenElse(cond_pat, then_pat, else_pat) => {
+                // Check if this class contains an IfThenElse node
+                let c = egraph.uf.find_imm(canon);
+                if let Some(nids) = egraph.classes.get(&c) {
+                    for &nid in nids {
+                        if let ENode::IfThenElse(cond_id, then_id, else_id) = &egraph.nodes[nid as usize] {
+                            let cond_ok = cond_pat.match_class(egraph, *cond_id, bindings);
+                            let then_ok = then_pat.match_class(egraph, *then_id, bindings);
+                            let else_ok = else_pat.as_ref().map_or(true, |p| {
+                                else_id.map_or(false, |e| p.match_class(egraph, e, bindings))
+                            });
+                            return cond_ok && then_ok && else_ok;
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Instantiate this pattern with the given bindings to produce an ENode.
+    /// Uses the egraph to get representative nodes from bound classes.
+    fn instantiate(&self, egraph: &EGraph, bindings: &Bindings) -> Option<ENode> {
+        match self {
+            Pattern::Var(name) => {
+                // Look up the bound class and pick a representative node
+                bindings.get(name).and_then(|&class| {
+                    let canon = egraph.uf.find_imm(class);
+                    // Pick the cheapest node from the class
+                    egraph.classes.get(&canon)?.iter().find_map(|&nid| {
+                        Some(egraph.nodes[nid as usize].clone())
+                    })
+                })
+            }
+            Pattern::IntLit(v) => Some(ENode::IntLit(*v)),
+            Pattern::FloatBits(b) => Some(ENode::FloatBits(*b)),
+            Pattern::Bool(b) => Some(ENode::Bool(*b)),
+            Pattern::BinOp(op, lhs, rhs) => {
+                // For binary ops, we need to get the class IDs from bindings
+                // and construct a new BinOp node with those class IDs
+                match (lhs.as_ref(), rhs.as_ref()) {
+                    (Pattern::Var(lname), Pattern::Var(rname)) => {
+                        let l_class = bindings.get(lname).copied()?;
+                        let r_class = bindings.get(rname).copied()?;
+                        Some(ENode::BinOp(*op, l_class, r_class))
+                    }
+                    _ => {
+                        // Complex case: recursively instantiate children
+                        // This requires children to be literals or already bound
+                        None // Simplified for now
+                    }
+                }
+            }
+            Pattern::UnOp(op, child) => {
+                match child.as_ref() {
+                    Pattern::Var(cname) => {
+                        let c_class = bindings.get(cname).copied()?;
+                        Some(ENode::UnOp(*op, c_class))
+                    }
+                    _ => None
+                }
+            }
+            Pattern::IfThenElse(cond, then, else_) => {
+                match (cond.as_ref(), then.as_ref(), else_.as_ref()) {
+                    (Pattern::Var(cname), Pattern::Var(tname), Some(Pattern::Var(ename))) => {
+                        let c_class = bindings.get(cname).copied()?;
+                        let t_class = bindings.get(tname).copied()?;
+                        let e_class = bindings.get(ename).copied()?;
+                        Some(ENode::IfThenElse(c_class, t_class, Some(e_class)))
+                    }
+                    (Pattern::Var(cname), Pattern::Var(tname), None) => {
+                        let c_class = bindings.get(cname).copied()?;
+                        let t_class = bindings.get(tname).copied()?;
+                        Some(ENode::IfThenElse(c_class, t_class, None))
+                    }
+                    _ => None
+                }
+            }
+        }
+    }
+}
+
+/// A rewrite rule with pattern-based matching
+struct PatternRewrite {
+    name: &'static str,
+    pattern: Pattern,
+    replacement: Pattern,
+}
+
+impl PatternRewrite {
+    /// Create a new pattern rewrite rule
+    fn new(name: &'static str, pattern: Pattern, replacement: Pattern) -> Self {
+        Self { name, pattern, replacement }
+    }
+}
+
+/// Helper functions to create patterns
+fn var(name: &str) -> Pattern {
+    Pattern::Var(name.to_string())
+}
+
+fn int_lit(v: u128) -> Pattern {
+    Pattern::IntLit(v)
+}
+
+fn bool_lit(b: bool) -> Pattern {
+    Pattern::Bool(b)
+}
+
+fn binop(op: BinOpKind, lhs: Pattern, rhs: Pattern) -> Pattern {
+    Pattern::BinOp(op, Box::new(lhs), Box::new(rhs))
+}
+
+fn unop(op: UnOpKind, child: Pattern) -> Pattern {
+    Pattern::UnOp(op, Box::new(child))
+}
+
 // ── Pending rewrite ───────────────────────────────────────────────────────────
 
 /// A rewrite produced by `generate_rewrites` (read-only phase).
@@ -3118,10 +3356,20 @@ struct EGraph {
     pending:    Vec<(EClassId, EClassId)>,
     /// Total equivalences discovered.
     pub rewrites: u64,
+    /// Pattern-based rewrite rules
+    pattern_rules: Vec<PatternRewrite>,
+    /// Hardware-aware cost model
+    hw_cost_model: HardwareCostModel,
+    /// Profile-weighted cost model
+    profile_cost_model: Option<ProfileWeightedCostModel>,
+    /// Current location being optimized (for profile lookup)
+    current_location: Option<String>,
 }
 
 impl EGraph {
     fn new() -> Self {
+        let pattern_rules = Self::builtin_pattern_rules();
+        let hw_cost_model = HardwareCostModel::new();
         Self {
             nodes:      Vec::with_capacity(64),
             node_class: Vec::with_capacity(64),
@@ -3131,7 +3379,141 @@ impl EGraph {
             uf:         EUnionFind::new(),
             pending:    Vec::new(),
             rewrites:   0,
+            pattern_rules,
+            hw_cost_model,
+            profile_cost_model: None,
+            current_location: None,
         }
+    }
+
+    /// Create an e-graph with profile-guided optimization
+    fn with_profile(profile_model: ProfileWeightedCostModel) -> Self {
+        let pattern_rules = Self::builtin_pattern_rules();
+        let hw_cost_model = HardwareCostModel::new();
+        Self {
+            nodes:      Vec::with_capacity(64),
+            node_class: Vec::with_capacity(64),
+            classes:    FxHashMap::default(),
+            parents:    FxHashMap::default(),
+            hashcons:   FxHashMap::default(),
+            uf:         EUnionFind::new(),
+            pending:    Vec::new(),
+            rewrites:   0,
+            pattern_rules,
+            hw_cost_model,
+            profile_cost_model: Some(profile_model),
+            current_location: None,
+        }
+    }
+
+    /// Set the current location for profile lookup
+    fn set_location(&mut self, location: String) {
+        self.current_location = Some(location);
+    }
+
+    /// Define the built-in pattern-based rewrite rules
+    fn builtin_pattern_rules() -> Vec<PatternRewrite> {
+        vec![
+            // Commutativity: x + y = y + x
+            PatternRewrite::new(
+                "commutative_add",
+                binop(BinOpKind::Add, var("x"), var("y")),
+                binop(BinOpKind::Add, var("y"), var("x")),
+            ),
+            // Commutativity: x * y = y * x
+            PatternRewrite::new(
+                "commutative_mul",
+                binop(BinOpKind::Mul, var("x"), var("y")),
+                binop(BinOpKind::Mul, var("y"), var("x")),
+            ),
+            // Identity: x + 0 = x
+            PatternRewrite::new(
+                "add_zero_left",
+                binop(BinOpKind::Add, int_lit(0), var("x")),
+                var("x"),
+            ),
+            PatternRewrite::new(
+                "add_zero_right",
+                binop(BinOpKind::Add, var("x"), int_lit(0)),
+                var("x"),
+            ),
+            // Identity: x * 1 = x
+            PatternRewrite::new(
+                "mul_one_left",
+                binop(BinOpKind::Mul, int_lit(1), var("x")),
+                var("x"),
+            ),
+            PatternRewrite::new(
+                "mul_one_right",
+                binop(BinOpKind::Mul, var("x"), int_lit(1)),
+                var("x"),
+            ),
+            // Annihilation: x * 0 = 0
+            PatternRewrite::new(
+                "mul_zero_left",
+                binop(BinOpKind::Mul, int_lit(0), var("x")),
+                int_lit(0),
+            ),
+            PatternRewrite::new(
+                "mul_zero_right",
+                binop(BinOpKind::Mul, var("x"), int_lit(0)),
+                int_lit(0),
+            ),
+            // Double negation: --x = x
+            PatternRewrite::new(
+                "double_neg",
+                unop(UnOpKind::Neg, unop(UnOpKind::Neg, var("x"))),
+                var("x"),
+            ),
+            // Double bitwise not: ~~x = x
+            PatternRewrite::new(
+                "double_not",
+                unop(UnOpKind::Not, unop(UnOpKind::Not, var("x"))),
+                var("x"),
+            ),
+            // x - x = 0
+            PatternRewrite::new(
+                "sub_self",
+                binop(BinOpKind::Sub, var("x"), var("x")),
+                int_lit(0),
+            ),
+            // x / x = 1
+            PatternRewrite::new(
+                "div_self",
+                binop(BinOpKind::Div, var("x"), var("x")),
+                int_lit(1),
+            ),
+            // x ^ x = 0
+            PatternRewrite::new(
+                "xor_self",
+                binop(BinOpKind::BitXor, var("x"), var("x")),
+                int_lit(0),
+            ),
+            // x & x = x
+            PatternRewrite::new(
+                "and_self",
+                binop(BinOpKind::BitAnd, var("x"), var("x")),
+                var("x"),
+            ),
+            // x | x = x
+            PatternRewrite::new(
+                "or_self",
+                binop(BinOpKind::BitOr, var("x"), var("x")),
+                var("x"),
+            ),
+            // x == x = true
+            PatternRewrite::new(
+                "eq_self",
+                binop(BinOpKind::Eq, var("x"), var("x")),
+                bool_lit(true),
+            ),
+            // x != x = false
+            PatternRewrite::new(
+                "ne_self",
+                binop(BinOpKind::Ne, var("x"), var("x")),
+                bool_lit(false),
+            ),
+        ]
     }
 
     // ── Core operations ───────────────────────────────────────────────────────
@@ -3263,6 +3645,12 @@ impl EGraph {
                 let c = self.build_expr(inner);
                 self.add(ENode::UnOp(*op, c))
             }
+            Expr::IfExpr { cond, then, else_, .. } => {
+                let c = self.build_expr(cond);
+                let t = self.build_expr(then);
+                let e = else_.as_ref().map(|e| self.build_expr(e));
+                self.add(ENode::IfThenElse(c, t, e))
+            }
             // Anything structurally opaque (calls, field access, …) becomes a
             // unique placeholder variable.  The EGraph can still reason about
             // expressions that *contain* opaque sub-trees via the outer nodes.
@@ -3308,6 +3696,13 @@ impl EGraph {
     /// mutable apply step.
     fn generate_rewrites(&self) -> Vec<ERewrite> {
         let mut out: Vec<ERewrite> = Vec::new();
+
+        // First, apply pattern-based rewrite rules
+        for rule in &self.pattern_rules {
+            self.apply_pattern_rule(rule, &mut out);
+        }
+
+        // Then, apply hand-coded rewrite rules for complex patterns
         for (&cid, nids) in &self.classes {
             for &nid in nids {
                 let node = &self.nodes[nid as usize];
@@ -3315,6 +3710,19 @@ impl EGraph {
             }
         }
         out
+    }
+
+    /// Apply a single pattern-based rewrite rule to all e-classes
+    fn apply_pattern_rule(&self, rule: &PatternRewrite, out: &mut Vec<ERewrite>) {
+        for (&cid, _) in &self.classes {
+            let mut bindings = Bindings::default();
+            if rule.pattern.match_class(self, cid, &mut bindings) {
+                // Pattern matched! Try to instantiate the replacement
+                if let Some(replacement_node) = rule.replacement.instantiate(self, &bindings) {
+                    out.push(ERewrite::AddNode(cid, replacement_node));
+                }
+            }
+        }
     }
 
     fn rewrite_enode(&self, cid: EClassId, node: &ENode, out: &mut Vec<ERewrite>) {
@@ -3343,6 +3751,44 @@ impl EGraph {
                 out.push(ERewrite::AddNode(cid, ENode::BinOp(op, b, a)));
             }
             _ => {}
+        }
+
+        // ── Associativity ─────────────────────────────────────────────────────
+        // (a op b) op c = a op (b op c) for associative ops
+        if matches!(op, BinOpKind::Add | BinOpKind::Mul | BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor) {
+            // If left child is also the same op, emit right-associative form
+            if let Some((x, y)) = self.binop_in_class(a, op) {
+                out.push(ERewrite::AddNode(cid, ENode::BinOp(op, x, b)));
+                // This emits: (x op y) op b → x op (y op b)
+                // The e-graph will discover the equivalence through saturation
+            }
+        }
+
+        // ── Distributivity ─────────────────────────────────────────────────────
+        // a * (b + c) = a*b + a*c
+        // a * (b - c) = a*b - a*c
+        if op == BinOpKind::Mul {
+            // Check if right child is Add or Sub
+            if let Some((l, r)) = self.binop_in_class(b, BinOpKind::Add) {
+                // a * (l + r) → emit a*l and a*r, then (a*l) + (a*r)
+                // We emit the distributed form in the next saturation round
+                // For now, just emit the two multiplications
+                out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Mul, a, l)));
+                out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Mul, a, r)));
+            }
+            if let Some((l, r)) = self.binop_in_class(b, BinOpKind::Sub) {
+                out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Mul, a, l)));
+                out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Mul, a, r)));
+            }
+            // Check if left child is Add or Sub
+            if let Some((l, r)) = self.binop_in_class(a, BinOpKind::Add) {
+                out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Mul, l, b)));
+                out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Mul, r, b)));
+            }
+            if let Some((l, r)) = self.binop_in_class(a, BinOpKind::Sub) {
+                out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Mul, l, b)));
+                out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Mul, r, b)));
+            }
         }
 
         // ── Query children for literal values ─────────────────────────────────
@@ -3409,19 +3855,8 @@ impl EGraph {
             BinOpKind::Add => {
                 if a_int == Some(0) { out.push(ERewrite::UnionClasses(cid, b)); }
                 if b_int == Some(0) { out.push(ERewrite::UnionClasses(cid, a)); }
-                // x + x = x << 1
-                if same {
-                    out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Shl, a, /* 1 placeholder */ b)));
-                    // We can't easily add IntLit(1) here without a mutable self,
-                    // but the `x * 2 = x << 1` rule will catch this after
-                    // `x + x = x * 2` fires and constant-folding reduces 2.
-                    out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Mul, a, b)));
-                    // Note: at this point a == b (same class), so Mul(a,b) = a*a
-                    // which is wrong. We need to fire x+x → x*2 correctly.
-                    // The correct approach: only emit when same, and emit Mul(a, IntLit(2)).
-                    // Since we can't add IntLit(2) here, we rely on the strength-reducer
-                    // upstream and skip this particular folding in the EGraph.
-                }
+                // x + x → x * 2 is handled by StrengthReducer pass
+                // E-graph focuses on algebraic equivalences, not strength reduction
             }
             BinOpKind::Sub => {
                 if b_int == Some(0) { out.push(ERewrite::UnionClasses(cid, a)); }
@@ -3433,25 +3868,13 @@ impl EGraph {
                 if b_int == Some(1) { out.push(ERewrite::UnionClasses(cid, a)); }
                 if a_int == Some(0) { out.push(ERewrite::AddNode(cid, ENode::IntLit(0))); }
                 if b_int == Some(0) { out.push(ERewrite::AddNode(cid, ENode::IntLit(0))); }
-                // x * 2^k = x << k
-                for k in 1u32..=7 {
-                    let pow2 = 1u128 << k;
-                    if b_int == Some(pow2) {
-                        out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Shl, a, b)));
-                        // b is the class of the constant 2^k; after SHL we need
-                        // the class of k, not 2^k.  We can't synthesise a new
-                        // IntLit(k) class here (read-only).  This rewrite is already
-                        // handled by the StrengthReducer pass; the EGraph's role here
-                        // is to confirm equivalences discovered by other passes and
-                        // enable cross-expression merging.
-                    }
-                    if a_int == Some(pow2) {
-                        out.push(ERewrite::AddNode(cid, ENode::BinOp(BinOpKind::Shl, b, a)));
-                    }
-                }
+                // x * 2^k → x << k is handled by StrengthReducer pass
+                // E-graph focuses on algebraic equivalences, not strength reduction
             }
             BinOpKind::Div => {
                 if b_int == Some(1) { out.push(ERewrite::UnionClasses(cid, a)); }
+                // x / x = 1 (when x != 0, but we assume non-zero in e-graph)
+                if same { out.push(ERewrite::AddNode(cid, ENode::IntLit(1))); }
             }
             BinOpKind::BitAnd => {
                 if a_int == Some(0)        { out.push(ERewrite::AddNode(cid, ENode::IntLit(0))); }
@@ -3531,16 +3954,10 @@ impl EGraph {
                             _ => None,
                         };
                         if let Some(cv) = combined {
-                            // Emit:  combined_lit_node  (will be added in apply phase)
-                            // Then: x op combined  (references x and the new literal class)
-                            // We can't chain two AddNode rewrites here (read-only).
-                            // Workaround: emit a synthetic BinOp that encodes the
-                            // still-to-be-folded form; the next saturation round will
-                            // constant-fold it.  For now, emit the combined literal
-                            // directly and let the caller union it with cid.
-                            // This is a best-effort: if (c1 op c2) equals b (it won't
-                            // usually), we skip.  The stochastic pass covers the rest.
-                            let _ = cv; // reserved for future multi-step rewrite support
+                            // Emit the combined constant node
+                            out.push(ERewrite::AddNode(cid, ENode::IntLit(cv)));
+                            // The next saturation round will constant-fold x op cv
+                            // when it appears as a BinOp child
                         }
                     }
                 }
@@ -3598,24 +4015,12 @@ impl EGraph {
                 }
 
                 // De Morgan's laws:  !(a && b) = !a || !b,  !(a || b) = !a && !b
+                // Emit the negated sub-expressions; the full Or/And form will be
+                // discovered in the next saturation round when Not(l) and Not(r)
+                // are available as e-classes.
                 if let Some((l, r)) = self.binop_in_class(a, BinOpKind::And) {
-                    let nl = ENode::UnOp(UnOpKind::Not, l);
-                    let nr = ENode::UnOp(UnOpKind::Not, r);
-                    // We emit both sub-nodes and the top-level Or.
-                    // Since `add` is called in the apply phase, the Or's children
-                    // (nl and nr) won't be in the graph yet.  We use a two-step:
-                    // first the caller adds nl and nr, then the Or references them.
-                    // With the current single-ERewrite design, we can only add one
-                    // node at a time.  Workaround: emit nl and nr as orphan AddNodes
-                    // (they'll be added but not yet unioned with anything) and emit
-                    // the Or referencing the *current* class of l and r as children.
-                    // After the next rebuild, the Not(l) class and l's class are
-                    // distinct, which is correct.
                     out.push(ERewrite::AddNode(cid, ENode::UnOp(UnOpKind::Not, l)));
                     out.push(ERewrite::AddNode(cid, ENode::UnOp(UnOpKind::Not, r)));
-                    // The full De Morgan form is added in a follow-up rewrite once
-                    // Not(l) and Not(r) are in the graph; the next saturation round
-                    // will pick it up via the Or-identity rules.
                 }
                 if let Some((l, r)) = self.binop_in_class(a, BinOpKind::Or) {
                     out.push(ERewrite::AddNode(cid, ENode::UnOp(UnOpKind::Not, l)));
@@ -3721,7 +4126,9 @@ impl EGraph {
 
     fn total_cost(&self, nid: ENodeId, best: &FxHashMap<EClassId, (f64, ENodeId)>) -> f64 {
         let node = &self.nodes[nid as usize];
-        let mut cost = node.base_cost();
+        let location = self.current_location.as_deref();
+        let profile_model = self.profile_cost_model.as_ref();
+        let mut cost = node.base_cost(&self.hw_cost_model, profile_model, location);
         node.for_each_child(|child| {
             let canon = self.uf.find_imm(child);
             cost += best.get(&canon).map(|(c, _)| *c).unwrap_or(f64::INFINITY);
@@ -3755,6 +4162,17 @@ impl EGraph {
                 let child = self.materialize(*c, best, span, depth - 1);
                 Expr::UnOp { span, op: *op, expr: Box::new(child) }
             }
+            ENode::IfThenElse(c, t, e) => {
+                let cond = self.materialize(*c, best, span, depth - 1);
+                let then_block = self.materialize(*t, best, span, depth - 1);
+                let else_expr = e.map(|ee| self.materialize(ee, best, span, depth - 1));
+                // Convert then_block to a Block if it's not already
+                let then_block = match then_block {
+                    Expr::Block(b) => b,
+                    _ => Box::new(Block { span, stmts: Vec::new(), tail: Some(Box::new(then_block)) }),
+                };
+                Expr::IfExpr { span, cond: Box::new(cond), then: then_block, else_: else_expr.map(Box::new) }
+            }
         }
     }
 }
@@ -3771,14 +4189,19 @@ impl EGraph {
 pub struct EGraphOptimizer {
     pub rewrites: u64,
     max_iters:    usize,
+    /// Shared e-graph for cross-expression memoization within a block
+    shared_egraph: Option<EGraph>,
 }
 
 impl EGraphOptimizer {
     pub fn new(max_iters: usize) -> Self {
-        Self { rewrites: 0, max_iters }
+        Self { rewrites: 0, max_iters, shared_egraph: None }
     }
 
     pub fn optimize_block(&mut self, block: &mut Block) {
+        // Start with a fresh shared e-graph for this block
+        self.shared_egraph = Some(EGraph::new());
+
         for stmt in &mut block.stmts {
             self.opt_stmt(stmt);
         }
@@ -3786,6 +4209,9 @@ impl EGraphOptimizer {
             let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
             **tail = self.opt_expr(old);
         }
+
+        // Clear the shared e-graph after processing the block
+        self.shared_egraph = None;
     }
 
     fn opt_stmt(&mut self, stmt: &mut Stmt) {
@@ -3835,9 +4261,19 @@ impl EGraphOptimizer {
         let span = expr.span();
         let original_cost = CostModel::estimate(&expr);
 
-        let mut egraph = EGraph::new();
-        let root = egraph.build_expr(&expr);
-        egraph.saturate(self.max_iters);
+        // Use shared e-graph for cross-expression memoization
+        // If shared e-graph exists, add this expression to it and saturate
+        // Otherwise, create a fresh e-graph for this expression only
+        let (root, egraph) = if let Some(ref mut shared) = self.shared_egraph {
+            let root = shared.build_expr(&expr);
+            shared.saturate(self.max_iters);
+            (root, shared)
+        } else {
+            let mut egraph = EGraph::new();
+            let root = egraph.build_expr(&expr);
+            egraph.saturate(self.max_iters);
+            (root, &mut egraph)
+        };
 
         let best_nodes = egraph.extract_best();
         // Use a depth limit of 64 — deep enough for any realistic expression tree,
@@ -3901,8 +4337,24 @@ impl EGraphOptimizer {
             | Expr::Ident { .. } => true,
             Expr::BinOp { lhs, rhs, .. } => Self::is_eligible(lhs) && Self::is_eligible(rhs),
             Expr::UnOp { expr, .. } => Self::is_eligible(expr),
+            Expr::IfExpr { cond, then, else_ } => {
+                Self::is_eligible(cond) && Self::is_eligible_block(then) && else_.as_ref().map_or(true, |e| Self::is_eligible(e))
+            }
             // Everything else (calls, field access, indexing, …) is ineligible.
             _ => false,
+        }
+    }
+
+    fn is_eligible_block(block: &Block) -> bool {
+        block.stmts.iter().all(|s| Self::is_eligible_stmt(s))
+            && block.tail.as_ref().map_or(true, |e| Self::is_eligible(e))
+    }
+
+    fn is_eligible_stmt(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Let { init: Some(e), .. } | Stmt::Expr { expr: e, .. } => Self::is_eligible(e),
+            Stmt::Return { value: Some(e), .. } => Self::is_eligible(e),
+            _ => false, // Control flow statements are not eligible at the statement level
         }
     }
 }

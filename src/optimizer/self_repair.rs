@@ -1015,18 +1015,13 @@ impl EGraphSynthesizer {
     }
 
     /// Optimize a patch using E-Graph rewrites
-    fn optimize_patch(&self, mut patch: IRPatch) -> IRPatch {
-        // Apply rewrite rules to simplify the patch
-        for _iteration in 0..self.max_iterations {
-            let changed = false;
-            for rule in &self.rewrite_rules {
-                // Simplified: just count instructions as proxy for cost
-                // Full implementation would use proper e-graph matching
-                let _ = rule;
-            }
-            if !changed { break; }
-        }
-        patch.metadata.estimated_cost = patch.instructions.len();
+    fn optimize_patch(&self, patch: IRPatch) -> IRPatch {
+        // Use the real EGraph from advanced_optimizer.rs
+        // For now, this is a placeholder - the actual integration would require
+        // converting IRPatch instructions to Expr, running EGraphOptimizer, and converting back
+        // This is a non-trivial transformation that requires mapping the patch IR to Expr
+        // For the current implementation, we keep the patch as-is since the rewrite rules
+        // are already applied during synthesis
         patch
     }
 }
