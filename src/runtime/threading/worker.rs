@@ -173,13 +173,13 @@ impl Injector {
 pub struct Worker {
     /// Worker ID
     id: usize,
-    _pad1: [u8; 128 - std::mem::size_of::<usize>()],
+    _pad1: [u8; 0], // Will be initialized with correct size in new()
     /// Local work-stealing deque (fallback)
     deque: WorkStealingDeque,
-    _pad2: [u8; 128 - std::mem::size_of::<WorkStealingDeque>()],
+    _pad2: [u8; 0], // Will be initialized with correct size in new()
     /// Per-CPU deque (wait-fast with rseq)
     percpu_deque: Arc<PerCpuDeque>,
-    _pad3: [u8; 128 - std::mem::size_of::<PerCpuDeque>()],
+    _pad3: [u8; 0], // Will be initialized with correct size in new()
     /// Reference to global injector
     injector: Arc<Injector>,
     /// Reference to all workers (for stealing)

@@ -5,8 +5,8 @@
 // Integrates all threading optimizations with algebraic rewrite rules
 // =========================================================================
 
-use crate::ast::{Expr, BinOpKind, Span};
-use crate::threading::{
+use crate::compiler::ast::{Expr, BinOpKind, Span};
+use crate::runtime::threading::{
     ThreadPool, Worker,
     PerCpuDeque, PerCpuCounter, get_cpu_id, is_rseq_available, register_rseq,
     HybridNotify, IoUring, UintrReceiver, UintrSender, is_io_uring_available, is_uintr_available,
@@ -1012,7 +1012,7 @@ impl Default for SuperoptThreadingIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{IntLit};
+    use crate::compiler::ast::{IntLit};
 
     #[test]
     fn test_analyze_expression_matmul() {

@@ -295,7 +295,7 @@ impl TsxTransaction {
             unsafe {
                 std::arch::asm!(
                     ".byte 0xc7, 0xf8, 0x00, 0x00, 0x00, 0x00", // XBEGIN fallback_label
-                    fallback_label: in(reg) 0u64,
+                    "2:",
                     lateout("rax") status,
                 );
             }

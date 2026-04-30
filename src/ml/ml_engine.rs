@@ -3,8 +3,8 @@
 // Enables full backpropagation through neural networks
 // =========================================================================
 
-use crate::gpu_backend::GpuMemoryManager;
-use crate::xla_backend::{compile_and_execute, XlaBackend, XlaConfig, XlaDevice};
+use crate::runtime::gpu_backend::GpuMemoryManager;
+use crate::ml::xla_backend::{compile_and_execute, XlaBackend, XlaConfig, XlaDevice};
 use rustc_hash::FxHashMap;
 use std::thread;
 use std::time::Instant;

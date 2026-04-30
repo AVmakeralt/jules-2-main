@@ -38,7 +38,7 @@ extern "C" {
     fn munmap(addr: *mut c_void, len: usize) -> i32;
 }
 
-use crate::ast::{BinOpKind, UnOpKind};
+use crate::compiler::ast::{BinOpKind, UnOpKind};
 use crate::interp::{Instr, RuntimeError, Value};
 
 // =============================================================================
@@ -444,6 +444,13 @@ impl NativeCodeGenerator {
                     BinOpKind::Add => self.add_rax_rcx(),
                     BinOpKind::Sub => self.sub_rax_rcx(),
                     BinOpKind::Mul => self.imul_rax_rcx(),
+                    BinOpKind::Div => self.idiv_rax_rcx(),
+                    BinOpKind::Rem => self.irem_rax_rcx(),
+                    BinOpKind::BitAnd => self.and_rax_rcx(),
+                    BinOpKind::BitOr => self.or_rax_rcx(),
+                    BinOpKind::BitXor => self.xor_rax_rcx(),
+                    BinOpKind::Shl => self.shl_rax_cl(),
+                    BinOpKind::Shr => self.shr_rax_cl(),
                     _ => return Err(format!("Unsupported BinOp in trace backend: {:?}", op)),
                 }
                 self.bind_slot_reg(*dst, Reg::RAX);
@@ -492,6 +499,13 @@ impl NativeCodeGenerator {
                     BinOpKind::Add => self.add_rax_rcx(),
                     BinOpKind::Sub => self.sub_rax_rcx(),
                     BinOpKind::Mul => self.imul_rax_rcx(),
+                    BinOpKind::Div => self.idiv_rax_rcx(),
+                    BinOpKind::Rem => self.irem_rax_rcx(),
+                    BinOpKind::BitAnd => self.and_rax_rcx(),
+                    BinOpKind::BitOr => self.or_rax_rcx(),
+                    BinOpKind::BitXor => self.xor_rax_rcx(),
+                    BinOpKind::Shl => self.shl_rax_cl(),
+                    BinOpKind::Shr => self.shr_rax_cl(),
                     _ => return Err(format!("Unsupported BinOp in unboxed mode: {:?}", op)),
                 }
                 // Store result to unboxed buffer
@@ -701,6 +715,13 @@ impl NativeCodeGenerator {
     fn add_rax_rcx(&mut self) { self.bbb(0x48, 0x01, 0xC8); }
     fn sub_rax_rcx(&mut self) { self.bbb(0x48, 0x29, 0xC8); }
     fn imul_rax_rcx(&mut self) { self.bbbb(0x48, 0x0F, 0xAF, 0xC1); }
+    fn idiv_rax_rcx(&mut self) { self.bbb(0x48, 0x99, 0xF7); self.b(0xF1); }
+    fn irem_rax_rcx(&mut self) { self.bbb(0x48, 0x99, 0xF7); self.b(0xF1); }
+    fn and_rax_rcx(&mut self) { self.bbb(0x48, 0x21, 0xC8); }
+    fn or_rax_rcx(&mut self) { self.bbb(0x48, 0x09, 0xC8); }
+    fn xor_rax_rcx(&mut self) { self.bbb(0x48, 0x31, 0xC8); }
+    fn shl_rax_cl(&mut self) { self.bb(0x48, 0xD3); self.b(0xE0); }
+    fn shr_rax_cl(&mut self) { self.bb(0x48, 0xD3); self.b(0xE8); }
     fn test_rax_rax(&mut self) { self.bbb(0x48, 0x85, 0xC0); }
 
     fn jne_label(&mut self, l: usize) { self.rel32_jump(0x0F, 0x85, l); }

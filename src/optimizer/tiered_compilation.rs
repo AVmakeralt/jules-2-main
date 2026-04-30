@@ -29,10 +29,10 @@ use std::time::Instant;
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::{FnDecl, Program};
+use crate::compiler::ast::{FnDecl, Program};
 use crate::interp::{compile_fn, CompiledFn, Interpreter, RuntimeError, Value};
-use crate::phase3_jit as jit;
-use crate::tracing_jit::TracingJIT;
+use crate::jit::phase3_jit as jit;
+use crate::jit::tracing_jit::TracingJIT;
 
 // =============================================================================
 // §1  TIER DEFINITIONS
@@ -283,7 +283,7 @@ impl TieredExecutionManager {
 
         // Initialize function states
         for item in &program.items {
-            if let crate::ast::Item::Fn(fn_decl) = item {
+            if let crate::compiler::ast::Item::Fn(fn_decl) = item {
                 let size = Self::estimate_function_size(fn_decl);
                 let state = FunctionState::new(fn_decl.name.clone(), size);
                 self.function_states.insert(fn_decl.name.clone(), state);
@@ -301,7 +301,7 @@ impl TieredExecutionManager {
         }
     }
 
-    fn count_block(block: &crate::ast::Block) -> usize {
+    fn count_block(block: &crate::compiler::ast::Block) -> usize {
         let mut count = block.stmts.len();
         for stmt in &block.stmts {
             count += Self::count_stmt(stmt);
@@ -312,34 +312,34 @@ impl TieredExecutionManager {
         count
     }
 
-    fn count_stmt(stmt: &crate::ast::Stmt) -> usize {
+    fn count_stmt(stmt: &crate::compiler::ast::Stmt) -> usize {
         match stmt {
-            crate::ast::Stmt::Expr { expr, .. } => Self::count_expr(expr),
-            crate::ast::Stmt::Let { init: Some(expr), .. } => Self::count_expr(expr),
-            crate::ast::Stmt::Let { .. } => 0,
-            crate::ast::Stmt::ForIn { iter, body, .. } => {
+            crate::compiler::ast::Stmt::Expr { expr, .. } => Self::count_expr(expr),
+            crate::compiler::ast::Stmt::Let { init: Some(expr), .. } => Self::count_expr(expr),
+            crate::compiler::ast::Stmt::Let { .. } => 0,
+            crate::compiler::ast::Stmt::ForIn { iter, body, .. } => {
                 Self::count_expr(iter) + Self::count_block(body)
             }
-            crate::ast::Stmt::EntityFor { body, .. } => {
+            crate::compiler::ast::Stmt::EntityFor { body, .. } => {
                 Self::count_block(body)
             }
-            crate::ast::Stmt::While { cond, body, .. } => {
+            crate::compiler::ast::Stmt::While { cond, body, .. } => {
                 Self::count_expr(cond) + Self::count_block(body)
             }
-            crate::ast::Stmt::Loop { body, .. } => {
+            crate::compiler::ast::Stmt::Loop { body, .. } => {
                 Self::count_block(body)
             }
-            crate::ast::Stmt::If { cond, then, else_, .. } => {
+            crate::compiler::ast::Stmt::If { cond, then, else_, .. } => {
                 let mut count = Self::count_expr(cond) + Self::count_block(then);
                 if let Some(else_branch) = else_ {
                     count += Self::count_if_or_block(else_branch);
                 }
                 count
             }
-            crate::ast::Stmt::Return { value: Some(expr), .. } => Self::count_expr(expr),
-            crate::ast::Stmt::Return { .. } => 0,
-            crate::ast::Stmt::Break { .. } | crate::ast::Stmt::Continue { .. } => 0,
-            crate::ast::Stmt::Match { expr, arms, .. } => {
+            crate::compiler::ast::Stmt::Return { value: Some(expr), .. } => Self::count_expr(expr),
+            crate::compiler::ast::Stmt::Return { .. } => 0,
+            crate::compiler::ast::Stmt::Break { .. } | crate::compiler::ast::Stmt::Continue { .. } => 0,
+            crate::compiler::ast::Stmt::Match { expr, arms, .. } => {
                 1 + Self::count_expr(expr) +
                     arms.iter().map(|arm| {
                         let guard_count = arm.guard.as_ref().map(|g| Self::count_expr(g)).unwrap_or(0);
@@ -347,41 +347,41 @@ impl TieredExecutionManager {
                         guard_count + body_count
                     }).sum::<usize>()
             }
-            crate::ast::Stmt::ParallelFor(_) |
-            crate::ast::Stmt::Spawn(_) |
-            crate::ast::Stmt::Sync(_) |
-            crate::ast::Stmt::Atomic(_) |
-            crate::ast::Stmt::Item(_) => 0,
+            crate::compiler::ast::Stmt::ParallelFor(_) |
+            crate::compiler::ast::Stmt::Spawn(_) |
+            crate::compiler::ast::Stmt::Sync(_) |
+            crate::compiler::ast::Stmt::Atomic(_) |
+            crate::compiler::ast::Stmt::Item(_) => 0,
         }
     }
 
-    fn count_if_or_block(if_or_block: &crate::ast::IfOrBlock) -> usize {
+    fn count_if_or_block(if_or_block: &crate::compiler::ast::IfOrBlock) -> usize {
         match if_or_block {
-            crate::ast::IfOrBlock::Block(block) => Self::count_block(block),
-            crate::ast::IfOrBlock::If(stmt) => {
+            crate::compiler::ast::IfOrBlock::Block(block) => Self::count_block(block),
+            crate::compiler::ast::IfOrBlock::If(stmt) => {
                 // If contains another Stmt (which should be an If statement)
                 Self::count_stmt(stmt)
             }
         }
     }
 
-    fn count_expr(expr: &crate::ast::Expr) -> usize {
+    fn count_expr(expr: &crate::compiler::ast::Expr) -> usize {
         match expr {
-            crate::ast::Expr::Call { func, args, .. } => {
+            crate::compiler::ast::Expr::Call { func, args, .. } => {
                 1 + Self::count_expr(func) + args.iter().map(|a| Self::count_expr(a)).sum::<usize>()
             }
-            crate::ast::Expr::BinOp { lhs, rhs, .. } => {
+            crate::compiler::ast::Expr::BinOp { lhs, rhs, .. } => {
                 1 + Self::count_expr(lhs) + Self::count_expr(rhs)
             }
-            crate::ast::Expr::UnOp { expr, .. } => 1 + Self::count_expr(expr),
-            crate::ast::Expr::IfExpr { cond, then, else_, .. } => {
+            crate::compiler::ast::Expr::UnOp { expr, .. } => 1 + Self::count_expr(expr),
+            crate::compiler::ast::Expr::IfExpr { cond, then, else_, .. } => {
                 let mut count = 1 + Self::count_expr(cond) + Self::count_block(then);
                 if let Some(else_block) = else_ {
                     count += Self::count_block(else_block);
                 }
                 count
             }
-            crate::ast::Expr::Block(block) => Self::count_block(block),
+            crate::compiler::ast::Expr::Block(block) => Self::count_block(block),
             _ => 1,
         }
     }

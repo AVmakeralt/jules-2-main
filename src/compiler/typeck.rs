@@ -48,12 +48,12 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::{
+use crate::compiler::ast::{
     AgentDecl, BinOpKind, Block, ComponentDecl, DimExpr, ElemType, Expr, FnDecl, GenericParam,
     Item, ModelDecl, ModelLayer, Pattern, Program, StructDecl, SystemDecl, TrainDecl, Type,
     UnOpKind, VecFamily, VecSize,
 };
-use crate::lexer::Span;
+use crate::compiler::lexer::Span;
 
 // =============================================================================
 // INTERNAL TYPE REPRESENTATION
@@ -2559,8 +2559,8 @@ impl TypeCk {
         ty
     }
 
-    fn check_stmt(&mut self, stmt: &crate::ast::Stmt, env: &mut TyEnv) {
-        use crate::ast::Stmt;
+    fn check_stmt(&mut self, stmt: &crate::compiler::ast::Stmt, env: &mut TyEnv) {
+        use crate::compiler::ast::Stmt;
         match stmt {
             Stmt::Let {
                 span,
@@ -2693,8 +2693,8 @@ impl TypeCk {
                 self.check_block(then, env);
                 if let Some(e) = else_ {
                     match e.as_ref() {
-                        crate::ast::IfOrBlock::If(s) => self.check_stmt(s, env),
-                        crate::ast::IfOrBlock::Block(b) => {
+                        crate::compiler::ast::IfOrBlock::If(s) => self.check_stmt(s, env),
+                        crate::compiler::ast::IfOrBlock::Block(b) => {
                             self.check_block(b, env);
                         }
                     }
@@ -3048,7 +3048,7 @@ impl TypeCk {
     fn check_agent(&mut self, a: &AgentDecl) {
         // Validate @AI / @PPO / @DQN ... decorators.
         for attr in &a.attrs {
-            if let crate::ast::Attribute::Named { name, .. } = attr {
+            if let crate::compiler::ast::Attribute::Named { name, .. } = attr {
                 if is_network_decorator(name) {
                     self.validate_ai_decorator(a, attr, name);
                 }
@@ -3058,7 +3058,7 @@ impl TypeCk {
         // If learning is reinforcement/imitation, there should be a policy model.
         if let Some(ls) = &a.learning {
             match &ls.kind {
-                crate::ast::LearningKind::Reinforcement | crate::ast::LearningKind::Imitation => {
+                crate::compiler::ast::LearningKind::Reinforcement | crate::compiler::ast::LearningKind::Imitation => {
                     if ls.policy_model.is_none() {
                         self.diag.warning(
                             ls.span,
@@ -3149,12 +3149,12 @@ impl TypeCk {
     fn validate_network_decorator(
         &mut self,
         a: &AgentDecl,
-        attr: &crate::ast::Attribute,
+        attr: &crate::compiler::ast::Attribute,
         decorator_name: &str,
     ) -> Option<()> {
-        if let crate::ast::Attribute::Named { args, .. } = attr {
+        if let crate::compiler::ast::Attribute::Named { args, .. } = attr {
             // Expect a string literal as the first argument.
-            if let Some(crate::ast::Expr::StrLit { value, span }) = args.first() {
+            if let Some(crate::compiler::ast::Expr::StrLit { value, span }) = args.first() {
                 if let Err(e) = self.validate_architecture_string(value) {
                     self.diag
                         .error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e));
@@ -3173,17 +3173,17 @@ impl TypeCk {
         None
     }
 
-    fn ai_number_literal(&self, e: &crate::ast::Expr) -> Option<f64> {
+    fn ai_number_literal(&self, e: &crate::compiler::ast::Expr) -> Option<f64> {
         match e {
-            crate::ast::Expr::FloatLit { value, .. } => Some(*value),
-            crate::ast::Expr::IntLit { value, .. } => Some(*value as f64),
+            crate::compiler::ast::Expr::FloatLit { value, .. } => Some(*value),
+            crate::compiler::ast::Expr::IntLit { value, .. } => Some(*value as f64),
             _ => None,
         }
     }
 
-    fn ai_u64_literal(&self, e: &crate::ast::Expr) -> Option<u64> {
+    fn ai_u64_literal(&self, e: &crate::compiler::ast::Expr) -> Option<u64> {
         match e {
-            crate::ast::Expr::IntLit { value, .. } => Some(*value as u64),
+            crate::compiler::ast::Expr::IntLit { value, .. } => Some(*value as u64),
             _ => None,
         }
     }
@@ -3191,17 +3191,17 @@ impl TypeCk {
     fn validate_ai_decorator(
         &mut self,
         a: &AgentDecl,
-        attr: &crate::ast::Attribute,
+        attr: &crate::compiler::ast::Attribute,
         decorator_name: &str,
     ) {
-        let crate::ast::Attribute::Named { args, .. } = attr else {
+        let crate::compiler::ast::Attribute::Named { args, .. } = attr else {
             return;
         };
         let dec = decorator_name.to_uppercase();
 
         // Optional positional first arg: network architecture string.
         if let Some(first) = args.first() {
-            if let crate::ast::Expr::StrLit { value, span } = first {
+            if let crate::compiler::ast::Expr::StrLit { value, span } = first {
                 if let Err(e) = self.validate_architecture_string(value) {
                     self.diag.error(*span, format!("@{}: {}", dec, e));
                 }
@@ -3210,14 +3210,14 @@ impl TypeCk {
 
         let mut has_learning_rate = false;
         for arg in args {
-            if let crate::ast::Expr::Assign { target, value, .. } = arg {
+            if let crate::compiler::ast::Expr::Assign { target, value, .. } = arg {
                 let key = match &**target {
-                    crate::ast::Expr::Ident { name, .. } => name.as_str(),
+                    crate::compiler::ast::Expr::Ident { name, .. } => name.as_str(),
                     _ => continue,
                 };
                 match key {
                     "network" => {
-                        if let crate::ast::Expr::StrLit { value: arch, span } = &**value {
+                        if let crate::compiler::ast::Expr::StrLit { value: arch, span } = &**value {
                             if let Err(e) = self.validate_architecture_string(arch) {
                                 self.diag.error(*span, format!("@{} network: {}", dec, e));
                             }
@@ -3555,8 +3555,8 @@ fn is_network_decorator(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::*;
-    use crate::lexer::Span;
+    use crate::compiler::ast::*;
+    use crate::compiler::lexer::Span;
 
     fn dummy() -> Span {
         Span::dummy()

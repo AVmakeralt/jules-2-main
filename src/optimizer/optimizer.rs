@@ -2480,13 +2480,13 @@ impl LrSchedule for WarmupCosineRestarts {
 
 /// Build an optimizer by kind + hyperparameters (matches the AST `OptimizerKind`).
 pub fn build_optimizer(
-    kind: crate::ast::OptimizerKind,
+    kind: crate::compiler::ast::OptimizerKind,
     lr: f32,
     weight_decay: f32,
     grad_clip: Option<GradClip>,
     schedule: Option<Box<dyn LrSchedule>>,
 ) -> Box<dyn Optimizer> {
-    use crate::ast::OptimizerKind::*;
+    use crate::compiler::ast::OptimizerKind::*;
     let clip = grad_clip;
     match kind {
         Adam => {

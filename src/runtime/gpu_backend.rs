@@ -503,7 +503,7 @@ fn batched_matmul(
         let batches_per_chunk = batch.div_ceil(threads);
         
         // Use custom threading engine instead of thread::scope
-        use crate::threading::join;
+        use crate::runtime::threading::join;
         
         let chunks: Vec<_> = out_data
             .chunks_mut(batches_per_chunk * batch_mat_size)

@@ -127,11 +127,11 @@ impl SparseSet {
 
 /// Thread-safe component storage wrapper using RwLock (not Mutex!)
 /// Fixed: RwLock for multi-threaded, better for read-heavy ECS
-pub struct ComponentStorage {
+pub struct ComponentStorageWrapper {
     inner: std::sync::RwLock<SparseSet>,
 }
 
-impl ComponentStorage {
+impl ComponentStorageWrapper {
     /// Create a new component storage with given stride
     pub fn new(stride: usize, participant: Arc<Participant>) -> Self {
         Self {

@@ -7,13 +7,13 @@
 // =========================================================================
 
 use std::sync::Arc;
-use crate::threading::lossy_computation::{
+use crate::runtime::threading::lossy_computation::{
     LossyComputationContext, PrecisionLevel, TaskPriority, HwCounterFeedback,
 };
-use crate::threading::hyper_sparse::{
+use crate::runtime::threading::hyper_sparse::{
     HyperSparseMap, HyperSparseSoA, SegmentedSieve,
 };
-use crate::threading::hw_optimizations::CatManager;
+use crate::runtime::threading::hw_optimizations::CatManager;
 
 /// Fused operation combining lossy computation and hyper-sparse data
 #[derive(Debug, Clone)]
@@ -349,7 +349,7 @@ impl OptimizationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::threading::lossy_computation::LossyComputationManager;
+    use crate::runtime::threading::lossy_computation::LossyComputationManager;
 
     #[test]
     fn test_fused_operation() {

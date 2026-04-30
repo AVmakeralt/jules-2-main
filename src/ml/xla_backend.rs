@@ -3,8 +3,8 @@
 // Provides XLA (Accelerated Linear Algebra) compilation and execution
 // =========================================================================
 
-use crate::ml_engine::{ComputationGraph, ComputeNode, Operation, Tensor};
-use crate::superopt_xla_bridge::SuperoptXlaBridge;
+use crate::ml::ml_engine::{ComputationGraph, ComputeNode, Operation, Tensor};
+use crate::ml::superopt_xla_bridge::SuperoptXlaBridge;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex};
 
@@ -53,6 +53,7 @@ pub struct XlaBackend {
     config: XlaConfig,
     computations: FxHashMap<u64, XlaComputation>,
     next_id: u64,
+    superopt_bridge: Option<SuperoptXlaBridge>,
     #[cfg(feature = "xla")]
     client: Option<Arc<Mutex<XlaClient>>>,
     #[cfg(not(feature = "xla"))]
@@ -84,10 +85,17 @@ impl XlaBackend {
         #[cfg(not(feature = "xla"))]
         let _client = None;
 
+        let superopt_bridge = if config.enable_superopt {
+            Some(SuperoptXlaBridge::new())
+        } else {
+            None
+        };
+
         Self {
             config,
             computations: FxHashMap::default(),
             next_id: 0,
+            superopt_bridge,
             #[cfg(feature = "xla")]
             client,
             #[cfg(not(feature = "xla"))]

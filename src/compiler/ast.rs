@@ -23,7 +23,7 @@
 //        • emit deterministic tick order when mutation order matters
 // =============================================================================
 
-use crate::lexer::Span;
+use crate::compiler::lexer::Span;
 
 // ─── Re-export Span for convenience in other modules ─────────────────────────
 

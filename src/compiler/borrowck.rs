@@ -7,8 +7,8 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::{AssignOpKind, Block, Expr, Item, Pattern, Program, Stmt, UnOpKind};
-use crate::lexer::Span;
+use crate::compiler::ast::{AssignOpKind, Block, Expr, Item, Pattern, Program, Stmt, UnOpKind};
+use crate::compiler::lexer::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -628,8 +628,8 @@ impl BorrowChecker {
                 self.check_block(then);
                 if let Some(else_) = else_ {
                     match &**else_ {
-                        crate::ast::IfOrBlock::If(s) => self.check_stmt(s),
-                        crate::ast::IfOrBlock::Block(b) => self.check_block(b),
+                        crate::compiler::ast::IfOrBlock::If(s) => self.check_stmt(s),
+                        crate::compiler::ast::IfOrBlock::Block(b) => self.check_block(b),
                     }
                 }
             }
@@ -731,7 +731,7 @@ pub fn jules_borrowck(program: &Program) -> Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::Lexer;
+    use crate::compiler::lexer::Lexer;
     use crate::parser::Parser;
 
     fn borrow_errors(source: &str) -> usize {

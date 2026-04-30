@@ -26,9 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bumpalo::Bump;
 use rustc_hash::FxHashMap;
 
-use crate::ast::{BinOpKind, Program};
+use crate::compiler::ast::{BinOpKind, Program};
 use crate::interp::{RuntimeError, Value};
-use crate::memory_management::PrefetchEngine;
+use crate::runtime::memory_management::PrefetchEngine;
 
 // =============================================================================
 // §1  BYTECODE INSTRUCTION SET
@@ -445,7 +445,7 @@ impl BytecodeCompiler {
         
         for item in &program.items {
             match item {
-                crate::ast::Item::Fn(fn_decl) => {
+                crate::compiler::ast::Item::Fn(fn_decl) => {
                     if let Some(body) = &fn_decl.body {
                         let mut fn_compiler = BytecodeCompiler::new();
                         fn_compiler.current_function.name = fn_decl.name.clone();
@@ -468,7 +468,7 @@ impl BytecodeCompiler {
         Ok(functions)
     }
     
-    fn compile_block(&mut self, block: &crate::ast::Block) -> Result<(), String> {
+    fn compile_block(&mut self, block: &crate::compiler::ast::Block) -> Result<(), String> {
         for stmt in &block.stmts {
             self.compile_stmt(stmt)?;
         }
@@ -478,11 +478,11 @@ impl BytecodeCompiler {
         Ok(())
     }
     
-    fn compile_stmt(&mut self, stmt: &crate::ast::Stmt) -> Result<(), String> {
+    fn compile_stmt(&mut self, stmt: &crate::compiler::ast::Stmt) -> Result<(), String> {
         match stmt {
-            crate::ast::Stmt::Let { pattern, init, .. } => {
+            crate::compiler::ast::Stmt::Let { pattern, init, .. } => {
                 let dst = match pattern {
-                    crate::ast::Pattern::Ident { name, .. } => {
+                    crate::compiler::ast::Pattern::Ident { name, .. } => {
                         if let Some(existing) = self.locals.get(name) {
                             *existing
                         } else {
@@ -491,7 +491,7 @@ impl BytecodeCompiler {
                             slot
                         }
                     }
-                    crate::ast::Pattern::Wildcard(_) => self.alloc_slot(),
+                    crate::compiler::ast::Pattern::Wildcard(_) => self.alloc_slot(),
                     _ => return Err("bytecode compiler only supports identifier/wildcard let bindings".to_string()),
                 };
                 if let Some(expr) = init {
@@ -500,10 +500,10 @@ impl BytecodeCompiler {
                     self.emit(Instr::LoadConstUnit { dst });
                 }
             }
-            crate::ast::Stmt::Expr { expr, .. } => {
+            crate::compiler::ast::Stmt::Expr { expr, .. } => {
                 self.compile_expr(expr, 0)?;
             }
-            crate::ast::Stmt::Return { value, .. } => {
+            crate::compiler::ast::Stmt::Return { value, .. } => {
                 if let Some(expr) = value {
                     self.compile_expr(expr, 0)?;
                 } else {
@@ -517,9 +517,9 @@ impl BytecodeCompiler {
         Ok(())
     }
     
-    fn compile_expr(&mut self, expr: &crate::ast::Expr, dst: u16) -> Result<(), String> {
+    fn compile_expr(&mut self, expr: &crate::compiler::ast::Expr, dst: u16) -> Result<(), String> {
         match expr {
-            crate::ast::Expr::IntLit { value, .. } => {
+            crate::compiler::ast::Expr::IntLit { value, .. } => {
                 let val = *value as i64;
                 if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
                     self.emit(Instr::LoadConstInt { dst, value: val });
@@ -528,13 +528,13 @@ impl BytecodeCompiler {
                     self.emit(Instr::LoadConst { dst, idx });
                 }
             }
-            crate::ast::Expr::FloatLit { value, .. } => {
+            crate::compiler::ast::Expr::FloatLit { value, .. } => {
                 self.emit(Instr::LoadConstFloat { dst, value: *value });
             }
-            crate::ast::Expr::BoolLit { value, .. } => {
+            crate::compiler::ast::Expr::BoolLit { value, .. } => {
                 self.emit(Instr::LoadConstBool { dst, value: *value });
             }
-            crate::ast::Expr::Ident { name, .. } => {
+            crate::compiler::ast::Expr::Ident { name, .. } => {
                 let slot = self
                     .locals
                     .get(name)
@@ -542,7 +542,7 @@ impl BytecodeCompiler {
                     .ok_or_else(|| format!("unknown local variable `{name}`"))?;
                 self.emit(Instr::Move { dst, src: slot });
             }
-            crate::ast::Expr::BinOp { op, lhs, rhs, .. } => {
+            crate::compiler::ast::Expr::BinOp { op, lhs, rhs, .. } => {
                 self.compile_expr(lhs, dst)?;
                 let lhs_slot = dst;
                 self.compile_expr(rhs, dst + 1)?;

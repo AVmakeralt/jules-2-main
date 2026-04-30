@@ -47,7 +47,7 @@ use std::ptr::NonNull;
 
 use libc::{mmap, mprotect, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
-use crate::ast::BinOpKind;
+use crate::compiler::ast::BinOpKind;
 use crate::interp::{CompiledFn, Instr, RuntimeError, Value};
 
 // ─────────────────────────────────────────────────────────────────────────────

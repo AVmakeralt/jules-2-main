@@ -3,7 +3,7 @@
 // Bridges the advanced optimizer's superoptimizer with XLA HLO generation
 // =========================================================================
 
-:se crate::ml_engine::{ComputationGraph, Operation};
+use crate::ml::ml_engine::{ComputationGraph, Operation};
 
 /// Bridge between superoptimizer and XLA backend
 pub struct SuperoptXlaBridge {

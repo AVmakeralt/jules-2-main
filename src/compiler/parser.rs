@@ -24,7 +24,7 @@
 use std::fmt;
 
 use crate::ast::*;
-use crate::lexer::{Span, Token, TokenKind};
+use crate::compiler::lexer::{Span, Token, TokenKind};
 
 // =============================================================================
 // §1  PARSE ERROR
@@ -3365,7 +3365,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::Lexer;
+    use crate::compiler::lexer::Lexer;
 
     fn parse(src: &str) -> (Program, Vec<ParseError>) {
         let mut lexer = Lexer::new(src);

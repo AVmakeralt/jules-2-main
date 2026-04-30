@@ -225,7 +225,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    // Create vtable for this closure type
+    // Create vtable for this closure type - moved inside the function to avoid generic static
     extern "C" fn run_task<T, F>(ptr: *mut ())
     where
         F: FnOnce() -> T,
@@ -255,7 +255,8 @@ where
         }
     }
 
-    static VTABLE: TaskVtable = TaskVtable {
+    // Create vtable on the stack instead of static
+    let vtable = TaskVtable {
         run: run_task::<T, F>,
         drop: drop_task::<T, F>,
     };
@@ -274,7 +275,7 @@ where
 
     unsafe {
         let task = &mut *(descriptor as *mut SlabTask);
-        task.vtable = &VTABLE;
+        task.vtable = &vtable;
         
         // Store closure in inline data
         let closure_ptr = task.data.as_mut_ptr() as *mut F;

@@ -99,7 +99,7 @@ pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
 }
 
 // Pull in the compiler passes.  In a real crate these would be separate modules.
-use crate::lexer::{LexError, Lexer, Span};
+use crate::compiler::lexer::{LexError, Lexer, Span};
 // use crate::parser::Parser;   // parser wired through `Pipeline`
 // use crate::typeck::TypeCk;
 // use crate::sema::SemaCtx;
@@ -640,7 +640,7 @@ impl Pipeline {
 
 #[derive(Debug)]
 pub enum PipelineResult {
-    Ok(crate::ast::Program),
+    Ok(crate::compiler::ast::Program),
     HaltedAt(PassName),
 }
 
@@ -1974,17 +1974,17 @@ struct BackendCapability {
     jax_reason: Option<String>,
 }
 
-fn activation_name_for_jax(a: &crate::ast::Activation) -> &'static str {
+fn activation_name_for_jax(a: &crate::compiler::ast::Activation) -> &'static str {
     match a {
-        crate::ast::Activation::Relu | crate::ast::Activation::LeakyRelu => "relu",
-        crate::ast::Activation::Tanh => "tanh",
-        crate::ast::Activation::Silu | crate::ast::Activation::Swish => "silu",
-        crate::ast::Activation::Gelu => "gelu",
+        crate::compiler::ast::Activation::Relu | crate::compiler::ast::Activation::LeakyRelu => "relu",
+        crate::compiler::ast::Activation::Tanh => "tanh",
+        crate::compiler::ast::Activation::Silu | crate::compiler::ast::Activation::Swish => "silu",
+        crate::compiler::ast::Activation::Gelu => "gelu",
         _ => "gelu",
     }
 }
 
-fn build_jax_ir_from_model(model: &crate::ast::ModelDecl) -> Result<JaxModelIr, String> {
+fn build_jax_ir_from_model(model: &crate::compiler::ast::ModelDecl) -> Result<JaxModelIr, String> {
     let mut input_dim = None;
     let mut layers = Vec::new();
     let mut activation = "gelu";
@@ -1992,10 +1992,10 @@ fn build_jax_ir_from_model(model: &crate::ast::ModelDecl) -> Result<JaxModelIr, 
 
     for layer in &model.layers {
         match layer {
-            crate::ast::ModelLayer::Input { size, .. } => {
+            crate::compiler::ast::ModelLayer::Input { size, .. } => {
                 input_dim = Some(*size);
             }
-            crate::ast::ModelLayer::Dense {
+            crate::compiler::ast::ModelLayer::Dense {
                 units,
                 activation: act,
                 ..
@@ -2003,17 +2003,17 @@ fn build_jax_ir_from_model(model: &crate::ast::ModelDecl) -> Result<JaxModelIr, 
                 layers.push(*units);
                 activation = activation_name_for_jax(act);
             }
-            crate::ast::ModelLayer::Output {
+            crate::compiler::ast::ModelLayer::Output {
                 units,
                 activation: act,
                 ..
             } => {
                 layers.push(*units);
-                if matches!(act, crate::ast::Activation::Linear) {
+                if matches!(act, crate::compiler::ast::Activation::Linear) {
                     task = "regression";
                 }
             }
-            crate::ast::ModelLayer::Dropout { .. } | crate::ast::ModelLayer::Norm { .. } => {
+            crate::compiler::ast::ModelLayer::Dropout { .. } | crate::compiler::ast::ModelLayer::Norm { .. } => {
                 // Ignored for export because the bridge currently trains dense MLPs.
             }
             other => {
@@ -2038,12 +2038,12 @@ fn build_jax_ir_from_model(model: &crate::ast::ModelDecl) -> Result<JaxModelIr, 
     })
 }
 
-fn feature_capability_matrix(program: &crate::ast::Program) -> Vec<BackendCapability> {
+fn feature_capability_matrix(program: &crate::compiler::ast::Program) -> Vec<BackendCapability> {
     program
         .items
         .iter()
         .filter_map(|item| match item {
-            crate::ast::Item::Model(m) => Some(m),
+            crate::compiler::ast::Item::Model(m) => Some(m),
             _ => None,
         })
         .map(|m| match build_jax_ir_from_model(m) {
@@ -2063,7 +2063,7 @@ fn feature_capability_matrix(program: &crate::ast::Program) -> Vec<BackendCapabi
         .collect()
 }
 
-fn print_feature_capability_matrix(program: &crate::ast::Program) {
+fn print_feature_capability_matrix(program: &crate::compiler::ast::Program) {
     let rows = feature_capability_matrix(program);
     if rows.is_empty() {
         return;
@@ -2082,9 +2082,9 @@ fn print_feature_capability_matrix(program: &crate::ast::Program) {
     }
 }
 
-fn build_jax_ir_from_program(program: &crate::ast::Program) -> Result<JaxModelIr, String> {
+fn build_jax_ir_from_program(program: &crate::compiler::ast::Program) -> Result<JaxModelIr, String> {
     let train_model = program.items.iter().find_map(|item| match item {
-        crate::ast::Item::Train(t) => t.model.as_deref(),
+        crate::compiler::ast::Item::Train(t) => t.model.as_deref(),
         _ => None,
     });
 
@@ -2092,7 +2092,7 @@ fn build_jax_ir_from_program(program: &crate::ast::Program) -> Result<JaxModelIr
         .items
         .iter()
         .filter_map(|item| match item {
-            crate::ast::Item::Model(m) => Some(m),
+            crate::compiler::ast::Item::Model(m) => Some(m),
             _ => None,
         })
         .find(|m| train_model.map_or(true, |name| m.name == name))
@@ -2432,7 +2432,7 @@ fn cmd_fmt(args: &CliArgs) -> i32 {
     let indent_str = "    ";
 
     for tok in &tokens {
-        use crate::lexer::TokenKind;
+        use crate::compiler::lexer::TokenKind;
         match &tok.kind {
             TokenKind::Eof => break,
             TokenKind::LBrace => {
@@ -2791,7 +2791,7 @@ impl Repl {
             Ansi::paint(self.cfg.color, Ansi::DIM, "Token stream:")
         );
         for tok in &tokens {
-            if matches!(tok.kind, crate::lexer::TokenKind::Eof) {
+            if matches!(tok.kind, crate::compiler::lexer::TokenKind::Eof) {
                 break;
             }
             println!("  {:4}:{:3}  {:?}", tok.span.line, tok.span.col, tok.kind);
@@ -3212,28 +3212,28 @@ mod tests {
     #[test]
     fn test_build_jax_ir_from_model_supported_dense() {
         let sp = Span::dummy();
-        let model = crate::ast::ModelDecl {
+        let model = crate::compiler::ast::ModelDecl {
             span: sp,
             attrs: vec![],
             name: "PolicyNet".to_string(),
             layers: vec![
-                crate::ast::ModelLayer::Input {
+                crate::compiler::ast::ModelLayer::Input {
                     span: sp,
                     size: 128,
                 },
-                crate::ast::ModelLayer::Dense {
+                crate::compiler::ast::ModelLayer::Dense {
                     span: sp,
                     units: 256,
-                    activation: crate::ast::Activation::Relu,
+                    activation: crate::compiler::ast::Activation::Relu,
                     bias: true,
                 },
-                crate::ast::ModelLayer::Output {
+                crate::compiler::ast::ModelLayer::Output {
                     span: sp,
                     units: 10,
-                    activation: crate::ast::Activation::Softmax,
+                    activation: crate::compiler::ast::Activation::Softmax,
                 },
             ],
-            device: crate::ast::ModelDevice::Auto,
+            device: crate::compiler::ast::ModelDevice::Auto,
             optimizer: None,
         };
 
@@ -3248,28 +3248,28 @@ mod tests {
     #[test]
     fn test_feature_capability_matrix_reports_unsupported_layer() {
         let sp = Span::dummy();
-        let model = crate::ast::ModelDecl {
+        let model = crate::compiler::ast::ModelDecl {
             span: sp,
             attrs: vec![],
             name: "VisionNet".to_string(),
             layers: vec![
-                crate::ast::ModelLayer::Input { span: sp, size: 64 },
-                crate::ast::ModelLayer::Conv2d {
+                crate::compiler::ast::ModelLayer::Input { span: sp, size: 64 },
+                crate::compiler::ast::ModelLayer::Conv2d {
                     span: sp,
                     filters: 32,
                     kernel_h: 3,
                     kernel_w: 3,
                     stride: 1,
-                    padding: crate::ast::Padding::Same,
-                    activation: crate::ast::Activation::Relu,
+                    padding: crate::compiler::ast::Padding::Same,
+                    activation: crate::compiler::ast::Activation::Relu,
                 },
             ],
-            device: crate::ast::ModelDevice::Auto,
+            device: crate::compiler::ast::ModelDevice::Auto,
             optimizer: None,
         };
-        let program = crate::ast::Program {
+        let program = crate::compiler::ast::Program {
             span: sp,
-            items: vec![crate::ast::Item::Model(model)],
+            items: vec![crate::compiler::ast::Item::Model(model)],
         };
         let rows = feature_capability_matrix(&program);
         assert_eq!(rows.len(), 1);
@@ -3729,16 +3729,16 @@ mod tests {
         let kinds: Vec<_> = tokens.iter().map(|t| &t.kind).collect();
         assert!(kinds
             .iter()
-            .any(|k| matches!(k, crate::lexer::TokenKind::AtGpu)));
+            .any(|k| matches!(k, crate::compiler::lexer::TokenKind::AtGpu)));
         assert!(kinds
             .iter()
-            .any(|k| matches!(k, crate::lexer::TokenKind::KwFn)));
+            .any(|k| matches!(k, crate::compiler::lexer::TokenKind::KwFn)));
         assert!(kinds
             .iter()
-            .any(|k| matches!(k, crate::lexer::TokenKind::MatMul)));
+            .any(|k| matches!(k, crate::compiler::lexer::TokenKind::MatMul)));
         assert!(kinds
             .iter()
-            .any(|k| matches!(k, crate::lexer::TokenKind::KwGrad)));
+            .any(|k| matches!(k, crate::compiler::lexer::TokenKind::KwGrad)));
     }
 
     #[test]

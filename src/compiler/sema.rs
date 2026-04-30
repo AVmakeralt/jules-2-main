@@ -75,12 +75,12 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::ast::{
+use crate::compiler::ast::{
     AccessMode, AgentDecl, Attribute, BehaviorRule, Block, ComponentDecl, EntityQuery, Expr,
     FnDecl, GoalDecl, Item, MatchArm, ModelDecl, ModelLayer, ParallelFor, Pattern, PerceptionKind,
     Program, Stmt, SystemDecl, TrainDecl,
 };
-use crate::lexer::Span;
+use crate::compiler::lexer::Span;
 
 // =============================================================================
 // §0  DIAGNOSTICS  (re-used from typeck; re-declared here for standalone use)
@@ -906,7 +906,7 @@ impl SemaCtx {
 
         // §4d  Memory capacity must be > 0.
         if let Some(mem) = &a.memory {
-            use crate::ast::MemoryCapacity;
+            use crate::compiler::ast::MemoryCapacity;
             match &mem.capacity {
                 Some(MemoryCapacity::Slots(0)) => {
                     self.err(mem.span, "memory `slots` capacity must be greater than 0");
@@ -1356,10 +1356,10 @@ impl SemaCtx {
                 // §3 Determinism check: if the loop is parallel/SIMD, warn on writes.
                 let is_parallel = matches!(
                     parallelism,
-                    crate::ast::ParallelismHint::Parallel
-                        | crate::ast::ParallelismHint::Simd
-                        | crate::ast::ParallelismHint::Gpu
-                        | crate::ast::ParallelismHint::SimdOrGpu { .. }
+                    crate::compiler::ast::ParallelismHint::Parallel
+                        | crate::compiler::ast::ParallelismHint::Simd
+                        | crate::compiler::ast::ParallelismHint::Gpu
+                        | crate::compiler::ast::ParallelismHint::SimdOrGpu { .. }
                 );
                 for acc in accesses {
                     if acc.mode.is_write() && is_parallel {
@@ -1478,8 +1478,8 @@ impl SemaCtx {
                 self.pop_scope();
                 if let Some(e) = else_ {
                     match e.as_ref() {
-                        crate::ast::IfOrBlock::If(s) => self.analyse_stmt(s),
-                        crate::ast::IfOrBlock::Block(b) => {
+                        crate::compiler::ast::IfOrBlock::If(s) => self.analyse_stmt(s),
+                        crate::compiler::ast::IfOrBlock::Block(b) => {
                             self.push_scope();
                             self.analyse_block(b);
                             self.pop_scope();
@@ -1758,7 +1758,7 @@ impl SemaCtx {
                 self.check_lvalue_mutability(object);
             }
             Expr::UnOp {
-                op: crate::ast::UnOpKind::Deref,
+                op: crate::compiler::ast::UnOpKind::Deref,
                 expr,
                 ..
             } => {
@@ -1905,8 +1905,8 @@ fn stmt_has_direct_break(stmt: &Stmt) -> bool {
         Stmt::If { then, else_, .. } => {
             block_has_break(then)
                 || else_.as_ref().map_or(false, |e| match e.as_ref() {
-                    crate::ast::IfOrBlock::Block(b) => block_has_break(b),
-                    crate::ast::IfOrBlock::If(s) => stmt_has_direct_break(s),
+                    crate::compiler::ast::IfOrBlock::Block(b) => block_has_break(b),
+                    crate::compiler::ast::IfOrBlock::If(s) => stmt_has_direct_break(s),
                 })
         }
         Stmt::Match { arms, .. } => arms.iter().any(|arm| expr_is_break(&arm.body)),
@@ -2059,8 +2059,8 @@ pub fn jules_sema(program: &Program) -> Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::*;
-    use crate::lexer::Span;
+    use crate::compiler::ast::*;
+    use crate::compiler::lexer::Span;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

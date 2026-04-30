@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHasher};
 
-use crate::self_repair::{
+use crate::optimizer::self_repair::{
     FailureType, FragilePath, IRPatch, PatchInstr, PatchMetadata,
     PatchPosition, PGOProfile, RepairConfig, RepairEvent, RepairStrategy,
     RuntimeValue, ValueType,
@@ -1761,7 +1761,7 @@ impl ProfilePersistence {
                         let call_count = Self::extract_field_u64(obj, "calls").unwrap_or(0);
                         profile.performance_data.insert(
                             key.to_string(),
-                            crate::self_repair::FunctionPerf {
+                            crate::optimizer::self_repair::FunctionPerf {
                                 name: key.to_string(),
                                 avg_cycles,
                                 p99_cycles,
@@ -2407,7 +2407,7 @@ impl CausalAnalyzer {
 /// The ultimate self-repair engine combining all components.
 pub struct UltimateSelfRepair {
     config: UltimateRepairConfig,
-    base_engine: crate::self_repair::SelfRepairEngine,
+    base_engine: crate::optimizer::self_repair::SelfRepairEngine,
     smt_verifier: SMTVerifier,
     shadow_validator: ShadowValidator,
     adaptive_thresholds: AdaptiveThresholds,
@@ -2443,7 +2443,7 @@ impl UltimateSelfRepair {
 
         Self {
             config: config.clone(),
-            base_engine: crate::self_repair::SelfRepairEngine::new(base_config),
+            base_engine: crate::optimizer::self_repair::SelfRepairEngine::new(base_config),
             smt_verifier: SMTVerifier::new(),
             shadow_validator: ShadowValidator::new(config.max_shadow_steps),
             adaptive_thresholds: AdaptiveThresholds::new(5),
@@ -2714,7 +2714,7 @@ impl UltimateSelfRepair {
     }
 
     /// Accessor for base engine (e.g., for PGO import).
-    pub fn base_engine_mut(&mut self) -> &mut crate::self_repair::SelfRepairEngine {
+    pub fn base_engine_mut(&mut self) -> &mut crate::optimizer::self_repair::SelfRepairEngine {
         &mut self.base_engine
     }
 }
@@ -2740,7 +2740,7 @@ pub fn create_production_repair_engine() -> UltimateSelfRepair {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::self_repair::{HotPath, FunctionPerf};
+    use crate::optimizer::self_repair::{HotPath, FunctionPerf};
 
     #[test]
     fn test_smt_verification_basic() {

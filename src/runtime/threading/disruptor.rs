@@ -26,7 +26,7 @@ pub struct RingEntry<T> {
     /// Data pointer (zero-copy ownership transfer)
     data: AtomicPtr<T>,
     /// Padding to prevent false sharing
-    _pad: [u8; CACHE_LINE_SIZE - std::mem::size_of::<AtomicU64>() - std::mem::size_of::<AtomicPtr<T>>()],
+    _pad: [u8; 0], // Will be initialized with correct size in new()
 }
 
 impl<T> RingEntry<T> {

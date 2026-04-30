@@ -75,14 +75,14 @@ macro_rules! hot_path {
     };
 }
 
-use crate::ast::{
+use crate::compiler::ast::{
     Activation, AgentDecl, AssignOpKind, BinOpKind, Block, ElemType, EntityQuery, Expr, FnDecl,
     Item, ModelDecl, ModelLayer, NormKind, OptimizerKind, ParallelismHint, Pattern, PoolOp,
     Program, RecurrentCell, Stmt, SystemDecl, TrainDecl, UnOpKind, VecSize,
 };
-use crate::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderCommand, RenderState};
-use crate::lexer::Span;
-use crate::ml_engine::{ComputationGraph, Optimizer, OptimizerState};
+use crate::game::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderCommand, RenderState};
+use crate::compiler::lexer::Span;
+use crate::ml::ml_engine::{ComputationGraph, Optimizer, OptimizerState};
 use matrixmultiply::sgemm;
 
 // =============================================================================
@@ -296,6 +296,54 @@ impl Value {
             Some(*b)
         } else {
             None
+        }
+    }
+
+    /// Get type tag for bytecode VM
+    #[inline(always)]
+    pub fn type_tag(&self) -> u8 {
+        match self {
+            Value::I8(_) => 0,
+            Value::I16(_) => 1,
+            Value::I32(_) => 2,
+            Value::I64(_) => 3,
+            Value::U8(_) => 4,
+            Value::U16(_) => 5,
+            Value::U32(_) => 6,
+            Value::U64(_) => 7,
+            Value::F32(_) => 8,
+            Value::F64(_) => 9,
+            Value::Bool(_) => 10,
+            Value::Str(_) => 11,
+            Value::Unit => 12,
+            Value::Vec2(_) => 13,
+            Value::Vec3(_) => 14,
+            Value::Vec4(_) => 15,
+            Value::IVec2(_) => 16,
+            Value::IVec3(_) => 17,
+            Value::IVec4(_) => 18,
+            Value::Mat2(_) => 19,
+            Value::Mat3(_) => 20,
+            Value::Mat4(_) => 21,
+            Value::Quat(_) => 22,
+            Value::Tensor(_) => 23,
+            Value::TensorFast(_) => 24,
+            Value::DataLoader(_) => 25,
+            Value::Tuple(_) => 26,
+            Value::Array(_) => 27,
+            Value::Struct { .. } => 28,
+            Value::HashMap(_) => 29,
+            Value::Some(_) => 30,
+            Value::None => 31,
+            Value::Ok(_) => 32,
+            Value::Err(_) => 33,
+            Value::Fn(_) => 34,
+            Value::Entity(_) => 35,
+            Value::World(_) => 36,
+            Value::Model(_) => 37,
+            Value::Return(_) => 38,
+            Value::Break(_) => 39,
+            Value::Continue => 40,
         }
     }
 
@@ -2557,8 +2605,8 @@ impl Compiler {
                     let end_jump = self.emit_jump();
                     self.patch_jump(else_jump);
                     match e.as_ref() {
-                        crate::ast::IfOrBlock::Block(b) => self.compile_block(b, dst),
-                        crate::ast::IfOrBlock::If(s) => self.compile_stmt(s),
+                        crate::compiler::ast::IfOrBlock::Block(b) => self.compile_block(b, dst),
+                        crate::compiler::ast::IfOrBlock::If(s) => self.compile_stmt(s),
                     }
                     self.patch_jump(end_jump);
                 } else {
@@ -4392,8 +4440,8 @@ impl Interpreter {
                     self.eval_block(then, env)
                 } else if let Some(e) = else_ {
                     match e.as_ref() {
-                        crate::ast::IfOrBlock::If(s) => self.eval_stmt(s, env),
-                        crate::ast::IfOrBlock::Block(b) => self.eval_block(b, env),
+                        crate::compiler::ast::IfOrBlock::If(s) => self.eval_stmt(s, env),
+                        crate::compiler::ast::IfOrBlock::Block(b) => self.eval_block(b, env),
                     }
                 } else {
                     Ok(Value::Unit)
@@ -4808,14 +4856,14 @@ impl Interpreter {
                     capture.insert(k.to_owned(), v.clone());
                 }
                 let decl = FnDecl {
-                    span: crate::lexer::Span::dummy(),
+                    span: crate::compiler::lexer::Span::dummy(),
                     attrs: vec![],
                     name: "<closure>".into(),
                     generics: vec![],
                     params: params.clone(),
                     ret_ty: None,
                     body: Some(Block {
-                        span: crate::lexer::Span::dummy(),
+                        span: crate::compiler::lexer::Span::dummy(),
                         stmts: vec![],
                         tail: Some(body.clone()),
                     }),
@@ -7387,7 +7435,7 @@ impl Interpreter {
                 if let Some(Value::Tensor(t)) = args.first() {
                     if let Some(graph) = &self.computation_graph {
                         let tensor = t.read().unwrap().clone();
-                        let ml_tensor = crate::ml_engine::Tensor {
+                        let ml_tensor = crate::ml::ml_engine::Tensor {
                             shape: tensor.shape.clone(),
                             data: tensor.cpu_data().to_vec(),
                         };
@@ -7420,7 +7468,7 @@ impl Interpreter {
                             .nodes
                             .get(&(node_id as u64))
                             .and_then(|node| node.gradient.clone())
-                            .unwrap_or_else(|| crate::ml_engine::Tensor::zeros(vec![1]));
+                            .unwrap_or_else(|| crate::ml::ml_engine::Tensor::zeros(vec![1]));
                         let interp_grad = Tensor::from_data(grad.shape, grad.data);
                         Ok(Value::Tensor(Arc::new(RwLock::new(interp_grad))))
                     } else {
@@ -8144,8 +8192,8 @@ impl Interpreter {
     // §17  CAST
     // =========================================================================
 
-    fn eval_cast(&self, v: Value, ty: &crate::ast::Type) -> Result<Value, RuntimeError> {
-        use crate::ast::{ElemType as E, Type};
+    fn eval_cast(&self, v: Value, ty: &crate::compiler::ast::Type) -> Result<Value, RuntimeError> {
+        use crate::compiler::ast::{ElemType as E, Type};
         let f = v.as_f64().unwrap_or(0.0);
         match ty {
             Type::Scalar(E::F32) => Ok(Value::F32(f as f32)),
@@ -8168,7 +8216,7 @@ impl Interpreter {
             (Pattern::Wildcard(_), _) => true,
             (Pattern::Ident { .. }, _) => true,
             (Pattern::Lit(_, lit), v) => {
-                use crate::ast::LitVal;
+                use crate::compiler::ast::LitVal;
                 match (lit, v) {
                     (LitVal::Int(n), Value::I32(x)) => *n == *x as u128,
                     (LitVal::Int(n), Value::I64(x)) => *n == *x as u128,
@@ -9346,8 +9394,8 @@ pub fn jules_train(program: &Program) -> Result<Vec<TrainingStats>, RuntimeError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::*;
-    use crate::lexer::Span;
+    use crate::compiler::ast::*;
+    use crate::compiler::lexer::Span;
 
     fn sp() -> Span {
         Span::dummy()

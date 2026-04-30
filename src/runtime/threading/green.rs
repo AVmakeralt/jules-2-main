@@ -92,6 +92,7 @@ extern "C" fn context_switch(
     new_regs: *const usize,
 ) {
     unsafe {
+        use std::arch::asm;
         // Save current context
         asm!(
             "mov rbx, [r8]",

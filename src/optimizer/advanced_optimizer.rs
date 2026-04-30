@@ -10,7 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 
 use rustc_hash::FxHashMap;
 
-use crate::ast::*;
+use crate::compiler::ast::*;
 use crate::Span;
 
 // §1  CONFIGURATION
@@ -4067,10 +4067,10 @@ impl Superoptimizer {
                     Self::collect_callees_in_block(then, callees);
                     if let Some(eb) = else_ {
                         match eb.as_ref() {
-                            crate::ast::IfOrBlock::If(if_stmt) => {
+                            crate::compiler::ast::IfOrBlock::If(if_stmt) => {
                                 Self::collect_callees_in_block_stmts(&[if_stmt.clone()], callees);
                             }
-                            crate::ast::IfOrBlock::Block(b) => {
+                            crate::compiler::ast::IfOrBlock::Block(b) => {
                                 Self::collect_callees_in_block(b, callees);
                             }
                         }

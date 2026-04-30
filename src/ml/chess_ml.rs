@@ -1,4 +1,4 @@
-use crate::gpu_backend::{GpuBackend, GpuMemoryManager};
+use crate::runtime::gpu_backend::{GpuBackend, GpuMemoryManager};
 use std::time::{Duration, Instant};
 
 const FEAT_DIM: usize = 8;

@@ -335,10 +335,15 @@ impl HwFeedbackCollector {
     /// Open perf_event (Linux)
     #[cfg(target_os = "linux")]
     fn open_perf_event(&self, event: PerfEvent) -> Result<i32, String> {
-        use libc::{perf_event_attr, perf_type_hw, PERF_FLAG_FD_CLOEXEC};
+        use libc::{c_int, c_void, syscall, perf_event_attr};
+
+        // Define constants that may not be available in all libc versions
+        const PERF_TYPE_HARDWARE: u32 = 0;
+        const PERF_FLAG_FD_CLOEXEC: u32 = 0o01000000;
+        const SYS_perf_event_open: c_int = 298;
 
         let mut attr: perf_event_attr = unsafe { std::mem::zeroed() };
-        attr.type_ = perf_type_hw::PERF_TYPE_HARDWARE as u32;
+        attr.type_ = PERF_TYPE_HARDWARE;
         attr.size = std::mem::size_of::<perf_event_attr>() as u32;
         attr.disabled = 1;
         attr.exclude_kernel = 1;
@@ -356,12 +361,12 @@ impl HwFeedbackCollector {
         };
 
         let fd = unsafe {
-            libc::syscall(
-                libc::SYS_perf_event_open,
+            syscall(
+                SYS_perf_event_open,
                 &attr as *const perf_event_attr,
-                -1, // pid (current process)
-                -1, // cpu (all CPUs)
-                -1, // group_fd
+                -1i32, // pid (current process)
+                -1i32, // cpu (all CPUs)
+                -1i32, // group_fd
                 PERF_FLAG_FD_CLOEXEC,
             )
         };
@@ -376,10 +381,11 @@ impl HwFeedbackCollector {
     /// Enable perf_event (Linux)
     #[cfg(target_os = "linux")]
     fn enable_perf_event(&self, fd: i32) -> Result<(), String> {
-        use libc::{IOCTL_PERF_EVENT_ENABLE, _IOC_NONE, _IOC_SIZE, _IOW};
+        // Define ioctl constants inline
+        const PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
+        const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
 
-        let cmd = _IOW(_IOC_NONE, 0x24, std::mem::size_of::<u32>()) as u64;
-        let result = unsafe { libc::ioctl(fd, IOCTL_PERF_EVENT_ENABLE as u64) };
+        let result = unsafe { libc::ioctl(fd, PERF_EVENT_IOC_ENABLE) };
 
         if result < 0 {
             return Err(format!("Failed to enable perf_event: errno {}", unsafe { *libc::__errno_location() }));
@@ -390,9 +396,9 @@ impl HwFeedbackCollector {
 
     /// Disable perf_event (Linux)
     #[cfg(target_os = "linux")]
-    fn disable_perf_event(&self, fd: i32) -> Result<(), String> {
+    fn dconstbt(&self, fdIOC_: i32) : u64 = 0x2401-> Result<(), String> {
         use libc::IOCTL_PERF_EVENT_DISABLE;
-
+_IOC
         let result = unsafe { libc::ioctl(fd, IOCTL_PERF_EVENT_DISABLE as u64) };
 
         if result < 0 {

@@ -49,7 +49,7 @@ use std::collections::{HashMap, HashSet, VecDeque, BTreeMap};
 use std::fs::File;
 use std::io::Write;
 
-use crate::ast::*;
+use crate::compiler::ast::*;
 
 // =============================================================================
 // §0  CONFIGURATION & CONSTANTS
