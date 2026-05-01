@@ -166,7 +166,7 @@ impl MlArenaPlan {
                 if free_end <= &tensor.lifetime_start && size <= (*free_end - *free_start) {
                     // Reuse this slot
                     offsets.insert(tensor.name.clone(), *free_start);
-                    let old_name = free_name.clone();
+                    let _old_name = free_name.clone();
                     free_list[i] = (*free_start, tensor.lifetime_end, tensor.name.clone());
                     alias_count += 1;
                     bytes_saved += size;
@@ -323,8 +323,57 @@ impl SimpleRng {
     }
 }
 
+/// A single node in the MCTS search tree.
+///
+/// Each node represents one [`TilingParams`] candidate.  The tree is rooted at
+/// a virtual "root" node (index 0) whose children are all first-level
+/// candidates.  During the search, unexplored children are expanded one at a
+/// time; visited children accumulate visit counts and total rewards so that UCB1
+/// can guide selection.
+#[derive(Debug, Clone)]
+struct MctsNode {
+    /// Index into `TilingParams::candidates()`, or `None` for the root.
+    candidate_idx: Option<usize>,
+    /// Number of times this node has been visited (backed-up through).
+    visits: u32,
+    /// Sum of rewards observed in simulations descending through this node.
+    total_reward: f64,
+    /// Indices of child nodes in the flat node arena.
+    children: Vec<usize>,
+    /// Index of the parent node (`usize::MAX` for the root).
+    parent: usize,
+}
+
+impl MctsNode {
+    fn new(candidate_idx: Option<usize>, parent: usize) -> Self {
+        Self { candidate_idx, visits: 0, total_reward: 0.0, children: vec![], parent }
+    }
+
+    /// UCB1 score for this node relative to its parent's visit count.
+    fn ucb1(&self, parent_visits: u32, exploration_constant: f64) -> f64 {
+        if self.visits == 0 {
+            return f64::INFINITY;
+        }
+        let exploitation = self.total_reward / self.visits as f64;
+        let exploration = exploration_constant * ((parent_visits as f64).ln() / self.visits as f64).sqrt();
+        exploitation + exploration
+    }
+}
+
 /// MCTS-ML tiling search engine.
-/// Explores tiling configurations using MCTS with hardware-aware reward.
+///
+/// Implements a proper Monte Carlo Tree Search with four distinct phases:
+///
+/// 1. **Selection** — walk from the root following the highest-UCB1 child at
+///    each level until reaching an unexpanded node or a leaf.
+/// 2. **Expansion** — add one unexplored child candidate to the selected node.
+/// 3. **Simulation** — evaluate the newly expanded candidate with the
+///    hardware-aware cost model (the "rollout").
+/// 4. **Backpropagation** — propagate the reward up through all ancestors.
+///
+/// The two-level tree (root → candidate nodes) naturally extends to deeper
+/// hierarchies (e.g. joint tiling + unroll search) by adding more levels of
+/// candidate expansion.
 pub struct MctsMlSearch {
     pub candidates_explored: u64,
     pub searches_run: u64,
@@ -332,15 +381,18 @@ pub struct MctsMlSearch {
 
 impl MctsMlSearch {
     pub fn new() -> Self {
-        Self {
-            candidates_explored: 0,
-            searches_run: 0,
-        }
+        Self { candidates_explored: 0, searches_run: 0 }
     }
 
-    /// Search for the optimal tiling of a matmul-like kernel.
-    /// Uses MCTS to explore the space of tiling parameters, with
-    /// hardware-aware cycle estimation as the reward function.
+    /// UCB1 exploration constant (√2 is the theoretical optimum for rewards in [0,1]).
+    const EXPLORATION_C: f64 = 1.414;
+
+    /// Search for the optimal tiling of a matmul-like kernel using true MCTS.
+    ///
+    /// # Arguments
+    /// * `m`, `n`, `k` — matrix dimensions used by the cost model.
+    /// * `hw` — hardware cost model consulted during simulation.
+    /// * `max_iterations` — total MCTS iterations (selection+expansion+simulation+backprop).
     pub fn search_tiling(
         &mut self,
         m: u64,
@@ -363,62 +415,111 @@ impl MctsMlSearch {
             };
         }
 
-        // Naive (untiled) baseline: single tile = full matrix
+        // Naive (untiled) baseline: use the very first candidate as the reference.
         let naive_cycles = candidates[0].estimate_cycles(m, n, k, hw);
 
-        // MCTS-style search: evaluate candidates with UCB1 selection
-        let mut visits: Vec<u32> = vec![0; candidates.len()];
-        let mut total_rewards: Vec<f64> = vec![0.0; candidates.len()];
-        let exploration_constant = 1.414;
-        let mut rng = SimpleRng::from_seed(m.wrapping_mul(31).wrapping_add(n).wrapping_mul(37).wrapping_add(k));
+        // ── Build the initial tree ────────────────────────────────────────────
+        // Node 0 is the virtual root; nodes 1..=N are one node per candidate.
+        let n_candidates = candidates.len();
+        let mut arena: Vec<MctsNode> = Vec::with_capacity(n_candidates + 1);
 
+        // Root node
+        arena.push(MctsNode::new(None, usize::MAX));
+        // One child node per candidate (pre-inserted but visits=0 = "unexpanded")
+        for idx in 0..n_candidates {
+            arena.push(MctsNode::new(Some(idx), 0));
+            arena[0].children.push(idx + 1); // root's children are nodes 1..=N
+        }
+
+        // Track which candidates have been simulated at least once.
+        let mut simulated_cycles: Vec<Option<f64>> = vec![None; n_candidates];
+
+        // ── MCTS main loop ────────────────────────────────────────────────────
         for _ in 0..max_iterations {
-            // Selection: pick candidate with highest UCB1
-            let total_parent_visits: u32 = visits.iter().sum();
-            let mut best_idx = 0;
-            let mut best_ucb = f64::NEG_INFINITY;
+            // 1. Selection — walk the tree following best UCB1.
+            let selected_node_idx = self.select(&arena, 0);
 
-            for (i, (&v, &r)) in visits.iter().zip(total_rewards.iter()).enumerate() {
-                let ucb = if v == 0 {
-                    f64::INFINITY
-                } else {
-                    let exploitation = r / v as f64;
-                    let exploration = exploration_constant * ((total_parent_visits as f64).ln() / v as f64).sqrt();
-                    exploitation + exploration
-                };
-                if ucb > best_ucb {
-                    best_ucb = ucb;
-                    best_idx = i;
-                }
-            }
+            // 2. Expansion — if the node is unexpanded, mark it visited.
+            //    (In this two-level tree every leaf is already a candidate node,
+            //    so "expansion" is the first simulation of that node.)
+            let candidate_idx = match arena[selected_node_idx].candidate_idx {
+                Some(ci) => ci,
+                None => continue, // root has no candidate; shouldn't happen
+            };
 
-            // Expansion + Simulation: evaluate the selected candidate
-            let params = &candidates[best_idx];
-            let cycles = params.estimate_cycles(m, n, k, hw);
+            // 3. Simulation — evaluate the candidate using the cost model.
+            let cycles = *simulated_cycles[candidate_idx]
+                .get_or_insert_with(|| candidates[candidate_idx].estimate_cycles(m, n, k, hw));
 
-            // Reward: negative cycles (lower = better), normalized
-            let reward = if naive_cycles > 0.0 { -cycles / naive_cycles } else { 0.0 };
+            // Reward: higher is better — normalise against the naive baseline.
+            let reward = if naive_cycles > 0.0 { naive_cycles / cycles.max(1e-9) } else { 1.0 };
+            // Clamp so rewards stay in a sensible range even with edge-case inputs.
+            let reward = reward.min(100.0).max(0.0);
 
-            // Backpropagation
-            visits[best_idx] += 1;
-            total_rewards[best_idx] += reward;
+            // 4. Backpropagation — update this node and all its ancestors.
+            self.backpropagate(&mut arena, selected_node_idx, reward);
             self.candidates_explored += 1;
         }
 
-        // Select the most-visited candidate (robust child selection)
-        let best_idx = visits.iter().enumerate()
-            .max_by_key(|(_, &v)| v)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
-        let best_cycles = candidates[best_idx].estimate_cycles(m, n, k, hw);
+        // ── Robust child selection — pick the most-visited direct child of root ─
+        let best_node_idx = arena[0]
+            .children
+            .iter()
+            .copied()
+            .max_by_key(|&ni| arena[ni].visits)
+            .unwrap_or(1);
+        let best_candidate_idx = arena[best_node_idx].candidate_idx.unwrap_or(0);
+        let best_cycles = candidates[best_candidate_idx].estimate_cycles(m, n, k, hw);
         let speedup = if best_cycles > 0.0 { naive_cycles / best_cycles } else { 1.0 };
 
         TilingSearchResult {
-            best_params: candidates[best_idx],
+            best_params: candidates[best_candidate_idx],
             best_cycles,
             candidates_explored: self.candidates_explored as usize,
             speedup_vs_naive: speedup,
+        }
+    }
+
+    /// Walk from `start_idx` downward, always following the child with the
+    /// highest UCB1 score.  Stops at a node whose children have all been
+    /// visited fewer than once (i.e. an unvisited or leaf node).
+    fn select(&self, arena: &[MctsNode], start_idx: usize) -> usize {
+        let mut current = start_idx;
+        loop {
+            let children = &arena[current].children;
+            if children.is_empty() {
+                // Leaf node — return it for simulation.
+                return current;
+            }
+            // Prefer any completely unvisited child first (avoids log(0) in UCB1).
+            if let Some(&unvisited) = children.iter().find(|&&ci| arena[ci].visits == 0) {
+                return unvisited;
+            }
+            // All children visited — pick best UCB1.
+            let parent_visits = arena[current].visits;
+            current = *children
+                .iter()
+                .max_by(|&&a, &&b| {
+                    arena[a].ucb1(parent_visits, Self::EXPLORATION_C)
+                        .partial_cmp(&arena[b].ucb1(parent_visits, Self::EXPLORATION_C))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(&children[0]);
+        }
+    }
+
+    /// Walk from `node_idx` up to the root, adding `reward` to `total_reward`
+    /// and incrementing `visits` at every node along the path.
+    fn backpropagate(&self, arena: &mut Vec<MctsNode>, node_idx: usize, reward: f64) {
+        let mut current = node_idx;
+        loop {
+            arena[current].visits += 1;
+            arena[current].total_reward += reward;
+            let parent = arena[current].parent;
+            if parent == usize::MAX {
+                break; // Reached the root.
+            }
+            current = parent;
         }
     }
 }
@@ -479,20 +580,78 @@ pub struct StabilityCheckResult {
 }
 
 /// Stochastic equivalence checker for numerical stability.
-/// Verifies that optimized kernels produce the same results as naive implementations.
+///
+/// Verifies that the numerically-stable form of a kernel (e.g. the
+/// log-sum-exp / online-softmax variant) produces results that are
+/// within an acceptable relative error of the naive implementation when
+/// evaluated over many randomly-generated inputs.
 pub struct StabilityChecker {
     pub checks_run: u64,
     pub checks_passed: u64,
     pub checks_failed: u64,
+    /// Internal RNG for randomized testing.
+    rng: SimpleRng,
 }
 
 impl StabilityChecker {
+    /// Number of random input vectors generated per stochastic softmax check.
+    const SOFTMAX_SAMPLE_COUNT: usize = 64;
+    /// Length of each randomly generated input vector.
+    const SOFTMAX_VECTOR_LEN: usize = 16;
+    /// Maximum permissible relative error between naive and stable softmax.
+    const SOFTMAX_TOL: f64 = 1e-5;
+
     pub fn new() -> Self {
-        Self { checks_run: 0, checks_passed: 0, checks_failed: 0 }
+        Self { checks_run: 0, checks_passed: 0, checks_failed: 0, rng: SimpleRng::from_seed(0xDEAD_BEEF_CAFE_1234) }
     }
 
-    /// Check softmax numerical stability: compare naive vs. log-sum-exp.
-    /// Returns true if the optimized version has <= relative error.
+    // ── Internal helpers ────────────────────────────────────────────────────
+
+    /// Naive softmax: `exp(x_i) / Σ exp(x_j)`.
+    /// Prone to overflow when `max(x)` is large.
+    fn naive_softmax(values: &[f64]) -> Vec<f64> {
+        let exps: Vec<f64> = values.iter().map(|&x| x.exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        exps.iter().map(|e| e / sum).collect()
+    }
+
+    /// Numerically stable softmax using the log-sum-exp shift trick:
+    /// `exp(x_i - max) / Σ exp(x_j - max)`.
+    fn stable_softmax(values: &[f64]) -> Vec<f64> {
+        let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let shifted: Vec<f64> = values.iter().map(|&x| (x - max_val).exp()).collect();
+        let sum: f64 = shifted.iter().sum();
+        shifted.iter().map(|e| e / sum).collect()
+    }
+
+    /// Maximum relative error between two output vectors.
+    fn max_relative_error(reference: &[f64], candidate: &[f64]) -> f64 {
+        reference
+            .iter()
+            .zip(candidate.iter())
+            .map(|(&r, &c)| {
+                if r.abs() > 1e-30 { ((c - r) / r).abs() } else { (c - r).abs() }
+            })
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// Generate a random f64 in `[lo, hi)` using the internal RNG.
+    fn rand_f64(&mut self, lo: f64, hi: f64) -> f64 {
+        let u = (self.rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64; // uniform [0,1)
+        lo + u * (hi - lo)
+    }
+
+    // ── Public API ──────────────────────────────────────────────────────────
+
+    /// Stochastically verify softmax numerical stability.
+    ///
+    /// Generates [`SOFTMAX_SAMPLE_COUNT`] random input vectors, applies both
+    /// the naive and the stable formulation, and measures the maximum relative
+    /// error across all outputs and all samples.  The check passes when the
+    /// error stays below [`SOFTMAX_TOL`].
+    ///
+    /// The seed values are derived from the provided reference `values` so
+    /// that results are deterministic for the same input.
     pub fn check_softmax_stability(&mut self, values: &[f64]) -> StabilityCheckResult {
         self.checks_run += 1;
 
@@ -506,43 +665,70 @@ impl StabilityChecker {
             };
         }
 
-        // Naive: exp(x_i) / sum(exp(x_j))
-        let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let exps: Vec<f64> = values.iter().map(|&x| (x - max_val).exp()).collect();
-        let sum_exp: f64 = exps.iter().sum();
-        let naive_results: Vec<f64> = exps.iter().map(|e| e / sum_exp).collect();
+        // Derive a stable seed from the reference values so tests are
+        // reproducible while still varying across different call sites.
+        let seed: u64 = values.iter().enumerate().fold(0xABCD_1234_u64, |acc, (i, &v)| {
+            acc.wrapping_add((i as u64).wrapping_mul(v.to_bits()))
+        });
+        self.rng = SimpleRng::from_seed(seed | 1);
 
-        // Stable: exp(x_i - max) / sum(exp(x_j - max))
-        // This is the same but explicitly shows the subtraction
-        let stable_results = naive_results.clone(); // In this implementation they're equivalent
+        // Determine the value range from the reference input to create
+        // perturbations at a similar scale, including large-value stress tests.
+        let ref_max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let ref_min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let scale = (ref_max - ref_min).max(1.0);
 
-        // Calculate max relative error
-        let mut max_rel_error = 0.0;
-        for (naive, stable) in naive_results.iter().zip(stable_results.iter()) {
-            if *naive != 0.0 {
-                let rel_err = ((stable - naive) / naive).abs();
-                max_rel_error = if rel_err > max_rel_error { rel_err } else { max_rel_error };
-            }
+        let len = values.len().max(Self::SOFTMAX_VECTOR_LEN);
+        let mut max_err: f64 = 0.0;
+        let mut total_samples = 0_usize;
+
+        // First, check the reference input itself.
+        {
+            let naive  = Self::naive_softmax(values);
+            let stable = Self::stable_softmax(values);
+            max_err = max_err.max(Self::max_relative_error(&stable, &naive));
+            total_samples += values.len();
         }
 
-        // Determine safe precision
+        // Then generate random perturbations to stress-test the stability.
+        for _ in 0..Self::SOFTMAX_SAMPLE_COUNT {
+            // Randomly mix small-magnitude and large-magnitude samples.
+            let use_large = self.rng.next_u64() % 4 == 0; // 25% chance of extreme inputs
+            let (lo, hi) = if use_large {
+                (ref_max, ref_max + scale * 100.0) // stress test near overflow
+            } else {
+                (ref_min - scale, ref_max + scale)
+            };
+            let sample: Vec<f64> = (0..len).map(|_| self.rand_f64(lo, hi)).collect();
+            let naive  = Self::naive_softmax(&sample);
+            let stable = Self::stable_softmax(&sample);
+            let err = Self::max_relative_error(&stable, &naive);
+            // Ignore NaN/Inf from the naive path — those are exactly the
+            // instability cases we are protecting against.
+            if err.is_finite() {
+                max_err = max_err.max(err);
+            }
+            total_samples += sample.len();
+        }
+
+        // Determine recommended precision based on worst-case error.
         let max_val_input = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let rec_precision = if max_rel_error < 1e-7 && Precision::Fp16.has_sufficient_range(max_val_input.exp()) {
+        let rec_precision = if max_err < 1e-7 && Precision::Fp16.has_sufficient_range(max_val_input.exp()) {
             Precision::Fp16
-        } else if max_rel_error < 1e-4 {
+        } else if max_err < 1e-4 {
             Precision::Bf16
         } else {
             Precision::Fp32
         };
 
-        let safe = max_rel_error < 1e-5;
-        if safe { self.checks_passed += 1; } else { self.checks_failed += 1; }
+        let is_safe = max_err < Self::SOFTMAX_TOL;
+        if is_safe { self.checks_passed += 1; } else { self.checks_failed += 1; }
 
         StabilityCheckResult {
-            is_safe: safe,
+            is_safe,
             recommended_precision: rec_precision,
-            max_relative_error: max_rel_error,
-            samples_tested: values.len(),
+            max_relative_error: max_err,
+            samples_tested: total_samples,
         }
     }
 
@@ -717,30 +903,45 @@ impl MlSuperoptimizer {
     }
 
     /// P1: Triple-nested loop → MatMul with MCTS tiling search.
+    ///
+    /// Extracts the actual iteration variables and matrix operands from the loop
+    /// nest structure, then runs MCTS to find the best tiling.  Falls back to
+    /// symbolic names ("A", "B", "C") when the operands cannot be inferred.
     fn try_matmul_loop(&mut self, stmts: &[Stmt]) -> Option<Stmt> {
         let stmt = stmts.first()?;
-        if let Stmt::ForIn { body, span, .. } = stmt {
-            for inner_stmt in &body.stmts {
-                if let Stmt::ForIn { body: inner_body, .. } = inner_stmt {
-                    for innermost_stmt in &inner_body.stmts {
-                        if let Stmt::ForIn { body: innermost_body, .. } = innermost_stmt {
+        if let Stmt::ForIn { var: _outer_var, iter: outer_iter, body: outer_body, span } = stmt {
+            for inner_stmt in &outer_body.stmts {
+                if let Stmt::ForIn { var: _mid_var, iter: mid_iter, body: mid_body, .. } = inner_stmt {
+                    for innermost_stmt in &mid_body.stmts {
+                        if let Stmt::ForIn { var: _inner_var, iter: inner_iter, body: innermost_body, .. } = innermost_stmt {
                             if self.is_matmul_accumulation(innermost_body) {
-                                // Run MCTS tiling search for optimal block sizes
+                                // --- extract loop-bound dimensions for the cost model ---
+                                let dim_m = Self::loop_bound_hint(outer_iter).unwrap_or(128);
+                                let dim_n = Self::loop_bound_hint(mid_iter).unwrap_or(128);
+                                let dim_k = Self::loop_bound_hint(inner_iter).unwrap_or(128);
+
+                                // Run MCTS tiling search with the actual (estimated) dimensions
                                 let tiling = self.mcts_search.search_tiling(
-                                    512, 512, 512, &mut self.hw_model, 100,
+                                    dim_m, dim_n, dim_k, &mut self.hw_model, 100,
                                 );
+                                self.stats.hardware_tiling_searches += 1;
+
+                                // --- extract actual matrix operand names from the accumulation body ---
+                                let (lhs_name, rhs_name, out_name) =
+                                    Self::infer_matmul_operands(innermost_body)
+                                        .unwrap_or_else(|| ("A".into(), "B".into(), "C".into()));
+
                                 let matmul_expr = Expr::MatMul {
                                     span: *span,
-                                    lhs: Box::new(Expr::Ident { span: *span, name: "A".into() }),
-                                    rhs: Box::new(Expr::Ident { span: *span, name: "B".into() }),
+                                    lhs: Box::new(Expr::Ident { span: *span, name: lhs_name }),
+                                    rhs: Box::new(Expr::Ident { span: *span, name: rhs_name }),
                                 };
-                                self.stats.hardware_tiling_searches += 1;
                                 return Some(Stmt::Expr {
                                     span: *span,
                                     expr: Expr::Assign {
                                         span: *span,
                                         op: AssignOpKind::Assign,
-                                        target: Box::new(Expr::Ident { span: *span, name: "C".into() }),
+                                        target: Box::new(Expr::Ident { span: *span, name: out_name }),
                                         value: Box::new(matmul_expr),
                                     },
                                     has_semi: true,
@@ -752,6 +953,63 @@ impl MlSuperoptimizer {
             }
         }
         None
+    }
+
+    /// Try to read a literal loop-bound hint from a range expression like `0..N`
+    /// or `0..=N`.  Returns `None` when the bound is a non-literal expression.
+    fn loop_bound_hint(iter: &Expr) -> Option<u64> {
+        // Match `lo..hi` or `lo..=hi` — look for the rhs of a Range BinOp.
+        if let Expr::BinOp { op: BinOpKind::Range | BinOpKind::RangeInclusive, rhs, .. } = iter {
+            match rhs.as_ref() {
+                Expr::IntLit { value, .. } => return Some(*value as u64),
+                _ => {}
+            }
+        }
+        // Match a bare integer literal used as the upper bound.
+        if let Expr::IntLit { value, .. } = iter {
+            return Some(*value as u64);
+        }
+        None
+    }
+
+    /// Walk the innermost loop body and identify the three matrix operand names
+    /// from the accumulation statement `C[i][j] += A[i][k] * B[k][j]`.
+    /// Returns `(lhs, rhs, output)` or `None` if the pattern is ambiguous.
+    fn infer_matmul_operands(block: &Block) -> Option<(String, String, String)> {
+        for stmt in &block.stmts {
+            if let Stmt::Expr { expr, .. } = stmt {
+                // Pattern 1: C[i][j] += A[i][k] * B[k][j]
+                if let Expr::Assign { op: AssignOpKind::AddAssign, target, value, .. } = expr {
+                    if let Expr::BinOp { op: BinOpKind::Mul, lhs: mul_lhs, rhs: mul_rhs, .. } = value.as_ref() {
+                        let out = Self::index_base_name(target)?;
+                        let a   = Self::index_base_name(mul_lhs)?;
+                        let b   = Self::index_base_name(mul_rhs)?;
+                        return Some((a, b, out));
+                    }
+                }
+                // Pattern 2: C[i][j] = C[i][j] + A[i][k] * B[k][j]
+                if let Expr::Assign { op: AssignOpKind::Assign, target, value, .. } = expr {
+                    if let Expr::BinOp { op: BinOpKind::Add, lhs: add_lhs, rhs: add_rhs, .. } = value.as_ref() {
+                        if let Expr::BinOp { op: BinOpKind::Mul, lhs: mul_lhs, rhs: mul_rhs, .. } = add_rhs.as_ref() {
+                            let out = Self::index_base_name(target)?;
+                            let a   = Self::index_base_name(mul_lhs)?;
+                            let b   = Self::index_base_name(mul_rhs)?;
+                            return Some((a, b, out));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract the base-object name from an index expression like `arr[i][j]`.
+    fn index_base_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Index { object, .. } => Self::index_base_name(object),
+            Expr::Ident { name, .. } => Some(name.clone()),
+            _ => None,
+        }
     }
 
     fn is_matmul_accumulation(&self, block: &Block) -> bool {
@@ -906,25 +1164,52 @@ impl MlSuperoptimizer {
     fn try_reduction_loop(&mut self, stmts: &[Stmt]) -> Option<Stmt> {
         let stmt = stmts.first()?;
         let span = stmt.span();
-        if let Stmt::ForIn { body, .. } = stmt {
+        if let Stmt::ForIn { iter, body, .. } = stmt {
+            // Capture the actual iterated collection for use in the replacement call.
+            let iter_name = match iter.as_ref() {
+                Expr::Ident { name, .. } => name.clone(),
+                // Handle `x.iter()` / `x.into_iter()` etc.
+                Expr::MethodCall { receiver, .. } => {
+                    if let Expr::Ident { name, .. } = receiver.as_ref() {
+                        name.clone()
+                    } else {
+                        return None; // Can't infer the collection — bail out.
+                    }
+                }
+                _ => return None,
+            };
+
             for s in &body.stmts {
                 if let Stmt::Expr { expr, .. } = s {
                     if let Expr::Assign { op, target, value, .. } = expr {
-                        let reduce_op = match op { AssignOpKind::AddAssign => "sum", _ => "" };
-                        if !reduce_op.is_empty() {
-                            if let Expr::Ident { name: target_name, .. } = target.as_ref() {
-                                let reduce_call = Expr::Call {
+                        let reduce_op = match op {
+                            AssignOpKind::AddAssign => "sum",
+                            AssignOpKind::MulAssign => "product",
+                            _ => continue,
+                        };
+                        if let Expr::Ident { name: target_name, .. } = target.as_ref() {
+                            // The reduction reads from `value` (e.g. `arr[i]`).
+                            // Use the iterated collection as the argument to the
+                            // intrinsic, matching its actual name in source code.
+                            let src_name = Self::index_base_name(value)
+                                .unwrap_or_else(|| iter_name.clone());
+                            let reduce_call = Expr::Call {
+                                span,
+                                func: Box::new(Expr::Ident { span, name: reduce_op.into() }),
+                                args: vec![Expr::Ident { span, name: src_name }],
+                                named: vec![],
+                            };
+                            return Some(Stmt::Let {
+                                span,
+                                pattern: Pattern::Ident {
                                     span,
-                                    func: Box::new(Expr::Ident { span, name: reduce_op.into() }),
-                                    args: vec![Expr::Ident { span, name: "arr".into() }],
-                                    named: vec![],
-                                };
-                                return Some(Stmt::Let {
-                                    span,
-                                    pattern: Pattern::Ident { span, name: target_name.clone(), mutable: false },
-                                    ty: None, init: Some(reduce_call), mutable: false,
-                                });
-                            }
+                                    name: target_name.clone(),
+                                    mutable: false,
+                                },
+                                ty: None,
+                                init: Some(reduce_call),
+                                mutable: false,
+                            });
                         }
                     }
                 }
@@ -1028,55 +1313,55 @@ impl MlSuperoptimizer {
     /// Try all ML-specific rewrites.
     fn try_ml_rewrite(&mut self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         // P2: MatMul + bias → fused linear (must be before auto-quant!)
-        if let Some(r) = self.try_matmul_bias_fusion(expr) { return r; }
+        if let Some(r) = self.try_matmul_bias_fusion(expr) { return Some(r); }
         // P4: LayerNorm
-        if let Some(r) = self.try_layernorm_pattern(expr) { return r; }
+        if let Some(r) = self.try_layernorm_pattern(expr) { return Some(r); }
         // P5: BatchNorm
-        if let Some(r) = self.try_batchnorm_pattern(expr) { return r; }
+        if let Some(r) = self.try_batchnorm_pattern(expr) { return Some(r); }
         // P6: Activations
-        if let Some(r) = self.try_activation_rewrite(expr) { return r; }
+        if let Some(r) = self.try_activation_rewrite(expr) { return Some(r); }
         // P9: Attention → FlashAttention
-        if let Some(r) = self.try_attention_pattern(expr) { return r; }
+        if let Some(r) = self.try_attention_pattern(expr) { return Some(r); }
         // P11: Transpose + MatMul → layout-synthesized fused matmul
-        if let Some(r) = self.try_transpose_matmul(expr) { return r; }
+        if let Some(r) = self.try_transpose_matmul(expr) { return Some(r); }
         // P12: Gradient accumulation
-        if let Some(r) = self.try_gradient_accumulation(expr) { return r; }
+        if let Some(r) = self.try_gradient_accumulation(expr) { return Some(r); }
         // P14: Zero-copy reshape
-        if let Some(r) = self.try_zero_copy_reshape(expr) { return r; }
+        if let Some(r) = self.try_zero_copy_reshape(expr) { return Some(r); }
         // P15: Dropout
-        if let Some(r) = self.try_dropout_pattern(expr) { return r; }
+        if let Some(r) = self.try_dropout_pattern(expr) { return Some(r); }
         // HadamardMul of MatMul → fused
-        if let Some(r) = self.try_hadamard_matmul_fusion(expr) { return r; }
+        if let Some(r) = self.try_hadamard_matmul_fusion(expr) { return Some(r); }
         // Elementwise chain fusion
-        if let Some(r) = self.try_elementwise_chain_fusion(expr) { return r; }
+        if let Some(r) = self.try_elementwise_chain_fusion(expr) { return Some(r); }
         // Scaled matmul (attention scaling)
-        if let Some(r) = self.try_scaled_matmul(expr) { return r; }
+        if let Some(r) = self.try_scaled_matmul(expr) { return Some(r); }
         // P16: Residual block pattern: x + sublayer(norm(x))
-        if let Some(r) = self.try_residual_block(expr) { return r; }
+        if let Some(r) = self.try_residual_block(expr) { return Some(r); }
         // P17: RMSNorm: x / sqrt(mean(x^2) + eps)
-        if let Some(r) = self.try_rmsnorm_pattern(expr) { return r; }
+        if let Some(r) = self.try_rmsnorm_pattern(expr) { return Some(r); }
         // P18: Rotary embedding: apply_rotary(q, cos, sin)
-        if let Some(r) = self.try_rotary_embedding(expr) { return r; }
+        if let Some(r) = self.try_rotary_embedding(expr) { return Some(r); }
         // P19: Auto-quantization detection (LOWEST PRIORITY — after all other rewrites)
-        if let Some(r) = self.try_auto_quantize(expr) { return r; }
+        if let Some(r) = self.try_auto_quantize(expr) { return Some(r); }
         None
     }
 
     // ─── P2: MatMul + Bias Fusion ─────────────────────────────────────────
 
-    fn try_matmul_bias_fusion(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_matmul_bias_fusion(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::BinOp { op: BinOpKind::Add, lhs, rhs, span } = expr {
             if let Expr::MatMul { .. } = lhs.as_ref() {
                 let fused = Expr::Call { span: *span,
                     func: Box::new(Expr::Ident { span: *span, name: "linear".into() }),
                     args: vec![*lhs.clone(), *rhs.clone()], named: vec![] };
-                return Some(Some((fused, "matmul_bias_fusion", 2.0, MlOptCategory::KernelFusion)));
+                return Some((fused, "matmul_bias_fusion", 2.0, MlOptCategory::KernelFusion));
             }
             if let Expr::MatMul { .. } = rhs.as_ref() {
                 let fused = Expr::Call { span: *span,
                     func: Box::new(Expr::Ident { span: *span, name: "linear".into() }),
                     args: vec![*rhs.clone(), *lhs.clone()], named: vec![] };
-                return Some(Some((fused, "matmul_bias_fusion", 2.0, MlOptCategory::KernelFusion)));
+                return Some((fused, "matmul_bias_fusion", 2.0, MlOptCategory::KernelFusion));
             }
         }
         None
@@ -1084,14 +1369,14 @@ impl MlSuperoptimizer {
 
     // ─── P4: LayerNorm ────────────────────────────────────────────────────
 
-    fn try_layernorm_pattern(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_layernorm_pattern(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::HadamardDiv { lhs, rhs, span } = expr {
             if self.is_sqrt_var_plus_eps(rhs) && self.is_x_minus_mean(lhs) {
                 let layernorm = Expr::Call { span: *span,
                     func: Box::new(Expr::Ident { span: *span, name: "layer_norm".into() }),
                     args: vec![Expr::Ident { span: *span, name: "x".into() }],
                     named: vec![("eps".into(), Expr::FloatLit { span: *span, value: 1e-5 })] };
-                return Some(Some((layernorm, "layernorm_fusion", 5.0, MlOptCategory::KernelFusion)));
+                return Some((layernorm, "layernorm_fusion", 5.0, MlOptCategory::KernelFusion));
             }
         }
         if let Expr::BinOp { op: BinOpKind::Div, lhs, rhs, span } = expr {
@@ -1100,7 +1385,7 @@ impl MlSuperoptimizer {
                     func: Box::new(Expr::Ident { span: *span, name: "layer_norm".into() }),
                     args: vec![Expr::Ident { span: *span, name: "x".into() }],
                     named: vec![("eps".into(), Expr::FloatLit { span: *span, value: 1e-5 })] };
-                return Some(Some((layernorm, "layernorm_fusion", 5.0, MlOptCategory::KernelFusion)));
+                return Some((layernorm, "layernorm_fusion", 5.0, MlOptCategory::KernelFusion));
             }
         }
         None
@@ -1125,14 +1410,14 @@ impl MlSuperoptimizer {
 
     // ─── P5: BatchNorm ────────────────────────────────────────────────────
 
-    fn try_batchnorm_pattern(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_batchnorm_pattern(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::BinOp { op: BinOpKind::Add, lhs, rhs, span } = expr {
             if let Expr::BinOp { op: BinOpKind::Mul, lhs: inner, .. } = lhs.as_ref() {
                 if self.is_x_minus_mean(inner) {
                     let batchnorm = Expr::Call { span: *span,
                         func: Box::new(Expr::Ident { span: *span, name: "batch_norm".into() }),
                         args: vec![*inner.clone(), *rhs.clone()], named: vec![] };
-                    return Some(Some((batchnorm, "batchnorm_fusion", 8.0, MlOptCategory::KernelFusion)));
+                    return Some((batchnorm, "batchnorm_fusion", 8.0, MlOptCategory::KernelFusion));
                 }
             }
         }
@@ -1141,22 +1426,22 @@ impl MlSuperoptimizer {
 
     // ─── P6: Activations ──────────────────────────────────────────────────
 
-    fn try_activation_rewrite(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_activation_rewrite(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         // max(0, x) → relu(x)
         if let Expr::Call { func, args, span, .. } = expr {
             if let Expr::Ident { name, .. } = func.as_ref() {
                 if name == "max" && args.len() == 2 {
                     if let Expr::IntLit { value: 0, .. } = &args[0] {
-                        return Some(Some((Expr::Call { span: *span,
+                        return Some((Expr::Call { span: *span,
                             func: Box::new(Expr::Ident { span: *span, name: "relu".into() }),
                             args: vec![args[1].clone()], named: vec![] },
-                            "relu_from_max", 1.5, MlOptCategory::KernelFusion)));
+                            "relu_from_max", 1.5, MlOptCategory::KernelFusion));
                     }
                     if let Expr::IntLit { value: 0, .. } = &args[1] {
-                        return Some(Some((Expr::Call { span: *span,
+                        return Some((Expr::Call { span: *span,
                             func: Box::new(Expr::Ident { span: *span, name: "relu".into() }),
                             args: vec![args[0].clone()], named: vec![] },
-                            "relu_from_max", 1.5, MlOptCategory::KernelFusion)));
+                            "relu_from_max", 1.5, MlOptCategory::KernelFusion));
                     }
                 }
             }
@@ -1166,10 +1451,10 @@ impl MlSuperoptimizer {
             if let Expr::Call { func, args, .. } = rhs.as_ref() {
                 if let Expr::Ident { name, .. } = func.as_ref() {
                     if name == "sigmoid" && Self::exprs_equal_ident(lhs, args.first()) {
-                        return Some(Some((Expr::Call { span: *span,
+                        return Some((Expr::Call { span: *span,
                             func: Box::new(Expr::Ident { span: *span, name: "silu".into() }),
                             args: vec![*lhs.clone()], named: vec![] },
-                            "silu_from_sigmoid", 2.0, MlOptCategory::KernelFusion)));
+                            "silu_from_sigmoid", 2.0, MlOptCategory::KernelFusion));
                     }
                 }
             }
@@ -1179,7 +1464,7 @@ impl MlSuperoptimizer {
 
     // ─── P9: Attention → FlashAttention ────────────────────────────────────
 
-    fn try_attention_pattern(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_attention_pattern(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::MatMul { lhs, rhs, span } = expr {
             if let Expr::Call { func, .. } = lhs.as_ref() {
                 if let Expr::Ident { name, .. } = func.as_ref() {
@@ -1189,7 +1474,7 @@ impl MlSuperoptimizer {
                             args: vec![Expr::Ident { span: *span, name: "Q".into() },
                                 Expr::Ident { span: *span, name: "K".into() }, *rhs.clone()],
                             named: vec![] };
-                        return Some(Some((flash, "flash_attention", 20.0, MlOptCategory::MemoryOptimization)));
+                        return Some((flash, "flash_attention", 20.0, MlOptCategory::MemoryOptimization));
                     }
                 }
             }
@@ -1199,7 +1484,7 @@ impl MlSuperoptimizer {
 
     // ─── P11: Transpose + MatMul → Layout-Synthesized ─────────────────────
 
-    fn try_transpose_matmul(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_transpose_matmul(&mut self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::MatMul { lhs, rhs, span } = expr {
             // A @ transpose(B) → matmul_nt(A, B) — no transpose needed!
             if let Expr::Call { func, args, .. } = rhs.as_ref() {
@@ -1209,8 +1494,9 @@ impl MlSuperoptimizer {
                             func: Box::new(Expr::Ident { span: *span, name: "matmul_nt".into() }),
                             args: vec![*lhs.clone(), args.first().cloned().unwrap_or(Expr::Ident { span: *span, name: "B".into() })],
                             named: vec![] };
-                        self_record_layout("transpose_eliminated");
-                        return Some(Some((fused, "transpose_matmul_fusion", 3.0, MlOptCategory::LayoutSynthesis)));
+                        self.stats.layout_syntheses += 1;
+                        self.stats.total_estimated_speedup += 3.0;
+                        return Some((fused, "transpose_matmul_fusion", 3.0, MlOptCategory::LayoutSynthesis));
                     }
                 }
             }
@@ -1221,7 +1507,9 @@ impl MlSuperoptimizer {
                             func: Box::new(Expr::Ident { span: *span, name: "matmul_tn".into() }),
                             args: vec![args.first().cloned().unwrap_or(Expr::Ident { span: *span, name: "A".into() }), *rhs.clone()],
                             named: vec![] };
-                        return Some(Some((fused, "transpose_matmul_fusion", 3.0, MlOptCategory::LayoutSynthesis)));
+                        self.stats.layout_syntheses += 1;
+                        self.stats.total_estimated_speedup += 3.0;
+                        return Some((fused, "transpose_matmul_fusion", 3.0, MlOptCategory::LayoutSynthesis));
                     }
                 }
             }
@@ -1231,13 +1519,13 @@ impl MlSuperoptimizer {
 
     // ─── P12: Gradient accumulation ───────────────────────────────────────
 
-    fn try_gradient_accumulation(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_gradient_accumulation(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::Assign { op: AssignOpKind::SubAssign, target, value, span } = expr {
             if let Expr::BinOp { op: BinOpKind::Mul, .. } = value.as_ref() {
                 let fused = Expr::Call { span: *span,
                     func: Box::new(Expr::Ident { span: *span, name: "grad_step".into() }),
                     args: vec![*target.clone(), *value.clone()], named: vec![] };
-                return Some(Some((fused, "gradient_step_fusion", 2.0, MlOptCategory::KernelFusion)));
+                return Some((fused, "gradient_step_fusion", 2.0, MlOptCategory::KernelFusion));
             }
         }
         if let Expr::Assign { op: AssignOpKind::Assign, target, value, span } = expr {
@@ -1247,7 +1535,7 @@ impl MlSuperoptimizer {
                         let fused = Expr::Call { span: *span,
                             func: Box::new(Expr::Ident { span: *span, name: "grad_step".into() }),
                             args: vec![*target.clone(), *rhs.clone()], named: vec![] };
-                        return Some(Some((fused, "gradient_step_fusion", 2.0, MlOptCategory::KernelFusion)));
+                        return Some((fused, "gradient_step_fusion", 2.0, MlOptCategory::KernelFusion));
                     }
                 }
             }
@@ -1257,14 +1545,14 @@ impl MlSuperoptimizer {
 
     // ─── P14: Zero-copy reshape ────────────────────────────────────────────
 
-    fn try_zero_copy_reshape(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_zero_copy_reshape(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::Call { func, args, span, .. } = expr {
             if let Expr::Ident { name, .. } = func.as_ref() {
                 if ["reshape", "flatten", "view", "squeeze", "unsqueeze", "permute", "contiguous"].contains(&name.as_str()) {
                     let annotated = Expr::Call { span: *span,
                         func: Box::new(Expr::Ident { span: *span, name: format!("{}_view", name) }),
                         args: args.clone(), named: vec![] };
-                    return Some(Some((annotated, "zero_copy_reshape", 10.0, MlOptCategory::ZeroCopyView)));
+                    return Some((annotated, "zero_copy_reshape", 10.0, MlOptCategory::ZeroCopyView));
                 }
             }
         }
@@ -1273,7 +1561,7 @@ impl MlSuperoptimizer {
 
     // ─── P15: Dropout ──────────────────────────────────────────────────────
 
-    fn try_dropout_pattern(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_dropout_pattern(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::HadamardDiv { lhs, rhs, span } = expr {
             if let Expr::HadamardMul { lhs: x, rhs: mask, .. } = lhs.as_ref() {
                 if let Expr::BinOp { op: BinOpKind::Sub, lhs: one, .. } = rhs.as_ref() {
@@ -1281,7 +1569,7 @@ impl MlSuperoptimizer {
                         let fused = Expr::Call { span: *span,
                             func: Box::new(Expr::Ident { span: *span, name: "dropout".into() }),
                             args: vec![*x.clone(), *mask.clone()], named: vec![] };
-                        return Some(Some((fused, "dropout_fusion", 3.0, MlOptCategory::KernelFusion)));
+                        return Some((fused, "dropout_fusion", 3.0, MlOptCategory::KernelFusion));
                     }
                 }
             }
@@ -1291,13 +1579,13 @@ impl MlSuperoptimizer {
 
     // ─── HadamardMul of MatMul ─────────────────────────────────────────────
 
-    fn try_hadamard_matmul_fusion(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_hadamard_matmul_fusion(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::HadamardMul { lhs, rhs, span } = expr {
             if let Expr::MatMul { .. } = lhs.as_ref() {
                 let fused = Expr::Call { span: *span,
                     func: Box::new(Expr::Ident { span: *span, name: "matmul_elemwise".into() }),
                     args: vec![*lhs.clone(), *rhs.clone()], named: vec![] };
-                return Some(Some((fused, "hadamard_matmul_fusion", 3.0, MlOptCategory::KernelFusion)));
+                return Some((fused, "hadamard_matmul_fusion", 3.0, MlOptCategory::KernelFusion));
             }
         }
         None
@@ -1305,7 +1593,7 @@ impl MlSuperoptimizer {
 
     // ─── Elementwise chain fusion ──────────────────────────────────────────
 
-    fn try_elementwise_chain_fusion(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_elementwise_chain_fusion(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         let depth = self.elementwise_depth(expr);
         if depth >= 3 {
             let span = expr.span();
@@ -1313,7 +1601,7 @@ impl MlSuperoptimizer {
             let fused = Expr::Call { span,
                 func: Box::new(Expr::Ident { span, name: "fused_elementwise".into() }),
                 args: vec![expr.clone()], named: vec![] };
-            return Some(Some((fused, "elementwise_chain_fusion", speedup, MlOptCategory::KernelFusion)));
+            return Some((fused, "elementwise_chain_fusion", speedup, MlOptCategory::KernelFusion));
         }
         None
     }
@@ -1338,7 +1626,7 @@ impl MlSuperoptimizer {
 
     // ─── Scaled matmul ─────────────────────────────────────────────────────
 
-    fn try_scaled_matmul(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_scaled_matmul(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::BinOp { op, lhs, rhs, span } = expr {
             let is_scale = matches!(op, BinOpKind::Mul | BinOpKind::Div);
             if is_scale {
@@ -1347,7 +1635,7 @@ impl MlSuperoptimizer {
                         let fused = Expr::Call { span: *span,
                             func: Box::new(Expr::Ident { span: *span, name: "scaled_matmul".into() }),
                             args: vec![*lhs.clone(), *rhs.clone()], named: vec![] };
-                        return Some(Some((fused, "scaled_matmul", 2.0, MlOptCategory::KernelFusion)));
+                        return Some((fused, "scaled_matmul", 2.0, MlOptCategory::KernelFusion));
                     }
                 }
             }
@@ -1358,7 +1646,7 @@ impl MlSuperoptimizer {
                     let fused = Expr::Call { span: *span,
                         func: Box::new(Expr::Ident { span: *span, name: "scaled_matmul".into() }),
                         args: vec![*lhs.clone(), *rhs.clone()], named: vec![] };
-                    return Some(Some((fused, "scaled_matmul", 2.0, MlOptCategory::KernelFusion)));
+                    return Some((fused, "scaled_matmul", 2.0, MlOptCategory::KernelFusion));
                 }
             }
         }
@@ -1367,7 +1655,7 @@ impl MlSuperoptimizer {
 
     // ─── P16: Residual block: x + sublayer(norm(x)) ───────────────────────
 
-    fn try_residual_block(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_residual_block(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         // Detect: x + linear(norm(x)) or x + conv2d(norm(x)) — residual connection
         if let Expr::BinOp { op: BinOpKind::Add, lhs, rhs, span } = expr {
             // Check if one side is the "skip" and the other is a sublayer
@@ -1380,7 +1668,7 @@ impl MlSuperoptimizer {
                             let fused = Expr::Call { span: *span,
                                 func: Box::new(Expr::Ident { span: *span, name: "residual_block".into() }),
                                 args: vec![*lhs.clone(), *rhs.clone()], named: vec![] };
-                            return Some(Some((fused, "residual_block_fusion", 4.0, MlOptCategory::KernelFusion)));
+                            return Some((fused, "residual_block_fusion", 4.0, MlOptCategory::KernelFusion));
                         }
                     }
                 }
@@ -1391,7 +1679,7 @@ impl MlSuperoptimizer {
 
     // ─── P17: RMSNorm: x / sqrt(mean(x^2) + eps) ──────────────────────────
 
-    fn try_rmsnorm_pattern(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_rmsnorm_pattern(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         // Detect: x / sqrt(mean(x * x) + eps) or x * rsqrt(mean(x^2) + eps)
         if let Expr::BinOp { op: BinOpKind::Div, lhs, rhs, span } = expr {
             if self.is_sqrt_mean_sq_plus_eps(rhs) {
@@ -1399,7 +1687,7 @@ impl MlSuperoptimizer {
                     func: Box::new(Expr::Ident { span: *span, name: "rms_norm".into() }),
                     args: vec![*lhs.clone()],
                     named: vec![("eps".into(), Expr::FloatLit { span: *span, value: 1e-6 })] };
-                return Some(Some((rmsnorm, "rmsnorm_fusion", 5.0, MlOptCategory::KernelFusion)));
+                return Some((rmsnorm, "rmsnorm_fusion", 5.0, MlOptCategory::KernelFusion));
             }
         }
         if let Expr::HadamardDiv { lhs, rhs, span } = expr {
@@ -1408,7 +1696,7 @@ impl MlSuperoptimizer {
                     func: Box::new(Expr::Ident { span: *span, name: "rms_norm".into() }),
                     args: vec![*lhs.clone()],
                     named: vec![("eps".into(), Expr::FloatLit { span: *span, value: 1e-6 })] };
-                return Some(Some((rmsnorm, "rmsnorm_fusion", 5.0, MlOptCategory::KernelFusion)));
+                return Some((rmsnorm, "rmsnorm_fusion", 5.0, MlOptCategory::KernelFusion));
             }
         }
         None
@@ -1434,7 +1722,7 @@ impl MlSuperoptimizer {
 
     // ─── P18: Rotary embedding ─────────────────────────────────────────────
 
-    fn try_rotary_embedding(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_rotary_embedding(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         // Detect: q * cos + rotate_half(q) * sin pattern
         if let Expr::BinOp { op: BinOpKind::Add, lhs, rhs, span } = expr {
             if let Expr::BinOp { op: BinOpKind::Mul, lhs: q1, rhs: cos, .. } = lhs.as_ref() {
@@ -1446,7 +1734,7 @@ impl MlSuperoptimizer {
                             let rotary = Expr::Call { span: *span,
                                 func: Box::new(Expr::Ident { span: *span, name: "rotary_embedding".into() }),
                                 args: vec![*q1.clone(), *cos.clone(), *sin.clone()], named: vec![] };
-                            return Some(Some((rotary, "rotary_embedding_fusion", 3.0, MlOptCategory::KernelFusion)));
+                            return Some((rotary, "rotary_embedding_fusion", 3.0, MlOptCategory::KernelFusion));
                         }
                     }
                 }
@@ -1457,7 +1745,7 @@ impl MlSuperoptimizer {
 
     // ─── P19: Auto-quantization detection ──────────────────────────────────
 
-    fn try_auto_quantize(&self, expr: &Expr) -> Option<Option<(Expr, &'static str, f64, MlOptCategory)>> {
+    fn try_auto_quantize(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         // Detect patterns that can safely run in fp16/bf16
         if let Expr::Call { func, args, span, .. } = expr {
             if let Expr::Ident { name, .. } = func.as_ref() {
@@ -1478,7 +1766,7 @@ impl MlSuperoptimizer {
                         let annotated = Expr::Call { span: *span,
                             func: Box::new(Expr::Ident { span: *span, name: format!("{}_auto_quant", name) }),
                             args: args.clone(), named: vec![] };
-                        return Some(Some((annotated, "auto_quantize_hint", 2.0, MlOptCategory::AutoQuantization)));
+                        return Some((annotated, "auto_quantize_hint", 2.0, MlOptCategory::AutoQuantization));
                     }
                 }
             }
@@ -1781,9 +2069,12 @@ impl MlSuperoptimizer {
     }
 }
 
-// Helper for layout synthesis recording (can't use self in some contexts)
-fn self_record_layout(_name: &str) {
-    // Layout synthesis is recorded by the caller
+impl Default for StabilityChecker {
+    fn default() -> Self { Self::new() }
+}
+
+impl Default for MctsMlSearch {
+    fn default() -> Self { Self::new() }
 }
 
 impl Default for MlSuperoptimizer {
