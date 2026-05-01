@@ -2281,6 +2281,7 @@ impl Env {
             self.values[slot as usize] = val;
         } else {
             // Slow path: new binding.
+            eprintln!("[DEBUG-ENV] set({name}): NOT FOUND in name_to_slot, calling set_local. Keys: {:?}", self.name_to_slot.keys().collect::<Vec<_>>());
             self.set_local(name, val);
         }
     }
@@ -4045,6 +4046,9 @@ pub struct Interpreter {
     jit_native_calls: u64,
     jit_vm_calls: u64,
     jit_fallback_calls: u64,
+    /// Level 4: Data-Dependent JIT Evolution engine.
+    /// Tracks observed runtime values and creates specialized code versions.
+    pub data_dependent_jit: crate::optimizer::data_dependent_jit::DataDependentJIT,
     ecs_query_scratch: Vec<EntityId>,
 }
 
@@ -4087,6 +4091,7 @@ impl Interpreter {
             jit_native_calls: 0,
             jit_vm_calls: 0,
             jit_fallback_calls: 0,
+            data_dependent_jit: crate::optimizer::data_dependent_jit::DataDependentJIT::new(),
             ecs_query_scratch: Vec::new(),
         }
     }

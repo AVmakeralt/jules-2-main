@@ -604,6 +604,30 @@ impl Pipeline {
             }
         }
 
+        // ── Pass 7: Level 4 Semantic Superoptimizer (Algorithmic Lifting) ─────
+        // Replaces algorithmic patterns with mathematically-equivalent O(1) formulas.
+        // e.g., sum of 1..n → n*(n+1)/2, polynomial → Horner's method
+        if self.opt_level >= 2 {
+            let mut semantic = crate::optimizer::semantic_superopt::SemanticSuperoptimizer::new();
+            semantic.optimize_program(&mut program);
+            if self.print_opt_stats && semantic.patterns_matched > 0 {
+                eprintln!("[opt/L4] semantic_patterns={} estimated_speedup={:.1}x",
+                    semantic.patterns_matched, semantic.total_estimated_speedup);
+            }
+        }
+
+        // ── Pass 8: Level 4 Polyhedral Optimizer (Cache-Tiled Loops) ──────────
+        // Analyzes loop nests and applies cache-optimal tiling, interchange,
+        // and fusion. Uses the real CPU cache model for tile size selection.
+        if self.opt_level >= 2 {
+            let mut polyhedral = crate::optimizer::polyhedral::PolyhedralOptimizer::new();
+            polyhedral.optimize_program(&mut program);
+            if self.print_opt_stats && polyhedral.loops_optimized > 0 {
+                eprintln!("[opt/L4] polyhedral_loops={} cache_miss_reduction={:.1}%",
+                    polyhedral.loops_optimized, polyhedral.total_cache_miss_reduction * 100.0);
+            }
+        }
+
         // ── Promote warnings to errors if requested ───────────────────────────
         if self.warn_as_error {
             for d in &mut unit.diags {

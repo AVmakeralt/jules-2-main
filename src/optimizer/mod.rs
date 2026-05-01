@@ -12,6 +12,9 @@ pub mod multi_tier_jit;
 pub mod optimizer;
 pub mod profile_guided;
 pub mod self_repair;
+pub mod data_dependent_jit;
+pub mod polyhedral;
+pub mod semantic_superopt;
 pub mod soa_optimizer;
 #[cfg(feature = "phase3-jit")]
 pub mod tiered_compilation;
