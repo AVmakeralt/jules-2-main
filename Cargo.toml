@@ -44,6 +44,10 @@ path = "src/tools/bench_mcts_superopt.rs"
 name = "train-gnn"
 path = "src/tools/train_gnn.rs"
 
+[[bin]]
+name = "bench-speed"
+path = "benches/bench_speed.rs"
+
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }
