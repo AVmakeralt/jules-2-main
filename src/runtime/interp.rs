@@ -117,9 +117,9 @@ pub enum Value {
     IVec2([i32; 2]),
     IVec3([i32; 3]),
     IVec4([i32; 4]),
-    Mat2([[f32; 2]; 2]),
-    Mat3([[f32; 3]; 3]),
-    Mat4([[f32; 4]; 4]),
+    Mat2(Box<[[f32; 2]; 2]>),
+    Mat3(Box<[[f32; 3]; 3]>),
+    Mat4(Box<[[f32; 4]; 4]>),
     Quat([f32; 4]), // [x, y, z, w]
 
     // ── Data pipelines / data loaders (Feature 8) ─────────────────────────────
@@ -2325,6 +2325,25 @@ impl Env {
             .iter()
             .map(|(name, &slot)| (name.as_ref(), &self.values[slot as usize]))
     }
+
+    /// Fast path: get i32 directly without cloning the Value enum
+    #[inline(always)]
+    pub fn get_i32(&self, name: &str) -> Option<i32> {
+        self.name_to_slot.get(name).and_then(|&slot| {
+            match self.values.get(slot as usize) {
+                Some(Value::I32(v)) => Some(*v),
+                _ => None,
+            }
+        })
+    }
+
+    /// Fast path: set i32 directly without creating a Value enum
+    #[inline(always)]
+    pub fn set_i32(&mut self, name: &str, val: i32) {
+        if let Some(&slot) = self.name_to_slot.get(name) {
+            self.values[slot as usize] = Value::I32(val);
+        }
+    }
 }
 
 // =============================================================================
@@ -4389,7 +4408,7 @@ impl Interpreter {
     // §11  STATEMENT EVALUATION
     // =========================================================================
 
-    #[inline(never)] // Large match: keep out of the hot inlining budget.
+    #[inline]
     pub fn eval_stmt(&mut self, stmt: &Stmt, env: &mut Env) -> Result<Value, RuntimeError> {
         match stmt {
             Stmt::Let { pattern, init, .. } => {
@@ -5130,10 +5149,10 @@ impl Interpreter {
                 };
                 Ok(Value::TensorFast(Arc::new(RefCell::new(out))))
             }
-            (Value::Mat3(a), Value::Mat3(b)) => Ok(Value::Mat3(mat3_mul(a, b))),
-            (Value::Mat4(a), Value::Mat4(b)) => Ok(Value::Mat4(mat4_mul(a, b))),
-            (Value::Mat3(m), Value::Vec3(v)) => Ok(Value::Vec3(mat3_vec3_mul(m, v))),
-            (Value::Mat4(m), Value::Vec4(v)) => Ok(Value::Vec4(mat4_vec4_mul(m, v))),
+            (Value::Mat3(ref a), Value::Mat3(ref b)) => Ok(Value::Mat3(Box::new(mat3_mul(**a, **b)))),
+            (Value::Mat4(ref a), Value::Mat4(ref b)) => Ok(Value::Mat4(Box::new(mat4_mul(**a, **b)))),
+            (Value::Mat3(ref m), Value::Vec3(v)) => Ok(Value::Vec3(mat3_vec3_mul(**m, v))),
+            (Value::Mat4(ref m), Value::Vec4(v)) => Ok(Value::Vec4(mat4_vec4_mul(**m, v))),
             (l, r) => rt_err!(
                 "@ requires tensor/matrix operands, got `{}` @ `{}`",
                 l.type_name(),
@@ -8723,7 +8742,7 @@ impl GpuBackend for JulesGpuAdapter {
 ///
 /// Hot path: I32 × I32 and F32 × F32 are handled first to avoid the full
 /// numeric type dispatch on every inner-loop iteration.
-#[inline]
+#[inline(always)]
 fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, RuntimeError> {
     // ── Ultra-fast path: I32 × I32 (loop counters, indices, most arithmetic) ──
     if let (Value::I32(a), Value::I32(b)) = (&l, &r) {
@@ -8793,6 +8812,78 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::Ne => Ok(Value::Bool(a != b)),
             _ => Err(RuntimeError::new(format!(
                 "op {:?} not defined for f32",
+                op
+            ))),
+        };
+    }
+    // ── Fast path: I64 × I64 ─────────────────────────────────────────────────
+    if let (Value::I64(a), Value::I64(b)) = (&l, &r) {
+        let (a, b) = (*a, *b);
+        return match op {
+            BinOpKind::Add => Ok(Value::I64(a.wrapping_add(b))),
+            BinOpKind::Sub => Ok(Value::I64(a.wrapping_sub(b))),
+            BinOpKind::Mul => Ok(Value::I64(a.wrapping_mul(b))),
+            BinOpKind::Div => {
+                if b == 0 {
+                    rt_err!("division by zero")
+                } else {
+                    Ok(Value::I64(a / b))
+                }
+            }
+            BinOpKind::Rem => {
+                if b == 0 {
+                    rt_err!("modulo by zero")
+                } else {
+                    Ok(Value::I64(a % b))
+                }
+            }
+            BinOpKind::Lt => Ok(Value::Bool(a < b)),
+            BinOpKind::Le => Ok(Value::Bool(a <= b)),
+            BinOpKind::Gt => Ok(Value::Bool(a > b)),
+            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
+            BinOpKind::Eq => Ok(Value::Bool(a == b)),
+            BinOpKind::Ne => Ok(Value::Bool(a != b)),
+            BinOpKind::BitAnd => Ok(Value::I64(a & b)),
+            BinOpKind::BitOr => Ok(Value::I64(a | b)),
+            BinOpKind::BitXor => Ok(Value::I64(a ^ b)),
+            BinOpKind::Shl => Ok(Value::I64(a << (b as u32))),
+            BinOpKind::Shr => Ok(Value::I64(a >> (b as u32))),
+            _ => Err(RuntimeError::new(format!(
+                "op {:?} not defined for i64",
+                op
+            ))),
+        };
+    }
+    // ── Fast path: F64 × F64 ─────────────────────────────────────────────────
+    if let (Value::F64(a), Value::F64(b)) = (&l, &r) {
+        let (a, b) = (*a, *b);
+        return match op {
+            BinOpKind::Add => Ok(Value::F64(a + b)),
+            BinOpKind::Sub => Ok(Value::F64(a - b)),
+            BinOpKind::Mul => Ok(Value::F64(a * b)),
+            BinOpKind::Div => {
+                if b == 0.0 {
+                    rt_err!("division by zero")
+                } else {
+                    Ok(Value::F64(a / b))
+                }
+            }
+            BinOpKind::Rem => Ok(Value::F64(a % b)),
+            BinOpKind::FloorDiv => {
+                if b == 0.0 {
+                    rt_err!("floor division by zero")
+                } else {
+                    Ok(Value::F64((a / b).floor()))
+                }
+            }
+            BinOpKind::Lt => Ok(Value::Bool(a < b)),
+            BinOpKind::Le => Ok(Value::Bool(a <= b)),
+            BinOpKind::Gt => Ok(Value::Bool(a > b)),
+            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
+            BinOpKind::Eq => Ok(Value::Bool(a == b)),
+            BinOpKind::Ne => Ok(Value::Bool(a != b)),
+            _ => Err(RuntimeError::new(format!(
+                "op {:?} not defined for f64",
                 op
             ))),
         };

@@ -369,12 +369,12 @@ pub fn dispatch(
         }
 
         // ── mat4 operations ──────────────────────────────────────────────
-        "math::mat4_identity" => Some(Ok(crate::interp::Value::Mat4([
+        "math::mat4_identity" => Some(Ok(crate::interp::Value::Mat4(Box::new([
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
-        ]))),
+        ])))),
         "math::mat4_perspective" => {
             if args.len() < 4 {
                 return rt_err!("mat4_perspective() requires fov_y, aspect, near, far");
@@ -385,12 +385,12 @@ pub fn dispatch(
                 get_num(args, 2),
                 get_num(args, 3),
             ) {
-                Some(Ok(crate::interp::Value::Mat4(make_perspective(
+                Some(Ok(crate::interp::Value::Mat4(Box::new(make_perspective(
                     fov as f32,
                     aspect as f32,
                     near as f32,
                     far as f32,
-                ))))
+                )))))
             } else {
                 rt_err!("mat4_perspective() requires fov_y, aspect, near, far")
             }
@@ -412,11 +412,11 @@ pub fn dispatch(
                 let upz = get_num(args, 8).unwrap_or(0.0) as f32;
                 let eye = [eyex as f32, eyey as f32, eyez as f32];
                 let target = [tx as f32, ty as f32, tz as f32];
-                Some(Ok(crate::interp::Value::Mat4(make_look_at(
+                Some(Ok(crate::interp::Value::Mat4(Box::new(make_look_at(
                     eye,
                     target,
                     [upx, upy, upz],
-                ))))
+                )))))
             } else {
                 rt_err!("mat4_look_at() requires eye/target/up")
             }
@@ -428,9 +428,9 @@ pub fn dispatch(
             if let (Some(x), Some(y), Some(z)) =
                 (get_num(args, 0), get_num(args, 1), get_num(args, 2))
             {
-                Some(Ok(crate::interp::Value::Mat4(make_translate(
+                Some(Ok(crate::interp::Value::Mat4(Box::new(make_translate(
                     x as f32, y as f32, z as f32,
-                ))))
+                )))))
             } else {
                 rt_err!("mat4_translate() requires x, y, z")
             }
@@ -442,37 +442,37 @@ pub fn dispatch(
             if let (Some(x), Some(y), Some(z)) =
                 (get_num(args, 0), get_num(args, 1), get_num(args, 2))
             {
-                Some(Ok(crate::interp::Value::Mat4(make_scale(
+                Some(Ok(crate::interp::Value::Mat4(Box::new(make_scale(
                     x as f32, y as f32, z as f32,
-                ))))
+                )))))
             } else {
                 rt_err!("mat4_scale() requires x, y, z")
             }
         }
         "math::mat4_rotate_x" => {
             if let Some(a) = get_num(args, 0) {
-                Some(Ok(crate::interp::Value::Mat4(make_rot_x(a as f32))))
+                Some(Ok(crate::interp::Value::Mat4(Box::new(make_rot_x(a as f32)))))
             } else {
                 rt_err!("mat4_rotate_x() requires angle")
             }
         }
         "math::mat4_rotate_y" => {
             if let Some(a) = get_num(args, 0) {
-                Some(Ok(crate::interp::Value::Mat4(make_rot_y(a as f32))))
+                Some(Ok(crate::interp::Value::Mat4(Box::new(make_rot_y(a as f32)))))
             } else {
                 rt_err!("mat4_rotate_y() requires angle")
             }
         }
         "math::mat4_rotate_z" => {
             if let Some(a) = get_num(args, 0) {
-                Some(Ok(crate::interp::Value::Mat4(make_rot_z(a as f32))))
+                Some(Ok(crate::interp::Value::Mat4(Box::new(make_rot_z(a as f32)))))
             } else {
                 rt_err!("mat4_rotate_z() requires angle")
             }
         }
         "math::mat4_mul" => {
             if let (Some(a), Some(b)) = (arg_mat4(0, args), arg_mat4(1, args)) {
-                Some(Ok(crate::interp::Value::Mat4(mat4_mul(a, b))))
+                Some(Ok(crate::interp::Value::Mat4(Box::new(mat4_mul(a, b)))))
             } else {
                 rt_err!("mat4_mul() requires two mat4 arguments")
             }
@@ -487,7 +487,7 @@ pub fn dispatch(
         "math::mat4_inverse" => {
             if let Some(m) = arg_mat4(0, args) {
                 if let Some(inv) = mat4_inverse(m) {
-                    Some(Ok(crate::interp::Value::Mat4(inv)))
+                    Some(Ok(crate::interp::Value::Mat4(Box::new(inv))))
                 } else {
                     rt_err!("mat4_inverse(): matrix is singular")
                 }
@@ -497,7 +497,7 @@ pub fn dispatch(
         }
         "math::mat4_transpose" => {
             if let Some(m) = arg_mat4(0, args) {
-                Some(Ok(crate::interp::Value::Mat4(mat4_transpose(m))))
+                Some(Ok(crate::interp::Value::Mat4(Box::new(mat4_transpose(m)))))
             } else {
                 rt_err!("mat4_transpose() requires a mat4 argument")
             }
@@ -515,7 +515,7 @@ pub fn dispatch(
                 let t = make_translate(pos[0], pos[1], pos[2]);
                 let r = quat_to_mat4(rot);
                 let s = make_scale(scale[0], scale[1], scale[2]);
-                Some(Ok(crate::interp::Value::Mat4(mat4_mul(mat4_mul(t, r), s))))
+                Some(Ok(crate::interp::Value::Mat4(Box::new(mat4_mul(mat4_mul(t, r), s)))))
             } else {
                 rt_err!("transform() requires pos: vec3, rot: quat, scale: vec3")
             }
@@ -771,7 +771,7 @@ fn arg_quat(i: usize, args: &[crate::interp::Value]) -> Option<[f32; 4]> {
 
 fn arg_mat4(i: usize, args: &[crate::interp::Value]) -> Option<[[f32; 4]; 4]> {
     match args.get(i) {
-        Some(crate::interp::Value::Mat4(m)) => Some(*m),
+        Some(crate::interp::Value::Mat4(ref m)) => Some(**m),
         _ => None,
     }
 }
