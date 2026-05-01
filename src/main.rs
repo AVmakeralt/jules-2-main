@@ -46,7 +46,7 @@ pub use tools::shader_tooling;
 
 // Standard library — game dev, ML, simulation.
 #[allow(clippy::manual_retain)]
-mod jules_std;
+pub mod jules_std;
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as FmtWrite;

@@ -37,6 +37,10 @@ name = "bench-prime-race"
 path = "src/tools/bench_prime_race.rs"
 
 [[bin]]
+name = "bench-extreme"
+path = "src/tools/bench_extreme.rs"
+
+[[bin]]
 name = "bench-mcts-superopt"
 path = "src/tools/bench_mcts_superopt.rs"
 required-features = ["gnn-optimizer"]

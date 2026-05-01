@@ -19,6 +19,8 @@ mod noise;
 mod pathfind;
 mod random;
 mod spatial;
+pub mod sieve_210;
+pub mod prng_simd;
 
 use crate::interp::{RuntimeError, Value};
 
@@ -36,6 +38,8 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         .or_else(|| net::dispatch(name, args))
         .or_else(|| alloc::dispatch(name, args))
         .or_else(|| collections::dispatch(name, args))
+        .or_else(|| sieve_210::dispatch(name, args))
+        .or_else(|| prng_simd::dispatch(name, args))
 }
 
 /// List all available stdlib modules and functions (for introspection).
