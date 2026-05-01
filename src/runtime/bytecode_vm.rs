@@ -21,13 +21,16 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bumpalo::Bump;
 use rustc_hash::FxHashMap;
 
 use crate::compiler::ast::{AssignOpKind, BinOpKind, IfOrBlock, Program, UnOpKind, VecSize};
-use crate::interp::{RuntimeError, Tensor, Value};
+use crate::interp::{RuntimeError, StructData, Tensor, Value};
+#[cfg(feature = "gnn-optimizer")]
 use crate::runtime::memory_management::PrefetchEngine;
 use crate::optimizer::data_dependent_jit::DataDependentJIT;
 
@@ -1363,6 +1366,7 @@ pub struct BytecodeVM {
     /// Execution statistics
     total_instructions: u64,
     total_time_ns: u64,
+    #[cfg(feature = "gnn-optimizer")]
     prefetch: PrefetchEngine,
 
     /// Native function table (indexed by CallNative.func_idx)
@@ -1390,6 +1394,7 @@ impl BytecodeVM {
             profiler: None,
             total_instructions: 0,
             total_time_ns: 0,
+            #[cfg(feature = "gnn-optimizer")]
             prefetch: PrefetchEngine::default(),
             native_functions: Vec::new(),
             call_stack: Vec::new(),
@@ -1532,13 +1537,16 @@ impl BytecodeVM {
             // Prefetch the write destination one slot ahead — the one software
             // hint that pays its cost (PREFETCHW eliminates the RFO stall).
             // Instruction-stream prefetch is intentionally omitted; see module doc.
-            self.prefetch.tick(branch_density);
-            self.prefetch.prefetch_dual(
-                // insn_base/pc/insn_len are ignored inside prefetch_dual now;
-                // pass them for API compatibility.
-                instructions.as_ptr(), pc, func_len,
-                slot_ptr, pc, slots.len(),
-            );
+            #[cfg(feature = "gnn-optimizer")]
+            {
+                self.prefetch.tick(branch_density);
+                self.prefetch.prefetch_dual(
+                    // insn_base/pc/insn_len are ignored inside prefetch_dual now;
+                    // pass them for API compatibility.
+                    instructions.as_ptr(), pc, func_len,
+                    slot_ptr, pc, slots.len(),
+                );
+            }
 
             // SAFETY: pc < func_len (loop guard), instructions is a valid slice.
             let instr = unsafe { &*instructions.as_ptr().add(pc) };
@@ -2284,9 +2292,9 @@ impl BytecodeVM {
                 Instr::LoadField { dst, obj, field_idx } => {
                     let obj_val = &slots[*obj as usize];
                     match obj_val {
-                        Value::Struct { name: _, fields } => {
+                        Value::Struct(data) => {
                             // field_idx corresponds to the Nth field in sorted order
-                            let sorted_field = fields.iter().nth(*field_idx as usize);
+                            let sorted_field = data.fields.iter().nth(*field_idx as usize);
                             match sorted_field {
                                 Some((_, v)) => {
                                     slots[*dst as usize] = v.clone();
@@ -2314,12 +2322,12 @@ impl BytecodeVM {
                     let src_val = slots[*src as usize].clone();
                     let obj_val = &mut slots[*obj as usize];
                     match obj_val {
-                        Value::Struct { name: _, fields } => {
+                        Value::Struct(data) => {
                             // Find the Nth field in sorted order and update it
-                            let key = fields.iter().nth(*field_idx as usize).map(|(k, _)| k.clone());
+                            let key = data.fields.iter().nth(*field_idx as usize).map(|(k, _)| k.clone());
                             match key {
                                 Some(k) => {
-                                    fields.insert(k, src_val);
+                                    data.fields.insert(k, src_val);
                                 }
                                 None => {
                                     return Err(RuntimeError::new(format!(
@@ -2347,7 +2355,7 @@ impl BytecodeVM {
                     // simultaneous immutable + mutable borrows of `slots`.
                     let result_val = match (arr_val, idx_val) {
                         (Value::Array(arr_mutex), Value::I64(i)) => {
-                            let guard = arr_mutex.lock().unwrap();
+                            let guard = arr_mutex.borrow();
                             let index = *i as usize;
                             match guard.get(index) {
                                 Some(v) => v.clone(),
@@ -2384,7 +2392,7 @@ impl BytecodeVM {
                     let idx_val = &slots[*idx as usize];
                     match (arr_val, idx_val) {
                         (Value::Array(arr_mutex), Value::I64(i)) => {
-                            let mut guard = arr_mutex.lock().unwrap();
+                            let mut guard = arr_mutex.borrow_mut();
                             let index = *i as usize;
                             if index < guard.len() {
                                 guard[index] = src_val;
@@ -2414,7 +2422,7 @@ impl BytecodeVM {
                 // ── Array/Tuple Length ──
                 Instr::ArrayLen { dst, arr } => {
                     let len = match &slots[*arr as usize] {
-                        Value::Array(arr_mutex) => arr_mutex.lock().unwrap().len(),
+                        Value::Array(arr_mutex) => arr_mutex.borrow().len(),
                         Value::Tuple(v) => v.len(),
                         Value::Str(s) => s.len(),
                         other => {
@@ -2598,8 +2606,8 @@ impl BytecodeVM {
                             slots[*dst as usize] = Value::Vec2([a[0]*b[0], a[1]*b[1]]);
                         }
                         (Value::Array(l_arr), Value::Array(r_arr)) => {
-                            let l_guard = l_arr.lock().unwrap();
-                            let r_guard = r_arr.lock().unwrap();
+                            let l_guard = l_arr.borrow();
+                            let r_guard = r_arr.borrow();
                             if l_guard.len() != r_guard.len() {
                                 return Err(RuntimeError::new(format!(
                                     "HadamardMul: array length mismatch ({} vs {}) at pc={pc}",
@@ -2617,7 +2625,7 @@ impl BytecodeVM {
                                 .collect();
                             drop(l_guard);
                             drop(r_guard);
-                            slots[*dst as usize] = Value::Array(std::sync::Arc::new(std::sync::Mutex::new(result)));
+                            slots[*dst as usize] = Value::Array(Rc::new(RefCell::new(result)));
                         }
                         _ => {
                             return Err(RuntimeError::new(format!(
@@ -2636,7 +2644,7 @@ impl BytecodeVM {
                     let elems: Vec<Value> = (0..c)
                         .map(|i| slots.get(s + i).cloned().unwrap_or(Value::Unit))
                         .collect();
-                    slots[*dst as usize] = Value::Array(std::sync::Arc::new(std::sync::Mutex::new(elems)));
+                    slots[*dst as usize] = Value::Array(Rc::new(RefCell::new(elems)));
                     pc += 1;
                 }
 
@@ -2647,7 +2655,7 @@ impl BytecodeVM {
                     let elems: Vec<Value> = (0..c)
                         .map(|i| slots.get(s + i).cloned().unwrap_or(Value::Unit))
                         .collect();
-                    slots[*dst as usize] = Value::Tuple(elems);
+                    slots[*dst as usize] = Value::Tuple(Box::new(elems));
                     pc += 1;
                 }
 
@@ -2670,23 +2678,18 @@ impl BytecodeVM {
                         };
                         fields.insert(key, field_val);
                     }
-                    slots[*dst as usize] = Value::Struct { name, fields };
+                    slots[*dst as usize] = Value::Struct(Box::new(StructData { name, fields }));
                     pc += 1;
                 }
 
-                // ── MakeRange: construct a range [lo, hi) or [lo, hi] ──
+                // ── MakeRange: construct a lazy range [lo, hi) or [lo, hi] ──
                 Instr::MakeRange { dst, lo, hi, inclusive } => {
                     let lo_val = &slots[*lo as usize];
                     let hi_val = &slots[*hi as usize];
-                    // Represent range as a Tuple of (lo, hi, inclusive_flag)
-                    let lo_i = lo_val.as_i64().unwrap_or(0);
-                    let hi_i = hi_val.as_i64().unwrap_or(0);
-                    let elems = vec![
-                        Value::I64(lo_i),
-                        Value::I64(hi_i),
-                        Value::Bool(*inclusive),
-                    ];
-                    slots[*dst as usize] = Value::Tuple(elems);
+                    // Use lazy Range variant to avoid materializing the full Vec.
+                    let lo_i = lo_val.as_i64().unwrap_or(0) as i32;
+                    let hi_i = hi_val.as_i64().unwrap_or(0) as i32;
+                    slots[*dst as usize] = Value::Range { start: lo_i, end: hi_i, inclusive: *inclusive };
                     pc += 1;
                 }
 
@@ -3240,7 +3243,7 @@ mod tests {
         let result = vm.execute(0, &[]).unwrap();
         match result {
             Value::Array(arr) => {
-                let guard = arr.lock().unwrap();
+                let guard = arr.borrow();
                 assert_eq!(guard.len(), 3);
                 assert_i64(&guard[0], 10);
                 assert_i64(&guard[1], 20);

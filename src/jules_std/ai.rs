@@ -403,7 +403,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         "ai::boid_separation" => {
             if args.len() < 4 { return Some(Err(rt_err!("boid_separation() requires px, py, min_dist, neighbor_positions"))); }
             if let (Some(px), Some(py), Some(md), Value::Array(narr)) = (f64_arg(args,0), f64_arg(args,1), f64_arg(args,2), &args[3]) {
-                let narr = narr.lock().unwrap();
+                let narr = narr.borrow();
                 let neighbors: Vec<[f32;2]> = narr.iter().filter_map(|v| {
                     if let Value::Vec2(a) = v { Some(*a) } else { None }
                 }).collect();
@@ -414,7 +414,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         "ai::boid_cohesion" => {
             if args.len() < 3 { return Some(Err(rt_err!("boid_cohesion() requires px, py, max_speed, neighbor_positions"))); }
             if let (Some(px), Some(py), Some(ms), Value::Array(narr)) = (f64_arg(args,0), f64_arg(args,1), f64_arg(args,2), &args[3]) {
-                let narr = narr.lock().unwrap();
+                let narr = narr.borrow();
                 let neighbors: Vec<[f32;2]> = narr.iter().filter_map(|v| {
                     if let Value::Vec2(a) = v { Some(*a) } else { None }
                 }).collect();
@@ -425,7 +425,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         "ai::boid_alignment" => {
             if args.len() < 3 { return Some(Err(rt_err!("boid_alignment() requires vx, vy, max_speed, neighbor_velocities"))); }
             if let (Some(vx), Some(vy), Some(ms), Value::Array(narr)) = (f64_arg(args,0), f64_arg(args,1), f64_arg(args,2), &args[3]) {
-                let narr = narr.lock().unwrap();
+                let narr = narr.borrow();
                 let neighbors: Vec<[f32;2]> = narr.iter().filter_map(|v| {
                     if let Value::Vec2(a) = v { Some(*a) } else { None }
                 }).collect();
@@ -448,10 +448,10 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 // Get neighbors from args[10] and args[11]
                 let (npos, nvel) = if args.len() > 11 {
                     let npos: Vec<[f32;2]> = if let Value::Array(a) = &args[10] {
-                        a.lock().ok().map(|arr| arr.iter().filter_map(|v| { if let Value::Vec2(x)=v{Some(*x)} else{None} }).collect()).unwrap_or_default()
+                        a.try_borrow().ok().map(|arr| arr.iter().filter_map(|v| { if let Value::Vec2(x)=v{Some(*x)} else{None} }).collect()).unwrap_or_default()
                     } else { vec![] };
                     let nvel: Vec<[f32;2]> = if let Value::Array(a) = &args[11] {
-                        a.lock().ok().map(|arr| arr.iter().filter_map(|v| { if let Value::Vec2(x)=v{Some(*x)} else{None} }).collect()).unwrap_or_default()
+                        a.try_borrow().ok().map(|arr| arr.iter().filter_map(|v| { if let Value::Vec2(x)=v{Some(*x)} else{None} }).collect()).unwrap_or_default()
                     } else { vec![] };
                     (npos, nvel)
                 } else { (vec![], vec![]) };
@@ -464,9 +464,9 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         "ai::utility_score" => {
             if args.len() < 3 { return Some(Err(rt_err!("utility_score() requires values[], weights[], curves[]"))); }
             if let (Value::Array(va), Value::Array(wa), Value::Array(ca)) = (&args[0], &args[1], &args[2]) {
-                let vals: Vec<f32> = va.lock().ok().map(|a| a.iter().filter_map(|v| v.as_f64().map(|x| x as f32)).collect()).unwrap_or_default();
-                let wts: Vec<f32> = wa.lock().ok().map(|a| a.iter().filter_map(|v| v.as_f64().map(|x| x as f32)).collect()).unwrap_or_default();
-                let crv: Vec<u8> = ca.lock().ok().map(|a| a.iter().filter_map(|v| v.as_i64().map(|x| x as u8)).collect()).unwrap_or_default();
+                let vals: Vec<f32> = va.try_borrow().ok().map(|a| a.iter().filter_map(|v| v.as_f64().map(|x| x as f32)).collect()).unwrap_or_default();
+                let wts: Vec<f32> = wa.try_borrow().ok().map(|a| a.iter().filter_map(|v| v.as_f64().map(|x| x as f32)).collect()).unwrap_or_default();
+                let crv: Vec<u8> = ca.try_borrow().ok().map(|a| a.iter().filter_map(|v| v.as_i64().map(|x| x as u8)).collect()).unwrap_or_default();
                 Some(Ok(Value::F32(utility_ai_score(&vals, &wts, &crv))))
             } else { Some(Err(rt_err!("utility_score() requires 3 arrays"))) }
         }
@@ -475,7 +475,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         "ai::bt_sequence" => {
             // Takes array of child statuses and returns overall status
             if let Value::Array(arr) = &args[0] {
-                let arr = arr.lock().unwrap();
+                let arr = arr.borrow();
                 // For simplicity: sequence succeeds if all are "success"
                 let all_success = arr.iter().all(|v| matches!(v, Value::Str(s) if s == "success"));
                 let has_running = arr.iter().any(|v| matches!(v, Value::Str(s) if s == "running"));
@@ -486,7 +486,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         }
         "ai::bt_selector" => {
             if let Value::Array(arr) = &args[0] {
-                let arr = arr.lock().unwrap();
+                let arr = arr.borrow();
                 let any_success = arr.iter().any(|v| matches!(v, Value::Str(s) if s == "success"));
                 let all_failure = arr.iter().all(|v| matches!(v, Value::Str(s) if s == "failure"));
                 if any_success { Some(Ok(Value::Str("success".into()))) }

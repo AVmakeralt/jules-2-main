@@ -49,7 +49,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             let dy = f64_arg(args, 4).unwrap_or(0.0) as f32;
             let dz = f64_arg(args, 5).unwrap_or(1.0) as f32;
             // Return as tuple: (origin: vec3, dir: vec3)
-            Some(Ok(Value::Tuple(vec![Value::Vec3([ox, oy, oz]), Value::Vec3([dx, dy, dz])])))
+            Some(Ok(Value::Tuple(Box::new(vec![Value::Vec3([ox, oy, oz]), Value::Vec3([dx, dy, dz])]))))
         }
         "geom::ray_at" => {
             if args.len() < 2 {
@@ -78,7 +78,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             let max = [f64_arg(args,3).unwrap_or(1.0) as f32,
                        f64_arg(args,4).unwrap_or(1.0) as f32,
                        f64_arg(args,5).unwrap_or(1.0) as f32];
-            Some(Ok(Value::Tuple(vec![Value::Vec3(min), Value::Vec3(max)])))
+            Some(Ok(Value::Tuple(Box::new(vec![Value::Vec3(min), Value::Vec3(max)]))))
         }
         "geom::aabb_contains" => {
             if args.len() < 2 {
@@ -107,8 +107,8 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             if let (Some((a_min, a_max)), Some((origin, dir))) = (aabb_from_arg(&args[0]), ray_from_arg(&args[1])) {
                 let result = ray_aabb_intersect(origin, dir, a_min, a_max);
                 match result {
-                    Some(t) => Some(Ok(Value::Tuple(vec![Value::Bool(true), Value::F32(t)]))),
-                    None => Some(Ok(Value::Tuple(vec![Value::Bool(false), Value::F32(0.0)]))),
+                    Some(t) => Some(Ok(Value::Tuple(Box::new(vec![Value::Bool(true), Value::F32(t)])))),
+                    None => Some(Ok(Value::Tuple(Box::new(vec![Value::Bool(false), Value::F32(0.0)])))),
                 }
             } else { Some(Err(rt_err!("geom::aabb_ray_intersect() requires aabb, ray"))) }
         }
@@ -130,13 +130,13 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             }
             if let Some(c) = vec3_arg(args, 0) {
                 let r = f64_arg(args, 1).unwrap_or(1.0) as f32;
-                Some(Ok(Value::Tuple(vec![Value::Vec3(c), Value::F32(r)])))
+                Some(Ok(Value::Tuple(Box::new(vec![Value::Vec3(c), Value::F32(r)]))))
             } else if args.len() >= 6 {
                 let c = [f64_arg(args,0).unwrap_or(0.0) as f32,
                          f64_arg(args,1).unwrap_or(0.0) as f32,
                          f64_arg(args,2).unwrap_or(0.0) as f32];
                 let r = f64_arg(args,3).unwrap_or(1.0) as f32;
-                Some(Ok(Value::Tuple(vec![Value::Vec3(c), Value::F32(r)])))
+                Some(Ok(Value::Tuple(Box::new(vec![Value::Vec3(c), Value::F32(r)]))))
             } else { Some(Err(rt_err!("geom::sphere() requires center + radius"))) }
         }
         "geom::sphere_intersects" => {
@@ -152,8 +152,8 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             if let (Some((center, radius)), Some((origin, dir))) = (sphere_from_arg(&args[0]), ray_from_arg(&args[1])) {
                 let result = ray_sphere_intersect(origin, dir, center, radius);
                 match result {
-                    Some(t) => Some(Ok(Value::Tuple(vec![Value::Bool(true), Value::F32(t)]))),
-                    None => Some(Ok(Value::Tuple(vec![Value::Bool(false), Value::F32(0.0)]))),
+                    Some(t) => Some(Ok(Value::Tuple(Box::new(vec![Value::Bool(true), Value::F32(t)])))),
+                    None => Some(Ok(Value::Tuple(Box::new(vec![Value::Bool(false), Value::F32(0.0)])))),
                 }
             } else { Some(Err(rt_err!("geom::sphere_ray_intersect() requires sphere, ray"))) }
         }
@@ -163,7 +163,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             if args.len() < 4 { return Some(Err(rt_err!("geom::plane() requires normal(xyz) + d"))); }
             if let Some(n) = vec3_arg(args, 0) {
                 let d = f64_arg(args, 1).unwrap_or(0.0) as f32;
-                Some(Ok(Value::Tuple(vec![Value::Vec3(n), Value::F32(d)])))
+                Some(Ok(Value::Tuple(Box::new(vec![Value::Vec3(n), Value::F32(d)]))))
             } else { Some(Err(rt_err!("geom::plane() requires normal + d"))) }
         }
         "geom::plane_distance" => {
@@ -178,10 +178,10 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             if let (Some((n, d)), Some((origin, dir))) = (plane_from_arg(&args[0]), ray_from_arg(&args[1])) {
                 let denom = n[0]*dir[0] + n[1]*dir[1] + n[2]*dir[2];
                 if denom.abs() < 1e-8 {
-                    Some(Ok(Value::Tuple(vec![Value::Bool(false), Value::F32(0.0)])))
+                    Some(Ok(Value::Tuple(Box::new(vec![Value::Bool(false), Value::F32(0.0)]))))
                 } else {
                     let t = -(n[0]*origin[0] + n[1]*origin[1] + n[2]*origin[2] + d) / denom;
-                    Some(Ok(Value::Tuple(vec![Value::Bool(t >= 0.0), Value::F32(t)])))
+                    Some(Ok(Value::Tuple(Box::new(vec![Value::Bool(t >= 0.0), Value::F32(t)]))))
                 }
             } else { Some(Err(rt_err!("geom::plane_ray_intersect() requires plane, ray"))) }
         }
@@ -198,7 +198,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                     out.push(Value::Vec3(p.0));
                     out.push(Value::F32(p.1));
                 }
-                Some(Ok(Value::Array(std::sync::Arc::new(std::sync::Mutex::new(out)))))
+                Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out)))))
             } else { Some(Err(rt_err!("frustum_from_perspective() requires 4 floats"))) }
         }
         "geom::frustum_contains_aabb" => {
@@ -395,7 +395,7 @@ fn plane_from_arg(v: &Value) -> Option<([f32;3], f32)> {
 fn frustum_planes_from_arg(v: &Value) -> Option<Vec<([f32;3], f32)>> {
     match v {
         Value::Array(arr) => {
-            let arr = arr.lock().ok()?;
+            let arr = arr.try_borrow().ok()?;
             if arr.len() < 12 { return None; }
             let mut planes = Vec::with_capacity(6);
             for i in (0..12).step_by(2) {

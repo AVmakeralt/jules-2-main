@@ -39,10 +39,12 @@ path = "src/tools/bench_prime_race.rs"
 [[bin]]
 name = "bench-mcts-superopt"
 path = "src/tools/bench_mcts_superopt.rs"
+required-features = ["gnn-optimizer"]
 
 [[bin]]
 name = "train-gnn"
 path = "src/tools/train_gnn.rs"
+required-features = ["gnn-optimizer"]
 
 [[bin]]
 name = "bench-speed"
@@ -90,19 +92,20 @@ phase4-llvm = []
 phase5-cow = []
 phase6-simd = []
 xla = []
+gnn-optimizer = []
 ultra-fast = ["phase3-jit", "phase6-simd"]
-full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd"]
+full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd", "gnn-optimizer"]
 
 [lints.rust]
-dead_code = "allow"
-unused_variables = "allow"
-unused_mut = "allow"
-unused_imports = "allow"
-unused_macros = "allow"
-unused_doc_comments = "allow"
+dead_code = "warn"
+unused_variables = "warn"
+unused_mut = "warn"
+unused_imports = "warn"
+unused_macros = "warn"
+unused_doc_comments = "warn"
 private_interfaces = "allow"
 non_camel_case_types = "allow"
-unreachable_patterns = "allow"
+unreachable_patterns = "warn"
 
 # =============================================================================
 # PERFORMANCE PROFILES
@@ -120,7 +123,7 @@ overflow-checks = true
 # Production release: optimized for speed
 [profile.release]
 opt-level = 3
-lto = "fat"                # Full LTO for maximum cross-crate inlining
+lto = "thin"              # Thin LTO for faster compile with near-identical runtime perf
 codegen-units = 1          # Single unit for maximum inlining & optimization
 panic = "abort"            # Removes unwinding machinery (~5% speedup)
 strip = "symbols"

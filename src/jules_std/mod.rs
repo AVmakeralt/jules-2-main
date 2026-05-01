@@ -100,7 +100,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "math".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             math_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("math::{}", s)))
@@ -137,7 +137,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "geom".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             geom_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("geom::{}", s)))
@@ -165,7 +165,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "random".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             random_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("random::{}", s)))
@@ -188,7 +188,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "noise".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             noise_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("noise::{}", s)))
@@ -213,7 +213,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "spatial".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             spatial_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("spatial::{}", s)))
@@ -232,7 +232,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "path".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             path_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("path::{}", s)))
@@ -256,7 +256,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "ai".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             ai_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("ai::{}", s)))
@@ -280,7 +280,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "net".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             net_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("net::{}", s)))
@@ -306,7 +306,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "alloc".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             alloc_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("alloc::{}", s)))
@@ -338,7 +338,7 @@ pub fn modules_value() -> Value {
     ];
     out.insert(
         "collections".into(),
-        Value::Array(std::sync::Arc::new(std::sync::Mutex::new(
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
             coll_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("collections::{}", s)))
@@ -346,5 +346,5 @@ pub fn modules_value() -> Value {
         ))),
     );
 
-    Value::HashMap(std::sync::Arc::new(std::sync::Mutex::new(out)))
+    Value::HashMap(std::rc::Rc::new(std::cell::RefCell::new(out)))
 }

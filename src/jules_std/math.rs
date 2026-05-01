@@ -535,11 +535,11 @@ pub fn dispatch(
                     [m[2][0] / scale[2], m[2][1] / scale[2], m[2][2] / scale[2]],
                 ];
                 let q = mat3_to_quat(rm);
-                let tup = crate::interp::Value::Tuple(vec![
+                let tup = crate::interp::Value::Tuple(Box::new(vec![
                     crate::interp::Value::Vec3(pos),
                     crate::interp::Value::Quat(q),
                     crate::interp::Value::Vec3(scale),
-                ]);
+                ]));
                 Some(Ok(tup))
             } else {
                 rt_err!("transform_from_mat4() requires a mat4 argument")

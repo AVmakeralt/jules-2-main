@@ -205,7 +205,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 return Some(Err(rt_err!("random::choice() requires an array")));
             }
             if let Value::Array(arr) = &args[0] {
-                let arr = arr.lock().unwrap();
+                let arr = arr.borrow();
                 if arr.is_empty() {
                     return Some(Err(rt_err!("random::choice(): empty array")));
                 }
@@ -220,8 +220,8 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 return Some(Err(rt_err!("random::weighted_choice() requires items, weights")));
             }
             if let (Value::Array(items_arr), Value::Array(weights_arr)) = (&args[0], &args[1]) {
-                let items = items_arr.lock().unwrap();
-                let weights = weights_arr.lock().unwrap();
+                let items = items_arr.borrow();
+                let weights = weights_arr.borrow();
                 if items.is_empty() || weights.is_empty() || items.len() != weights.len() {
                     return Some(Err(rt_err!("random::weighted_choice(): items/weights length mismatch")));
                 }
@@ -245,7 +245,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         // ── Shuffle (Fisher-Yates) ───────────────────────────────────────
         "random::shuffle" => {
             if let Value::Array(arr) = &args[0] {
-                let mut arr = arr.lock().unwrap();
+                let mut arr = arr.borrow_mut();
                 for i in (1..arr.len()).rev() {
                     let j = GLOBAL_PCG.with(|r| r.borrow_mut().next_range(0, (i + 1) as u32)) as usize;
                     arr.swap(i, j);
@@ -260,7 +260,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 return Some(Err(rt_err!("random::sample() requires array, count")));
             }
             if let (Value::Array(arr), Some(n)) = (&args[0], i64_arg(args, 1)) {
-                let arr = arr.lock().unwrap();
+                let arr = arr.borrow();
                 let n = n as usize;
                 if n > arr.len() {
                     return Some(Err(rt_err!("random::sample(): n > array length")));
@@ -276,7 +276,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                     }
                 }
                 let result: Vec<Value> = selected.into_iter().map(|i| arr[i].clone()).collect();
-                Some(Ok(Value::Array(std::sync::Arc::new(std::sync::Mutex::new(result)))))
+                Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(result)))))
             } else { Some(Err(rt_err!("random::sample() requires array + int"))) }
         }
 

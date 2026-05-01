@@ -301,12 +301,12 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                     (host, None)
                 };
                 let port = port.unwrap_or(if proto == "https" { 443 } else { 80 });
-                Some(Ok(Value::Tuple(vec![
+                Some(Ok(Value::Tuple(Box::new(vec![
                     Value::Str(proto.into()),
                     Value::Str(hostname.into()),
                     Value::I64(port),
                     Value::Str(path.into()),
-                ])))
+                ]))))
             } else { Some(Err(rt_err!("net::parse_url() requires url string"))) }
         }
 

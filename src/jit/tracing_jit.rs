@@ -16,7 +16,7 @@
 // =============================================================================
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::mem;
 use std::ptr;
 use std::ffi::c_void;
@@ -79,14 +79,14 @@ pub struct SideExit {
 #[derive(Debug, Clone)]
 pub struct PolymorphicInlineCache {
     /// Map from (slot, failed_type) to trace_id
-    entries: HashMap<(u16, ValueType), u32>,
+    entries: FxHashMap<(u16, ValueType), u32>,
     max_entries: usize,
 }
 
 impl PolymorphicInlineCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
             max_entries,
         }
     }
@@ -140,12 +140,12 @@ pub struct TraceRecorder {
     current_trace: Option<Trace>,
     next_trace_id: u32,
     traces: Vec<Trace>,
-    trace_selection: HashMap<u64, u32>,
+    trace_selection: FxHashMap<u64, u32>,
 }
 
 impl TraceRecorder {
     pub fn new() -> Self {
-        Self { current_trace: None, next_trace_id: 0, traces: Vec::new(), trace_selection: HashMap::new() }
+        Self { current_trace: None, next_trace_id: 0, traces: Vec::new(), trace_selection: FxHashMap::default() }
     }
 
     pub fn start_recording(&mut self, entry_pc: usize) {
@@ -187,7 +187,7 @@ impl TraceRecorder {
         if let Some(mut trace) = self.current_trace.take() {
             // Fix #1: Type specialization analysis
             // If all slots in the trace are the same type, we can use unboxed storage
-            let mut slot_types: HashMap<u16, ValueType> = HashMap::new();
+            let mut slot_types: FxHashMap<u16, ValueType> = FxHashMap::default();
             for instr in &trace.instructions {
                 self.collect_slot_types(&instr.instruction, &mut slot_types);
             }
@@ -226,7 +226,7 @@ impl TraceRecorder {
         } else { None }
     }
     
-    fn collect_slot_types(&self, instr: &Instr, slot_types: &mut HashMap<u16, ValueType>) {
+    fn collect_slot_types(&self, instr: &Instr, slot_types: &mut FxHashMap<u16, ValueType>) {
         match instr {
             Instr::LoadI32(dst, _) => { slot_types.insert(*dst, ValueType::I64); }
             Instr::LoadI64(dst, _) => { slot_types.insert(*dst, ValueType::I64); }
@@ -284,18 +284,18 @@ enum RegState { Empty, Occupied(u16), Dirty(u16) }
 
 pub struct NativeCodeGenerator {
     code: Vec<u8>,
-    labels: HashMap<usize, usize>,
+    labels: FxHashMap<usize, usize>,
     patch_sites: Vec<PatchSite>,
-    reg_map: HashMap<Reg, RegState>,
-    slot_reg: HashMap<u16, Reg>,
+    reg_map: FxHashMap<Reg, RegState>,
+    slot_reg: FxHashMap<u16, Reg>,
     next_label_id: usize,
 }
 
 impl NativeCodeGenerator {
     pub fn new() -> Self {
         Self {
-            code: Vec::with_capacity(4096), labels: HashMap::new(), patch_sites: Vec::new(),
-            reg_map: HashMap::new(), slot_reg: HashMap::new(),
+            code: Vec::with_capacity(4096), labels: FxHashMap::default(), patch_sites: Vec::new(),
+            reg_map: FxHashMap::default(), slot_reg: FxHashMap::default(),
             next_label_id: 0,
         }
     }
@@ -359,7 +359,7 @@ impl NativeCodeGenerator {
     fn optimize_trace(&self, instrs: &[TraceInstruction]) -> Vec<TraceInstruction> {
         let mut out = Vec::with_capacity(instrs.len());
         {
-        let mut last_load: HashMap<u16, i64> = HashMap::new();
+        let mut last_load: FxHashMap<u16, i64> = FxHashMap::default();
         
         for ti in instrs {
             match &ti.instruction {

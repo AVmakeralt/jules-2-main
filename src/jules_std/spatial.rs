@@ -386,7 +386,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                     if let Some(sh) = v.get(h as usize - 1) {
                         let ids = sh.query(x as f32, y as f32, z as f32, r as f32);
                         let vals: Vec<Value> = ids.into_iter().map(|id| Value::U64(id)).collect();
-                        Some(Ok(Value::Array(std::sync::Arc::new(std::sync::Mutex::new(vals)))))
+                        Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vals)))))
                     } else { Some(Err(rt_err!("hash_query(): invalid handle"))) }
                 })
             } else { Some(Err(rt_err!("hash_query() requires handle, x, y, z, radius"))) }
@@ -437,7 +437,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                     if let Some(qt) = v.get(h as usize - 1) {
                         let ids = qt.query(x as f32, y as f32, r as f32);
                         let vals: Vec<Value> = ids.into_iter().map(|id| Value::U64(id)).collect();
-                        Some(Ok(Value::Array(std::sync::Arc::new(std::sync::Mutex::new(vals)))))
+                        Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vals)))))
                     } else { Some(Err(rt_err!("quadtree_query(): invalid handle"))) }
                 })
             } else { Some(Err(rt_err!("quadtree_query() requires handle, x, y, radius"))) }
@@ -479,7 +479,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                     if let Some(o) = v.get(h as usize - 1) {
                         let ids = o.query(x as f32, y as f32, z as f32, r as f32);
                         let vals: Vec<Value> = ids.into_iter().map(|id| Value::U64(id)).collect();
-                        Some(Ok(Value::Array(std::sync::Arc::new(std::sync::Mutex::new(vals)))))
+                        Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vals)))))
                     } else { Some(Err(rt_err!("octree_query(): invalid handle"))) }
                 })
             } else { Some(Err(rt_err!("octree_query() requires handle, x, y, z, radius"))) }
@@ -492,7 +492,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         "spatial::bvh_build" => {
             if args.len() < 2 { return Some(Err(rt_err!("bvh_build() requires handle, items"))); }
             if let (Some(h), Value::Array(arr)) = (i64_arg(args,0), &args[1]) {
-                let arr = arr.lock().unwrap();
+                let arr = arr.borrow();
                 // Items: array of tuples (id: u64, min: vec3, max: vec3)
                 let mut items = Vec::new();
                 for v in arr.iter() {
@@ -525,7 +525,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                             [x1 as f32, y1 as f32, z1 as f32],
                         );
                         let vals: Vec<Value> = ids.into_iter().map(|id| Value::U64(id)).collect();
-                        Some(Ok(Value::Array(std::sync::Arc::new(std::sync::Mutex::new(vals)))))
+                        Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vals)))))
                     } else { Some(Err(rt_err!("bvh_query(): invalid handle"))) }
                 })
             } else { Some(Err(rt_err!("bvh_query() requires handle, min, max"))) }

@@ -43,7 +43,6 @@
 
 #![allow(
     clippy::match_single_binding,
-    clippy::large_enum_variant,
     clippy::too_many_arguments
 )]
 
@@ -51,6 +50,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -110,6 +110,12 @@ pub enum Value {
     Str(String),
     Unit,
 
+    // ── Lazy range (avoids materializing full Vec for 0..N) ─────────────────────
+    /// Lazy range: stores (start, end) and produces values on demand via iteration
+    /// rather than materializing the entire range in memory. This avoids allocating
+    /// 88KB+ of Value objects for a simple 0..1000 range expression.
+    Range { start: i32, end: i32, inclusive: bool },
+
     // ── SIMD vectors (stored as flat f32 arrays) ──────────────────────────────
     Vec2([f32; 2]),
     Vec3([f32; 3]),
@@ -123,7 +129,7 @@ pub enum Value {
     Quat([f32; 4]), // [x, y, z, w]
 
     // ── Data pipelines / data loaders (Feature 8) ─────────────────────────────
-    DataLoader(Arc<Mutex<DataLoader>>),
+    DataLoader(Rc<RefCell<DataLoader>>),
 
     // ── Tensors (Feature 1) ───────────────────────────────────────────────────
     /// Tensor with thread-safe access (for parallel execution)
@@ -132,14 +138,11 @@ pub enum Value {
     TensorFast(Arc<RefCell<Tensor>>),
 
     // ── Compound ─────────────────────────────────────────────────────────────
-    Tuple(Vec<Value>),
-    Array(Arc<Mutex<Vec<Value>>>),
-    Struct {
-        name: String,
-        fields: FxHashMap<String, Value>,
-    },
+    Tuple(Box<Vec<Value>>),
+    Array(Rc<RefCell<Vec<Value>>>),
+    Struct(Box<StructData>),
     /// HashMap: key -> value pairs (keys currently strings)
-    HashMap(Arc<Mutex<FxHashMap<String, Value>>>),
+    HashMap(Rc<RefCell<FxHashMap<String, Value>>>),
 
     // ── Option / Result types ─────────────────────────────────────────────────
     /// `Some(value)` or `None` (for Option<T>)
@@ -156,15 +159,28 @@ pub enum Value {
 
     // ── ECS handles ──────────────────────────────────────────────────────────
     Entity(EntityId),
-    World(Arc<Mutex<EcsWorld>>),
+    World(Rc<RefCell<EcsWorld>>),
 
     // ── Neural-network model handle ───────────────────────────────────────────
-    Model(Arc<Mutex<NnModel>>),
+    Model(Rc<RefCell<NnModel>>),
 
     // ── Control flow signals (never escape to user code) ─────────────────────
     Return(Box<Value>),
     Break(Option<Box<Value>>),
     Continue,
+}
+
+/// Boxed payload for [`Value::Struct`], keeping the enum size small.
+#[derive(Debug, Clone)]
+pub struct StructData {
+    pub name: String,
+    pub fields: FxHashMap<String, Value>,
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Value::Unit
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -185,7 +201,7 @@ impl DataLoader {
         // Clone only the batch slice; the rest stays in-place.
         let chunk: Vec<Value> = self.samples[self.index..end].to_vec();
         self.index = end;
-        Some(Value::Array(Arc::new(Mutex::new(chunk))))
+        Some(Value::Array(Rc::new(RefCell::new(chunk))))
     }
 
     pub fn has_next(&self) -> bool {
@@ -228,6 +244,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Str(_) => "str",
             Value::Unit => "()",
+            Value::Range { .. } => "range",
             Value::Vec2(_) => "vec2",
             Value::Vec3(_) => "vec3",
             Value::Vec4(_) => "vec4",
@@ -244,7 +261,7 @@ impl Value {
             Value::Tuple(_) => "tuple",
             Value::Array(_) => "array",
             Value::HashMap(_) => "map",
-            Value::Struct { name, .. } => name,
+            Value::Struct(data) => &data.name,
             Value::Some(_) => "Some",
             Value::None => "None",
             Value::Ok(_) => "Ok",
@@ -331,7 +348,7 @@ impl Value {
             Value::DataLoader(_) => 25,
             Value::Tuple(_) => 26,
             Value::Array(_) => 27,
-            Value::Struct { .. } => 28,
+            Value::Struct(_) => 28,
             Value::HashMap(_) => 29,
             Value::Some(_) => 30,
             Value::None => 31,
@@ -344,6 +361,7 @@ impl Value {
             Value::Return(_) => 38,
             Value::Break(_) => 39,
             Value::Continue => 40,
+            Value::Range { .. } => 41,
         }
     }
 
@@ -416,6 +434,9 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Str(s) => write!(f, "{s}"),
             Value::Unit => write!(f, "()"),
+            Value::Range { start, end, inclusive } => {
+                if *inclusive { write!(f, "{start}..={end}") } else { write!(f, "{start}..{end}") }
+            }
             Value::Vec2(v) => write!(f, "vec2({}, {})", v[0], v[1]),
             Value::Vec3(v) => write!(f, "vec3({}, {}, {})", v[0], v[1], v[2]),
             Value::Vec4(v) => write!(f, "vec4({}, {}, {}, {})", v[0], v[1], v[2], v[3]),
@@ -434,9 +455,9 @@ impl fmt::Display for Value {
                 let inner: Vec<_> = vs.iter().map(|v| v.to_string()).collect();
                 write!(f, "({})", inner.join(", "))
             }
-            Value::Struct { name, .. } => write!(f, "{name} {{ … }}"),
+            Value::Struct(data) => write!(f, "{} {{ … }}", data.name),
             Value::DataLoader(d) => {
-                let d = d.lock().unwrap();
+                let d = d.borrow();
                 write!(
                     f,
                     "dataloader(batch_size={}, index={}, total={})",
@@ -450,7 +471,7 @@ impl fmt::Display for Value {
             Value::Ok(v) => write!(f, "Ok({})", v),
             Value::Err(v) => write!(f, "Err({})", v),
             Value::HashMap(m) => {
-                let m = m.lock().unwrap();
+                let m = m.borrow();
                 write!(f, "{{ {} items }}", m.len())
             }
             Value::Entity(id) => write!(f, "Entity({id})"),
@@ -458,7 +479,7 @@ impl fmt::Display for Value {
             Value::Model(_) => write!(f, "<model>"),
             Value::Fn(_) => write!(f, "<fn>"),
             Value::Array(a) => {
-                let a = a.lock().unwrap();
+                let a = a.borrow();
                 write!(f, "[…; {}]", a.len())
             }
             Value::Return(v) => write!(f, "return {v}"),
@@ -912,8 +933,8 @@ pub struct EcsWorld {
     components: FxHashMap<String, SparseSet>,
     /// Pending events (signal_name → Vec<EntityId>)
     events: FxHashMap<String, Vec<EntityId>>,
-    vec3_plan_cache: FxHashMap<String, Vec3PlanCache>,
-    fused_plan_cache: FxHashMap<String, FusedPlanCache>,
+    vec3_plan_cache: FxHashMap<u64, Vec3PlanCache>,
+    fused_plan_cache: FxHashMap<u64, FusedPlanCache>,
     /// Fix #2: Archetype-based SoA storage
     archetypes: FxHashMap<ArchetypeId, Archetype>,
     archetype_entity_map: FxHashMap<EntityId, ArchetypeId>,
@@ -1051,12 +1072,28 @@ impl EcsWorld {
     }
 
     #[inline]
-    fn plan_key2(a: &str, b: &str) -> String {
-        format!("{a}|{b}")
+    fn plan_key2(a: &str, b: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        use rustc_hash::FxHasher;
+        let mut h = FxHasher::default();
+        a.hash(&mut h);
+        0xFFu8.hash(&mut h); // separator
+        b.hash(&mut h);
+        h.finish()
     }
     #[inline]
-    fn plan_key4(a: &str, b: &str, c: &str, d: &str) -> String {
-        format!("{a}|{b}|{c}|{d}")
+    fn plan_key4(a: &str, b: &str, c: &str, d: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        use rustc_hash::FxHasher;
+        let mut h = FxHasher::default();
+        a.hash(&mut h);
+        0xFFu8.hash(&mut h);
+        b.hash(&mut h);
+        0xFFu8.hash(&mut h);
+        c.hash(&mut h);
+        0xFFu8.hash(&mut h);
+        d.hash(&mut h);
+        h.finish()
     }
 
     /// Get or create an archetype for a set of component types.
@@ -2165,7 +2202,7 @@ impl Scheduler {
     pub fn tick(
         &self,
         systems: &FxHashMap<String, Arc<SystemDecl>>,
-        world: &Arc<Mutex<EcsWorld>>,
+        world: &Rc<RefCell<EcsWorld>>,
         interp: &mut Interpreter,
         delta_time: f32,
     ) -> Result<(), RuntimeError> {
@@ -2281,7 +2318,6 @@ impl Env {
             self.values[slot as usize] = val;
         } else {
             // Slow path: new binding.
-            eprintln!("[DEBUG-ENV] set({name}): NOT FOUND in name_to_slot, calling set_local. Keys: {:?}", self.name_to_slot.keys().collect::<Vec<_>>());
             self.set_local(name, val);
         }
     }
@@ -3212,7 +3248,10 @@ pub fn vm_exec(
                 }
             }
             Instr::Move(d, s) => {
-                let v = reg!(*s).clone();
+                // Use mem::take instead of clone — the source register is no longer needed after the move.
+                // This avoids copying the full Value struct (now ~24 bytes after boxing, but still
+                // cheaper to move ownership than clone for compound variants with Rc/Box).
+                let v = std::mem::take(reg_mut!(*s));
                 *reg_mut!(*d) = v;
             }
             Instr::Load(d, slot) => {
@@ -3220,7 +3259,8 @@ pub fn vm_exec(
                 *reg_mut!(*d) = v;
             }
             Instr::Store(slot, s) => {
-                let v = reg!(*s).clone();
+                // Use mem::take instead of clone — the source register value is consumed by the store.
+                let v = std::mem::take(reg_mut!(*s));
                 *slot_mut!(*slot) = v;
             }
 
@@ -3403,11 +3443,11 @@ pub fn vm_exec(
                 *reg_mut!(*d) = interp.eval_method(recv, method, call_args, &mut env)?;
             }
 
-            Instr::NewArray(d) => *reg_mut!(*d) = Value::Array(Arc::new(Mutex::new(Vec::new()))),
+            Instr::NewArray(d) => *reg_mut!(*d) = Value::Array(Rc::new(RefCell::new(Vec::new()))),
             Instr::ArrayPush(arr, v) => {
                 if let Value::Array(a) = &reg!(*arr) {
                     let val = reg!(*v).clone();
-                    a.lock().unwrap().push(val);
+                    a.borrow_mut().push(val);
                 }
             }
             Instr::ArrayGet(d, arr, idx) => {
@@ -3419,28 +3459,28 @@ pub fn vm_exec(
                 let i = reg!(*idx).as_i64().unwrap_or(0) as usize;
                 let v = reg!(*val).clone();
                 if let Value::Array(a) = &reg!(*arr) {
-                    let mut lock = a.lock().unwrap();
+                    let mut lock = a.borrow_mut();
                     if i < lock.len() {
                         lock[i] = v;
                     }
                 }
             }
             Instr::NewHashMap(d) => {
-                *reg_mut!(*d) = Value::HashMap(Arc::new(Mutex::new(FxHashMap::default())));
+                *reg_mut!(*d) = Value::HashMap(Rc::new(RefCell::new(FxHashMap::default())));
             }
             Instr::NewTuple(d, start, count) => {
                 let mut vals = Vec::with_capacity(*count as usize);
                 for i in 0..*count {
                     vals.push(regs[(*start + i) as usize].clone());
                 }
-                *reg_mut!(*d) = Value::Tuple(vals);
+                *reg_mut!(*d) = Value::Tuple(Box::new(vals));
             }
             Instr::NewStruct(d, ni) => {
                 let name = str_c!(*ni).to_owned();
-                *reg_mut!(*d) = Value::Struct {
+                *reg_mut!(*d) = Value::Struct(Box::new(StructData {
                     name,
                     fields: FxHashMap::default(),
-                };
+                }));
             }
             Instr::FieldGet(d, obj, fi) => {
                 let o = reg!(*obj).clone();
@@ -3451,8 +3491,8 @@ pub fn vm_exec(
                 let field = str_pool[*fi as usize].clone();
                 let v = reg!(*val).clone();
                 match &mut regs[*obj as usize] {
-                    Value::Struct { fields, .. } => {
-                        fields.insert(field, v);
+                    Value::Struct(data) => {
+                        data.fields.insert(field, v);
                     }
                     _ => {}
                 }
@@ -3466,7 +3506,7 @@ pub fn vm_exec(
                 let i = reg!(*idx).as_i64().unwrap_or(0) as usize;
                 let v = reg!(*val).clone();
                 if let Value::Array(a) = &regs[*obj as usize] {
-                    let mut lock = a.lock().unwrap();
+                    let mut lock = a.borrow_mut();
                     if i < lock.len() {
                         lock[i] = v;
                     }
@@ -3494,13 +3534,13 @@ pub fn vm_exec(
                 let s = reg!(*lo).as_i64().unwrap_or(0) as i32;
                 let e = reg!(*hi).as_i64().unwrap_or(0) as i32;
                 *reg_mut!(*d) =
-                    Value::Array(Arc::new(Mutex::new((s..e).map(Value::I32).collect())));
+                    Value::Array(Rc::new(RefCell::new((s..e).map(Value::I32).collect())));
             }
             Instr::RangeIncl(d, lo, hi) => {
                 let s = reg!(*lo).as_i64().unwrap_or(0) as i32;
                 let e = reg!(*hi).as_i64().unwrap_or(0) as i32;
                 *reg_mut!(*d) =
-                    Value::Array(Arc::new(Mutex::new((s..=e).map(Value::I32).collect())));
+                    Value::Array(Rc::new(RefCell::new((s..=e).map(Value::I32).collect())));
             }
             Instr::MatMulInstr(d, l, r) => {
                 let lv = reg!(*l).clone();
@@ -3995,13 +4035,13 @@ pub struct Interpreter {
     /// Top-level model registry (AST decls; instantiated on demand).
     pub model_decls: FxHashMap<String, ModelDecl>,
     /// Live model instances.
-    pub models: FxHashMap<String, Arc<Mutex<NnModel>>>,
+    pub models: FxHashMap<String, Rc<RefCell<NnModel>>>,
     /// Agent declarations.
     pub agent_decls: FxHashMap<String, AgentDecl>,
     /// Struct/component type registry (name → field list).
     pub types: FxHashMap<String, Vec<String>>,
     /// ECS world (global singleton for now).
-    pub world: Arc<Mutex<EcsWorld>>,
+    pub world: Rc<RefCell<EcsWorld>>,
     /// GPU dispatch backend (None = CPU-only).
     pub gpu: Option<Box<dyn GpuBackend>>,
     /// Thread pool size for `spawn` / parallel loops.
@@ -4060,7 +4100,7 @@ impl Interpreter {
             models: FxHashMap::default(),
             agent_decls: FxHashMap::default(),
             types: FxHashMap::default(),
-            world: Arc::new(Mutex::new(EcsWorld::default())),
+            world: Rc::new(RefCell::new(EcsWorld::default())),
             gpu: Some(Box::new(JulesGpuAdapter::new())),
             n_threads: 4,
             physics_world: Some(Arc::new(Mutex::new(PhysicsWorld::new()))),
@@ -4356,7 +4396,7 @@ impl Interpreter {
     pub fn run_system(
         &mut self,
         sys: &SystemDecl,
-        world: &Arc<Mutex<EcsWorld>>,
+        world: &Rc<RefCell<EcsWorld>>,
         delta_time: f32,
     ) -> Result<(), RuntimeError> {
         let mut env = Env::new();
@@ -4613,7 +4653,7 @@ impl Interpreter {
         // Snapshot the matching entity list (safe: world locked briefly).
         self.ecs_query_scratch.clear();
         {
-            let w = self.world.lock().unwrap();
+            let w = self.world.borrow();
             w.query_into(&query.with, &query.without, &mut self.ecs_query_scratch);
         }
 
@@ -4767,7 +4807,7 @@ impl Interpreter {
                     .iter()
                     .map(|e| self.eval_expr(e, env))
                     .collect::<Result<_, _>>()?;
-                Ok(Value::Array(Arc::new(Mutex::new(vals))))
+                Ok(Value::Array(Rc::new(RefCell::new(vals))))
             }
 
             Expr::Tuple { elems, .. } => {
@@ -4775,7 +4815,7 @@ impl Interpreter {
                     .iter()
                     .map(|e| self.eval_expr(e, env))
                     .collect::<Result<_, _>>()?;
-                Ok(Value::Tuple(vals))
+                Ok(Value::Tuple(Box::new(vals)))
             }
 
             // ── Arithmetic ────────────────────────────────────────────────────
@@ -4831,9 +4871,10 @@ impl Interpreter {
                     .iter()
                     .map(|a| self.eval_expr(a, env))
                     .collect::<Result<_, _>>()?;
-                // Check for built-in functions by name first
+                // Check for built-in functions by name first.
+                // Pass args by reference to avoid cloning when the builtin path succeeds.
                 if let Expr::Ident { name, .. } = func.as_ref() {
-                    if let Ok(result) = self.eval_builtin(name, args_v.clone()) {
+                    if let Ok(result) = self.eval_builtin_ref(name, &args_v) {
                         return Ok(result);
                     }
                 }
@@ -4916,12 +4957,10 @@ impl Interpreter {
                 let hi_v = hi.as_ref().map(|e| self.eval_expr(e, env)).transpose()?;
                 let start = lo_v.and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                 let end = hi_v.and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let range: Vec<Value> = if *inclusive {
-                    (start..=end).map(Value::I32).collect()
-                } else {
-                    (start..end).map(Value::I32).collect()
-                };
-                Ok(Value::Array(Arc::new(Mutex::new(range))))
+                // Use lazy Range variant instead of materializing full Vec.
+                // The range is expanded on demand when iterated (e.g., in for-loops),
+                // avoiding O(n) allocation for large ranges like 0..10000.
+                Ok(Value::Range { start, end, inclusive: *inclusive })
             }
 
             Expr::Cast { expr, ty, .. } => {
@@ -4972,10 +5011,10 @@ impl Interpreter {
                 for (fname, fexpr) in fields {
                     field_vals.insert(fname.clone(), self.eval_expr(fexpr, env)?);
                 }
-                Ok(Value::Struct {
+                Ok(Value::Struct(Box::new(StructData {
                     name: name.clone(),
                     fields: field_vals,
-                })
+                })))
             }
             Expr::KronProd { lhs, rhs, .. } => {
                 let l = self.eval_tensor(lhs, env)?;
@@ -5202,16 +5241,16 @@ impl Interpreter {
                 if let Expr::Ident { name, .. } = object.as_ref() {
                     // For entity field access, write to the world.
                     if let Some(Value::Entity(id)) = env.get(name).cloned() {
-                        let mut w = self.world.lock().unwrap();
+                        let mut w = self.world.borrow_mut();
                         if let Some(comp) = w.get_component_mut(id, field) {
                             *comp = effective_rhs;
                         } else {
                             w.insert_component(id, field, effective_rhs);
                         }
-                    } else if let Some(Value::Struct { fields: _, .. }) = env.get(name).cloned() {
+                    } else if let Some(Value::Struct(_)) = env.get(name).cloned() {
                         let mut s = env.get(name).unwrap().clone();
-                        if let Value::Struct { ref mut fields, .. } = s {
-                            fields.insert(field.clone(), effective_rhs);
+                        if let Value::Struct(ref mut data) = s {
+                            data.fields.insert(field.clone(), effective_rhs);
                         }
                         env.set(name, s);
                     }
@@ -5227,7 +5266,7 @@ impl Interpreter {
                         0
                     };
                     if let Some(Value::Array(arr)) = env.get(name).cloned() {
-                        arr.lock().unwrap()[idx] = effective_rhs;
+                        arr.borrow_mut()[idx] = effective_rhs;
                     }
                 }
             }
@@ -5242,12 +5281,12 @@ impl Interpreter {
 
     fn eval_field(&mut self, obj: Value, field: &str) -> Result<Value, RuntimeError> {
         match obj {
-            Value::Struct { ref fields, .. } => fields
+            Value::Struct(ref data) => data.fields
                 .get(field)
                 .cloned()
                 .ok_or_else(|| RuntimeError::new(format!("no field `{field}`"))),
             Value::Entity(id) => {
-                let w = self.world.lock().unwrap();
+                let w = self.world.borrow();
                 // Field name maps to component type by convention (lowercase → CamelCase).
                 // We try the field name directly, then a title-cased version.
                 let comp = w.get_component(id, field).or_else(|| {
@@ -5283,7 +5322,7 @@ impl Interpreter {
         match obj {
             Value::Array(arr) => {
                 let idx = indices.first().and_then(|v| v.as_i64()).unwrap_or(0) as usize;
-                let a = arr.lock().unwrap();
+                let a = arr.borrow();
                 a.get(idx)
                     .cloned()
                     .ok_or_else(|| RuntimeError::new(format!("index {idx} out of bounds")))
@@ -5612,18 +5651,27 @@ impl Interpreter {
                 .iter()
                 .map(|n| Value::Str((*n).to_string()))
                 .collect::<Vec<_>>();
-            out.insert(module.to_string(), Value::Array(Arc::new(Mutex::new(vals))));
+            out.insert(module.to_string(), Value::Array(Rc::new(RefCell::new(vals))));
         }
         // Merge std library modules into the output without overwriting
         // interpreter-specific catalogs (which intentionally include short names).
         if let Value::HashMap(std_map) = std_modules {
-            if let Ok(map) = std_map.lock() {
+            if let Ok(map) = std_map.try_borrow() {
                 for (k, v) in map.iter() {
                     out.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
         }
-        Value::HashMap(Arc::new(Mutex::new(out)))
+        Value::HashMap(Rc::new(RefCell::new(out)))
+    }
+
+    /// Evaluate a built-in function, taking args by reference to avoid
+    /// cloning when the function is a builtin (saves 1 clone per builtin call).
+    pub fn eval_builtin_ref(&mut self, name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+        // Clone only on the success path — most builtins that match will consume
+        // the args by cloning individual values they need, which is cheaper than
+        // cloning the entire Vec upfront.
+        self.eval_builtin(name, args.to_vec())
     }
 
     pub fn eval_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -6019,13 +6067,13 @@ impl Interpreter {
                         let dy = ty - cy;
                         let dist = (dx * dx + dy * dy).sqrt();
                         if dist <= max_delta.max(0.0) || dist <= 1e-12 {
-                            Ok(Value::Array(Arc::new(Mutex::new(vec![
+                            Ok(Value::Array(Rc::new(RefCell::new(vec![
                                 Value::F32(tx as f32),
                                 Value::F32(ty as f32),
                             ]))))
                         } else {
                             let s = max_delta.max(0.0) / dist;
-                            Ok(Value::Array(Arc::new(Mutex::new(vec![
+                            Ok(Value::Array(Rc::new(RefCell::new(vec![
                                 Value::F32((cx + dx * s) as f32),
                                 Value::F32((cy + dy * s) as f32),
                             ]))))
@@ -6051,7 +6099,7 @@ impl Interpreter {
             }
             "math::rand_unit2" => {
                 let theta = pseudo_rand() as f64 * (2.0 * consts::PI);
-                Ok(Value::Array(Arc::new(Mutex::new(vec![
+                Ok(Value::Array(Rc::new(RefCell::new(vec![
                     Value::F32(theta.cos() as f32),
                     Value::F32(theta.sin() as f32),
                 ]))))
@@ -6079,7 +6127,7 @@ impl Interpreter {
                         i += step;
                     }
                 }
-                Ok(Value::Array(Arc::new(Mutex::new(items))))
+                Ok(Value::Array(Rc::new(RefCell::new(items))))
             }
             "arange" => {
                 let start = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -6102,21 +6150,21 @@ impl Interpreter {
                         i += step;
                     }
                 }
-                Ok(Value::Array(Arc::new(Mutex::new(items))))
+                Ok(Value::Array(Rc::new(RefCell::new(items))))
             }
             "zeros" => {
                 let len = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0).max(0) as usize;
                 let v = vec![Value::F32(0.0); len];
-                Ok(Value::Array(Arc::new(Mutex::new(v))))
+                Ok(Value::Array(Rc::new(RefCell::new(v))))
             }
             "ones" => {
                 let len = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0).max(0) as usize;
                 let v = vec![Value::F32(1.0); len];
-                Ok(Value::Array(Arc::new(Mutex::new(v))))
+                Ok(Value::Array(Rc::new(RefCell::new(v))))
             }
             "math::softmax" | "tensor::softmax" => {
                 if let Some(Value::Array(a)) = args.first() {
-                    let values = a.lock().unwrap();
+                    let values = a.borrow();
                     let nums: Vec<f32> = values
                         .iter()
                         .map(|v| v.as_f64().map(|x| x as f32))
@@ -6129,7 +6177,7 @@ impl Interpreter {
                         .into_iter()
                         .map(|x| Value::F32(x / sum.max(1e-12)))
                         .collect::<Vec<_>>();
-                    Ok(Value::Array(Arc::new(Mutex::new(out))))
+                    Ok(Value::Array(Rc::new(RefCell::new(out))))
                 } else if let Some(Value::Tensor(t)) = args.first() {
                     let out = t.read().unwrap().apply_activation(&Activation::Softmax);
                     Ok(Value::TensorFast(Arc::new(RefCell::new(out))))
@@ -6141,7 +6189,7 @@ impl Interpreter {
                 Some(Value::Tensor(t)) => Ok(Value::F32(t.read().unwrap().sum_all())),
                 Some(Value::Array(a)) => {
                     let mut s = 0.0f32;
-                    for v in a.lock().unwrap().iter() {
+                    for v in a.borrow().iter() {
                         s += v
                             .as_f64()
                             .ok_or_else(|| RuntimeError::new("tensor::sum expects numeric array"))?
@@ -6157,7 +6205,7 @@ impl Interpreter {
                     Ok(Value::F32(tt.sum_all() / tt.numel().max(1) as f32))
                 }
                 Some(Value::Array(a)) => {
-                    let values = a.lock().unwrap();
+                    let values = a.borrow();
                     if values.is_empty() {
                         return Ok(Value::F32(0.0));
                     }
@@ -6183,7 +6231,7 @@ impl Interpreter {
                 }
                 Some(Value::Array(a)) => {
                     let mut max_v = f32::NEG_INFINITY;
-                    for v in a.lock().unwrap().iter() {
+                    for v in a.borrow().iter() {
                         let x = v
                             .as_f64()
                             .ok_or_else(|| RuntimeError::new("tensor::max expects numeric array"))?
@@ -6211,7 +6259,7 @@ impl Interpreter {
                     )))))
                 }
                 Some(Value::Array(a)) => {
-                    let values = a.lock().unwrap();
+                    let values = a.borrow();
                     let nums = values
                         .iter()
                         .map(|v| v.as_f64().map(|x| x as f32))
@@ -6224,7 +6272,7 @@ impl Interpreter {
                         .into_iter()
                         .map(|x| Value::F32(x / norm))
                         .collect::<Vec<_>>();
-                    Ok(Value::Array(Arc::new(Mutex::new(out))))
+                    Ok(Value::Array(Rc::new(RefCell::new(out))))
                 }
                 _ => rt_err!("tensor::normalize expects Tensor or Array[number]"),
             },
@@ -6241,7 +6289,7 @@ impl Interpreter {
 
                 let mut samples: Vec<Value> = Vec::new();
                 match source {
-                    Value::Array(a) => samples = a.lock().unwrap().clone(),
+                    Value::Array(a) => samples = a.borrow().clone(),
                     Value::Tensor(t) => {
                         let t = t.read().unwrap();
                         if t.shape.is_empty() {
@@ -6296,7 +6344,7 @@ impl Interpreter {
                 if shuffle {
                     loader.reset();
                 }
-                Ok(Value::DataLoader(Arc::new(Mutex::new(loader))))
+                Ok(Value::DataLoader(Rc::new(RefCell::new(loader))))
             }
 
             // ── I/O functions ─────────────────────────────────────────────────
@@ -6342,8 +6390,8 @@ impl Interpreter {
             "compute::device" => Ok(Value::Str("cpu".to_string())),
             "compute::parallel_map" => {
                 if let Some(Value::Array(a)) = args.first() {
-                    Ok(Value::Array(Arc::new(Mutex::new(
-                        a.lock().unwrap().clone(),
+                    Ok(Value::Array(Rc::new(RefCell::new(
+                        a.borrow().clone(),
                     ))))
                 } else {
                     rt_err!("compute::parallel_map currently expects an array")
@@ -6358,7 +6406,7 @@ impl Interpreter {
                         .iter()
                         .map(|d| Value::I64(*d as i64))
                         .collect::<Vec<_>>();
-                    Ok(Value::Array(Arc::new(Mutex::new(shape_vals))))
+                    Ok(Value::Array(Rc::new(RefCell::new(shape_vals))))
                 } else {
                     rt_err!("debug::tensor_shape requires a Tensor")
                 }
@@ -6389,7 +6437,7 @@ impl Interpreter {
                     "compiled_fn_count".to_string(),
                     Value::I64(self.compiled_fns.len() as i64),
                 );
-                Ok(Value::HashMap(Arc::new(Mutex::new(state))))
+                Ok(Value::HashMap(Rc::new(RefCell::new(state))))
             }
             "debug::runtime_profile" => {
                 let enabled = args.first().and_then(|v| v.as_bool()).unwrap_or(true);
@@ -6428,9 +6476,9 @@ impl Interpreter {
                     row.insert("total_ms".to_string(), Value::F64(total_ms));
                     row.insert("avg_us".to_string(), Value::F64(avg_us));
                     row.insert("weight".to_string(), Value::F64(weight));
-                    out.push(Value::HashMap(Arc::new(Mutex::new(row))));
+                    out.push(Value::HashMap(Rc::new(RefCell::new(row))));
                 }
-                Ok(Value::Array(Arc::new(Mutex::new(out))))
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
             }
             "quant::int8_export" => Ok(Value::Bool(true)),
             "sim::world" => {
@@ -6458,23 +6506,23 @@ impl Interpreter {
                 let mut vel = [0.0_f32, 0.0_f32];
                 let mut size = [0.5_f32, 0.5_f32];
                 if let Some(Value::HashMap(map)) = args.get(1) {
-                    let m = map.lock().unwrap();
+                    let m = map.borrow();
                     if let Some(Value::Array(arr)) = m.get("position") {
-                        let vals = arr.lock().unwrap();
+                        let vals = arr.borrow();
                         if vals.len() >= 2 {
                             pos[0] = vals[0].as_f64().unwrap_or(0.0) as f32;
                             pos[1] = vals[1].as_f64().unwrap_or(0.0) as f32;
                         }
                     }
                     if let Some(Value::Array(arr)) = m.get("velocity") {
-                        let vals = arr.lock().unwrap();
+                        let vals = arr.borrow();
                         if vals.len() >= 2 {
                             vel[0] = vals[0].as_f64().unwrap_or(0.0) as f32;
                             vel[1] = vals[1].as_f64().unwrap_or(0.0) as f32;
                         }
                     }
                     if let Some(Value::Array(arr)) = m.get("size") {
-                        let vals = arr.lock().unwrap();
+                        let vals = arr.borrow();
                         if vals.len() >= 2 {
                             size[0] = vals[0].as_f64().unwrap_or(0.5) as f32 * 0.5;
                             size[1] = vals[1].as_f64().unwrap_or(0.5) as f32 * 0.5;
@@ -6532,7 +6580,7 @@ impl Interpreter {
                     .get_mut(&entity_id)
                     .ok_or_else(|| RuntimeError::new("sim::apply: unknown entity id"))?;
                 if let Some(Value::Array(action)) = args.get(2) {
-                    let a = action.lock().unwrap();
+                    let a = action.borrow();
                     if a.len() >= 2 {
                         ent.vel[0] += a[0].as_f64().unwrap_or(0.0) as f32;
                         ent.vel[1] += a[1].as_f64().unwrap_or(0.0) as f32;
@@ -6557,22 +6605,22 @@ impl Interpreter {
                         row.insert("id".into(), Value::I64(id));
                         row.insert(
                             "position".into(),
-                            Value::Array(Arc::new(Mutex::new(vec![
+                            Value::Array(Rc::new(RefCell::new(vec![
                                 Value::F32(e.pos[0]),
                                 Value::F32(e.pos[1]),
                             ]))),
                         );
                         row.insert(
                             "velocity".into(),
-                            Value::Array(Arc::new(Mutex::new(vec![
+                            Value::Array(Rc::new(RefCell::new(vec![
                                 Value::F32(e.vel[0]),
                                 Value::F32(e.vel[1]),
                             ]))),
                         );
-                        out.push(Value::HashMap(Arc::new(Mutex::new(row))));
+                        out.push(Value::HashMap(Rc::new(RefCell::new(row))));
                     }
                 }
-                Ok(Value::Array(Arc::new(Mutex::new(out))))
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
             }
             "sim::state_tensor" => {
                 let world_id = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
@@ -6611,7 +6659,7 @@ impl Interpreter {
                 })?;
                 let pos = match args.get(1) {
                     Some(Value::Array(arr)) => {
-                        let vals = arr.lock().unwrap();
+                        let vals = arr.borrow();
                         if vals.len() < 2 {
                             return rt_err!("sim::nearest_entity requires [x,y] position");
                         }
@@ -6654,7 +6702,7 @@ impl Interpreter {
                 })?;
                 let pos = match args.get(1) {
                     Some(Value::Array(arr)) => {
-                        let vals = arr.lock().unwrap();
+                        let vals = arr.borrow();
                         if vals.len() < 2 {
                             return rt_err!("sim::query_radius requires [x,y] position");
                         }
@@ -6682,7 +6730,7 @@ impl Interpreter {
                 }
                 ids.sort_unstable();
                 let vals = ids.into_iter().map(Value::I64).collect::<Vec<_>>();
-                Ok(Value::Array(Arc::new(Mutex::new(vals))))
+                Ok(Value::Array(Rc::new(RefCell::new(vals))))
             }
             "window::create" => {
                 let width = args.get(0).and_then(|v| v.as_i64()).unwrap_or(800).max(1);
@@ -6755,7 +6803,7 @@ impl Interpreter {
                     RuntimeError::new("window::size(window_id) requires window_id")
                 })?;
                 if let Some(w) = self.windows.get(&id) {
-                    Ok(Value::Array(Arc::new(Mutex::new(vec![
+                    Ok(Value::Array(Rc::new(RefCell::new(vec![
                         Value::I64(w.width),
                         Value::I64(w.height),
                     ]))))
@@ -6826,7 +6874,7 @@ impl Interpreter {
 
             // ── Collection functions ──────────────────────────────────────────
             "len" => match args.first() {
-                Some(Value::Array(a)) => Ok(Value::I32(a.lock().unwrap().len() as i32)),
+                Some(Value::Array(a)) => Ok(Value::I32(a.borrow().len() as i32)),
                 Some(Value::Str(s)) => Ok(Value::I32(s.len() as i32)),
                 Some(v) => rt_err!("len() not applicable to {}", v.type_name()),
                 None => rt_err!("len() requires an argument"),
@@ -6877,7 +6925,7 @@ impl Interpreter {
             }
 
             // ── HashMap / Collection constructors ──────────────────────────────
-            "HashMap::new" => Ok(Value::HashMap(Arc::new(Mutex::new(FxHashMap::default())))),
+            "HashMap::new" => Ok(Value::HashMap(Rc::new(RefCell::new(FxHashMap::default())))),
 
             // ── File I/O ───────────────────────────────────────────────────────
             "read_file" => {
@@ -7009,7 +7057,7 @@ impl Interpreter {
                                 ));
                             }
                             names.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
-                            Ok(Value::Array(Arc::new(Mutex::new(names))))
+                            Ok(Value::Array(Rc::new(RefCell::new(names))))
                         }
                         Err(e) => rt_err!("sys::list_dir failed: {}", e),
                     }
@@ -7022,7 +7070,7 @@ impl Interpreter {
                     match std::fs::read(path) {
                         Ok(bytes) => {
                             let values = bytes.into_iter().map(|b| Value::U8(b)).collect();
-                            Ok(Value::Array(Arc::new(Mutex::new(values))))
+                            Ok(Value::Array(Rc::new(RefCell::new(values))))
                         }
                         Err(e) => rt_err!("sys::read_bytes failed: {}", e),
                     }
@@ -7060,7 +7108,7 @@ impl Interpreter {
                                 .map(|d| d.as_secs() as i64)
                                 .unwrap_or(0);
                             out.insert("modified_unix".into(), Value::I64(modified));
-                            Ok(Value::HashMap(Arc::new(Mutex::new(out))))
+                            Ok(Value::HashMap(Rc::new(RefCell::new(out))))
                         }
                         Err(e) => rt_err!("sys::metadata failed: {}", e),
                     }
@@ -7071,8 +7119,7 @@ impl Interpreter {
             "sys::write_bytes" => match (args.get(0), args.get(1)) {
                 (Some(Value::Str(path)), Some(Value::Array(data))) => {
                     let bytes: Vec<u8> = data
-                        .lock()
-                        .unwrap()
+                        .borrow()
                         .iter()
                         .map(|v| match v {
                             Value::U8(x) => Ok(*x),
@@ -7150,7 +7197,7 @@ impl Interpreter {
                                 "stderr".into(),
                                 Value::Str(String::from_utf8_lossy(&out.stderr).into_owned()),
                             );
-                            Ok(Value::HashMap(Arc::new(Mutex::new(result))))
+                            Ok(Value::HashMap(Rc::new(RefCell::new(result))))
                         }
                         Err(e) => rt_err!("sys::exec failed: {}", e),
                     }
@@ -7160,7 +7207,7 @@ impl Interpreter {
             }
             "sys::exec_argv" => match (args.get(0), args.get(1)) {
                 (Some(Value::Str(program)), Some(Value::Array(argv))) => {
-                    let arg_values = argv.lock().unwrap();
+                    let arg_values = argv.borrow();
                     let mut parsed = Vec::with_capacity(arg_values.len());
                     for v in arg_values.iter() {
                         if let Value::Str(s) = v {
@@ -7186,7 +7233,7 @@ impl Interpreter {
                                 "stderr".into(),
                                 Value::Str(String::from_utf8_lossy(&out.stderr).into_owned()),
                             );
-                            Ok(Value::HashMap(Arc::new(Mutex::new(result))))
+                            Ok(Value::HashMap(Rc::new(RefCell::new(result))))
                         }
                         Err(e) => rt_err!("sys::exec_argv failed: {}", e),
                     }
@@ -7195,7 +7242,7 @@ impl Interpreter {
             },
             "sys::exec_argv_in" => match (args.get(0), args.get(1), args.get(2)) {
                 (Some(Value::Str(program)), Some(Value::Array(argv)), Some(Value::Str(cwd))) => {
-                    let arg_values = argv.lock().unwrap();
+                    let arg_values = argv.borrow();
                     let mut parsed = Vec::with_capacity(arg_values.len());
                     for v in arg_values.iter() {
                         if let Value::Str(s) = v {
@@ -7226,7 +7273,7 @@ impl Interpreter {
                                 "stderr".into(),
                                 Value::Str(String::from_utf8_lossy(&out.stderr).into_owned()),
                             );
-                            Ok(Value::HashMap(Arc::new(Mutex::new(result))))
+                            Ok(Value::HashMap(Rc::new(RefCell::new(result))))
                         }
                         Err(e) => rt_err!("sys::exec_argv_in failed: {}", e),
                     }
@@ -7482,7 +7529,7 @@ impl Interpreter {
                             entry.insert("kind".into(), Value::Str("clear".into()));
                             entry.insert(
                                 "color".into(),
-                                Value::Array(Arc::new(Mutex::new(vec![
+                                Value::Array(Rc::new(RefCell::new(vec![
                                     Value::F32(color[0]),
                                     Value::F32(color[1]),
                                     Value::F32(color[2]),
@@ -7506,7 +7553,7 @@ impl Interpreter {
                             entry.insert("layer".into(), Value::I64(layer as i64));
                             entry.insert(
                                 "color".into(),
-                                Value::Array(Arc::new(Mutex::new(vec![
+                                Value::Array(Rc::new(RefCell::new(vec![
                                     Value::F32(color[0]),
                                     Value::F32(color[1]),
                                     Value::F32(color[2]),
@@ -7533,9 +7580,9 @@ impl Interpreter {
                             entry.insert("layer".into(), Value::I64(layer as i64));
                         }
                     }
-                    out.push(Value::HashMap(Arc::new(Mutex::new(entry))));
+                    out.push(Value::HashMap(Rc::new(RefCell::new(entry))));
                 }
-                Ok(Value::Array(Arc::new(Mutex::new(out))))
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
             }
             "render::stats" => {
                 let render = self.render_state.as_ref().unwrap().lock().unwrap();
@@ -7551,7 +7598,7 @@ impl Interpreter {
                     "materials".into(),
                     Value::I64(render.materials.len() as i64),
                 );
-                Ok(Value::HashMap(Arc::new(Mutex::new(map))))
+                Ok(Value::HashMap(Rc::new(RefCell::new(map))))
             }
 
             // ── Input functions ───────────────────────────────────────────────────
@@ -7975,7 +8022,7 @@ impl Interpreter {
                             })
                             .into_inner()
                             .unwrap();
-                        let out = m.lock().unwrap().forward(x_owned)?;
+                        let out = m.borrow_mut().forward(x_owned)?;
                         Ok(Value::TensorFast(Arc::new(RefCell::new(out))))
                     } else {
                         rt_err!("forward() expects tensor")
@@ -7987,7 +8034,7 @@ impl Interpreter {
             // ── DataLoader / data pipeline methods ─────────────────────────────
             (Value::DataLoader(_), "next") => {
                 if let Value::DataLoader(dl) = recv {
-                    let mut dl = dl.lock().unwrap();
+                    let mut dl = dl.borrow_mut();
                     if let Some(batch) = dl.next_batch() {
                         Ok(Value::Some(Box::new(batch)))
                     } else {
@@ -7999,14 +8046,14 @@ impl Interpreter {
             }
             (Value::DataLoader(_), "has_next") => {
                 if let Value::DataLoader(dl) = recv {
-                    Ok(Value::Bool(dl.lock().unwrap().has_next()))
+                    Ok(Value::Bool(dl.borrow().has_next()))
                 } else {
                     unreachable!()
                 }
             }
             (Value::DataLoader(_), "reset") => {
                 if let Value::DataLoader(dl) = recv {
-                    dl.lock().unwrap().reset();
+                    dl.borrow_mut().reset();
                     Ok(Value::Unit)
                 } else {
                     unreachable!()
@@ -8014,7 +8061,7 @@ impl Interpreter {
             }
             (Value::DataLoader(_), "shuffle") => {
                 if let Value::DataLoader(dl) = recv {
-                    let mut d = dl.lock().unwrap();
+                    let mut d = dl.borrow_mut();
                     d.shuffle = true;
                     d.reset();
                     Ok(Value::Unit)
@@ -8030,10 +8077,10 @@ impl Interpreter {
                         .map(|i| i.max(1) as usize)
                         .unwrap_or(1);
                     let (samples, shuffle) = {
-                        let dl = dl.lock().unwrap();
+                        let dl = dl.borrow();
                         (dl.samples.clone(), dl.shuffle)
                     };
-                    Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
+                    Ok(Value::DataLoader(Rc::new(RefCell::new(DataLoader {
                         samples,
                         batch_size: size,
                         index: 0,
@@ -8051,14 +8098,14 @@ impl Interpreter {
                         .map(|i| i.max(0) as usize)
                         .unwrap_or(1);
                     let (samples, batch_size, shuffle) = {
-                        let dl = dl.lock().unwrap();
+                        let dl = dl.borrow();
                         (dl.samples.clone(), dl.batch_size, dl.shuffle)
                     };
                     let mut repeated = Vec::new();
                     for _ in 0..times {
                         repeated.extend_from_slice(&samples);
                     }
-                    Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
+                    Ok(Value::DataLoader(Rc::new(RefCell::new(DataLoader {
                         samples: repeated,
                         batch_size,
                         index: 0,
@@ -8070,8 +8117,8 @@ impl Interpreter {
             }
             (Value::DataLoader(_), "collect") => {
                 if let Value::DataLoader(dl) = recv {
-                    let data = dl.lock().unwrap().samples.clone();
-                    Ok(Value::Array(Arc::new(Mutex::new(data))))
+                    let data = dl.borrow().samples.clone();
+                    Ok(Value::Array(Rc::new(RefCell::new(data))))
                 } else {
                     unreachable!()
                 }
@@ -8083,7 +8130,7 @@ impl Interpreter {
                         _ => return rt_err!("map() requires a function argument"),
                     };
                     let (batch_size, shuffle, samples) = {
-                        let dl = dl.lock().unwrap();
+                        let dl = dl.borrow();
                         (dl.batch_size, dl.shuffle, dl.samples.clone())
                     };
                     let mut mapped = Vec::new();
@@ -8093,7 +8140,7 @@ impl Interpreter {
                             self.eval_call(Value::Fn(func.clone()), vec![sample], &mut call_env)?;
                         mapped.push(mapped_val);
                     }
-                    Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
+                    Ok(Value::DataLoader(Rc::new(RefCell::new(DataLoader {
                         samples: mapped,
                         batch_size,
                         index: 0,
@@ -8110,7 +8157,7 @@ impl Interpreter {
                         _ => return rt_err!("filter() requires a function argument"),
                     };
                     let (batch_size, shuffle, samples) = {
-                        let dl = dl.lock().unwrap();
+                        let dl = dl.borrow();
                         (dl.batch_size, dl.shuffle, dl.samples.clone())
                     };
                     let mut filtered = Vec::new();
@@ -8125,7 +8172,7 @@ impl Interpreter {
                             filtered.push(sample);
                         }
                     }
-                    Ok(Value::DataLoader(Arc::new(Mutex::new(DataLoader {
+                    Ok(Value::DataLoader(Rc::new(RefCell::new(DataLoader {
                         samples: filtered,
                         batch_size,
                         index: 0,
@@ -8139,7 +8186,7 @@ impl Interpreter {
             // ── World methods ──────────────────────────────────────────────────
             (Value::World(_), "spawn") => {
                 if let Value::World(w) = recv {
-                    let id = w.lock().unwrap().spawn();
+                    let id = w.borrow_mut().spawn();
                     Ok(Value::Entity(id))
                 } else {
                     unreachable!()
@@ -8148,7 +8195,7 @@ impl Interpreter {
             (Value::World(_), "despawn") => {
                 if let Value::World(w) = recv {
                     if let Some(Value::Entity(id)) = args.first() {
-                        w.lock().unwrap().despawn(*id);
+                        w.borrow_mut().despawn(*id);
                     }
                     Ok(Value::Unit)
                 } else {
@@ -8158,7 +8205,7 @@ impl Interpreter {
             // ── Array / string methods ─────────────────────────────────────────
             (Value::Array(_), "len") => {
                 if let Value::Array(a) = recv {
-                    Ok(Value::I32(a.lock().unwrap().len() as i32))
+                    Ok(Value::I32(a.borrow().len() as i32))
                 } else {
                     unreachable!()
                 }
@@ -8166,7 +8213,7 @@ impl Interpreter {
             (Value::Array(_), "push") => {
                 if let Value::Array(a) = recv {
                     if let Some(v) = args.into_iter().next() {
-                        a.lock().unwrap().push(v);
+                        a.borrow_mut().push(v);
                     }
                     Ok(Value::Unit)
                 } else {
@@ -8175,14 +8222,14 @@ impl Interpreter {
             }
             (Value::Array(_), "pop") => {
                 if let Value::Array(a) = recv {
-                    Ok(a.lock().unwrap().pop().unwrap_or(Value::Unit))
+                    Ok(a.borrow_mut().pop().unwrap_or(Value::Unit))
                 } else {
                     unreachable!()
                 }
             }
             (Value::Array(_), "clear") => {
                 if let Value::Array(a) = recv {
-                    a.lock().unwrap().clear();
+                    a.borrow_mut().clear();
                     Ok(Value::Unit)
                 } else {
                     unreachable!()
@@ -8194,7 +8241,7 @@ impl Interpreter {
                 if let Value::HashMap(m) = recv {
                     match (args.get(0), args.get(1)) {
                         (Some(Value::Str(k)), Some(v)) => {
-                            m.lock().unwrap().insert(k.clone(), v.clone());
+                            m.borrow_mut().insert(k.clone(), v.clone());
                             Ok(Value::Unit)
                         }
                         _ => rt_err!("insert() requires (string_key, value)"),
@@ -8206,7 +8253,7 @@ impl Interpreter {
             (Value::HashMap(_), "get") => {
                 if let Value::HashMap(m) = recv {
                     if let Some(Value::Str(k)) = args.first() {
-                        let map = m.lock().unwrap();
+                        let map = m.borrow();
                         Ok(map.get(k).cloned().unwrap_or(Value::None))
                     } else {
                         rt_err!("get() requires string key")
@@ -8218,7 +8265,7 @@ impl Interpreter {
             (Value::HashMap(_), "remove") => {
                 if let Value::HashMap(m) = recv {
                     if let Some(Value::Str(k)) = args.first() {
-                        Ok(m.lock().unwrap().remove(k).unwrap_or(Value::None))
+                        Ok(m.borrow_mut().remove(k).unwrap_or(Value::None))
                     } else {
                         rt_err!("remove() requires string key")
                     }
@@ -8228,14 +8275,14 @@ impl Interpreter {
             }
             (Value::HashMap(_), "len") => {
                 if let Value::HashMap(m) = recv {
-                    Ok(Value::I32(m.lock().unwrap().len() as i32))
+                    Ok(Value::I32(m.borrow().len() as i32))
                 } else {
                     unreachable!()
                 }
             }
             (Value::HashMap(_), "clear") => {
                 if let Value::HashMap(m) = recv {
-                    m.lock().unwrap().clear();
+                    m.borrow_mut().clear();
                     Ok(Value::Unit)
                 } else {
                     unreachable!()
@@ -8244,20 +8291,19 @@ impl Interpreter {
             (Value::HashMap(_), "keys") => {
                 if let Value::HashMap(m) = recv {
                     let keys: Vec<Value> = m
-                        .lock()
-                        .unwrap()
+                        .borrow()
                         .keys()
                         .map(|k| Value::Str(k.clone()))
                         .collect();
-                    Ok(Value::Array(Arc::new(Mutex::new(keys))))
+                    Ok(Value::Array(Rc::new(RefCell::new(keys))))
                 } else {
                     unreachable!()
                 }
             }
             (Value::HashMap(_), "values") => {
                 if let Value::HashMap(m) = recv {
-                    let values: Vec<Value> = m.lock().unwrap().values().cloned().collect();
-                    Ok(Value::Array(Arc::new(Mutex::new(values))))
+                    let values: Vec<Value> = m.borrow().values().cloned().collect();
+                    Ok(Value::Array(Rc::new(RefCell::new(values))))
                 } else {
                     unreachable!()
                 }
@@ -8265,7 +8311,7 @@ impl Interpreter {
             (Value::HashMap(_), "contains_key") => {
                 if let Value::HashMap(m) = recv {
                     if let Some(Value::Str(k)) = args.first() {
-                        Ok(Value::Bool(m.lock().unwrap().contains_key(k)))
+                        Ok(Value::Bool(m.borrow().contains_key(k)))
                     } else {
                         rt_err!("contains_key() requires string key")
                     }
@@ -8283,7 +8329,7 @@ impl Interpreter {
             (Value::Str(s), "trim_end") => Ok(Value::Str(s.trim_end().to_string())),
             (Value::Str(s), "chars") => {
                 let chars: Vec<Value> = s.chars().map(|c| Value::Str(c.to_string())).collect();
-                Ok(Value::Array(Arc::new(Mutex::new(chars))))
+                Ok(Value::Array(Rc::new(RefCell::new(chars))))
             }
             (Value::Str(s), "reverse") => Ok(Value::Str(s.chars().rev().collect())),
             (Value::Str(s), "starts_with") => {
@@ -8313,7 +8359,7 @@ impl Interpreter {
                         .split(delim.as_str())
                         .map(|part| Value::Str(part.to_string()))
                         .collect();
-                    Ok(Value::Array(Arc::new(Mutex::new(parts))))
+                    Ok(Value::Array(Rc::new(RefCell::new(parts))))
                 } else {
                     rt_err!("split() requires a string argument")
                 }
@@ -8390,7 +8436,7 @@ impl Interpreter {
                 elems.len() == vs.len()
                     && elems
                         .iter()
-                        .zip(vs)
+                        .zip(vs.iter())
                         .all(|(p, v)| self.pattern_matches(p, v))
             }
             (Pattern::Or { arms, .. }, v) => arms.iter().any(|p| self.pattern_matches(p, v)),
@@ -8404,15 +8450,15 @@ impl Interpreter {
             Pattern::Wildcard(_) => {}
             Pattern::Tuple { elems, .. } => {
                 if let Value::Tuple(vs) = val {
-                    for (p, v) in elems.iter().zip(vs) {
-                        self.bind_pattern(p, v, env);
+                    for (p, v) in elems.iter().zip(vs.iter()) {
+                        self.bind_pattern(p, v.clone(), env);
                     }
                 }
             }
             Pattern::Struct { fields, .. } => {
-                if let Value::Struct { fields: fmap, .. } = val {
+                if let Value::Struct(ref data) = val {
                     for (fname, maybe_pat) in fields {
-                        if let Some(fval) = fmap.get(fname) {
+                        if let Some(fval) = data.fields.get(fname) {
                             if let Some(p) = maybe_pat {
                                 self.bind_pattern(p, fval.clone(), env);
                             } else {
@@ -8430,9 +8476,17 @@ impl Interpreter {
 
     fn value_to_iter(&self, v: Value) -> Result<Vec<Value>, RuntimeError> {
         match v {
-            Value::Array(a) => Ok(a.lock().unwrap().clone()),
-            Value::Tuple(vs) => Ok(vs),
+            Value::Array(a) => Ok(a.borrow().clone()),
+            Value::Tuple(vs) => Ok((*vs).clone()),
             Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
+            Value::Range { start, end, inclusive } => {
+                // Expand the lazy range on demand when iterated.
+                if inclusive {
+                    Ok((start..=end).map(Value::I32).collect())
+                } else {
+                    Ok((start..end).map(Value::I32).collect())
+                }
+            }
             _ => rt_err!("value `{}` is not iterable", v.type_name()),
         }
     }
@@ -8503,7 +8557,7 @@ impl Interpreter {
                 if let Some(decl) = self.model_decls.get(model_name).cloned() {
                     let model = NnModel::from_decl(&decl);
                     self.models
-                        .insert(model_name.clone(), Arc::new(Mutex::new(model)));
+                        .insert(model_name.clone(), Rc::new(RefCell::new(model)));
                 }
             }
         }
@@ -8515,7 +8569,7 @@ impl Interpreter {
         for _env_idx in 0..num_envs {
             // Reset world state for each episode.
             {
-                let mut w = self.world.lock().unwrap();
+                let mut w = self.world.borrow_mut();
                 *w = EcsWorld::default();
             }
 
@@ -8533,7 +8587,7 @@ impl Interpreter {
                 // 2. Forward pass through policy network.
                 let _action = if let Some(model_name) = &decl.model {
                     if let Some(m) = self.models.get(model_name).cloned() {
-                        let out = m.lock().unwrap().forward(obs)?;
+                        let out = m.borrow_mut().forward(obs)?;
                         Value::TensorFast(Arc::new(RefCell::new(out)))
                     } else {
                         Value::Unit
@@ -8550,7 +8604,7 @@ impl Interpreter {
                     .signals
                     .iter()
                     .map(|sig| {
-                        let w = self.world.lock().unwrap();
+                        let w = self.world.borrow();
                         let count = w
                             .events
                             .get(&sig.name)
@@ -8586,7 +8640,7 @@ impl Interpreter {
                     .map(|o| o.learning_rate as f32)
                     .unwrap_or(3e-4);
                 update_model_weights(
-                    &mut *model.lock().unwrap(),
+                    &mut *model.borrow_mut(),
                     total_reward / num_envs as f32,
                     lr,
                 );
@@ -10155,7 +10209,7 @@ mod tests {
     fn test_interp_dataloader_basics() {
         let mut interp = mk_interp();
         let mut env = Env::new();
-        let source = Value::Array(Arc::new(Mutex::new(vec![
+        let source = Value::Array(Rc::new(RefCell::new(vec![
             Value::I32(1),
             Value::I32(2),
             Value::I32(3),
@@ -10180,7 +10234,7 @@ mod tests {
         match next_batch {
             Value::Some(boxed_batch) => {
                 if let Value::Array(arr) = *boxed_batch {
-                    let v = arr.lock().unwrap();
+                    let v = arr.borrow();
                     assert_eq!(v.len(), 2);
                 } else {
                     panic!("expected array batch");
@@ -10193,7 +10247,7 @@ mod tests {
             .eval_method(loader.clone(), "collect", vec![], &mut env)
             .unwrap();
         match collected {
-            Value::Array(arr) => assert_eq!(arr.lock().unwrap().len(), 4),
+            Value::Array(arr) => assert_eq!(arr.borrow().len(), 4),
             _ => panic!("expected array from collect"),
         }
 
@@ -10201,7 +10255,7 @@ mod tests {
             .eval_method(loader.clone(), "repeat", vec![Value::I32(2)], &mut env)
             .unwrap();
         if let Value::DataLoader(dl) = repeated {
-            assert_eq!(dl.lock().unwrap().samples.len(), 8);
+            assert_eq!(dl.borrow().samples.len(), 8);
         } else {
             panic!("expected DataLoader from repeat");
         }
@@ -10210,7 +10264,7 @@ mod tests {
             .eval_method(loader, "batch", vec![Value::I32(1)], &mut env)
             .unwrap();
         if let Value::DataLoader(dl) = b {
-            assert_eq!(dl.lock().unwrap().batch_size, 1);
+            assert_eq!(dl.borrow().batch_size, 1);
         } else {
             panic!("expected DataLoader from batch");
         }
@@ -10224,7 +10278,7 @@ mod tests {
             .eval_builtin("range", vec![Value::I32(0), Value::I32(5), Value::I32(2)])
             .unwrap();
         if let Value::Array(arr) = r {
-            let a = arr.lock().unwrap();
+            let a = arr.borrow();
             let ints: Vec<i32> = a
                 .iter()
                 .filter_map(|v| match v {
@@ -10239,7 +10293,7 @@ mod tests {
 
         let z = interp.eval_builtin("zeros", vec![Value::I32(3)]).unwrap();
         if let Value::Array(arr) = z {
-            assert_eq!(arr.lock().unwrap().len(), 3);
+            assert_eq!(arr.borrow().len(), 3);
         } else {
             panic!("expected array from zeros");
         }
@@ -10247,8 +10301,7 @@ mod tests {
         let o = interp.eval_builtin("ones", vec![Value::I32(2)]).unwrap();
         if let Value::Array(arr) = o {
             let values: Vec<f32> = arr
-                .lock()
-                .unwrap()
+                .borrow()
                 .iter()
                 .filter_map(|v| match v {
                     Value::F32(x) => Some(*x),
@@ -10267,7 +10320,7 @@ mod tests {
 
         let modules = interp.eval_builtin("std::modules", vec![]).unwrap();
         if let Value::HashMap(map) = modules {
-            let m = map.lock().unwrap();
+            let m = map.borrow();
             assert!(m.contains_key("core"));
             assert!(m.contains_key("math"));
             assert!(m.contains_key("tensor"));
@@ -10275,7 +10328,7 @@ mod tests {
             assert!(m.contains_key("train"));
             assert!(m.contains_key("render"));
             if let Some(Value::Array(math_mod)) = m.get("math") {
-                let vals = math_mod.lock().unwrap();
+                let vals = math_mod.borrow();
                 assert!(vals
                     .iter()
                     .any(|v| matches!(v, Value::Str(s) if s == "distance2")));
@@ -10283,7 +10336,7 @@ mod tests {
                 panic!("expected math module list");
             }
             if let Some(Value::Array(render_mod)) = m.get("render") {
-                let vals = render_mod.lock().unwrap();
+                let vals = render_mod.borrow();
                 assert!(vals
                     .iter()
                     .any(|v| matches!(v, Value::Str(s) if s == "render::flush")));
@@ -10315,7 +10368,7 @@ mod tests {
         let s = interp
             .eval_builtin(
                 "tensor::sum",
-                vec![Value::Array(Arc::new(Mutex::new(vec![
+                vec![Value::Array(Rc::new(RefCell::new(vec![
                     Value::I32(1),
                     Value::I32(2),
                     Value::I32(3),
@@ -10339,18 +10392,18 @@ mod tests {
         let mut entity = FxHashMap::default();
         entity.insert(
             "position".into(),
-            Value::Array(Arc::new(Mutex::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
+            Value::Array(Rc::new(RefCell::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
         );
         entity.insert(
             "velocity".into(),
-            Value::Array(Arc::new(Mutex::new(vec![Value::F32(1.0), Value::F32(0.0)]))),
+            Value::Array(Rc::new(RefCell::new(vec![Value::F32(1.0), Value::F32(0.0)]))),
         );
         let e = interp
             .eval_builtin(
                 "sim::spawn",
                 vec![
                     Value::I64(world_id),
-                    Value::HashMap(Arc::new(Mutex::new(entity))),
+                    Value::HashMap(Rc::new(RefCell::new(entity))),
                 ],
             )
             .unwrap();
@@ -10366,10 +10419,10 @@ mod tests {
             .eval_builtin("sim::get_state", vec![Value::I64(world_id)])
             .unwrap();
         if let Value::Array(rows) = state {
-            let rows = rows.lock().unwrap();
+            let rows = rows.borrow();
             assert_eq!(rows.len(), 1);
             if let Value::HashMap(map) = &rows[0] {
-                let m = map.lock().unwrap();
+                let m = map.borrow();
                 assert!(matches!(m.get("id"), Some(Value::I64(id)) if *id == entity_id));
             } else {
                 panic!("expected state row hashmap");
@@ -10447,14 +10500,14 @@ mod tests {
         let norm = interp
             .eval_builtin(
                 "tensor::normalize",
-                vec![Value::Array(Arc::new(Mutex::new(vec![
+                vec![Value::Array(Rc::new(RefCell::new(vec![
                     Value::F32(3.0),
                     Value::F32(4.0),
                 ])))],
             )
             .unwrap();
         if let Value::Array(arr) = norm {
-            let vals = arr.lock().unwrap();
+            let vals = arr.borrow();
             let a = match vals[0] {
                 Value::F32(v) => v,
                 _ => 0.0,
@@ -10496,7 +10549,7 @@ mod tests {
             .eval_builtin("window::size", vec![Value::I64(id)])
             .unwrap()
         {
-            let s = sz.lock().unwrap();
+            let s = sz.borrow();
             assert!(matches!(s[0], Value::I64(320)));
             assert!(matches!(s[1], Value::I64(200)));
         } else {
@@ -10523,7 +10576,7 @@ mod tests {
             .eval_builtin("debug::runtime_hotspots", vec![Value::I64(4)])
             .unwrap();
         if let Value::Array(rows) = hotspots {
-            let vals = rows.lock().unwrap();
+            let vals = rows.borrow();
             assert!(!vals.is_empty());
         } else {
             panic!("expected array from debug::runtime_hotspots");
@@ -10547,11 +10600,11 @@ mod tests {
             let y = (i / 16) as f32 * 0.4;
             entity.insert(
                 "position".into(),
-                Value::Array(Arc::new(Mutex::new(vec![Value::F32(x), Value::F32(y)]))),
+                Value::Array(Rc::new(RefCell::new(vec![Value::F32(x), Value::F32(y)]))),
             );
             entity.insert(
                 "velocity".into(),
-                Value::Array(Arc::new(Mutex::new(vec![
+                Value::Array(Rc::new(RefCell::new(vec![
                     Value::F32(0.2),
                     Value::F32(-0.1),
                 ]))),
@@ -10561,7 +10614,7 @@ mod tests {
                     "sim::spawn",
                     vec![
                         Value::I64(world_id),
-                        Value::HashMap(Arc::new(Mutex::new(entity))),
+                        Value::HashMap(Rc::new(RefCell::new(entity))),
                     ],
                 )
                 .unwrap();
@@ -10652,7 +10705,7 @@ mod tests {
 
         let stats = interp.eval_builtin("render::stats", vec![]).unwrap();
         if let Value::HashMap(m) = stats {
-            let m = m.lock().unwrap();
+            let m = m.borrow();
             assert!(matches!(m.get("width"), Some(Value::I64(1280))));
             assert!(matches!(m.get("height"), Some(Value::I64(720))));
             assert!(matches!(m.get("queued_commands"), Some(Value::I64(3))));
@@ -10662,7 +10715,7 @@ mod tests {
 
         let flushed = interp.eval_builtin("render::flush", vec![]).unwrap();
         if let Value::Array(cmds) = flushed {
-            let cmds = cmds.lock().unwrap();
+            let cmds = cmds.borrow();
             assert_eq!(cmds.len(), 3);
         } else {
             panic!("expected command list from render::flush");
@@ -10670,7 +10723,7 @@ mod tests {
 
         let stats_after = interp.eval_builtin("render::stats", vec![]).unwrap();
         if let Value::HashMap(m) = stats_after {
-            let m = m.lock().unwrap();
+            let m = m.borrow();
             assert!(matches!(m.get("queued_commands"), Some(Value::I64(0))));
         } else {
             panic!("expected render::stats map");
@@ -10741,7 +10794,7 @@ mod tests {
             )
             .unwrap();
         if let Value::Array(v) = move_towards {
-            let v = v.lock().unwrap();
+            let v = v.borrow();
             let x = match v[0] {
                 Value::F32(n) => n,
                 _ => panic!("x should be f32"),
@@ -10774,7 +10827,7 @@ mod tests {
             .unwrap();
         let unit = interp.eval_builtin("math::rand_unit2", vec![]).unwrap();
         if let Value::Array(v) = unit {
-            let v = v.lock().unwrap();
+            let v = v.borrow();
             let x = match v[0] {
                 Value::F32(n) => n,
                 _ => panic!("x should be f32"),
@@ -10805,13 +10858,13 @@ mod tests {
             let mut entity = FxHashMap::default();
             entity.insert(
                 "position".into(),
-                Value::Array(Arc::new(Mutex::new(vec![Value::F32(x), Value::F32(y)]))),
+                Value::Array(Rc::new(RefCell::new(vec![Value::F32(x), Value::F32(y)]))),
             );
             entity.insert(
                 "velocity".into(),
-                Value::Array(Arc::new(Mutex::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
+                Value::Array(Rc::new(RefCell::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
             );
-            Value::HashMap(Arc::new(Mutex::new(entity)))
+            Value::HashMap(Rc::new(RefCell::new(entity)))
         };
         let _ = interp
             .eval_builtin("sim::spawn", vec![Value::I64(world_id), mk_ent(0.0, 0.0)])
@@ -10834,7 +10887,7 @@ mod tests {
                 "sim::nearest_entity",
                 vec![
                     Value::I64(world_id),
-                    Value::Array(Arc::new(Mutex::new(vec![Value::F32(1.8), Value::F32(0.0)]))),
+                    Value::Array(Rc::new(RefCell::new(vec![Value::F32(1.8), Value::F32(0.0)]))),
                     Value::F32(10.0),
                 ],
             )
@@ -10846,13 +10899,13 @@ mod tests {
                 "sim::query_radius",
                 vec![
                     Value::I64(world_id),
-                    Value::Array(Arc::new(Mutex::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
+                    Value::Array(Rc::new(RefCell::new(vec![Value::F32(0.0), Value::F32(0.0)]))),
                     Value::F32(1.0),
                 ],
             )
             .unwrap();
         match qr {
-            Value::Array(ids) => assert_eq!(ids.lock().unwrap().len(), 1),
+            Value::Array(ids) => assert_eq!(ids.borrow().len(), 1),
             _ => panic!("expected id array"),
         }
     }
@@ -10887,7 +10940,7 @@ mod tests {
             Value::Bool(true)
         ));
 
-        let bytes = Value::Array(Arc::new(Mutex::new(vec![
+        let bytes = Value::Array(Rc::new(RefCell::new(vec![
             Value::U8(0),
             Value::U8(1),
             Value::U8(2),
@@ -10908,8 +10961,7 @@ mod tests {
             .unwrap();
         if let Value::Array(arr) = read_back {
             let got: Vec<u8> = arr
-                .lock()
-                .unwrap()
+                .borrow()
                 .iter()
                 .map(|v| match v {
                     Value::U8(b) => *b,
@@ -10944,7 +10996,7 @@ mod tests {
             .eval_builtin("sys::exec", vec![Value::Str("printf jules_sys_ok".into())])
             .unwrap();
         if let Value::HashMap(map) = exec_result {
-            let m = map.lock().unwrap();
+            let m = map.borrow();
             assert!(matches!(m.get("ok"), Some(Value::Bool(true))));
             assert!(matches!(m.get("stdout"), Some(Value::Str(s)) if s == "jules_sys_ok"));
         } else {
@@ -10955,12 +11007,12 @@ mod tests {
                 "sys::exec_argv",
                 vec![
                     Value::Str("printf".into()),
-                    Value::Array(Arc::new(Mutex::new(vec![Value::Str(" argv_ok".into())]))),
+                    Value::Array(Rc::new(RefCell::new(vec![Value::Str(" argv_ok".into())]))),
                 ],
             )
             .unwrap();
         if let Value::HashMap(map) = exec_argv {
-            let m = map.lock().unwrap();
+            let m = map.borrow();
             assert!(matches!(m.get("ok"), Some(Value::Bool(true))));
             assert!(matches!(m.get("stdout"), Some(Value::Str(s)) if s == " argv_ok"));
         } else {
@@ -10972,8 +11024,7 @@ mod tests {
             .unwrap();
         if let Value::Array(arr) = list_result {
             let names: Vec<String> = arr
-                .lock()
-                .unwrap()
+                .borrow()
                 .iter()
                 .map(|v| match v {
                     Value::Str(s) => s.clone(),
@@ -10993,7 +11044,7 @@ mod tests {
             )
             .unwrap();
         if let Value::HashMap(map) = metadata {
-            let m = map.lock().unwrap();
+            let m = map.borrow();
             assert!(matches!(m.get("is_file"), Some(Value::Bool(true))));
             assert!(matches!(m.get("len"), Some(Value::I64(4))));
         } else {

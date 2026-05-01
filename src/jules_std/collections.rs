@@ -25,7 +25,7 @@ fn f64_arg(args: &[Value], i: usize) -> Option<f64> {
     args.get(i).and_then(|v| v.as_f64())
 }
 
-fn array_arg(args: &[Value], i: usize) -> Option<std::sync::Arc<std::sync::Mutex<Vec<Value>>>> {
+fn array_arg(args: &[Value], i: usize) -> Option<std::rc::Rc<std::cell::RefCell<Vec<Value>>>> {
     match args.get(i) {
         Some(Value::Array(a)) => Some(a.clone()),
         _ => None,
@@ -481,7 +481,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                     let s = s.borrow();
                     if let Some(ss) = s.get(h as usize - 1) {
                         let arr = ss.to_array();
-                        Some(Ok(Value::Array(std::sync::Arc::new(std::sync::Mutex::new(arr)))))
+                        Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(arr)))))
                     } else { Some(Err(rt_err!("sorted_set_to_array(): invalid handle"))) }
                 })
             } else { Some(Err(rt_err!("sorted_set_to_array() requires handle"))) }
@@ -492,13 +492,13 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             if args.len() < 2 { return Some(Err(rt_err!("par_map() requires array, fn_name"))); }
             // Simplified: just map with identity since we can't call Jules functions from here
             if let Value::Array(arr) = &args[0] {
-                let arr = arr.lock().unwrap();
-                Some(Ok(Value::Array(std::sync::Arc::new(std::sync::Mutex::new(arr.clone())))))
+                let arr = arr.borrow();
+                Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(arr.clone())))))
             } else { Some(Err(rt_err!("par_map() requires array"))) }
         }
         "collections::par_reduce" => {
             if let Value::Array(arr) = &args[0] {
-                let arr = arr.lock().unwrap();
+                let arr = arr.borrow();
                 if arr.is_empty() { return Some(Ok(Value::Unit)); }
                 let sum: f64 = arr.iter().filter_map(|v| v.as_f64()).sum();
                 Some(Ok(Value::F64(sum)))

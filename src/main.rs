@@ -619,6 +619,7 @@ impl Pipeline {
         // ── Pass 7: Level 4 Semantic Superoptimizer (Algorithmic Lifting) ─────
         // Replaces algorithmic patterns with mathematically-equivalent O(1) formulas.
         // e.g., sum of 1..n → n*(n+1)/2, polynomial → Horner's method
+        #[cfg(feature = "gnn-optimizer")]
         if self.opt_level >= 2 {
             let mut semantic = crate::optimizer::semantic_superopt::SemanticSuperoptimizer::new();
             semantic.optimize_program(&mut program);
@@ -631,6 +632,7 @@ impl Pipeline {
         // ── Pass 8: Level 4 Polyhedral Optimizer (Cache-Tiled Loops) ──────────
         // Analyzes loop nests and applies cache-optimal tiling, interchange,
         // and fusion. Uses the real CPU cache model for tile size selection.
+        #[cfg(feature = "gnn-optimizer")]
         if self.opt_level >= 2 {
             let mut polyhedral = crate::optimizer::polyhedral::PolyhedralOptimizer::new();
             polyhedral.optimize_program(&mut program);
@@ -644,6 +646,7 @@ impl Pipeline {
         // Recognizes ML kernel patterns (matmul, softmax, attention, conv2d,
         // layer_norm, etc.) and replaces them with optimal fused implementations.
         // This is what XLA/TensorRT/TVM do — but at the language level.
+        #[cfg(feature = "gnn-optimizer")]
         if self.opt_level >= 2 {
             let mut ml_opt = crate::optimizer::ml_superopt::MlSuperoptimizer::new();
             ml_opt.optimize_program(&mut program);

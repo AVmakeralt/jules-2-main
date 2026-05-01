@@ -356,7 +356,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         "noise::worley2_cellular" => {
             if let (Some(x), Some(y)) = (f64_arg(args,0), f64_arg(args,1)) {
                 let (f1, f2) = worley2_cellular(x, y);
-                Some(Ok(Value::Tuple(vec![Value::F64(f1), Value::F64(f2)])))
+                Some(Ok(Value::Tuple(Box::new(vec![Value::F64(f1), Value::F64(f2)]))))
             } else { Some(Err(rt_err!("noise::worley2_cellular() requires x, y"))) }
         }
         "noise::fbm2" => {
