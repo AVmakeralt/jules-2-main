@@ -13,6 +13,7 @@ pub mod optimizer;
 pub mod profile_guided;
 pub mod self_repair;
 pub mod data_dependent_jit;
+pub mod ml_superopt;
 pub mod polyhedral;
 pub mod semantic_superopt;
 pub mod soa_optimizer;

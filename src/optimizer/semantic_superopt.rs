@@ -1270,7 +1270,7 @@ impl SemanticSuperoptimizer {
     fn mask_simplify(&self, expr: &Expr) -> Option<Expr> {
         // (x | y) & ~y → x & ~y   (when ~y appears literally as bitwise NOT)
         if let Expr::BinOp { op: BinOpKind::BitAnd, lhs, rhs: not_y, span } = expr {
-            if let Expr::UnOp { op: UnOpKind::BitNot, expr: y2, .. } = not_y.as_ref() {
+            if let Expr::UnOp { op: UnOpKind::Not, expr: y2, .. } = not_y.as_ref() {
                 if let Expr::BinOp { op: BinOpKind::BitOr, lhs: x, rhs: y1, .. } = lhs.as_ref() {
                     if Self::exprs_equal(y1, y2) {
                         let span = *span;
@@ -1749,10 +1749,9 @@ impl SemanticSuperoptimizer {
                 } else {
                     // if false { e1 } else { e2 } → e2
                     if let Some(else_block) = else_ {
-                        if let IfOrBlock::Block(b) = else_block.as_ref() {
-                            if let Some(tail) = &b.tail {
-                                return Some(*tail.clone());
-                            }
+                        // else_block is already &Block (the Stmt::If else_ field)
+                        if let Some(tail) = &else_block.tail {
+                            return Some(*tail.clone());
                         }
                     }
                 }

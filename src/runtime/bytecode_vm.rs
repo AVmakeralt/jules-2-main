@@ -478,6 +478,19 @@ impl BytecodeCompiler {
     
     /// Compile program to bytecode
     pub fn compile_program(&mut self, program: &Program) -> Result<Vec<BytecodeFunction>, String> {
+        // First pass: register all function names so they can be referenced
+        // during compilation of other functions (cross-function calls).
+        let mut function_names = Vec::new();
+        for item in &program.items {
+            if let crate::compiler::ast::Item::Fn(fn_decl) = item {
+                if fn_decl.body.is_some() {
+                    let idx = self.functions.len();
+                    self.functions.insert(fn_decl.name.clone(), idx);
+                    function_names.push(fn_decl.name.clone());
+                }
+            }
+        }
+
         // Compile each top-level function
         let mut functions = Vec::new();
         
@@ -492,9 +505,16 @@ impl BytecodeCompiler {
                         for (i, p) in fn_decl.params.iter().enumerate() {
                             fn_compiler.locals.insert(p.name.clone(), i as u16);
                         }
+                        // Share the function name table so cross-function calls work
+                        fn_compiler.functions = self.functions.clone();
                         
                         // Compile function body
                         fn_compiler.compile_block(body, 0)?;
+                        
+                        // Set num_locals to the total number of slots allocated
+                        // (params + locals + temporaries).  This is critical for
+                        // the VM to allocate the correct slot array size.
+                        fn_compiler.current_function.num_locals = fn_compiler.next_slot;
                         
                         functions.push(fn_compiler.current_function);
                     }
@@ -507,7 +527,9 @@ impl BytecodeCompiler {
     }
     
     fn compile_block(&mut self, block: &crate::compiler::ast::Block, dst: u16) -> Result<(), String> {
+        eprintln!("[bc-compiler] compile_block: {} stmts, tail={}, dst={}", block.stmts.len(), block.tail.is_some(), dst);
         for stmt in &block.stmts {
+            eprintln!("[bc-compiler]   stmt: {:?}", std::mem::discriminant(stmt));
             self.compile_stmt(stmt)?;
         }
         if let Some(tail) = &block.tail {
@@ -732,6 +754,7 @@ impl BytecodeCompiler {
                 }
             }
             Stmt::While { cond, body, .. } => {
+                eprintln!("[bc-compiler] WHILE: body has {} stmts, tail={}", body.stmts.len(), body.tail.is_some());
                 let loop_start = self.current_function.instructions.len();
                 self.loop_starts.push(loop_start);
 
@@ -900,12 +923,22 @@ impl BytecodeCompiler {
 
             // ── Variable / path ───────────────────────────────────────────
             Expr::Ident { name, .. } => {
-                let slot = self
-                    .locals
-                    .get(name)
-                    .copied()
-                    .ok_or_else(|| format!("unknown local variable `{name}`"))?;
-                self.emit(Instr::Move { dst, src: slot });
+                if let Some(&slot) = self.locals.get(name) {
+                    self.emit(Instr::Move { dst, src: slot });
+                } else if self.functions.contains_key(name) {
+                    // This is a reference to a known function — create a Fn value
+                    // so it can be called via the Call instruction.
+                    // We store the function name as a constant; the VM will
+                    // resolve it at runtime via the function table.
+                    let idx = self.current_function.add_constant(Value::Str(name.clone()));
+                    self.emit(Instr::LoadConst { dst, idx });
+                } else if name == "print" || name == "println" {
+                    // Built-in functions — store name as constant
+                    let idx = self.current_function.add_constant(Value::Str(name.clone()));
+                    self.emit(Instr::LoadConst { dst, idx });
+                } else {
+                    return Err(format!("unknown local variable `{name}`"));
+                }
             }
             Expr::Path { segments, .. } => {
                 // Treat single-segment paths as identifiers
@@ -1009,35 +1042,42 @@ impl BytecodeCompiler {
 
             // ── Assignment ────────────────────────────────────────────────
             Expr::Assign { op, target, value, .. } => {
+                // Always allocate a temp slot for the RHS result to avoid
+                // clobbering the target variable's slot when dst overlaps.
+                let result_slot = self.alloc_slot();
                 if op.is_compound() {
                     // Compound assignment (+=, etc.): evaluate target, then RHS,
                     // apply operator, then store back.
-                    self.compile_expr(target, dst)?;
+                    self.compile_expr(target, result_slot)?;
                     let old_val = self.alloc_slot();
-                    self.emit(Instr::Move { dst: old_val, src: dst });
+                    self.emit(Instr::Move { dst: old_val, src: result_slot });
                     let rhs_slot = self.alloc_slot();
                     self.compile_expr(value, rhs_slot)?;
 
                     match op.to_binop() {
-                        Some(BinOpKind::Add)    => self.emit(Instr::Add { dst, lhs: old_val, rhs: rhs_slot }),
-                        Some(BinOpKind::Sub)    => self.emit(Instr::Sub { dst, lhs: old_val, rhs: rhs_slot }),
-                        Some(BinOpKind::Mul)    => self.emit(Instr::Mul { dst, lhs: old_val, rhs: rhs_slot }),
-                        Some(BinOpKind::Div)    => self.emit(Instr::Div { dst, lhs: old_val, rhs: rhs_slot }),
-                        Some(BinOpKind::Rem)    => self.emit(Instr::Rem { dst, lhs: old_val, rhs: rhs_slot }),
-                        Some(BinOpKind::BitAnd) => self.emit(Instr::BitAnd { dst, lhs: old_val, rhs: rhs_slot }),
-                        Some(BinOpKind::BitOr)  => self.emit(Instr::BitOr { dst, lhs: old_val, rhs: rhs_slot }),
-                        Some(BinOpKind::BitXor) => self.emit(Instr::BitXor { dst, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::Add)    => self.emit(Instr::Add { dst: result_slot, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::Sub)    => self.emit(Instr::Sub { dst: result_slot, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::Mul)    => self.emit(Instr::Mul { dst: result_slot, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::Div)    => self.emit(Instr::Div { dst: result_slot, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::Rem)    => self.emit(Instr::Rem { dst: result_slot, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::BitAnd) => self.emit(Instr::BitAnd { dst: result_slot, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::BitOr)  => self.emit(Instr::BitOr { dst: result_slot, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::BitXor) => self.emit(Instr::BitXor { dst: result_slot, lhs: old_val, rhs: rhs_slot }),
                         _ => {
                             // MatMulAssign etc. — fallback: just assign RHS
-                            self.emit(Instr::Move { dst, src: rhs_slot });
+                            self.compile_expr(value, result_slot)?;
                         }
                     }
                 } else {
-                    // Plain assignment: compile RHS, then store into target
-                    self.compile_expr(value, dst)?;
+                    // Plain assignment: compile RHS into a temp slot
+                    self.compile_expr(value, result_slot)?;
                 }
                 // Store result into the target lvalue
-                self.compile_store_target(target, dst)?;
+                self.compile_store_target(target, result_slot)?;
+                // Also copy to dst for the expression's return value
+                if dst != result_slot {
+                    self.emit(Instr::Move { dst, src: result_slot });
+                }
             }
 
             // ── Field access ──────────────────────────────────────────────
@@ -1063,16 +1103,62 @@ impl BytecodeCompiler {
 
             // ── Function call ─────────────────────────────────────────────
             Expr::Call { func, args, .. } => {
-                let argc = args.len() as u16;
-                let arg_start = dst.wrapping_add(2);
-                // Compile each argument into sequential slots
-                for (i, arg) in args.iter().enumerate() {
-                    self.compile_expr(arg, arg_start + i as u16)?;
+                // ── Special-case: print() → emit Print instruction directly ──
+                if let Expr::Ident { name, .. } = func.as_ref() {
+                    if name == "print" {
+                        if args.len() == 1 {
+                            self.compile_expr(&args[0], dst)?;
+                            self.emit(Instr::Print { src: dst });
+                        } else {
+                            // print() with 0 or 2+ args: compile each and print
+                            for arg in args {
+                                self.compile_expr(arg, dst)?;
+                                self.emit(Instr::Print { src: dst });
+                            }
+                        }
+                    } else if name == "println" {
+                        if args.len() == 1 {
+                            self.compile_expr(&args[0], dst)?;
+                            self.emit(Instr::Print { src: dst });
+                        } else if args.is_empty() {
+                            self.emit(Instr::LoadConstUnit { dst });
+                            self.emit(Instr::Print { src: dst });
+                        }
+                    } else if self.functions.contains_key(name) {
+                        // Call to a known user-defined function
+                        let argc = args.len() as u16;
+                        let arg_start = dst.wrapping_add(2);
+                        for (i, arg) in args.iter().enumerate() {
+                            self.compile_expr(arg, arg_start + i as u16)?;
+                        }
+                        // Create a Fn value for the callee
+                        let fn_name_idx = self.current_function.add_constant(Value::Str(name.clone()));
+                        self.emit(Instr::LoadConst { dst: dst.wrapping_add(1), idx: fn_name_idx });
+                        // We need a Value::Fn — create one via a LoadFn-like approach
+                        // For now, use the function name to look up at runtime
+                        self.emit(Instr::Call { dst, func: dst.wrapping_add(1), argc, start: arg_start });
+                    } else {
+                        // Unknown function — compile as a generic call
+                        let argc = args.len() as u16;
+                        let arg_start = dst.wrapping_add(2);
+                        for (i, arg) in args.iter().enumerate() {
+                            self.compile_expr(arg, arg_start + i as u16)?;
+                        }
+                        let func_slot = dst.wrapping_add(1);
+                        self.compile_expr(func, func_slot)?;
+                        self.emit(Instr::Call { dst, func: func_slot, argc, start: arg_start });
+                    }
+                } else {
+                    // Callee is a complex expression (e.g., `f(x)(y)`)
+                    let argc = args.len() as u16;
+                    let arg_start = dst.wrapping_add(2);
+                    for (i, arg) in args.iter().enumerate() {
+                        self.compile_expr(arg, arg_start + i as u16)?;
+                    }
+                    let func_slot = dst.wrapping_add(1);
+                    self.compile_expr(func, func_slot)?;
+                    self.emit(Instr::Call { dst, func: func_slot, argc, start: arg_start });
                 }
-                // Compile the callee expression
-                let func_slot = dst.wrapping_add(1);
-                self.compile_expr(func, func_slot)?;
-                self.emit(Instr::Call { dst, func: func_slot, argc, start: arg_start });
             }
 
             // ── Method call ───────────────────────────────────────────────
@@ -1340,7 +1426,8 @@ impl BytecodeVM {
         let start_time = std::time::Instant::now();
 
         // Initialize slots with arguments
-        let num_slots = self.functions[func_idx].num_locals.max(self.functions[func_idx].num_params) as usize;
+        let needed_slots = self.functions[func_idx].num_locals.max(self.functions[func_idx].num_params) as usize;
+        let num_slots = needed_slots.max(64); // Minimum slot size to avoid index-out-of-bounds
         self.memory_pool.slots.resize(num_slots, Value::Unit);
         self.memory_pool.max_slot_used = num_slots.saturating_sub(1);
         for (i, arg) in args.iter().enumerate() {
@@ -1414,12 +1501,25 @@ impl BytecodeVM {
         let mut branch_density: u8 = 0;
         // Sampling counter: profile every 256 instructions instead of every one.
         let mut profile_counter: u8 = 0;
+        // Safety counter: abort infinite loops during development
+        let mut safety_counter: u64 = 0;
         
         // Pre-compute slot pointer for write-intent prefetch in the dispatch loop.
         let slot_ptr = slots.as_mut_ptr();
 
         // Main dispatch loop
         while pc < func_len {
+            safety_counter += 1;
+            if safety_counter > 100_000 {
+                eprintln!("[bytecode-vm] SAFETY: infinite loop detected at pc={pc} in func {:?}, slots={:?}", 
+                    func.name, &slots[..8.min(slots.len())]);
+                // Dump last few instructions for debugging
+                let start = pc.saturating_sub(5);
+                for i in start..func_len.min(start+15) {
+                    eprintln!("  [{}] {:?}", i, &instructions[i]);
+                }
+                return Err(RuntimeError::new("infinite loop detected (safety counter)"));
+            }
             // Sampled profiling: avoids an atomic fetch_add on every instruction.
             // The counter wraps every 256 dispatches; profiler sees ~0.4% of PCs.
             if let Some(ref profiler) = self.profiler {
@@ -2068,24 +2168,43 @@ impl BytecodeVM {
                                         num_locals: self.functions[idx].num_locals,
                                     });
 
-                                    // SAFETY: vm_ptr is a raw pointer to self created
-                                    // before `slots` borrowed self.memory_pool.slots.
-                                    // At this point all slot reads for this instruction
-                                    // have been cloned into locals (`args`, `dst_idx`).
-                                    // `execute()` will resize/reinit self.memory_pool.slots
-                                    // but the caller's slots are captured in `args`.
-                                    // After execute() returns, we write the result via
-                                    // self.memory_pool.slots (not through the `slots`
-                                    // alias, which may be stale after resize).
                                     let result = unsafe { (*vm_ptr).execute(idx, &args) };
 
                                     // Pop the call frame
                                     self.call_stack.pop();
 
-                                    // Place result in dst — use vm_ptr to avoid
-                                    // conflicting with the `slots` mutable borrow
-                                    // (slots may also be stale if execute() resized
-                                    // the vec).
+                                    match result {
+                                        Ok(ret_val) => {
+                                            unsafe {
+                                                (&mut (*vm_ptr).memory_pool.slots)[dst_idx] = ret_val;
+                                            }
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                    pc += 1;
+                                }
+                                None => {
+                                    return Err(RuntimeError::new(format!(
+                                        "Call: unknown function `{fn_name}` at pc={pc}"
+                                    )));
+                                }
+                            }
+                        }
+                        Value::Str(fn_name) => {
+                            // Function referenced by name (from BytecodeCompiler)
+                            let callee_idx = self.functions.iter().position(|f| f.name == *fn_name);
+                            match callee_idx {
+                                Some(idx) => {
+                                    self.call_stack.push(CallFrame {
+                                        return_pc: pc + 1,
+                                        base_slot: 0,
+                                        num_locals: self.functions[idx].num_locals,
+                                    });
+
+                                    let result = unsafe { (*vm_ptr).execute(idx, &args) };
+
+                                    self.call_stack.pop();
+
                                     match result {
                                         Ok(ret_val) => {
                                             unsafe {
@@ -2105,7 +2224,7 @@ impl BytecodeVM {
                         }
                         other => {
                             return Err(RuntimeError::new(format!(
-                                "Call: expected Fn, got {} at pc={pc}",
+                                "Call: expected Fn or Str, got {} at pc={pc}",
                                 other.type_name()
                             )));
                         }
@@ -2864,6 +2983,25 @@ impl BytecodeVM {
                 0.0
             },
         }
+    }
+
+    /// Load a full program (AST) into the VM by compiling all functions to bytecode.
+    /// This is the primary entry point for running Jules programs without the
+    /// tree-walking interpreter.
+    pub fn load_program(&mut self, program: &Program) -> Result<(), String> {
+        let mut compiler = BytecodeCompiler::new();
+        let functions = compiler.compile_program(program)?;
+        self.load_functions(functions);
+        Ok(())
+    }
+
+    /// Call a named function with the given arguments.
+    /// Returns the function's return value or a runtime error.
+    /// This is the primary API for executing Jules programs via the bytecode VM.
+    pub fn call_fn(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        let func_idx = self.functions.iter().position(|f| f.name == name)
+            .ok_or_else(|| RuntimeError::new(format!("undefined function `{name}`")))?;
+        self.execute(func_idx, &args)
     }
 }
 

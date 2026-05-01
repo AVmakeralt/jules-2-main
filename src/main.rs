@@ -73,6 +73,9 @@ pub fn jules_check(filename: &str, source: &str) -> Vec<Diag> {
 ///
 /// Pass `entry = "main"` for normal execution, `"#test"` to run all @test
 /// functions, or `"#bench"` to run all @benchmark functions.
+///
+/// **Execution path**: Uses the standalone bytecode VM by default (fast).
+/// Falls back to the tree-walking interpreter if bytecode compilation fails.
 pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
     let source = fs::read_to_string(path).map_err(|e| format!("cannot read `{path}`: {e}"))?;
     let mut unit = CompileUnit::new(path, &source);
@@ -87,6 +90,15 @@ pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
         return Err(msgs.join("\n"));
     }
     if let PipelineResult::Ok(program) = result {
+        // Try the standalone bytecode VM first (fast path).
+        let mut vm = crate::runtime::bytecode_vm::BytecodeVM::new();
+        if vm.load_program(&program).is_ok() {
+            return vm
+                .call_fn(entry, vec![])
+                .map(|_| ())
+                .map_err(|e| e.message);
+        }
+        // Fallback: tree-walking interpreter.
         let mut interp = crate::interp::Interpreter::new();
         interp.load_program(&program);
         interp
@@ -625,6 +637,24 @@ impl Pipeline {
             if self.print_opt_stats && polyhedral.loops_optimized > 0 {
                 eprintln!("[opt/L4] polyhedral_loops={} cache_miss_reduction={:.1}%",
                     polyhedral.loops_optimized, polyhedral.total_cache_miss_reduction * 100.0);
+            }
+        }
+
+        // ── Pass 9: ML Superoptimizer (Domain-Specific ML Kernel Optimization) ──
+        // Recognizes ML kernel patterns (matmul, softmax, attention, conv2d,
+        // layer_norm, etc.) and replaces them with optimal fused implementations.
+        // This is what XLA/TensorRT/TVM do — but at the language level.
+        if self.opt_level >= 2 {
+            let mut ml_opt = crate::optimizer::ml_superopt::MlSuperoptimizer::new();
+            ml_opt.optimize_program(&mut program);
+            if self.print_opt_stats && ml_opt.stats.patterns_matched > 0 {
+                eprintln!("[opt/ML] ml_patterns={} loop_to_kernel={} fusions={} stability={} mem_opt={} speedup={:.1}x",
+                    ml_opt.stats.patterns_matched,
+                    ml_opt.stats.loop_to_kernel,
+                    ml_opt.stats.kernel_fusions,
+                    ml_opt.stats.numerical_stability_fixes,
+                    ml_opt.stats.memory_optimizations,
+                    ml_opt.stats.total_estimated_speedup);
             }
         }
 
@@ -1904,7 +1934,7 @@ fn cmd_run(args: &CliArgs) -> i32 {
         return 1;
     }
 
-    // Run the interpreter.
+    // Run the program.
     if let PipelineResult::Ok(program) = result {
         if args.tiered {
             #[cfg(feature = "phase3-jit")]
@@ -1940,39 +1970,60 @@ fn cmd_run(args: &CliArgs) -> i32 {
             }
             #[cfg(not(feature = "phase3-jit"))]
             {
-                eprintln!(
-                    "warning: --tiered requested but binary was built without `phase3-jit`; running interpreter"
-                );
-                let mut interp = crate::interp::Interpreter::new();
-                interp.load_program(&program);
-                match interp.call_fn(&args.entry, vec![]) {
-                    Ok(val) => {
-                        if !matches!(val, crate::interp::Value::Unit) {
-                            println!("{val}");
-                        }
-                    }
-                    Err(e) => {
-                        let diag = adapt_runtime_error(e);
-                        emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
-                        return 1;
-                    }
-                }
+                // Tiered compilation not available; fall through to default path
             }
-        } else {
-            // Use plain interpreter (existing behavior)
-            let mut interp = crate::interp::Interpreter::new();
-            interp.load_program(&program);
-            match interp.call_fn(&args.entry, vec![]) {
-                Ok(val) => {
-                    if !matches!(val, crate::interp::Value::Unit) {
-                        println!("{val}");
+        }
+
+        // ── DEFAULT: Bytecode VM (fast, no interpreter) ────────────────────
+        // Try the standalone BytecodeVM first.  This avoids the tree-walking
+        // interpreter entirely — all arithmetic, control flow, and function
+        // calls are handled by the register-based bytecode VM with I64/F64
+        // fast paths and no Value allocation on the hot path.
+        {
+            let mut vm = crate::runtime::bytecode_vm::BytecodeVM::new();
+            match vm.load_program(&program) {
+                Ok(()) => {
+                    match vm.call_fn(&args.entry, vec![]) {
+                        Ok(val) => {
+                            if !matches!(val, crate::interp::Value::Unit) {
+                                println!("{val}");
+                            }
+                            return 0;
+                        }
+                        Err(e) => {
+                            // Bytecode VM execution failed; log and fall through
+                            // to interpreter for better error messages.
+                            if !args.quiet {
+                                eprintln!("[bytecode-vm] execution error: {} (falling back to interpreter)", e.message);
+                            }
+                        }
                     }
                 }
                 Err(e) => {
-                    let diag = adapt_runtime_error(e);
-                    emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
-                    return 1;
+                    // Bytecode compilation failed (unsupported features);
+                    // fall through to interpreter below.
+                    if !args.quiet {
+                        eprintln!("[bytecode-vm] compilation error: {e} (falling back to interpreter)");
+                    }
                 }
+            }
+        }
+
+        // ── FALLBACK: Tree-walking interpreter ─────────────────────────────
+        // Used when the bytecode VM cannot handle certain language features
+        // (closures with captures, ECS/game constructs, etc.).
+        let mut interp = crate::interp::Interpreter::new();
+        interp.load_program(&program);
+        match interp.call_fn(&args.entry, vec![]) {
+            Ok(val) => {
+                if !matches!(val, crate::interp::Value::Unit) {
+                    println!("{val}");
+                }
+            }
+            Err(e) => {
+                let diag = adapt_runtime_error(e);
+                emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                return 1;
             }
         }
     }

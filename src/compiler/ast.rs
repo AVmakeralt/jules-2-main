@@ -770,6 +770,30 @@ pub enum Stmt {
     Atomic(AtomicBlock),
 }
 
+impl Stmt {
+    /// Return the span of this statement.
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. } => *span,
+            Stmt::Expr { span, .. } => *span,
+            Stmt::Return { span, .. } => *span,
+            Stmt::Break { span, .. } => *span,
+            Stmt::Continue { span, .. } => *span,
+            Stmt::ForIn { span, .. } => *span,
+            Stmt::EntityFor { span, .. } => *span,
+            Stmt::While { span, .. } => *span,
+            Stmt::Loop { span, .. } => *span,
+            Stmt::If { span, .. } => *span,
+            Stmt::Match { span, .. } => *span,
+            Stmt::Item(item) => item.span(),
+            Stmt::ParallelFor(pf) => pf.span,
+            Stmt::Spawn(sb) => sb.span,
+            Stmt::Sync(sb) => sb.span,
+            Stmt::Atomic(ab) => ab.span,
+        }
+    }
+}
+
 /// Used for `else if` and `else { }` chains.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IfOrBlock {
