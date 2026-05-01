@@ -24,6 +24,12 @@ pub mod prng_simd;
 pub mod morton;
 pub mod genesis_weave;
 pub mod collision;
+pub mod sdf_ray;
+pub mod gaussian_splat;
+pub mod vpl_lighting;
+pub mod sprite_pipe;
+pub mod voxel_mesh;
+pub mod aurora_flux;
 
 use crate::interp::{RuntimeError, Value};
 
@@ -46,6 +52,12 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         .or_else(|| morton::dispatch(name, args))
         .or_else(|| genesis_weave::dispatch(name, args))
         .or_else(|| collision::dispatch(name, args))
+        .or_else(|| sdf_ray::dispatch(name, args))
+        .or_else(|| gaussian_splat::dispatch(name, args))
+        .or_else(|| vpl_lighting::dispatch(name, args))
+        .or_else(|| sprite_pipe::dispatch(name, args))
+        .or_else(|| voxel_mesh::dispatch(name, args))
+        .or_else(|| aurora_flux::dispatch(name, args))
 }
 
 /// List all available stdlib modules and functions (for introspection).
@@ -440,6 +452,89 @@ pub fn modules_value() -> Value {
             collision_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("collision::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let sdf_ray_fns = vec![
+        "march",
+        "sdf_world",
+        "normal",
+        "verify",
+    ];
+    out.insert(
+        "sdf_ray".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            sdf_ray_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("sdf_ray::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let gaussian_splat_fns = vec![
+        "generate",
+        "fog",
+        "god_rays",
+        "verify",
+    ];
+    out.insert(
+        "gaussian_splat".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            gaussian_splat_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("gaussian_splat::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let vpl_lighting_fns = vec![
+        "compute",
+        "shadow",
+        "ao",
+        "god_rays",
+        "verify",
+    ];
+    out.insert(
+        "vpl_lighting".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            vpl_lighting_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("vpl_lighting::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let sprite_pipe_fns = vec![
+        "at_morton",
+        "generate",
+        "palette",
+        "anim_frame",
+        "verify",
+    ];
+    out.insert(
+        "sprite_pipe".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            sprite_pipe_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("sprite_pipe::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let voxel_mesh_fns = vec![
+        "is_solid",
+        "generate_chunk",
+        "mesh",
+        "lod_query",
+        "verify",
+    ];
+    out.insert(
+        "voxel_mesh".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            voxel_mesh_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("voxel_mesh::{}", s)))
                 .collect(),
         ))),
     );

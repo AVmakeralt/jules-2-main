@@ -1,12 +1,18 @@
 // =============================================================================
-// bench-genesis-weave — Comprehensive Benchmark for Genesis Weave Stack
+// bench-genesis-weave — Comprehensive Benchmark for Genesis Weave + Aurora Flux
 //
-// Benchmarks all components of the Jules-spec world generation system:
+// Benchmarks all components of the Jules-spec world generation + rendering system:
 //   1. 210-Wheel Sieve (prime counting at scale)
 //   2. SIMD PRNG (throughput in GiB/s)
 //   3. Morton Encoding (2D/3D encode/decode throughput)
 //   4. Genesis Weave (terrain, biome, entity, exclusion queries/s)
 //   5. Collision System (probes/s, resolution throughput)
+//   6. SDF Ray Marching (sphere tracing + sieve-assisted steps/s)
+//   7. Gaussian Splatting (splats/s, fog, god rays)
+//   8. VPL Lighting (shadow probes/s, AO, atmospheric scattering)
+//   9. Sprite Pipeline (sprite generation/s, palette swap, flocking)
+//  10. Voxel Meshing (chunk generation, marching cubes, LOD queries)
+//  11. Aurora Flux Unified Pipeline (retro vs modern, temporal reprojection)
 // =============================================================================
 
 use std::time::Instant;
@@ -27,14 +33,29 @@ fn main() {
     let genesis_ok = jules::jules_std::genesis_weave::verify_genesis();
     let collision_ok = jules::jules_std::collision::verify_collision();
 
+    // Aurora Flux verification
+    let sdf_ok = jules::jules_std::sdf_ray::verify_sdf_ray();
+    let splat_ok = jules::jules_std::gaussian_splat::verify_gaussian_splat();
+    let vpl_ok = jules::jules_std::vpl_lighting::verify_vpl_lighting();
+    let sprite_ok = jules::jules_std::sprite_pipe::verify_sprite_pipe();
+    let voxel_ok = jules::jules_std::voxel_mesh::verify_voxel_mesh();
+    let aurora_ok = jules::jules_std::aurora_flux::verify_aurora_flux();
+
     println!("  Sieve 210:      {}", if sieve_ok { "✓ PASS" } else { "✗ FAIL" });
     println!("  PRNG SIMD:      {}", if prng_ok { "✓ PASS" } else { "✗ FAIL" });
     println!("  Morton:         {}", if morton_ok { "✓ PASS" } else { "✗ FAIL" });
     println!("  Genesis Weave:  {}", if genesis_ok { "✓ PASS" } else { "✗ FAIL" });
     println!("  Collision:      {}", if collision_ok { "✓ PASS" } else { "✗ FAIL" });
+    println!("  SDF Ray:        {}", if sdf_ok { "✓ PASS" } else { "✗ FAIL" });
+    println!("  Gaussian Splat: {}", if splat_ok { "✓ PASS" } else { "✗ FAIL" });
+    println!("  VPL Lighting:   {}", if vpl_ok { "✓ PASS" } else { "✗ FAIL" });
+    println!("  Sprite Pipe:    {}", if sprite_ok { "✓ PASS" } else { "✗ FAIL" });
+    println!("  Voxel Mesh:     {}", if voxel_ok { "✓ PASS" } else { "✗ FAIL" });
+    println!("  Aurora Flux:    {}", if aurora_ok { "✓ PASS" } else { "✗ FAIL" });
     println!();
 
-    if !(sieve_ok && prng_ok && morton_ok && genesis_ok && collision_ok) {
+    if !(sieve_ok && prng_ok && morton_ok && genesis_ok && collision_ok
+         && sdf_ok && splat_ok && vpl_ok && sprite_ok && voxel_ok && aurora_ok) {
         eprintln!("⚠ Some verification tests failed — benchmarks may be unreliable.");
         println!();
     }
@@ -398,13 +419,404 @@ fn main() {
     }
     println!();
 
+    // ── Benchmark 6: SDF Ray Marching ──────────────────────────────────
+    println!("▶ Benchmark 6: SDF Ray Marching (Sphere Tracing)");
+    {
+        use jules::jules_std::sdf_ray::{Vec3, Ray, SdfContext, ray_march, sieve_ray_march, sdf_world};
+
+        let ctx = SdfContext {
+            seed: 42,
+            max_steps: 128,
+            epsilon: 0.001,
+            chunk_size: 128.0,
+        };
+
+        // Standard ray march
+        let n_march = 50_000u64;
+        let t = Instant::now();
+        let mut total_steps = 0u64;
+        let mut hit_count = 0usize;
+        for i in 0..n_march {
+            let angle = (i as f64) * 0.001;
+            let ray = Ray {
+                origin: Vec3::new(0.0, 50.0, 0.0),
+                direction: Vec3::new(angle.sin(), -0.5, angle.cos()).normalize(),
+            };
+            let hit = ray_march(&ctx, &ray);
+            total_steps += hit.steps as u64;
+            if hit.hit { hit_count += 1; }
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_march as f64) / elapsed.as_secs_f64();
+        let avg_steps = total_steps as f64 / n_march as f64;
+        println!("  ray_march:        {:>12} rays in {:.2?}  ({:.0}K rays/s)  [avg steps: {:.1}, hits: {}]",
+            n_march, elapsed, rate / 1_000.0, avg_steps, hit_count);
+
+        // Sieve-assisted ray march
+        let t = Instant::now();
+        let mut total_steps_sieve = 0u64;
+        let mut hit_count_sieve = 0usize;
+        for i in 0..n_march {
+            let angle = (i as f64) * 0.001;
+            let ray = Ray {
+                origin: Vec3::new(0.0, 50.0, 0.0),
+                direction: Vec3::new(angle.sin(), -0.5, angle.cos()).normalize(),
+            };
+            let hit = sieve_ray_march(&ctx, &ray);
+            total_steps_sieve += hit.steps as u64;
+            if hit.hit { hit_count_sieve += 1; }
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_march as f64) / elapsed.as_secs_f64();
+        let avg_steps_sieve = total_steps_sieve as f64 / n_march as f64;
+        println!("  sieve_ray_march:  {:>12} rays in {:.2?}  ({:.0}K rays/s)  [avg steps: {:.1}, hits: {}]",
+            n_march, elapsed, rate / 1_000.0, avg_steps_sieve, hit_count_sieve);
+
+        // SDF world query throughput
+        let n_sdf = 500_000u64;
+        let t = Instant::now();
+        let mut sum = 0.0f64;
+        for i in 0..n_sdf {
+            let x = (i as f64) * 0.01;
+            sum += sdf_world(&ctx, &Vec3::new(x, x * 0.5, x * 0.3));
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_sdf as f64) / elapsed.as_secs_f64();
+        println!("  sdf_world:        {:>12} queries in {:.2?}  ({:.0}K queries/s)  [sum: {:.4}]",
+            n_sdf, elapsed, rate / 1_000.0, sum);
+    }
+    println!();
+
+    // ── Benchmark 7: Gaussian Splatting ────────────────────────────────
+    println!("▶ Benchmark 7: Deterministic Gaussian Splatting");
+    {
+        use jules::jules_std::gaussian_splat::{SplatContext, generate_splats, fog_color, material_palette};
+        use jules::jules_std::sdf_ray::{HitInfo, Vec3 as SVec3};
+
+        let ctx = SplatContext {
+            seed: 42,
+            splats_per_hit: 8,
+            base_scale: 1.0,
+            fog_density: 0.02,
+            time: 0.0,
+            screen_width: 1920,
+            screen_height: 1080,
+            fov: 1.047,
+        };
+
+        // Splat generation
+        let n_splat = 100_000u64;
+        let hit = HitInfo {
+            hit: true,
+            distance: 100.0,
+            position: SVec3::new(10.0, 50.0, 20.0),
+            normal: SVec3::new(0.0, 1.0, 0.0),
+            material_id: 3,
+            steps: 50,
+        };
+        let t = Instant::now();
+        let mut total_splats = 0usize;
+        for i in 0..n_splat {
+            let mut h = hit.clone();
+            h.position.x = (i as f64) * 0.1;
+            let splats = generate_splats(&ctx, &h, 3);
+            total_splats += splats.len();
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_splat as f64) / elapsed.as_secs_f64();
+        println!("  generate_splats:  {:>12} hits in {:.2?}  ({:.0}K hits/s)  [total splats: {}]",
+            n_splat, elapsed, rate / 1_000.0, total_splats);
+
+        // Fog calculation
+        let n_fog = 100_000u64;
+        let ray = jules::jules_std::sdf_ray::Ray {
+            origin: SVec3::new(0.0, 0.0, 0.0),
+            direction: SVec3::new(1.0, 0.0, 0.0),
+        };
+        let t = Instant::now();
+        let mut sum = 0.0f64;
+        for i in 0..n_fog {
+            sum += fog_color(&ctx, &ray, (i as f64) * 0.1)[0] as f64;
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_fog as f64) / elapsed.as_secs_f64();
+        println!("  fog_color:        {:>12} queries in {:.2?}  ({:.0}K queries/s)  [sum: {:.4}]",
+            n_fog, elapsed, rate / 1_000.0, sum);
+
+        // Material palette
+        let n_palette = 1_000_000u64;
+        let mut rng = jules::jules_std::prng_simd::SquaresRng::new(42);
+        let t = Instant::now();
+        let mut sum = 0.0f64;
+        for i in 0..n_palette {
+            let color = material_palette((i % 8) as u32, rng.next_f64());
+            sum += color[0] as f64;
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_palette as f64) / elapsed.as_secs_f64();
+        println!("  material_palette: {:>12} lookups in {:.2?}  ({:.0}K lookups/s)",
+            n_palette, elapsed, rate / 1_000.0);
+    }
+    println!();
+
+    // ── Benchmark 8: VPL Lighting ─────────────────────────────────────
+    println!("▶ Benchmark 8: SIMD VPL Lighting");
+    {
+        use jules::jules_std::vpl_lighting::{VplContext, ambient_occlusion};
+        use jules::jules_std::sdf_ray::SdfContext;
+
+        let vpl_ctx = VplContext {
+            seed: 42,
+            light_spacing: 10,
+            max_lights: 64,
+            shadow_bias: 0.01,
+            ambient: [0.1, 0.1, 0.15],
+            sun_direction: jules::jules_std::sdf_ray::Vec3::new(0.5, 0.8, 0.3).normalize(),
+            sun_color: [1.0, 0.95, 0.85],
+            sun_intensity: 1.0,
+        };
+        let sdf_ctx = SdfContext { seed: 42, max_steps: 128, epsilon: 0.001, chunk_size: 128.0 };
+
+        // Ambient occlusion
+        let n_ao = 100_000u64;
+        let t = Instant::now();
+        let mut sum = 0.0f64;
+        for i in 0..n_ao {
+            let x = (i as f64) * 0.1;
+            let point = jules::jules_std::sdf_ray::Vec3::new(x, 50.0, x * 0.5);
+            let normal = jules::jules_std::sdf_ray::Vec3::new(0.0, 1.0, 0.0);
+            sum += ambient_occlusion(&vpl_ctx, &sdf_ctx, &point, &normal);
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_ao as f64) / elapsed.as_secs_f64();
+        println!("  ambient_occlusion:{:>12} queries in {:.2?}  ({:.0}K queries/s)  [avg: {:.4}]",
+            n_ao, elapsed, rate / 1_000.0, sum / n_ao as f64);
+
+        // VPL position generation
+        let n_vpl = 10_000u64;
+        let t = Instant::now();
+        let mut total_lights = 0usize;
+        for i in 0..n_vpl {
+            let center = jules::jules_std::sdf_ray::Vec3::new((i as f64) * 10.0, 50.0, (i as f64) * 10.0);
+            let lights = jules::jules_std::vpl_lighting::generate_vpl_positions(&vpl_ctx, &center, 100.0);
+            total_lights += lights.len();
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_vpl as f64) / elapsed.as_secs_f64();
+        println!("  vpl_generate:     {:>12} regions in {:.2?}  ({:.0}K regions/s)  [avg lights: {:.1}]",
+            n_vpl, elapsed, rate / 1_000.0, total_lights as f64 / n_vpl as f64);
+    }
+    println!();
+
+    // ── Benchmark 9: Sprite Pipeline ──────────────────────────────────
+    println!("▶ Benchmark 9: Fat Point Sprite Pipeline");
+    {
+        use jules::jules_std::sprite_pipe::{SpriteContext, sprite_at_morton, batch_sprites_8, encode_sprite_packet, decode_sprite_packet};
+
+        let ctx = SpriteContext {
+            seed: 42,
+            atlas_size: 256,
+            palette_count: 16,
+            cell_size: 64,
+            time: 0.0,
+            max_sprites: 10000,
+        };
+
+        // Sprite at Morton index
+        let n_sprite = 500_000u64;
+        let t = Instant::now();
+        let mut count = 0usize;
+        for i in 0..n_sprite {
+            let sprite = sprite_at_morton(&ctx, i);
+            if sprite.atlas_id > 0 { count += 1; }
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_sprite as f64) / elapsed.as_secs_f64();
+        println!("  sprite_at_morton: {:>12} queries in {:.2?}  ({:.0}K queries/s)  [valid: {}]",
+            n_sprite, elapsed, rate / 1_000.0, count);
+
+        // Batch 8 sprite generation
+        let n_batch = 50_000u64;
+        let positions = [
+            (100.0, 100.0), (200.0, 200.0), (300.0, 300.0), (400.0, 400.0),
+            (500.0, 500.0), (600.0, 600.0), (700.0, 700.0), (800.0, 800.0),
+        ];
+        let t = Instant::now();
+        for _ in 0..n_batch {
+            let _ = batch_sprites_8(&ctx, &positions);
+        }
+        let elapsed = t.elapsed();
+        let total = n_batch * 8;
+        let rate = (total as f64) / elapsed.as_secs_f64();
+        println!("  batch_sprites_8:  {:>12} sprites in {:.2?}  ({:.0}K sprites/s)  [8x SIMD]",
+            total, elapsed, rate / 1_000.0);
+
+        // Packet encode/decode roundtrip
+        let n_pkt = 1_000_000u64;
+        let t = Instant::now();
+        let mut sum = 0u64;
+        for i in 0..n_pkt {
+            let sprite = sprite_at_morton(&ctx, i);
+            let packet = encode_sprite_packet(&sprite);
+            let decoded = decode_sprite_packet(&packet);
+            sum += decoded.atlas_id as u64;
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_pkt as f64) / elapsed.as_secs_f64();
+        println!("  packet_roundtrip: {:>12} ops in {:.2?}  ({:.0}K ops/s)  [checksum: {}]",
+            n_pkt, elapsed, rate / 1_000.0, sum);
+    }
+    println!();
+
+    // ── Benchmark 10: Voxel Meshing ───────────────────────────────────
+    println!("▶ Benchmark 10: Voxel Meshing + LOD");
+    {
+        use jules::jules_std::voxel_mesh::{VoxelContext, is_voxel_solid, generate_chunk, voxel_at_lod};
+
+        let ctx = VoxelContext {
+            seed: 42,
+            chunk_size: 16,
+            isovalue: 0.5,
+            lod_level: 0,
+            max_lod: 5,
+        };
+
+        // Voxel solid query
+        let n_voxel = 500_000u64;
+        let t = Instant::now();
+        let mut solid_count = 0usize;
+        for i in 0..n_voxel {
+            let x = (i % 256) as i64;
+            let y = ((i / 256) % 64) as i64;
+            let z = (i / 16384) as i64;
+            if is_voxel_solid(&ctx, x, y, z) { solid_count += 1; }
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_voxel as f64) / elapsed.as_secs_f64();
+        println!("  is_voxel_solid:   {:>12} queries in {:.2?}  ({:.0}K queries/s)  [solid: {}]",
+            n_voxel, elapsed, rate / 1_000.0, solid_count);
+
+        // LOD queries
+        let n_lod = 200_000u64;
+        let t = Instant::now();
+        let mut lod_count = 0usize;
+        for i in 0..n_lod {
+            if voxel_at_lod(&ctx, (i % 256) as i64, ((i/256)%64) as i64, (i/16384) as i64, 2) {
+                lod_count += 1;
+            }
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_lod as f64) / elapsed.as_secs_f64();
+        println!("  voxel_at_lod(2):  {:>12} queries in {:.2?}  ({:.0}K queries/s)  [solid: {}]",
+            n_lod, elapsed, rate / 1_000.0, lod_count);
+
+        // Chunk generation (8x8x8)
+        let n_chunks = 1_000u64;
+        let t = Instant::now();
+        let mut total_voxels = 0usize;
+        for i in 0..n_chunks {
+            let chunk = generate_chunk(&ctx, ((i * 8) as i64, 0, ((i * 3) as i64)));
+            total_voxels += chunk.data.len();
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_chunks as f64) / elapsed.as_secs_f64();
+        println!("  generate_chunk:   {:>12} chunks in {:.2?}  ({:.0} chunks/s)  [voxels: {}]",
+            n_chunks, elapsed, rate, total_voxels);
+    }
+    println!();
+
+    // ── Benchmark 11: Aurora Flux Pipeline ────────────────────────────
+    println!("▶ Benchmark 11: Aurora Flux Unified Pipeline");
+    {
+        use jules::jules_std::aurora_flux::{AuroraConfig, RenderMode, render_pixel_unified};
+        use jules::jules_std::sdf_ray::Vec3 as AVec3;
+
+        // Retro mode pixel rendering
+        let retro_config = AuroraConfig {
+            seed: 42,
+            mode: RenderMode::Retro,
+            screen_width: 320,
+            screen_height: 240,
+            fov: 1.047,
+            pixel_downsample: 8,
+            ray_trace_enabled: false,
+            max_ray_steps: 64,
+            splats_per_hit: 4,
+            max_vpl_lights: 16,
+            vpl_light_spacing: 20,
+            temporal_reprojection: true,
+            lod_max: 3,
+            fog_density: 0.02,
+            time: 0.0,
+        };
+
+        let n_retro = 10_000u64;
+        let t = Instant::now();
+        let mut sum = 0.0f64;
+        for i in 0..n_retro {
+            let angle = (i as f64) * 0.001;
+            let ray = jules::jules_std::sdf_ray::Ray {
+                origin: AVec3::new(0.0, 50.0, 0.0),
+                direction: AVec3::new(angle.sin(), -0.5, angle.cos()).normalize(),
+            };
+            let pixel = render_pixel_unified(&retro_config, &ray);
+            sum += pixel.r as f64;
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_retro as f64) / elapsed.as_secs_f64();
+        println!("  retro_pixel:      {:>12} pixels in {:.2?}  ({:.0} pixels/s)  [sum: {:.4}]",
+            n_retro, elapsed, rate, sum);
+
+        // Modern mode pixel rendering
+        let modern_config = AuroraConfig {
+            seed: 42,
+            mode: RenderMode::Modern,
+            screen_width: 1920,
+            screen_height: 1080,
+            pixel_downsample: 1,
+            ray_trace_enabled: true,
+            max_ray_steps: 128,
+            splats_per_hit: 8,
+            max_vpl_lights: 64,
+            vpl_light_spacing: 10,
+            ..retro_config
+        };
+
+        let n_modern = 5_000u64;
+        let t = Instant::now();
+        let mut sum = 0.0f64;
+        for i in 0..n_modern {
+            let angle = (i as f64) * 0.001;
+            let ray = jules::jules_std::sdf_ray::Ray {
+                origin: AVec3::new(0.0, 50.0, 0.0),
+                direction: AVec3::new(angle.sin(), -0.5, angle.cos()).normalize(),
+            };
+            let pixel = render_pixel_unified(&modern_config, &ray);
+            sum += pixel.r as f64;
+        }
+        let elapsed = t.elapsed();
+        let rate = (n_modern as f64) / elapsed.as_secs_f64();
+        println!("  modern_pixel:     {:>12} pixels in {:.2?}  ({:.0} pixels/s)  [sum: {:.4}]",
+            n_modern, elapsed, rate, sum);
+
+        // Temporal reprojection estimate
+        println!("  retro_config:     320x240, downsample=8x, no ray-trace");
+        println!("  modern_config:    1920x1080, downsample=1x, ray-trace ON");
+        println!("  Estimated FPS:    retro ~{:.0} fps, modern ~{:.0} fps (single-core debug)",
+            rate * (320.0 * 240.0) / 1_000_000.0,
+            (n_modern as f64 / elapsed.as_secs_f64()) * (1920.0 * 1080.0) / 1_000_000_000.0);
+    }
+    println!();
+
     // ── Summary ────────────────────────────────────────────────────────
     println!("╔══════════════════════════════════════════════════════════════════╗");
     println!("║                    BENCHMARK COMPLETE                           ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
-    println!("  All Genesis Weave algorithms are now part of the built-in library.");
-    println!("  Modules: sieve_210, prng_simd, morton, genesis_weave, collision");
+    println!("  All Genesis Weave + Aurora Flux algorithms are now part of the built-in library.");
+    println!("  Modules: sieve_210, prng_simd, morton, genesis_weave, collision,");
+    println!("           sdf_ray, gaussian_splat, vpl_lighting, sprite_pipe,");
+    println!("           voxel_mesh, aurora_flux");
     println!("  Each module is available via stdlib dispatch (e.g., genesis::terrain_height)");
     println!();
     println!("  Run with 'cargo run --bin bench-genesis-weave --release' for");

@@ -285,14 +285,15 @@ pub fn terrain_height(seed: u64, x: f64, y: f64, z: f64) -> f64 {
         let fz = (z * frequency).floor() as i64;
 
         // Query the PRNG oracle at the 8 corners of the current cell
+        // Use wrapping_add to prevent overflow with very large coordinates
         let v000 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx, fy, fz));
-        let v100 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx + 1, fy, fz));
-        let v010 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx, fy + 1, fz));
-        let v110 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx + 1, fy + 1, fz));
-        let v001 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx, fy, fz + 1));
-        let v101 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx + 1, fy, fz + 1));
-        let v011 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx, fy + 1, fz + 1));
-        let v111 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx + 1, fy + 1, fz + 1));
+        let v100 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx.wrapping_add(1), fy, fz));
+        let v010 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx, fy.wrapping_add(1), fz));
+        let v110 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx.wrapping_add(1), fy.wrapping_add(1), fz));
+        let v001 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx, fy, fz.wrapping_add(1)));
+        let v101 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx.wrapping_add(1), fy, fz.wrapping_add(1)));
+        let v011 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx, fy.wrapping_add(1), fz.wrapping_add(1)));
+        let v111 = hash_to_f64(hash_coord_3d(seed.wrapping_add(_octave as u64), fx.wrapping_add(1), fy.wrapping_add(1), fz.wrapping_add(1)));
 
         // Smooth interpolation (smoothstep) within the cell
         let dx = (x * frequency).fract();
