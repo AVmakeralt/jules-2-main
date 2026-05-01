@@ -3,6 +3,7 @@ pub mod advanced_optimizer;
 pub mod advanced_self_repair;
 pub mod autovec;
 pub mod gnn_egraph_optimizer;
+pub mod gnn_trained_weights;
 pub mod hardware_cost_model;
 pub mod inline_cache;
 pub mod mcts_superoptimizer;

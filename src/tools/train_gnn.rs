@@ -10,6 +10,7 @@ use std::time::Instant;
 use jules::compiler::ast::*;
 use jules::compiler::lexer::Span;
 use jules::optimizer::gnn_egraph_optimizer::*;
+use jules::optimizer::gnn_trained_weights::load_pretrained_gnn;
 use jules::optimizer::hardware_cost_model::Microarchitecture;
 use jules::optimizer::mcts_superoptimizer::*;
 
@@ -446,6 +447,103 @@ fn main() {
         println!("  {:25}  {:>10}  {:>10.3}  {:>8.3}",
             name, top_action_name, confidence, result.value_prediction);
     }
+
+    // ── Phase 7: Pre-Trained 100k-Param GNN Benchmark ──
+    println!();
+    println!("-- Phase 7: Pre-Trained 100k-Param GNN (Baked-In Weights) --");
+    println!();
+
+    let pretrained_model = load_pretrained_gnn();
+    println!("  Pre-trained model loaded: {} params", {
+        let mut c = 0;
+        c += pretrained_model.embedding.len() + pretrained_model.embedding_bias.len();
+        for layer in &pretrained_model.gnn_layers {
+            c += layer.w_self.len() + layer.w_neigh.len() + layer.bias.len();
+            c += layer.layer_norm.gamma.len() + layer.layer_norm.beta.len();
+            if let Some(k) = &layer.attn_key { c += k.len(); }
+            if let Some(q) = &layer.attn_query { c += q.len(); }
+        }
+        c += pretrained_model.readout.w.len() + pretrained_model.readout.b.len();
+        c += pretrained_model.policy_head.w1.len() + pretrained_model.policy_head.b1.len()
+           + pretrained_model.policy_head.w2.len() + pretrained_model.policy_head.b2.len();
+        c += pretrained_model.value_head.w1.len() + pretrained_model.value_head.b1.len()
+           + pretrained_model.value_head.w2.len() + pretrained_model.value_head.b2.len();
+        c
+    });
+
+    // Create optimizer with pre-trained model
+    let pretrained_config = GnnConfig {
+        hidden_dim: 96,
+        num_layers: 4,
+        num_heads: 4,
+        num_actions: 12,
+        node_feature_dim: 33,
+        learning_rate: 0.001,
+        gamma: 0.99,
+        num_episodes: 0,
+        batch_size: 32,
+        use_attention: true,
+        value_loss_coef: 0.5,
+        entropy_coef: 0.01,
+    };
+
+    let mut pretrained_opt = GnnEgraphOptimizer::new(pretrained_config);
+    // Replace the model with the pre-trained one
+    *pretrained_opt.model_mut() = pretrained_model;
+
+    // Benchmark pre-trained GNN
+    let mut pretrained_improved = 0usize;
+    let mut total_pretrained = 0u32;
+
+    println!("  {:25}  {:>8}  {:>8}  {:>8}  {:>8}", "Expression", "OrigCyc", "MCTSCyc", "PreGNN1", "PreGNN5");
+    println!("  {}", "-".repeat(65));
+
+    for (name, expr) in &training_exprs {
+        let instr = Instr::from_expr(expr).unwrap();
+        let original_cost = cost_est.estimate(&instr);
+
+        let mcts_cost = {
+            let res = mcts_opt.optimize(expr);
+            if let Some(ref opt) = res {
+                cost_est.estimate(&Instr::from_expr(opt).unwrap_or_else(|| instr.clone()))
+            } else { original_cost }
+        };
+
+        // Pre-trained GNN single-step
+        let pretrained1_result = pretrained_opt.optimize_gnn_only(expr);
+        let pretrained1_cost = pretrained1_result.optimized_cost;
+
+        // Pre-trained GNN multi-step
+        let pretrained5_result = gnn_optimize_multi_step(&mut pretrained_opt, expr, 5);
+        let pretrained5_cost = pretrained5_result.optimized_cost;
+
+        total_pretrained += pretrained5_cost;
+        if pretrained5_cost < original_cost { pretrained_improved += 1; }
+
+        println!("  {:25}  {:>8}  {:>8}  {:>8}  {:>8}",
+            name, original_cost, mcts_cost, pretrained1_cost, pretrained5_cost);
+    }
+
+    let pretrained_red = if total_orig > 0 { (total_orig - total_pretrained) as f64 / total_orig as f64 * 100.0 } else { 0.0 };
+    println!();
+    println!("  Pre-trained GNN (100k params): {}/{} improved, {:.1}% cycle reduction", 
+        pretrained_improved, training_exprs.len(), pretrained_red);
+
+    // Pre-trained throughput
+    let t0 = Instant::now();
+    let mut pretrained_improved_count = 0;
+    for _ in 0..stress_count {
+        let result = pretrained_opt.optimize_gnn_only(&stress_expr);
+        if result.is_improved() { pretrained_improved_count += 1; }
+    }
+    let pretrained_elapsed = t0.elapsed();
+
+    println!("  Pre-trained GNN throughput: {} exprs in {:?} ({:.0} exprs/sec)",
+        stress_count, pretrained_elapsed,
+        stress_count as f64 / pretrained_elapsed.as_secs_f64().max(1e-12));
+
+    let pretrained_speedup = mcts_elapsed.as_secs_f64() / pretrained_elapsed.as_secs_f64().max(1e-12);
+    println!("  Pre-trained GNN speedup over MCTS: {:.1}x", pretrained_speedup);
 
     // ── Final Summary ──
     println!();
