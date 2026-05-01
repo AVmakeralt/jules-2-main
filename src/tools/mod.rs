@@ -1,4 +1,5 @@
 pub mod asset_importer;
+pub mod bench_optimizations;
 pub mod ffi;
 pub mod frame_debugger;
 pub mod hot_reload;

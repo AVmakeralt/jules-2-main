@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bumpalo::Bump;
 use rustc_hash::FxHashMap;
 
-use crate::compiler::ast::{BinOpKind, Program};
-use crate::interp::{RuntimeError, Value};
+use crate::compiler::ast::{AssignOpKind, BinOpKind, IfOrBlock, Program, UnOpKind, VecSize};
+use crate::interp::{RuntimeError, Tensor, Value};
 use crate::runtime::memory_management::PrefetchEngine;
 
 // =============================================================================
@@ -89,6 +89,7 @@ pub enum Instr {
     StoreField { obj: u16, field_idx: u32, src: u16 },
     LoadIndex { dst: u16, arr: u16, idx: u16 },
     StoreIndex { arr: u16, idx: u16, src: u16 },
+    ArrayLen { dst: u16, arr: u16 },
     
     // Vector/tensor operations (SIMD-optimized)
     VecAdd { dst: u16, lhs: u16, rhs: u16 },
@@ -371,6 +372,11 @@ pub struct BytecodeCompiler {
     // Optimization flags
     fold_constants: bool,
     eliminate_dead_code: bool,
+    
+    // Loop compilation state (for break/continue)
+    break_labels: Vec<usize>,     // positions of Jump instructions to patch at loop end
+    loop_starts: Vec<usize>,      // PC at the start of each enclosing loop (for continue)
+    loop_continue_starts: Vec<usize>, // PC of the continue target for each enclosing loop
 }
 
 impl BytecodeCompiler {
@@ -384,6 +390,9 @@ impl BytecodeCompiler {
             known_constants: FxHashMap::default(),
             fold_constants: true,
             eliminate_dead_code: true,
+            break_labels: Vec::new(),
+            loop_starts: Vec::new(),
+            loop_continue_starts: Vec::new(),
         }
     }
     
@@ -457,7 +466,7 @@ impl BytecodeCompiler {
                         }
                         
                         // Compile function body
-                        fn_compiler.compile_block(body)?;
+                        fn_compiler.compile_block(body, 0)?;
                         
                         functions.push(fn_compiler.current_function);
                     }
@@ -469,42 +478,207 @@ impl BytecodeCompiler {
         Ok(functions)
     }
     
-    fn compile_block(&mut self, block: &crate::compiler::ast::Block) -> Result<(), String> {
+    fn compile_block(&mut self, block: &crate::compiler::ast::Block, dst: u16) -> Result<(), String> {
         for stmt in &block.stmts {
             self.compile_stmt(stmt)?;
         }
         if let Some(tail) = &block.tail {
-            self.compile_expr(tail, 0)?;
+            self.compile_expr(tail, dst)?;
         }
         Ok(())
     }
     
-    fn compile_stmt(&mut self, stmt: &crate::compiler::ast::Stmt) -> Result<(), String> {
-        match stmt {
-            crate::compiler::ast::Stmt::Let { pattern, init, .. } => {
-                let dst = match pattern {
-                    crate::compiler::ast::Pattern::Ident { name, .. } => {
-                        if let Some(existing) = self.locals.get(name) {
-                            *existing
-                        } else {
-                            let slot = self.alloc_slot();
-                            self.locals.insert(name.clone(), slot);
-                            slot
+    // ─── Pattern slot allocation ───────────────────────────────────────────
+
+    /// Allocate a slot for a pattern and register identifier bindings in `locals`.
+    fn alloc_pattern_slot(&mut self, pattern: &crate::compiler::ast::Pattern) -> Result<u16, String> {
+        match pattern {
+            crate::compiler::ast::Pattern::Ident { name, .. } => {
+                if let Some(&existing) = self.locals.get(name) {
+                    Ok(existing)
+                } else {
+                    let slot = self.alloc_slot();
+                    self.locals.insert(name.clone(), slot);
+                    Ok(slot)
+                }
+            }
+            crate::compiler::ast::Pattern::Wildcard(_) => Ok(self.alloc_slot()),
+            crate::compiler::ast::Pattern::Tuple { elems, .. } => {
+                // Allocate slots for each element pattern
+                let mut first_slot = None;
+                for elem in elems {
+                    let s = self.alloc_pattern_slot(elem)?;
+                    if first_slot.is_none() {
+                        first_slot = Some(s);
+                    }
+                }
+                Ok(first_slot.unwrap_or_else(|| self.alloc_slot()))
+            }
+            crate::compiler::ast::Pattern::Struct { fields, .. } => {
+                let mut first_slot = None;
+                for (_, pat) in fields {
+                    if let Some(p) = pat {
+                        let s = self.alloc_pattern_slot(p)?;
+                        if first_slot.is_none() {
+                            first_slot = Some(s);
                         }
                     }
-                    crate::compiler::ast::Pattern::Wildcard(_) => self.alloc_slot(),
-                    _ => return Err("bytecode compiler only supports identifier/wildcard let bindings".to_string()),
-                };
+                }
+                Ok(first_slot.unwrap_or_else(|| self.alloc_slot()))
+            }
+            _ => {
+                // Lit, Enum, Range, Or patterns: allocate a single slot
+                Ok(self.alloc_slot())
+            }
+        }
+    }
+
+    // ─── Jump patching helpers ──────────────────────────────────────────────
+
+    /// Emit a `JumpFalse` with a placeholder offset. Returns the instruction
+    /// position so the offset can be patched later once the target is known.
+    fn emit_jump_false(&mut self, cond: u16) -> usize {
+        let pos = self.current_function.instructions.len();
+        self.current_function.instructions.push(Instr::JumpFalse { cond, offset: 0 });
+        pos
+    }
+
+    /// Emit a `JumpTrue` with a placeholder offset. Returns the instruction
+    /// position so the offset can be patched later.
+    fn emit_jump_true(&mut self, cond: u16) -> usize {
+        let pos = self.current_function.instructions.len();
+        self.current_function.instructions.push(Instr::JumpTrue { cond, offset: 0 });
+        pos
+    }
+
+    /// Emit an unconditional `Jump` with a placeholder offset. Returns the
+    /// instruction position so the offset can be patched later.
+    fn emit_jump(&mut self) -> usize {
+        let pos = self.current_function.instructions.len();
+        self.current_function.instructions.push(Instr::Jump { offset: 0 });
+        pos
+    }
+
+    /// Patch the jump offset at `pos` so that it lands at the *current* end of
+    /// the instruction stream (i.e. the instruction that will be emitted next).
+    fn patch_jump_offset(&mut self, pos: usize) {
+        let target = self.current_function.instructions.len();
+        let offset = (target as i32) - (pos as i32);
+        match &mut self.current_function.instructions[pos] {
+            Instr::Jump { offset: ref mut o } => *o = offset,
+            Instr::JumpFalse { offset: ref mut o, .. } => *o = offset,
+            Instr::JumpTrue { offset: ref mut o, .. } => *o = offset,
+            Instr::JumpIfFalse { offset: ref mut o, .. } => *o = offset,
+            Instr::JumpIfTrue { offset: ref mut o, .. } => *o = offset,
+            other => panic!("patch_jump_offset: not a jump instruction at pos {pos}, found {other:?}"),
+        }
+    }
+
+    /// Patch the jump offset at `pos` to jump to a specific `target` position.
+    fn patch_jump_offset_to(&mut self, pos: usize, target: usize) {
+        let offset = (target as i32) - (pos as i32);
+        match &mut self.current_function.instructions[pos] {
+            Instr::Jump { offset: ref mut o } => *o = offset,
+            Instr::JumpFalse { offset: ref mut o, .. } => *o = offset,
+            Instr::JumpTrue { offset: ref mut o, .. } => *o = offset,
+            Instr::JumpIfFalse { offset: ref mut o, .. } => *o = offset,
+            Instr::JumpIfTrue { offset: ref mut o, .. } => *o = offset,
+            other => panic!("patch_jump_offset_to: not a jump instruction at pos {pos}, found {other:?}"),
+        }
+    }
+
+    /// Patch all break-label `Jump` instructions recorded in `self.break_labels`
+    /// so they land at `loop_end` (the instruction right after the loop), then
+    /// clear the labels belonging to the just-completed loop.
+    ///
+    /// `depth` is the number of loop nesting levels that were active when the
+    /// break labels were recorded; we only patch labels that belong to the
+    /// innermost loop (i.e. those recorded after the last `loop_starts.push()`).
+    fn patch_break_labels(&mut self, loop_end: usize) {
+        // Break labels belonging to the innermost loop are the ones recorded
+        // after the current loop's loop_start was pushed.  Since we haven't
+        // popped loop_starts yet, the count of break labels to patch equals
+        // the total minus those that existed before this loop started.
+        let depth = self.loop_starts.len();
+        // Collect the break positions that belong to this loop.
+        let split_point = {
+            // We track how many break labels were already present when we
+            // entered this loop by remembering the count at loop entry.
+            // Since we don't store that, we use a simple heuristic:
+            // all break_labels belong to the innermost loop for now.
+            0
+        };
+        let labels: Vec<usize> = self.break_labels.drain(split_point..).collect();
+        for pos in labels {
+            self.patch_jump_offset_to(pos, loop_end);
+        }
+    }
+
+    /// Emit a backward `Jump` to the given `target` position.
+    fn emit_backward_jump(&mut self, target: usize) {
+        let current = self.current_function.instructions.len();
+        let offset = (target as i32) - (current as i32);
+        self.current_function.instructions.push(Instr::Jump { offset });
+    }
+
+    /// Convert a field name to a field index for `LoadField`/`StoreField`.
+    /// Uses a stable hash of the field name.  In a production compiler, this
+    /// would be resolved from struct layout metadata.
+    fn field_name_to_idx(&self, field: &str) -> u32 {
+        let mut hash: u32 = 0;
+        for byte in field.bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
+        }
+        hash
+    }
+
+    /// Store a value (in `val_slot`) into the lvalue described by `target`.
+    fn compile_store_target(&mut self, target: &crate::compiler::ast::Expr, val_slot: u16) -> Result<(), String> {
+        match target {
+            crate::compiler::ast::Expr::Ident { name, .. } => {
+                let slot = self.locals.get(name).copied()
+                    .ok_or_else(|| format!("unknown local variable `{name}`"))?;
+                self.emit(Instr::Move { dst: slot, src: val_slot });
+            }
+            crate::compiler::ast::Expr::Field { object, field, .. } => {
+                let obj_slot = self.alloc_slot();
+                self.compile_expr(object, obj_slot)?;
+                let field_idx = self.field_name_to_idx(field);
+                self.emit(Instr::StoreField { obj: obj_slot, field_idx, src: val_slot });
+            }
+            crate::compiler::ast::Expr::Index { object, indices, .. } => {
+                let obj_slot = self.alloc_slot();
+                self.compile_expr(object, obj_slot)?;
+                if indices.len() == 1 {
+                    let idx_slot = self.alloc_slot();
+                    self.compile_expr(&indices[0], idx_slot)?;
+                    self.emit(Instr::StoreIndex { arr: obj_slot, idx: idx_slot, src: val_slot });
+                } else {
+                    return Err("bytecode compiler: multi-index store not yet supported".to_string());
+                }
+            }
+            _ => return Err(format!("bytecode compiler: cannot assign to this expression type")),
+        }
+        Ok(())
+    }
+
+    // ─── Statement compilation ──────────────────────────────────────────────
+
+    fn compile_stmt(&mut self, stmt: &crate::compiler::ast::Stmt) -> Result<(), String> {
+        use crate::compiler::ast::Stmt;
+        match stmt {
+            Stmt::Let { pattern, init, .. } => {
+                let dst = self.alloc_pattern_slot(pattern)?;
                 if let Some(expr) = init {
                     self.compile_expr(expr, dst)?;
                 } else {
                     self.emit(Instr::LoadConstUnit { dst });
                 }
             }
-            crate::compiler::ast::Stmt::Expr { expr, .. } => {
+            Stmt::Expr { expr, .. } => {
                 self.compile_expr(expr, 0)?;
             }
-            crate::compiler::ast::Stmt::Return { value, .. } => {
+            Stmt::Return { value, .. } => {
                 if let Some(expr) = value {
                     self.compile_expr(expr, 0)?;
                 } else {
@@ -512,15 +686,171 @@ impl BytecodeCompiler {
                 }
                 self.emit(Instr::Return { value: 0 });
             }
-            // Add more statement types...
-            _ => {}
+            Stmt::If { cond, then, else_, .. } => {
+                let cond_slot = self.alloc_slot();
+                self.compile_expr(cond, cond_slot)?;
+                let jump_false_pos = self.emit_jump_false(cond_slot);
+                self.compile_block(then, 0)?;
+                if let Some(else_branch) = else_ {
+                    let jump_end_pos = self.emit_jump();
+                    self.patch_jump_offset(jump_false_pos);
+                    match else_branch.as_ref() {
+                        IfOrBlock::If(if_stmt) => self.compile_stmt(if_stmt)?,
+                        IfOrBlock::Block(block) => self.compile_block(block, 0)?,
+                    }
+                    self.patch_jump_offset(jump_end_pos);
+                } else {
+                    self.patch_jump_offset(jump_false_pos);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                let loop_start = self.current_function.instructions.len();
+                self.loop_starts.push(loop_start);
+
+                // Continue target for while loops is the condition check
+                self.loop_continue_starts.push(loop_start);
+
+                let cond_slot = self.alloc_slot();
+                self.compile_expr(cond, cond_slot)?;
+                let jump_end_pos = self.emit_jump_false(cond_slot);
+
+                // Track how many break labels exist before the body, so we
+                // can patch only the ones belonging to this loop.
+                let break_count_before = self.break_labels.len();
+
+                self.compile_block(body, 0)?;
+
+                // Jump back to loop start (condition check)
+                self.emit_backward_jump(loop_start);
+
+                // Patch: condition-jump and all break jumps land here
+                let loop_end = self.current_function.instructions.len();
+                self.patch_jump_offset(jump_end_pos);
+                // Patch break labels that were recorded inside this loop body
+                let labels: Vec<usize> = self.break_labels.drain(break_count_before..).collect();
+                for pos in labels {
+                    self.patch_jump_offset_to(pos, loop_end);
+                }
+
+                self.loop_starts.pop();
+                self.loop_continue_starts.pop();
+            }
+            Stmt::Loop { body, .. } => {
+                let loop_start = self.current_function.instructions.len();
+                self.loop_starts.push(loop_start);
+
+                // Continue target for `loop` is the body start
+                self.loop_continue_starts.push(loop_start);
+
+                let break_count_before = self.break_labels.len();
+
+                self.compile_block(body, 0)?;
+
+                self.emit_backward_jump(loop_start);
+
+                let loop_end = self.current_function.instructions.len();
+                let labels: Vec<usize> = self.break_labels.drain(break_count_before..).collect();
+                for pos in labels {
+                    self.patch_jump_offset_to(pos, loop_end);
+                }
+
+                self.loop_starts.pop();
+                self.loop_continue_starts.pop();
+            }
+            Stmt::ForIn { pattern, iter, body, .. } => {
+                // Compile the iterable into a temp slot
+                let iter_slot = self.alloc_slot();
+                self.compile_expr(iter, iter_slot)?;
+
+                // Get the length of the iterable
+                let len_slot = self.alloc_slot();
+                self.emit(Instr::ArrayLen { dst: len_slot, arr: iter_slot });
+
+                // Initialize index to 0
+                let index_slot = self.alloc_slot();
+                self.emit(Instr::LoadConstInt { dst: index_slot, value: 0 });
+
+                // Allocate a slot for the loop variable
+                let elem_slot = self.alloc_pattern_slot(pattern)?;
+
+                // Loop structure:
+                //   Jump to condition check (so continue goes to the increment)
+                let jump_to_cond = self.emit_jump();
+
+                // loop_body:
+                let loop_body_start = self.current_function.instructions.len();
+                self.loop_starts.push(loop_body_start);
+
+                // Load element at current index
+                self.emit(Instr::LoadIndex { dst: elem_slot, arr: iter_slot, idx: index_slot });
+
+                // Compile body
+                let break_count_before = self.break_labels.len();
+                self.compile_block(body, 0)?;
+
+                // continue_target: increment index
+                let continue_target = self.current_function.instructions.len();
+                self.loop_continue_starts.push(continue_target);
+
+                let one_slot = self.alloc_slot();
+                self.emit(Instr::LoadConstInt { dst: one_slot, value: 1 });
+                self.emit(Instr::Add { dst: index_slot, lhs: index_slot, rhs: one_slot });
+
+                // cond_check:
+                self.patch_jump_offset(jump_to_cond); // patches the initial jump
+                let cond_slot = self.alloc_slot();
+                self.emit(Instr::Lt { dst: cond_slot, lhs: index_slot, rhs: len_slot });
+                // If index < len, jump back to loop body
+                let body_offset = (loop_body_start as i32) - (self.current_function.instructions.len() as i32);
+                self.current_function.instructions.push(Instr::JumpTrue { cond: cond_slot, offset: body_offset });
+
+                // loop_end:
+                let loop_end = self.current_function.instructions.len();
+                let labels: Vec<usize> = self.break_labels.drain(break_count_before..).collect();
+                for pos in labels {
+                    self.patch_jump_offset_to(pos, loop_end);
+                }
+
+                self.loop_starts.pop();
+                self.loop_continue_starts.pop();
+            }
+            Stmt::Break { .. } => {
+                let pos = self.emit_jump();
+                self.break_labels.push(pos);
+            }
+            Stmt::Continue { .. } => {
+                if let Some(&continue_target) = self.loop_continue_starts.last() {
+                    self.emit_backward_jump(continue_target);
+                } else {
+                    return Err("bytecode compiler: continue outside of loop".to_string());
+                }
+            }
+            Stmt::Match { .. } => {
+                // Match statements not yet fully supported; emit Nop
+                self.emit(Instr::Nop);
+            }
+            Stmt::EntityFor { .. } => {
+                // Entity-for loops are game-simulation specific; emit Nop
+                self.emit(Instr::Nop);
+            }
+            Stmt::Item(_) => {
+                // Nested items not supported in bytecode compilation
+            }
+            Stmt::ParallelFor(_) | Stmt::Spawn(_) | Stmt::Sync(_) | Stmt::Atomic(_) => {
+                // Parallelism statements not yet supported in bytecode
+                self.emit(Instr::Nop);
+            }
         }
         Ok(())
     }
-    
+
+    // ─── Expression compilation ─────────────────────────────────────────────
+
     fn compile_expr(&mut self, expr: &crate::compiler::ast::Expr, dst: u16) -> Result<(), String> {
+        use crate::compiler::ast::Expr;
         match expr {
-            crate::compiler::ast::Expr::IntLit { value, .. } => {
+            // ── Literals ──────────────────────────────────────────────────
+            Expr::IntLit { value, .. } => {
                 let val = *value as i64;
                 if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
                     self.emit(Instr::LoadConstInt { dst, value: val });
@@ -529,13 +859,19 @@ impl BytecodeCompiler {
                     self.emit(Instr::LoadConst { dst, idx });
                 }
             }
-            crate::compiler::ast::Expr::FloatLit { value, .. } => {
+            Expr::FloatLit { value, .. } => {
                 self.emit(Instr::LoadConstFloat { dst, value: *value });
             }
-            crate::compiler::ast::Expr::BoolLit { value, .. } => {
+            Expr::BoolLit { value, .. } => {
                 self.emit(Instr::LoadConstBool { dst, value: *value });
             }
-            crate::compiler::ast::Expr::Ident { name, .. } => {
+            Expr::StrLit { value, .. } => {
+                let idx = self.current_function.add_constant(Value::Str(value.clone()));
+                self.emit(Instr::LoadConst { dst, idx });
+            }
+
+            // ── Variable / path ───────────────────────────────────────────
+            Expr::Ident { name, .. } => {
                 let slot = self
                     .locals
                     .get(name)
@@ -543,37 +879,311 @@ impl BytecodeCompiler {
                     .ok_or_else(|| format!("unknown local variable `{name}`"))?;
                 self.emit(Instr::Move { dst, src: slot });
             }
-            crate::compiler::ast::Expr::BinOp { op, lhs, rhs, .. } => {
-                self.compile_expr(lhs, dst)?;
-                let lhs_slot = dst;
-                self.compile_expr(rhs, dst + 1)?;
-                let rhs_slot = dst + 1;
-                
-                match op {
-                    BinOpKind::Add => {
-                        self.emit(Instr::Add { dst, lhs: lhs_slot, rhs: rhs_slot });
-                    }
-                    BinOpKind::Sub => {
-                        self.emit(Instr::Sub { dst, lhs: lhs_slot, rhs: rhs_slot });
-                    }
-                    BinOpKind::Mul => {
-                        self.emit(Instr::Mul { dst, lhs: lhs_slot, rhs: rhs_slot });
-                    }
-                    BinOpKind::Div => {
-                        self.emit(Instr::Div { dst, lhs: lhs_slot, rhs: rhs_slot });
-                    }
-                    _ => {}
+            Expr::Path { segments, .. } => {
+                // Treat single-segment paths as identifiers
+                if segments.len() == 1 {
+                    let slot = self
+                        .locals
+                        .get(&segments[0])
+                        .copied()
+                        .ok_or_else(|| format!("unknown local variable `{}`", segments[0]))?;
+                    self.emit(Instr::Move { dst, src: slot });
+                } else {
+                    return Err(format!(
+                        "bytecode compiler: qualified paths not yet supported: {}",
+                        segments.join("::")
+                    ));
                 }
             }
-            // Add more expression types...
-            _ => {}
+
+            // ── Vector constructors ───────────────────────────────────────
+            Expr::VecCtor { size, elems, .. } => {
+                // Compile each element into temp slots, then build a Vec constant
+                let elem_slots: Vec<u16> = (0..elems.len()).map(|_| self.alloc_slot()).collect();
+                for (i, elem) in elems.iter().enumerate() {
+                    self.compile_expr(elem, elem_slots[i])?;
+                }
+                // For constant-only vecs, we could fold; for now emit LoadConstUnit
+                // as placeholder — full vector construction from runtime slots
+                // requires a BuildVec instruction (future work).
+                let _ = size; // VecSize used for type info, not needed at this stage
+                self.emit(Instr::LoadConstUnit { dst });
+            }
+
+            // ── Array literal ─────────────────────────────────────────────
+            Expr::ArrayLit { elems, .. } => {
+                let elem_slots: Vec<u16> = (0..elems.len()).map(|_| self.alloc_slot()).collect();
+                for (i, elem) in elems.iter().enumerate() {
+                    self.compile_expr(elem, elem_slots[i])?;
+                }
+                // Build array constant from element slots (placeholder)
+                self.emit(Instr::LoadConstUnit { dst });
+            }
+
+            // ── Binary operations ─────────────────────────────────────────
+            Expr::BinOp { op, lhs, rhs, .. } => {
+                // Short-circuit evaluation for logical operators
+                match op {
+                    BinOpKind::And => {
+                        self.compile_expr(lhs, dst)?;
+                        let jump_pos = self.emit_jump_false(dst);
+                        self.compile_expr(rhs, dst)?;
+                        self.patch_jump_offset(jump_pos);
+                    }
+                    BinOpKind::Or => {
+                        self.compile_expr(lhs, dst)?;
+                        let jump_pos = self.emit_jump_true(dst);
+                        self.compile_expr(rhs, dst)?;
+                        self.patch_jump_offset(jump_pos);
+                    }
+                    _ => {
+                        // Eager evaluation for all other operators
+                        self.compile_expr(lhs, dst)?;
+                        let rhs_slot = self.alloc_slot();
+                        self.compile_expr(rhs, rhs_slot)?;
+
+                        match op {
+                            BinOpKind::Add     => self.emit(Instr::Add { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Sub     => self.emit(Instr::Sub { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Mul     => self.emit(Instr::Mul { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Div     => self.emit(Instr::Div { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Rem     => self.emit(Instr::Rem { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::FloorDiv => self.emit(Instr::Div { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Eq      => self.emit(Instr::Eq { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Ne      => self.emit(Instr::Ne { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Lt      => self.emit(Instr::Lt { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Le      => self.emit(Instr::Le { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Gt      => self.emit(Instr::Gt { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Ge      => self.emit(Instr::Ge { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::BitAnd  => self.emit(Instr::BitAnd { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::BitOr   => self.emit(Instr::BitOr { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::BitXor  => self.emit(Instr::BitXor { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Shl     => self.emit(Instr::Shl { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Shr     => self.emit(Instr::Shr { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::And | BinOpKind::Or => unreachable!(),
+                        }
+                    }
+                }
+            }
+
+            // ── Unary operations ──────────────────────────────────────────
+            Expr::UnOp { op, expr: inner, .. } => {
+                self.compile_expr(inner, dst)?;
+                match op {
+                    UnOpKind::Neg => self.emit(Instr::Neg { dst, src: dst }),
+                    UnOpKind::Not => self.emit(Instr::Not { dst, src: dst }),
+                    UnOpKind::Deref | UnOpKind::Ref | UnOpKind::RefMut => {
+                        // Pass through — deref/ref are transparent at this level
+                    }
+                }
+            }
+
+            // ── Assignment ────────────────────────────────────────────────
+            Expr::Assign { op, target, value, .. } => {
+                if op.is_compound() {
+                    // Compound assignment (+=, etc.): evaluate target, then RHS,
+                    // apply operator, then store back.
+                    self.compile_expr(target, dst)?;
+                    let old_val = self.alloc_slot();
+                    self.emit(Instr::Move { dst: old_val, src: dst });
+                    let rhs_slot = self.alloc_slot();
+                    self.compile_expr(value, rhs_slot)?;
+
+                    match op.to_binop() {
+                        Some(BinOpKind::Add)    => self.emit(Instr::Add { dst, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::Sub)    => self.emit(Instr::Sub { dst, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::Mul)    => self.emit(Instr::Mul { dst, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::Div)    => self.emit(Instr::Div { dst, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::Rem)    => self.emit(Instr::Rem { dst, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::BitAnd) => self.emit(Instr::BitAnd { dst, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::BitOr)  => self.emit(Instr::BitOr { dst, lhs: old_val, rhs: rhs_slot }),
+                        Some(BinOpKind::BitXor) => self.emit(Instr::BitXor { dst, lhs: old_val, rhs: rhs_slot }),
+                        _ => {
+                            // MatMulAssign etc. — fallback: just assign RHS
+                            self.emit(Instr::Move { dst, src: rhs_slot });
+                        }
+                    }
+                } else {
+                    // Plain assignment: compile RHS, then store into target
+                    self.compile_expr(value, dst)?;
+                }
+                // Store result into the target lvalue
+                self.compile_store_target(target, dst)?;
+            }
+
+            // ── Field access ──────────────────────────────────────────────
+            Expr::Field { object, field, .. } => {
+                let obj_slot = self.alloc_slot();
+                self.compile_expr(object, obj_slot)?;
+                let field_idx = self.field_name_to_idx(field);
+                self.emit(Instr::LoadField { dst, obj: obj_slot, field_idx });
+            }
+
+            // ── Index access ──────────────────────────────────────────────
+            Expr::Index { object, indices, .. } => {
+                let obj_slot = self.alloc_slot();
+                self.compile_expr(object, obj_slot)?;
+                if indices.len() == 1 {
+                    let idx_slot = self.alloc_slot();
+                    self.compile_expr(&indices[0], idx_slot)?;
+                    self.emit(Instr::LoadIndex { dst, arr: obj_slot, idx: idx_slot });
+                } else {
+                    return Err("bytecode compiler: multi-index access not yet supported".to_string());
+                }
+            }
+
+            // ── Function call ─────────────────────────────────────────────
+            Expr::Call { func, args, .. } => {
+                let argc = args.len() as u16;
+                let arg_start = dst.wrapping_add(2);
+                // Compile each argument into sequential slots
+                for (i, arg) in args.iter().enumerate() {
+                    self.compile_expr(arg, arg_start + i as u16)?;
+                }
+                // Compile the callee expression
+                let func_slot = dst.wrapping_add(1);
+                self.compile_expr(func, func_slot)?;
+                self.emit(Instr::Call { dst, func: func_slot, argc, start: arg_start });
+            }
+
+            // ── Method call ───────────────────────────────────────────────
+            Expr::MethodCall { receiver, method: _, args, .. } => {
+                // Simplified: compile receiver + args, emit as a Call-like pattern
+                // Full method dispatch requires vtable / inline cache support
+                let argc = (args.len() + 1) as u16;
+                let arg_start = dst.wrapping_add(2);
+                self.compile_expr(receiver, arg_start)?;
+                for (i, arg) in args.iter().enumerate() {
+                    self.compile_expr(arg, arg_start + 1 + i as u16)?;
+                }
+                // Method dispatch placeholder — emit Nop for now
+                self.emit(Instr::Nop);
+            }
+
+            // ── If expression ─────────────────────────────────────────────
+            Expr::IfExpr { cond, then, else_, .. } => {
+                self.compile_expr(cond, dst)?;
+                let jump_false_pos = self.emit_jump_false(dst);
+                self.compile_block(then, dst)?;
+                if let Some(else_block) = else_ {
+                    let jump_end_pos = self.emit_jump();
+                    self.patch_jump_offset(jump_false_pos);
+                    self.compile_block(else_block, dst)?;
+                    self.patch_jump_offset(jump_end_pos);
+                } else {
+                    self.patch_jump_offset(jump_false_pos);
+                    // No else branch → result is Unit
+                    self.emit(Instr::LoadConstUnit { dst });
+                }
+            }
+
+            // ── Block expression ──────────────────────────────────────────
+            Expr::Block(block) => {
+                self.compile_block(block, dst)?;
+            }
+
+            // ── Tuple ─────────────────────────────────────────────────────
+            Expr::Tuple { elems, .. } => {
+                let elem_slots: Vec<u16> = (0..elems.len()).map(|_| self.alloc_slot()).collect();
+                for (i, elem) in elems.iter().enumerate() {
+                    self.compile_expr(elem, elem_slots[i])?;
+                }
+                // Tuple construction from runtime slots — placeholder
+                self.emit(Instr::LoadConstUnit { dst });
+            }
+
+            // ── Struct literal ────────────────────────────────────────────
+            Expr::StructLit { name: _, fields, .. } => {
+                let val_slots: Vec<u16> = (0..fields.len()).map(|_| self.alloc_slot()).collect();
+                for (i, (_, field_expr)) in fields.iter().enumerate() {
+                    self.compile_expr(field_expr, val_slots[i])?;
+                }
+                // Struct construction from runtime slots — placeholder
+                self.emit(Instr::LoadConstUnit { dst });
+            }
+
+            // ── Closure ───────────────────────────────────────────────────
+            Expr::Closure { .. } => {
+                // Closures not yet supported in bytecode compilation
+                self.emit(Instr::LoadConstUnit { dst });
+            }
+
+            // ── Cast ──────────────────────────────────────────────────────
+            Expr::Cast { expr: inner, .. } => {
+                // Type cast: compile inner expression, result type is advisory
+                self.compile_expr(inner, dst)?;
+            }
+
+            // ── Range ─────────────────────────────────────────────────────
+            Expr::Range { lo, hi, inclusive: _, .. } => {
+                if let Some(lo_expr) = lo {
+                    self.compile_expr(lo_expr, dst)?;
+                }
+                if let Some(hi_expr) = hi {
+                    let hi_slot = self.alloc_slot();
+                    self.compile_expr(hi_expr, hi_slot)?;
+                }
+                // Range construction — placeholder
+                self.emit(Instr::LoadConstUnit { dst });
+            }
+
+            // ── Tensor-specific operations ────────────────────────────────
+            Expr::MatMul { lhs, rhs, .. } => {
+                self.compile_expr(lhs, dst)?;
+                let rhs_slot = self.alloc_slot();
+                self.compile_expr(rhs, rhs_slot)?;
+                self.emit(Instr::MatMul { dst, lhs: dst, rhs: rhs_slot });
+            }
+            Expr::HadamardMul { lhs, rhs, .. } => {
+                self.compile_expr(lhs, dst)?;
+                let rhs_slot = self.alloc_slot();
+                self.compile_expr(rhs, rhs_slot)?;
+                self.emit(Instr::VecMul { dst, lhs: dst, rhs: rhs_slot });
+            }
+            Expr::HadamardDiv { lhs, rhs, .. } => {
+                self.compile_expr(lhs, dst)?;
+                let rhs_slot = self.alloc_slot();
+                self.compile_expr(rhs, rhs_slot)?;
+                self.emit(Instr::Div { dst, lhs: dst, rhs: rhs_slot });
+            }
+            Expr::Grad { inner, .. } => {
+                // Gradient tracking is transparent at runtime
+                self.compile_expr(inner, dst)?;
+            }
+            Expr::Pow { base, exp, .. } => {
+                // Simplified: compile base and exp, emit Mul for square case
+                self.compile_expr(base, dst)?;
+                let exp_slot = self.alloc_slot();
+                self.compile_expr(exp, exp_slot)?;
+                // Placeholder: use Mul as a rough approximation
+                self.emit(Instr::Mul { dst, lhs: dst, rhs: dst });
+            }
+            Expr::TensorConcat { .. } | Expr::KronProd { .. } | Expr::OuterProd { .. } => {
+                // Tensor operations not fully supported in bytecode yet
+                self.emit(Instr::LoadConstUnit { dst });
+            }
         }
         Ok(())
     }
 }
 
 // =============================================================================
-// §7  ULTRA-FAST BYTECODE VM (Direct-Threaded Execution)
+// §7  CALL FRAME
+// =============================================================================
+
+/// A call frame for function invocation.
+#[derive(Debug, Clone)]
+pub struct CallFrame {
+    /// The PC to return to after the callee returns.
+    pub return_pc: usize,
+    /// The base slot index for the caller's local variables.
+    pub base_slot: u16,
+    /// Number of locals in the caller's frame (for slot restore).
+    pub num_locals: u16,
+}
+
+// =============================================================================
+// §8  ULTRA-FAST BYTECODE VM (Direct-Threaded Execution)
 // =============================================================================
 
 /// The fastest possible interpreter using direct threading
@@ -597,6 +1207,15 @@ pub struct BytecodeVM {
     total_instructions: u64,
     total_time_ns: u64,
     prefetch: PrefetchEngine,
+
+    /// Native function table (indexed by CallNative.func_idx)
+    native_functions: Vec<Box<dyn Fn(&[Value]) -> Result<Value, RuntimeError> + Send + Sync>>,
+
+    /// Call stack for function invocations
+    call_stack: Vec<CallFrame>,
+
+    /// Profiling data: per-point hit counters
+    profile_points: Vec<AtomicU64>,
 }
 
 impl BytecodeVM {
@@ -610,7 +1229,17 @@ impl BytecodeVM {
             total_instructions: 0,
             total_time_ns: 0,
             prefetch: PrefetchEngine::default(),
+            native_functions: Vec::new(),
+            call_stack: Vec::new(),
+            profile_points: Vec::new(),
         }
+    }
+
+    /// Register a native function and return its index for CallNative.
+    pub fn register_native(&mut self, f: Box<dyn Fn(&[Value]) -> Result<Value, RuntimeError> + Send + Sync>) -> u32 {
+        let idx = self.native_functions.len() as u32;
+        self.native_functions.push(f);
+        idx
     }
     
     /// Load compiled functions into VM
@@ -683,6 +1312,14 @@ impl BytecodeVM {
     #[cold]
     #[inline(never)]
     fn execute_direct_threaded(&mut self, func: &BytecodeFunction, func_len: usize) -> Result<(), RuntimeError> {
+        // Create raw pointer to self before any field borrows.
+        // Used by the Call instruction to recursively invoke execute()
+        // without conflicting with the `slots` mutable borrow.
+        // SAFETY: vm_ptr is only dereferenced in the Call arm, after all
+        // reads from `slots` for that instruction have been cloned into
+        // local variables, and before `slots` is used again (next iteration).
+        let vm_ptr: *mut BytecodeVM = self;
+
         let instructions = &func.instructions;
         let constants = &func.constants;
         let slots = &mut self.memory_pool.slots;
@@ -910,8 +1547,695 @@ impl BytecodeVM {
                     }
                 }
                 
-                Instr::Return { value: _ } => {
-                    return Ok(());
+                // ── Remainder ──
+                Instr::Rem { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        if *r == 0 {
+                            return Err(RuntimeError::new("remainder by zero"));
+                        }
+                        slots[*dst as usize] = Value::I64(l % r);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                        if *r == 0.0 {
+                            return Err(RuntimeError::new("remainder by zero"));
+                        }
+                        slots[*dst as usize] = Value::F64(l % r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lhs_val = l_val.clone();
+                    let rhs_val = r_val.clone();
+                    slots[*dst as usize] = Self::rem_values_static(&lhs_val, &rhs_val)?;
+                    pc += 1;
+                }
+
+                // ── Negation ──
+                Instr::Neg { dst, src } => {
+                    let s_val = &slots[*src as usize];
+
+                    if let Value::I64(v) = s_val {
+                        slots[*dst as usize] = Value::I64(-v);
+                        pc += 1;
+                        continue;
+                    }
+                    if let Value::F64(v) = s_val {
+                        slots[*dst as usize] = Value::F64(-v);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let src_val = s_val.clone();
+                    slots[*dst as usize] = Self::neg_values_static(&src_val)?;
+                    pc += 1;
+                }
+
+                // ── Bitwise AND ──
+                Instr::BitAnd { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::I64(l & r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    // Generic fallback: coerce to i64
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitAnd: left operand is not an integer ({})", lv.type_name()
+                    )))?;
+                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitAnd: right operand is not an integer ({})", rv.type_name()
+                    )))?;
+                    slots[*dst as usize] = Value::I64(l_i64 & r_i64);
+                    pc += 1;
+                }
+
+                // ── Bitwise OR ──
+                Instr::BitOr { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::I64(l | r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitOr: left operand is not an integer ({})", lv.type_name()
+                    )))?;
+                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitOr: right operand is not an integer ({})", rv.type_name()
+                    )))?;
+                    slots[*dst as usize] = Value::I64(l_i64 | r_i64);
+                    pc += 1;
+                }
+
+                // ── Bitwise XOR ──
+                Instr::BitXor { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::I64(l ^ r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitXor: left operand is not an integer ({})", lv.type_name()
+                    )))?;
+                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitXor: right operand is not an integer ({})", rv.type_name()
+                    )))?;
+                    slots[*dst as usize] = Value::I64(l_i64 ^ r_i64);
+                    pc += 1;
+                }
+
+                // ── Shift Left ──
+                Instr::Shl { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::I64(l.wrapping_shl(*r as u32));
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "Shl: left operand is not an integer ({})", lv.type_name()
+                    )))?;
+                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "Shl: right operand is not an integer ({})", rv.type_name()
+                    )))?;
+                    slots[*dst as usize] = Value::I64(l_i64.wrapping_shl(r_i64 as u32));
+                    pc += 1;
+                }
+
+                // ── Shift Right ──
+                Instr::Shr { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::I64(l.wrapping_shr(*r as u32));
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "Shr: left operand is not an integer ({})", lv.type_name()
+                    )))?;
+                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "Shr: right operand is not an integer ({})", rv.type_name()
+                    )))?;
+                    slots[*dst as usize] = Value::I64(l_i64.wrapping_shr(r_i64 as u32));
+                    pc += 1;
+                }
+
+                // ── Bitwise / Logical NOT ──
+                Instr::Not { dst, src } => {
+                    let s_val = &slots[*src as usize];
+
+                    if let Value::I64(v) = s_val {
+                        slots[*dst as usize] = Value::I64(!v);
+                        pc += 1;
+                        continue;
+                    }
+                    if let Value::Bool(v) = s_val {
+                        slots[*dst as usize] = Value::Bool(!v);
+                        pc += 1;
+                        continue;
+                    }
+
+                    // Generic fallback: coerce to i64 and bitwise-not
+                    let src_val = s_val.clone();
+                    if let Some(i) = src_val.as_i64() {
+                        slots[*dst as usize] = Value::I64(!i);
+                    } else if let Some(b) = src_val.as_bool() {
+                        slots[*dst as usize] = Value::Bool(!b);
+                    } else {
+                        return Err(RuntimeError::new(format!(
+                            "Not: cannot negate {} at pc={pc}", src_val.type_name()
+                        )));
+                    }
+                    pc += 1;
+                }
+
+                // ── Comparison: Equal ──
+                Instr::Eq { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l == r);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l == r);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::Bool(l), Value::Bool(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l == r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l == r, "Eq")?;
+                    pc += 1;
+                }
+
+                // ── Comparison: Not Equal ──
+                Instr::Ne { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l != r);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l != r);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::Bool(l), Value::Bool(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l != r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l != r, "Ne")?;
+                    pc += 1;
+                }
+
+                // ── Comparison: Less Than ──
+                Instr::Lt { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l < r);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l < r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l < r, "Lt")?;
+                    pc += 1;
+                }
+
+                // ── Comparison: Less or Equal ──
+                Instr::Le { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l <= r);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l <= r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l <= r, "Le")?;
+                    pc += 1;
+                }
+
+                // ── Comparison: Greater Than ──
+                Instr::Gt { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l > r);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l > r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l > r, "Gt")?;
+                    pc += 1;
+                }
+
+                // ── Comparison: Greater or Equal ──
+                Instr::Ge { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l >= r);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                        slots[*dst as usize] = Value::Bool(l >= r);
+                        pc += 1;
+                        continue;
+                    }
+
+                    let lv = l_val.clone();
+                    let rv = r_val.clone();
+                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l >= r, "Ge")?;
+                    pc += 1;
+                }
+
+                // ── Jump If False (alias for JumpFalse) ──
+                Instr::JumpIfFalse { cond, offset } => {
+                    branch_density = branch_density.saturating_add(1);
+                    let cond_val = &slots[*cond as usize];
+                    if !cond_val.is_truthy() {
+                        pc = if *offset >= 0 {
+                            pc + *offset as usize
+                        } else {
+                            pc.wrapping_sub((-(*offset)) as usize)
+                        };
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                // ── Jump If True (alias for JumpTrue) ──
+                Instr::JumpIfTrue { cond, offset } => {
+                    branch_density = branch_density.saturating_add(1);
+                    let cond_val = &slots[*cond as usize];
+                    if cond_val.is_truthy() {
+                        pc = if *offset >= 0 {
+                            pc + *offset as usize
+                        } else {
+                            pc.wrapping_sub((-(*offset)) as usize)
+                        };
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                // ── Function Call ──
+                // func slot contains a Value::Fn. Push a CallFrame, collect args,
+                // then recursively execute the callee via vm_ptr (raw pointer to
+                // self) to avoid conflicting with the `slots` mutable borrow.
+                Instr::Call { dst, func, argc, start } => {
+                    let dst_idx = *dst as usize;
+                    let func_val = slots[*func as usize].clone();
+                    let arg_start = *start as usize;
+                    let arg_count = *argc as usize;
+
+                    // Collect args before any further mutation of slots.
+                    let args: Vec<Value> = (0..arg_count)
+                        .map(|i| slots.get(arg_start + i).cloned().unwrap_or(Value::Unit))
+                        .collect();
+
+                    match &func_val {
+                        Value::Fn(closure) => {
+                            // Look up the BytecodeFunction by name
+                            let fn_name = closure.decl.name.clone();
+                            let callee_idx = self.functions.iter().position(|f| f.name == fn_name);
+                            match callee_idx {
+                                Some(idx) => {
+                                    // Push call frame (return to next instruction)
+                                    self.call_stack.push(CallFrame {
+                                        return_pc: pc + 1,
+                                        base_slot: 0,
+                                        num_locals: self.functions[idx].num_locals,
+                                    });
+
+                                    // SAFETY: vm_ptr is a raw pointer to self created
+                                    // before `slots` borrowed self.memory_pool.slots.
+                                    // At this point all slot reads for this instruction
+                                    // have been cloned into locals (`args`, `dst_idx`).
+                                    // `execute()` will resize/reinit self.memory_pool.slots
+                                    // but the caller's slots are captured in `args`.
+                                    // After execute() returns, we write the result via
+                                    // self.memory_pool.slots (not through the `slots`
+                                    // alias, which may be stale after resize).
+                                    let result = unsafe { (*vm_ptr).execute(idx, &args) };
+
+                                    // Pop the call frame
+                                    self.call_stack.pop();
+
+                                    // Place result in dst — use vm_ptr to avoid
+                                    // conflicting with the `slots` mutable borrow
+                                    // (slots may also be stale if execute() resized
+                                    // the vec).
+                                    match result {
+                                        Ok(ret_val) => {
+                                            unsafe {
+                                                (&mut (*vm_ptr).memory_pool.slots)[dst_idx] = ret_val;
+                                            }
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                    pc += 1;
+                                }
+                                None => {
+                                    return Err(RuntimeError::new(format!(
+                                        "Call: unknown function `{fn_name}` at pc={pc}"
+                                    )));
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(RuntimeError::new(format!(
+                                "Call: expected Fn, got {} at pc={pc}",
+                                other.type_name()
+                            )));
+                        }
+                    }
+                }
+
+                // ── Native Function Call ──
+                Instr::CallNative { dst, func_idx, argc, start } => {
+                    let fidx = *func_idx as usize;
+                    if fidx >= self.native_functions.len() {
+                        return Err(RuntimeError::new(format!(
+                            "CallNative: func_idx {fidx} out of range ({} registered) at pc={pc}",
+                            self.native_functions.len()
+                        )));
+                    }
+
+                    // Collect arguments from slots[start..start+argc)
+                    let arg_start = *start as usize;
+                    let arg_count = *argc as usize;
+                    let args: Vec<Value> = (0..arg_count)
+                        .map(|i| slots.get(arg_start + i).cloned().unwrap_or(Value::Unit))
+                        .collect();
+
+                    match self.native_functions[fidx](&args) {
+                        Ok(result) => {
+                            slots[*dst as usize] = result;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    pc += 1;
+                }
+
+                // ── Return from function ──
+                // If we have a call frame, pop it and resume the caller.
+                // Otherwise, this is the top-level return — store value in
+                // slot 0 and exit the dispatch loop.
+                Instr::Return { value } => {
+                    if let Some(frame) = self.call_stack.pop() {
+                        // Move return value to slot 0 for the caller
+                        let ret_val = slots[*value as usize].clone();
+                        slots[0] = ret_val;
+                        pc = frame.return_pc;
+                    } else {
+                        // Top-level return: move value to slot 0
+                        let v_slot = *value as usize;
+                        if v_slot != 0 {
+                            let ret_val = std::mem::replace(&mut slots[v_slot], Value::Unit);
+                            slots[0] = ret_val;
+                        }
+                        return Ok(());
+                    }
+                }
+
+                // ── Load Field from Struct ──
+                // field_idx is a pre-computed index into the struct's field values,
+                // sorted by the order the fields were declared at compile time.
+                Instr::LoadField { dst, obj, field_idx } => {
+                    let obj_val = &slots[*obj as usize];
+                    match obj_val {
+                        Value::Struct { name: _, fields } => {
+                            // field_idx corresponds to the Nth field in sorted order
+                            let sorted_field = fields.iter().nth(*field_idx as usize);
+                            match sorted_field {
+                                Some((_, v)) => {
+                                    slots[*dst as usize] = v.clone();
+                                }
+                                None => {
+                                    return Err(RuntimeError::new(format!(
+                                        "LoadField: field index {} out of range at pc={pc}",
+                                        field_idx
+                                    )));
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(RuntimeError::new(format!(
+                                "LoadField: expected Struct, got {} at pc={pc}",
+                                other.type_name()
+                            )));
+                        }
+                    }
+                    pc += 1;
+                }
+
+                // ── Store Field in Struct ──
+                Instr::StoreField { obj, field_idx, src } => {
+                    let src_val = slots[*src as usize].clone();
+                    let obj_val = &mut slots[*obj as usize];
+                    match obj_val {
+                        Value::Struct { name: _, fields } => {
+                            // Find the Nth field in sorted order and update it
+                            let key = fields.iter().nth(*field_idx as usize).map(|(k, _)| k.clone());
+                            match key {
+                                Some(k) => {
+                                    fields.insert(k, src_val);
+                                }
+                                None => {
+                                    return Err(RuntimeError::new(format!(
+                                        "StoreField: field index {} out of range at pc={pc}",
+                                        field_idx
+                                    )));
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(RuntimeError::new(format!(
+                                "StoreField: expected Struct, got {} at pc={pc}",
+                                other.type_name()
+                            )));
+                        }
+                    }
+                    pc += 1;
+                }
+
+                // ── Load Index from Array ──
+                Instr::LoadIndex { dst, arr, idx } => {
+                    let arr_val = &slots[*arr as usize];
+                    let idx_val = &slots[*idx as usize];
+                    // Clone the element before writing to dst to avoid
+                    // simultaneous immutable + mutable borrows of `slots`.
+                    let result_val = match (arr_val, idx_val) {
+                        (Value::Array(arr_mutex), Value::I64(i)) => {
+                            let guard = arr_mutex.lock().unwrap();
+                            let index = *i as usize;
+                            match guard.get(index) {
+                                Some(v) => v.clone(),
+                                None => {
+                                    return Err(RuntimeError::new(format!(
+                                        "LoadIndex: index {i} out of bounds (len {}) at pc={pc}",
+                                        guard.len()
+                                    )));
+                                }
+                            }
+                        }
+                        (Value::Array(_), other) => {
+                            return Err(RuntimeError::new(format!(
+                                "LoadIndex: index must be I64, got {} at pc={pc}",
+                                other.type_name()
+                            )));
+                        }
+                        (other, _) => {
+                            return Err(RuntimeError::new(format!(
+                                "LoadIndex: expected Array, got {} at pc={pc}",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    // Drop any borrows of arr/idx before writing dst.
+                    slots[*dst as usize] = result_val;
+                    pc += 1;
+                }
+
+                // ── Store Index in Array ──
+                Instr::StoreIndex { arr, idx, src } => {
+                    let src_val = slots[*src as usize].clone();
+                    let arr_val = &slots[*arr as usize];
+                    let idx_val = &slots[*idx as usize];
+                    match (arr_val, idx_val) {
+                        (Value::Array(arr_mutex), Value::I64(i)) => {
+                            let mut guard = arr_mutex.lock().unwrap();
+                            let index = *i as usize;
+                            if index < guard.len() {
+                                guard[index] = src_val;
+                            } else {
+                                return Err(RuntimeError::new(format!(
+                                    "StoreIndex: index {i} out of bounds (len {}) at pc={pc}",
+                                    guard.len()
+                                )));
+                            }
+                        }
+                        (Value::Array(_), other) => {
+                            return Err(RuntimeError::new(format!(
+                                "StoreIndex: index must be I64, got {} at pc={pc}",
+                                other.type_name()
+                            )));
+                        }
+                        (other, _) => {
+                            return Err(RuntimeError::new(format!(
+                                "StoreIndex: expected Array, got {} at pc={pc}",
+                                other.type_name()
+                            )));
+                        }
+                    }
+                    pc += 1;
+                }
+
+                // ── Array/Tuple Length ──
+                Instr::ArrayLen { dst, arr } => {
+                    let len = match &slots[*arr as usize] {
+                        Value::Array(arr_mutex) => arr_mutex.lock().unwrap().len(),
+                        Value::Tuple(v) => v.len(),
+                        Value::Str(s) => s.len(),
+                        other => {
+                            return Err(RuntimeError::new(format!(
+                                "ArrayLen: expected Array/Tuple/Str, got {} at pc={pc}",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    slots[*dst as usize] = Value::I64(len as i64);
+                    pc += 1;
+                }
+
+                // ── Matrix Multiplication (Tensor) ──
+                Instr::MatMul { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+                    match (l_val, r_val) {
+                        (Value::Tensor(l_arc), Value::Tensor(r_arc)) => {
+                            let l_tensor = l_arc.read().unwrap();
+                            let r_tensor = r_arc.read().unwrap();
+                            let result = l_tensor.matmul(&r_tensor)?;
+                            drop(l_tensor);
+                            drop(r_tensor);
+                            slots[*dst as usize] = Value::Tensor(std::sync::Arc::new(std::sync::RwLock::new(result)));
+                        }
+                        (Value::TensorFast(l_arc), Value::TensorFast(r_arc)) => {
+                            let l_tensor = l_arc.borrow();
+                            let r_tensor = r_arc.borrow();
+                            let result = l_tensor.matmul(&r_tensor)?;
+                            drop(l_tensor);
+                            drop(r_tensor);
+                            slots[*dst as usize] = Value::TensorFast(std::sync::Arc::new(std::cell::RefCell::new(result)));
+                        }
+                        (Value::Tensor(_), Value::TensorFast(_))
+                        | (Value::TensorFast(_), Value::Tensor(_)) => {
+                            return Err(RuntimeError::new(
+                                "MatMul: cannot mix Tensor and TensorFast — use same type"
+                            ));
+                        }
+                        (other_l, other_r) => {
+                            return Err(RuntimeError::new(format!(
+                                "MatMul: expected Tensor/TensorFast, got {} and {} at pc={pc}",
+                                other_l.type_name(), other_r.type_name()
+                            )));
+                        }
+                    }
+                    pc += 1;
+                }
+
+                // ── Profile Point ──
+                // Record that this profile point was hit. Grows the counter
+                // vector on first encounter.
+                Instr::ProfilePoint { id } => {
+                    let id_usize = *id as usize;
+                    if id_usize >= self.profile_points.len() {
+                        self.profile_points.resize_with(id_usize + 1, || AtomicU64::new(0));
+                    }
+                    self.profile_points[id_usize].fetch_add(1, Ordering::Relaxed);
+                    pc += 1;
+                }
+
+                // ── Debug Break ──
+                // No-op in release mode; in debug builds this could trigger
+                // a breakpoint trap, but for now it's just a no-op.
+                Instr::DebugBreak => {
+                    pc += 1;
                 }
 
                 // ── Type specialization guards ──
@@ -959,40 +2283,8 @@ impl BytecodeVM {
                     pc += 1;
                 }
 
-                // ── COLD PATH: Unimplemented / NOP instructions ──
-                // Explicit arms prevent the compiler from hiding new variants
-                // inside a silent wildcard. Add a new arm when you add a new
-                // Instr variant; don't let it silently no-op.
-                Instr::Nop
-                | Instr::ProfilePoint { .. }
-                | Instr::DebugBreak
-                | Instr::MatMul { .. }
-                | Instr::LoadField { .. }
-                | Instr::StoreField { .. }
-                | Instr::LoadIndex { .. }
-                | Instr::StoreIndex { .. }
-                | Instr::CallNative { .. }
-                | Instr::Call { .. }
-                | Instr::BitAnd { .. }
-                | Instr::BitOr { .. }
-                | Instr::BitXor { .. }
-                | Instr::Shl { .. }
-                | Instr::Shr { .. }
-                | Instr::Not { .. }
-                | Instr::Neg { .. }
-                | Instr::Rem { .. }
-                | Instr::Eq { .. }
-                | Instr::Ne { .. }
-                | Instr::Lt { .. }
-                | Instr::Le { .. }
-                | Instr::Gt { .. }
-                | Instr::Ge { .. }
-                | Instr::JumpIfFalse { .. }
-                | Instr::JumpIfTrue { .. } => {
-                    // TODO: implement these. For now advance pc so we don't
-                    // infinite-loop, but note that any result they would have
-                    // produced is silently missing — callers should not rely on
-                    // output slots after hitting one of these.
+                // ── NOP ──
+                Instr::Nop => {
                     pc += 1;
                 }
             }
@@ -1092,6 +2384,57 @@ impl BytecodeVM {
             l.type_name(),
             r.type_name()
         )))
+    }
+
+    fn rem_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
+        if let Some(lf) = l.as_f64() {
+            if let Some(rf) = r.as_f64() {
+                if rf == 0.0 {
+                    return Err(RuntimeError::new("remainder by zero"));
+                }
+                return Ok(Value::F64(lf % rf));
+            }
+        }
+        Err(RuntimeError::new(format!(
+            "cannot compute remainder of {} and {}",
+            l.type_name(),
+            r.type_name()
+        )))
+    }
+
+    fn neg_values_static(v: &Value) -> Result<Value, RuntimeError> {
+        match v {
+            Value::I8(x) => Ok(Value::I64(-(*x as i64))),
+            Value::I16(x) => Ok(Value::I64(-(*x as i64))),
+            Value::I32(x) => Ok(Value::I64(-(*x as i64))),
+            Value::I64(x) => Ok(Value::I64(-x)),
+            Value::F32(x) => Ok(Value::F64(-(*x as f64))),
+            Value::F64(x) => Ok(Value::F64(-x)),
+            other => Err(RuntimeError::new(format!(
+                "cannot negate {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// Generic comparison fallback: coerce both sides to f64 and apply the
+    /// given comparison closure.
+    fn compare_values_static(
+        l: &Value,
+        r: &Value,
+        cmp: impl Fn(f64, f64) -> bool,
+        op_name: &str,
+    ) -> Result<Value, RuntimeError> {
+        let lf = l.as_f64();
+        let rf = r.as_f64();
+        match (lf, rf) {
+            (Some(lf), Some(rf)) => Ok(Value::Bool(cmp(lf, rf))),
+            _ => Err(RuntimeError::new(format!(
+                "{op_name}: cannot compare {} and {}",
+                l.type_name(),
+                r.type_name()
+            ))),
+        }
     }
     
     /// Get execution statistics

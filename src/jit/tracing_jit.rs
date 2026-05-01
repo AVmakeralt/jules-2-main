@@ -56,7 +56,7 @@ impl Value {
             Value::F64(_) | Value::F32(_) => ValueType::F64,
             Value::Bool(_) => ValueType::Bool,
             Value::Unit => ValueType::Unit,
-            Value::Tensor(_) => ValueType::Tensor,
+            Value::Tensor(_) | Value::TensorFast(_) => ValueType::Tensor,
             _ => ValueType::Unknown,
         }
     }

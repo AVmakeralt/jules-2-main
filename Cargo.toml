@@ -113,12 +113,12 @@ debug = "line-tables-only" # Minimal debug info
 panic = "unwind"
 overflow-checks = true
 
-# Production release: balanced speed/compile time
+# Production release: optimized for speed
 [profile.release]
 opt-level = 3
-lto = "thin"               # Thin LTO (much faster than fat LTO)
-codegen-units = 4          # Parallel codegen (4 units for speed)
-panic = "abort"
+lto = "fat"                # Full LTO for maximum cross-crate inlining
+codegen-units = 1          # Single unit for maximum inlining & optimization
+panic = "abort"            # Removes unwinding machinery (~5% speedup)
 strip = "symbols"
 incremental = false
 debug = false

@@ -103,7 +103,8 @@ impl FunctionState {
         let mut tracing_jit = TracingJIT::new();
         // Keep tier-3 in managed tracing mode unless explicitly enabled for
         // native codegen stability work.
-        tracing_jit.compile_trigger = u64::MAX / 2;
+        // Compile trace after 50 executions — balances warm-up quality vs. latency.
+        tracing_jit.compile_trigger = 50;
 
         Self {
             name,
@@ -252,7 +253,8 @@ impl TieredExecutionManager {
         let mut tracing_jit = TracingJIT::new();
         // Keep tier-3 in managed tracing mode unless explicitly enabled for
         // native codegen stability work.
-        tracing_jit.compile_trigger = u64::MAX / 2;
+        // Compile trace after 50 executions — balances warm-up quality vs. latency.
+        tracing_jit.compile_trigger = 50;
 
         Self {
             function_states: FxHashMap::default(),
