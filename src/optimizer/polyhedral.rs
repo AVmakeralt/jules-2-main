@@ -73,13 +73,13 @@ impl CacheModel {
         // Micro-kernel dimensions (tuned for register blocking)
         let mr = 8; // 8 rows of A in registers
         let nr = 4; // 4 columns of B in registers
-        
+
         // Compute KC: max k-chunk that fits both A-panels and B-panels in L1
         // MR * KC * 4 + KC * NR * 4 ≤ L1_size
         // KC * (MR + NR) * 4 ≤ L1_size
         // KC ≤ L1_size / ((MR + NR) * 4)
         let kc_from_l1 = self.l1_size / ((mr + nr) * 4);
-        
+
         // But we also want the A tile to fit in L2:
         // MC * KC * 4 ≤ L2_size  →  MC ≤ L2_size / (KC * 4)
         // And the B tile: KC * NC * 4 ≤ L2_size  →  NC ≤ L2_size / (KC * 4)
@@ -87,16 +87,16 @@ impl CacheModel {
         // Use 2/3 of L2 to leave room for C and other data
         let l2_usable = (self.l2_size as f64 * 0.667) as usize;
         let kc = kc_from_l1.min(k).min(512); // cap at 512 for practical reasons
-        
+
         // MC and NC: fit in L2
         let mc = (l2_usable / (kc * 4 + 1)).min(m);
         let nc = (l2_usable / (kc * 4 + 1)).min(n);
-        
+
         // Round to multiples of MR/NR for clean micro-kernel dispatch
         let mc = ((mc / mr) * mr).max(mr);
         let nc = ((nc / nr) * nr).max(nr);
         let kc = (kc / 4 * 4).max(4); // Round to 4 for alignment
-        
+
         TileSizes {
             mc, nc, kc,
             mr, nr,
@@ -186,6 +186,22 @@ pub struct PolyhedralOptResult {
     pub cache_miss_reduction: f64,
 }
 
+// =============================================================================
+// Internal helper: a single loop layer in a nested loop structure
+// =============================================================================
+
+/// Internal representation of a single loop layer extracted from a nested ForIn.
+/// Used by loop interchange and tiling transformations.
+#[derive(Debug, Clone)]
+struct LoopLayer {
+    /// The iterator variable name (e.g., "i", "j", "k")
+    iter_var: String,
+    /// The iteration expression (e.g., `0..N`)
+    iter_expr: Expr,
+    /// The loop label, if any
+    label: Option<String>,
+}
+
 /// The polyhedral optimizer
 pub struct PolyhedralOptimizer {
     /// Cache model for the target machine
@@ -224,10 +240,14 @@ impl PolyhedralOptimizer {
     }
 
     fn optimize_block(&mut self, block: &mut Block) {
-        // Analyze loop nests in this block and apply transformations
+        // Analyze loop nests and apply per-statement transformations
         for stmt in &mut block.stmts {
             self.optimize_stmt(stmt);
         }
+
+        // Apply loop fusion on adjacent loops in this block
+        self.apply_fusion(block);
+
         if let Some(tail) = &mut block.tail {
             let optimized = self.optimize_expr(std::mem::replace(
                 tail.as_mut(),
@@ -247,15 +267,18 @@ impl PolyhedralOptimizer {
             _ => None,
         };
 
-        // Then apply transformations and recurse
+        // Apply polyhedral transformations (interchange, tiling) if warranted
+        if let Some(ref result) = analysis_result {
+            if result.interchange_applied || result.tiling_applied {
+                self.loops_optimized += 1;
+                self.total_cache_miss_reduction += result.cache_miss_reduction;
+                self.apply_transformation(stmt, result);
+            }
+        }
+
+        // Then recurse into sub-statements
         match stmt {
             Stmt::ForIn { body, .. } => {
-                // Apply analysis results
-                if let Some(result) = analysis_result {
-                    self.loops_optimized += 1;
-                    self.total_cache_miss_reduction += result.cache_miss_reduction;
-                    // Transformation is noted; runtime kernels already use optimal tiling
-                }
                 self.optimize_block(body);
             }
             Stmt::While { body, .. } => {
@@ -285,6 +308,10 @@ impl PolyhedralOptimizer {
         // But we can annotate expressions with optimization hints
         expr
     }
+
+    // =========================================================================
+    // Loop nest analysis (read-only)
+    // =========================================================================
 
     /// Analyze a loop statement to extract a loop nest descriptor
     fn analyze_loop_nest(&self, stmt: &Stmt) -> Option<LoopNest> {
@@ -467,7 +494,7 @@ impl PolyhedralOptimizer {
             let m = (nest.upper_bounds.get(0).copied().unwrap_or(64)) as usize;
             let n = (nest.upper_bounds.get(1).copied().unwrap_or(64)) as usize;
             let k = nest.access_patterns.len().max(1) * 64;
-            
+
             result.tile_sizes = Some(self.cache.matmul_tile_sizes(m, k, n));
             result.tiling_applied = true;
             result.cache_miss_reduction = result.cache_miss_reduction.max(0.8);
@@ -513,18 +540,638 @@ impl PolyhedralOptimizer {
         scores.into_iter().map(|(name, _)| name).collect()
     }
 
+    // =========================================================================
+    // AST transformation: apply_transformation (interchange + tiling)
+    // =========================================================================
+
     /// Apply a polyhedral transformation to the AST.
     /// This modifies the loop structure to use the optimized order and tiling.
-    fn apply_transformation(&self, _stmt: &mut Stmt, _result: &PolyhedralOptResult) {
-        // Full AST transformation for loop interchange and tiling would require
-        // restructuring the loop nest. The runtime matmul kernel already uses
-        // optimal tiling (see ml_engine.rs microkernel_8x4), so the main win
-        // here is at the IR level where we can annotate loops with tiling hints.
-        //
-        // For now, the polyhedral analysis results are used by:
-        // 1. The JIT compiler to generate tiled loops
-        // 2. The bytecode compiler to reorder loop nests
-        // 3. The ML engine which already has hand-tiled kernels
+    fn apply_transformation(&self, stmt: &mut Stmt, result: &PolyhedralOptResult) {
+        // Step 1: Apply loop interchange (reorder nesting)
+        if result.interchange_applied {
+            self.apply_interchange(stmt, result);
+        }
+        // Step 2: Apply loop tiling (add tile loops) on the (now reordered) nest
+        if result.tiling_applied {
+            self.apply_tiling(stmt, result);
+        }
+    }
+
+    // =========================================================================
+    // Loop interchange
+    // =========================================================================
+
+    /// Apply loop interchange: reorder the nesting of loop layers according
+    /// to the `optimized_order` in the analysis result.
+    ///
+    /// Example: `for i in 0..M { for j in 0..N { for k in 0..K { body } } }`
+    /// With optimal order [i, k, j] becomes:
+    /// `for i in 0..M { for k in 0..K { for j in 0..N { body } } }`
+    fn apply_interchange(&self, stmt: &mut Stmt, result: &PolyhedralOptResult) {
+        let (layers, innermost_body) = match Self::extract_loop_nest(stmt) {
+            Some(nest) => nest,
+            None => return,
+        };
+
+        if layers.len() < 2 {
+            return;
+        }
+
+        // Create a mapping from variable name to layer index
+        let mut var_to_idx = std::collections::HashMap::new();
+        for (i, l) in layers.iter().enumerate() {
+            var_to_idx.insert(l.iter_var.clone(), i);
+        }
+
+        // Reorder layers according to optimized_order
+        let mut reordered_layers = Vec::with_capacity(layers.len());
+        for var_name in &result.optimized_order {
+            if let Some(&idx) = var_to_idx.get(var_name) {
+                reordered_layers.push(layers[idx].clone());
+            }
+        }
+
+        // If we couldn't reorder all layers, bail out
+        if reordered_layers.len() != layers.len() {
+            return;
+        }
+
+        // Check that the reordering is actually different
+        let is_different = reordered_layers.iter().zip(layers.iter())
+            .any(|(a, b)| a.iter_var != b.iter_var);
+        if !is_different {
+            return;
+        }
+
+        // Build the new nested loop structure
+        let new_stmt = Self::build_nested_loop(&reordered_layers, innermost_body);
+        *stmt = new_stmt;
+    }
+
+    // =========================================================================
+    // Loop tiling
+    // =========================================================================
+
+    /// Apply loop tiling: wrap each loop in tile loops for cache optimization.
+    ///
+    /// Transforms:
+    /// ```text
+    /// for i in 0..M {
+    ///     for j in 0..N {
+    ///         body
+    ///     }
+    /// }
+    /// ```
+    /// Into:
+    /// ```text
+    /// for tile_i in 0..(M / MC + 1) {
+    ///     for i in (tile_i * MC)..min((tile_i + 1) * MC, M) {
+    ///         for tile_j in 0..(N / NC + 1) {
+    ///             for j in (tile_j * NC)..min((tile_j + 1) * NC, N) {
+    ///                 body
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    fn apply_tiling(&self, stmt: &mut Stmt, result: &PolyhedralOptResult) {
+        let tile_sizes = match &result.tile_sizes {
+            Some(ts) => *ts,
+            None => return,
+        };
+
+        let (layers, innermost_body) = match Self::extract_loop_nest(stmt) {
+            Some(nest) => nest,
+            None => return,
+        };
+
+        if layers.is_empty() {
+            return;
+        }
+
+        // Tile size for each loop depth
+        let tile_size_for_depth = [tile_sizes.mc, tile_sizes.nc, tile_sizes.kc];
+
+        let num_to_tile = layers.len().min(tile_size_for_depth.len());
+
+        let mut tiled_layers = Vec::new();
+
+        for (i, layer) in layers.iter().enumerate() {
+            if i < num_to_tile {
+                let tile_size = tile_size_for_depth[i];
+
+                // Create tile loop variable name, e.g. "tile_i"
+                let tile_var = format!("tile_{}", layer.iter_var);
+
+                // Extract upper bound from iter expression
+                let upper_bound = Self::extract_range_upper_bound(&layer.iter_expr);
+
+                // Create tile loop: for tile_var in 0..(upper_bound / tile_size + 1)
+                let num_tiles_expr = Expr::BinOp {
+                    span: Span::dummy(),
+                    op: BinOpKind::Add,
+                    lhs: Box::new(Expr::BinOp {
+                        span: Span::dummy(),
+                        op: BinOpKind::FloorDiv,
+                        lhs: Box::new(upper_bound.clone()),
+                        rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: tile_size as u128 }),
+                    }),
+                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+                };
+
+                let tile_iter = Expr::Range {
+                    span: Span::dummy(),
+                    lo: Some(Box::new(Expr::IntLit { span: Span::dummy(), value: 0 })),
+                    hi: Some(Box::new(num_tiles_expr)),
+                    inclusive: false,
+                };
+
+                tiled_layers.push(LoopLayer {
+                    iter_var: tile_var.clone(),
+                    iter_expr: tile_iter,
+                    label: None,
+                });
+
+                // Create inner loop: for var in (tile_var * tile_size)..min((tile_var + 1) * tile_size, upper_bound)
+                let lo_expr = Expr::BinOp {
+                    span: Span::dummy(),
+                    op: BinOpKind::Mul,
+                    lhs: Box::new(Expr::Ident { span: Span::dummy(), name: tile_var.clone() }),
+                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: tile_size as u128 }),
+                };
+
+                let hi_inner = Expr::BinOp {
+                    span: Span::dummy(),
+                    op: BinOpKind::Mul,
+                    lhs: Box::new(Expr::BinOp {
+                        span: Span::dummy(),
+                        op: BinOpKind::Add,
+                        lhs: Box::new(Expr::Ident { span: Span::dummy(), name: tile_var }),
+                        rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+                    }),
+                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: tile_size as u128 }),
+                };
+
+                let hi_expr = Expr::Call {
+                    span: Span::dummy(),
+                    func: Box::new(Expr::Ident { span: Span::dummy(), name: "min".to_string() }),
+                    args: vec![hi_inner, upper_bound],
+                    named: vec![],
+                };
+
+                let inner_iter = Expr::Range {
+                    span: Span::dummy(),
+                    lo: Some(Box::new(lo_expr)),
+                    hi: Some(Box::new(hi_expr)),
+                    inclusive: false,
+                };
+
+                tiled_layers.push(LoopLayer {
+                    iter_var: layer.iter_var.clone(),
+                    iter_expr: inner_iter,
+                    label: layer.label.clone(),
+                });
+            } else {
+                // No tiling for this layer (beyond 3 dims), keep as-is
+                tiled_layers.push(layer.clone());
+            }
+        }
+
+        let new_stmt = Self::build_nested_loop(&tiled_layers, innermost_body);
+        *stmt = new_stmt;
+    }
+
+    // =========================================================================
+    // Loop fusion
+    // =========================================================================
+
+    /// Apply loop fusion: merge adjacent ForIn loops with the same iteration
+    /// space when there are no conflicting dependencies.
+    ///
+    /// Example:
+    /// ```text
+    /// for i in 0..N { A[i] = B[i] + 1 }
+    /// for i in 0..N { C[i] = A[i] * 2 }
+    /// ```
+    /// →
+    /// ```text
+    /// for i in 0..N { A[i] = B[i] + 1; C[i] = A[i] * 2 }
+    /// ```
+    fn apply_fusion(&self, block: &mut Block) {
+        let mut i = 0;
+        while i + 1 < block.stmts.len() {
+            let can_fuse = self.can_fuse_loops(&block.stmts[i], &block.stmts[i + 1]);
+            if can_fuse {
+                let fused = self.fuse_loops(&block.stmts[i], &block.stmts[i + 1]);
+                block.stmts[i] = fused;
+                block.stmts.remove(i + 1);
+                // Don't increment i; check if the fused loop can fuse with the next
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Check if two adjacent ForIn loops can be safely fused.
+    ///
+    /// Safety criteria:
+    /// 1. Both are ForIn loops with the same iterator variable name
+    /// 2. Both have the same iteration space (structurally equal iter expressions)
+    /// 3. Loop2's writes don't overlap with loop1's reads (anti-dependency)
+    /// 4. Loop2's writes don't overlap with loop1's writes (output dependency)
+    fn can_fuse_loops(&self, stmt1: &Stmt, stmt2: &Stmt) -> bool {
+        let (pat1, iter1, body1, label1) = match stmt1 {
+            Stmt::ForIn { pattern, iter, body, label, .. } => (pattern, iter, body, label),
+            _ => return false,
+        };
+        let (pat2, iter2, body2, label2) = match stmt2 {
+            Stmt::ForIn { pattern, iter, body, label, .. } => (pattern, iter, body, label),
+            _ => return false,
+        };
+
+        // Both must have simple identifier patterns
+        let name1 = match pat1 {
+            Pattern::Ident { name, .. } => name.clone(),
+            _ => return false,
+        };
+        let name2 = match pat2 {
+            Pattern::Ident { name, .. } => name.clone(),
+            _ => return false,
+        };
+
+        // Same iterator variable name
+        if name1 != name2 {
+            return false;
+        }
+
+        // Same iteration space (structural equality)
+        if iter1 != iter2 {
+            return false;
+        }
+
+        // If either has a label, don't fuse (break/continue targets would be ambiguous)
+        if label1.is_some() || label2.is_some() {
+            return false;
+        }
+
+        // Check for dependency conflicts
+        let mut loop1_reads = Vec::new();
+        let mut loop1_writes = Vec::new();
+        let mut loop2_writes = Vec::new();
+
+        Self::collect_array_names_from_block(body1, &mut loop1_reads, &mut loop1_writes);
+        Self::collect_array_names_from_block(body2, &mut loop1_reads, &mut loop2_writes);
+        // ^ Reusing loop1_reads for loop2 reads since we don't need them separately
+
+        // Actually, collect separately for clarity
+        let mut _loop2_reads = Vec::new();
+        loop1_reads.clear();
+        loop1_writes.clear();
+        loop2_writes.clear();
+
+        Self::collect_array_names_from_block(body1, &mut loop1_reads, &mut loop1_writes);
+        Self::collect_array_names_from_block(body2, &mut _loop2_reads, &mut loop2_writes);
+
+        // Don't fuse if loop2 writes to something loop1 reads (anti-dependency:
+        // in the original, loop1 finishes all reads before loop2 starts writing;
+        // after fusion, loop2 could overwrite a value loop1 hasn't read yet in
+        // a future iteration)
+        for w in &loop2_writes {
+            if loop1_reads.contains(w) {
+                return false;
+            }
+        }
+
+        // Don't fuse if both loops write to the same array (output dependency)
+        for w in &loop1_writes {
+            if loop2_writes.contains(w) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Fuse two adjacent ForIn loops into a single loop by merging their bodies.
+    fn fuse_loops(&self, stmt1: &Stmt, stmt2: &Stmt) -> Stmt {
+        let (span1, pattern1, iter1, body1, label1) = match stmt1 {
+            Stmt::ForIn { span, pattern, iter, body, label } =>
+                (*span, pattern.clone(), iter.clone(), body.clone(), label.clone()),
+            _ => unreachable!("fuse_loops called on non-ForIn"),
+        };
+        let (_span2, _pattern2, _iter2, body2, _label2) = match stmt2 {
+            Stmt::ForIn { span, pattern, iter, body, label } =>
+                (*span, pattern.clone(), iter.clone(), body.clone(), label.clone()),
+            _ => unreachable!("fuse_loops called on non-ForIn"),
+        };
+
+        // Merge the bodies: all stmts from body1 followed by all stmts from body2
+        let mut merged_stmts = body1.stmts;
+        merged_stmts.extend(body2.stmts);
+
+        // If either body has a tail expression, convert it to a statement
+        if let Some(tail_expr) = body1.tail {
+            merged_stmts.push(Stmt::Expr {
+                span: Span::dummy(),
+                expr: *tail_expr,
+                has_semi: true,
+            });
+        }
+        if let Some(tail_expr) = body2.tail {
+            merged_stmts.push(Stmt::Expr {
+                span: Span::dummy(),
+                expr: *tail_expr,
+                has_semi: true,
+            });
+        }
+
+        let merged_body = Block {
+            span: Span::dummy(),
+            stmts: merged_stmts,
+            tail: None,
+        };
+
+        Stmt::ForIn {
+            span: span1,
+            pattern: pattern1,
+            iter: iter1,
+            body: merged_body,
+            label: label1,
+        }
+    }
+
+    // =========================================================================
+    // Shared helpers for AST manipulation
+    // =========================================================================
+
+    /// Extract nested ForIn loop layers and the innermost body.
+    ///
+    /// A "perfect nest" is a sequence of ForIn loops where each loop body
+    /// contains exactly one ForIn statement (except the innermost, which
+    /// can contain arbitrary statements).
+    ///
+    /// Returns `None` if the statement is not a ForIn or the nest is not
+    /// perfectly nested.
+    fn extract_loop_nest(stmt: &Stmt) -> Option<(Vec<LoopLayer>, Block)> {
+        let mut layers = Vec::new();
+        let mut current = stmt;
+
+        loop {
+            match current {
+                Stmt::ForIn { pattern, iter, body, label, .. } => {
+                    let iter_var = match pattern {
+                        Pattern::Ident { name, .. } => name.clone(),
+                        _ => return None,
+                    };
+                    layers.push(LoopLayer {
+                        iter_var,
+                        iter_expr: iter.clone(),
+                        label: label.clone(),
+                    });
+
+                    // Check if body has a single ForIn statement (perfect nesting)
+                    if body.stmts.len() == 1 && body.tail.is_none() {
+                        if matches!(body.stmts[0], Stmt::ForIn { .. }) {
+                            current = &body.stmts[0];
+                            continue;
+                        }
+                    }
+                    // This is the innermost body (multiple stmts, tail, or non-loop stmt)
+                    return Some((layers, body.clone()));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Build a nested ForIn loop structure from layers and an innermost body.
+    ///
+    /// The layers are ordered outermost-first. The returned statement is the
+    /// outermost ForIn loop.
+    fn build_nested_loop(layers: &[LoopLayer], innermost_body: Block) -> Stmt {
+        let mut body = innermost_body;
+
+        // Build from innermost to outermost
+        for layer in layers.iter().rev() {
+            let for_stmt = Stmt::ForIn {
+                span: Span::dummy(),
+                pattern: Pattern::Ident {
+                    span: Span::dummy(),
+                    name: layer.iter_var.clone(),
+                    mutable: false,
+                },
+                iter: layer.iter_expr.clone(),
+                body,
+                label: layer.label.clone(),
+            };
+            body = Block {
+                span: Span::dummy(),
+                stmts: vec![for_stmt],
+                tail: None,
+            };
+        }
+
+        // The outermost ForIn is the first (and only) statement in the body
+        body.stmts.into_iter().next().unwrap()
+    }
+
+    /// Extract the upper bound from an iteration expression.
+    ///
+    /// - `Expr::Range { hi: Some(N), inclusive: false }` → `N`
+    /// - `Expr::Range { hi: Some(N), inclusive: true }` → `N + 1`
+    /// - `Expr::BinOp { op: Lt, rhs: N, .. }` → `N`
+    /// - `Expr::Call { func: "range", args: [N] }` → `N`
+    fn extract_range_upper_bound(iter_expr: &Expr) -> Expr {
+        match iter_expr {
+            Expr::Range { hi, inclusive, .. } => {
+                match hi {
+                    Some(hi_expr) => {
+                        if *inclusive {
+                            // `0..=N` → exclusive upper bound is `N + 1`
+                            Expr::BinOp {
+                                span: Span::dummy(),
+                                op: BinOpKind::Add,
+                                lhs: Box::new((**hi_expr).clone()),
+                                rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+                            }
+                        } else {
+                            (**hi_expr).clone()
+                        }
+                    }
+                    None => Expr::IntLit { span: Span::dummy(), value: 1024 },
+                }
+            }
+            Expr::BinOp { op: BinOpKind::Lt, rhs, .. } => {
+                (**rhs).clone()
+            }
+            Expr::BinOp { op: BinOpKind::Le, rhs, .. } => {
+                // i <= N → exclusive upper bound is N + 1
+                Expr::BinOp {
+                    span: Span::dummy(),
+                    op: BinOpKind::Add,
+                    lhs: Box::new((**rhs).clone()),
+                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+                }
+            }
+            Expr::Call { func, args, .. } => {
+                if let Expr::Ident { name, .. } = func.as_ref() {
+                    if name == "range" && !args.is_empty() {
+                        return args[0].clone();
+                    }
+                }
+                Expr::IntLit { span: Span::dummy(), value: 1024 }
+            }
+            _ => Expr::IntLit { span: Span::dummy(), value: 1024 },
+        }
+    }
+
+    /// Collect the set of array names read from and written to in a block.
+    ///
+    /// This is used by the loop fusion safety check. Names are deduplicated
+    /// within each set.
+    fn collect_array_names_from_block(
+        block: &Block,
+        reads: &mut Vec<String>,
+        writes: &mut Vec<String>,
+    ) {
+        for stmt in &block.stmts {
+            Self::collect_array_names_from_stmt(stmt, reads, writes);
+        }
+        if let Some(tail) = &block.tail {
+            Self::collect_array_names_from_expr(tail, reads, writes, false);
+        }
+    }
+
+    fn collect_array_names_from_stmt(
+        stmt: &Stmt,
+        reads: &mut Vec<String>,
+        writes: &mut Vec<String>,
+    ) {
+        match stmt {
+            Stmt::Expr { expr, .. } => {
+                Self::collect_array_names_from_expr(expr, reads, writes, false);
+            }
+            Stmt::Let { init: Some(expr), .. } => {
+                Self::collect_array_names_from_expr(expr, reads, writes, false);
+            }
+            Stmt::ForIn { body, .. } => {
+                Self::collect_array_names_from_block(body, reads, writes);
+            }
+            Stmt::While { body, .. } => {
+                Self::collect_array_names_from_block(body, reads, writes);
+            }
+            Stmt::Loop { body, .. } => {
+                Self::collect_array_names_from_block(body, reads, writes);
+            }
+            Stmt::If { then, else_, .. } => {
+                Self::collect_array_names_from_block(then, reads, writes);
+                if let Some(else_box) = else_ {
+                    match &**else_box {
+                        IfOrBlock::If(inner_stmt) => {
+                            Self::collect_array_names_from_stmt(inner_stmt, reads, writes);
+                        }
+                        IfOrBlock::Block(b) => {
+                            Self::collect_array_names_from_block(b, reads, writes);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Recursively collect array names from an expression.
+    ///
+    /// When `in_assign_target` is true, Index accesses are recorded as writes
+    /// instead of reads.
+    fn collect_array_names_from_expr(
+        expr: &Expr,
+        reads: &mut Vec<String>,
+        writes: &mut Vec<String>,
+        in_assign_target: bool,
+    ) {
+        match expr {
+            Expr::Index { object, indices, .. } => {
+                if let Expr::Ident { name, .. } = object.as_ref() {
+                    if in_assign_target {
+                        if !writes.contains(name) {
+                            writes.push(name.clone());
+                        }
+                    } else {
+                        if !reads.contains(name) {
+                            reads.push(name.clone());
+                        }
+                    }
+                }
+                // Index expressions themselves are reads
+                for idx in indices {
+                    Self::collect_array_names_from_expr(idx, reads, writes, false);
+                }
+            }
+            Expr::Assign { target, value, .. } => {
+                Self::collect_array_names_from_expr(target, reads, writes, true);
+                Self::collect_array_names_from_expr(value, reads, writes, false);
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::collect_array_names_from_expr(lhs, reads, writes, in_assign_target);
+                Self::collect_array_names_from_expr(rhs, reads, writes, in_assign_target);
+            }
+            Expr::UnOp { expr: inner, .. } => {
+                Self::collect_array_names_from_expr(inner, reads, writes, in_assign_target);
+            }
+            Expr::Call { func: _, args, named, .. } => {
+                for arg in args {
+                    Self::collect_array_names_from_expr(arg, reads, writes, false);
+                }
+                for (_, val) in named {
+                    Self::collect_array_names_from_expr(val, reads, writes, false);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                Self::collect_array_names_from_expr(receiver, reads, writes, false);
+                for arg in args {
+                    Self::collect_array_names_from_expr(arg, reads, writes, false);
+                }
+            }
+            Expr::Field { object, .. } => {
+                Self::collect_array_names_from_expr(object, reads, writes, in_assign_target);
+            }
+            Expr::IfExpr { then, else_, .. } => {
+                Self::collect_array_names_from_block(then, reads, writes);
+                if let Some(e) = else_ {
+                    Self::collect_array_names_from_block(e, reads, writes);
+                }
+            }
+            Expr::Closure { body: inner, .. } => {
+                Self::collect_array_names_from_expr(inner, reads, writes, false);
+            }
+            Expr::Block(b) => {
+                Self::collect_array_names_from_block(b, reads, writes);
+            }
+            // Leaf expressions with no sub-expressions to recurse into
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. }
+            | Expr::Ident { .. }
+            | Expr::Path { .. }
+            | Expr::Range { .. }
+            | Expr::VecCtor { .. }
+            | Expr::ArrayLit { .. }
+            | Expr::Cast { .. }
+            | Expr::Tuple { .. }
+            | Expr::StructLit { .. }
+            | Expr::MatMul { .. }
+            | Expr::HadamardMul { .. }
+            | Expr::HadamardDiv { .. }
+            | Expr::TensorConcat { .. }
+            | Expr::KronProd { .. }
+            | Expr::OuterProd { .. }
+            | Expr::Grad { .. }
+            | Expr::Pow { .. } => {}
+            // Catch-all for any future variants
+            _ => {}
+        }
     }
 }
 
@@ -537,6 +1184,80 @@ impl Default for PolyhedralOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: create a dummy span
+    fn d() -> Span {
+        Span::dummy()
+    }
+
+    /// Helper: create an identifier expression
+    fn ident(name: &str) -> Expr {
+        Expr::Ident { span: d(), name: name.to_string() }
+    }
+
+    /// Helper: create an integer literal expression
+    fn int_lit(val: u128) -> Expr {
+        Expr::IntLit { span: d(), value: val }
+    }
+
+    /// Helper: create a range expression `lo..hi`
+    fn range(lo: Expr, hi: Expr) -> Expr {
+        Expr::Range {
+            span: d(),
+            lo: Some(Box::new(lo)),
+            hi: Some(Box::new(hi)),
+            inclusive: false,
+        }
+    }
+
+    /// Helper: create a simple ForIn loop
+    fn for_in(var: &str, iter: Expr, body_stmts: Vec<Stmt>) -> Stmt {
+        Stmt::ForIn {
+            span: d(),
+            pattern: Pattern::Ident { span: d(), name: var.to_string(), mutable: false },
+            iter,
+            body: Block { span: d(), stmts: body_stmts, tail: None },
+            label: None,
+        }
+    }
+
+    /// Helper: create an expression statement
+    fn expr_stmt(expr: Expr) -> Stmt {
+        Stmt::Expr { span: d(), expr, has_semi: true }
+    }
+
+    /// Helper: create an index expression `arr[idx1, idx2]`
+    fn index_expr(arr: &str, indices: Vec<Expr>) -> Expr {
+        Expr::Index {
+            span: d(),
+            object: Box::new(ident(arr)),
+            indices,
+        }
+    }
+
+    /// Helper: create an assignment `target += value`
+    fn add_assign_expr(target: Expr, value: Expr) -> Expr {
+        Expr::Assign {
+            span: d(),
+            op: AssignOpKind::AddAssign,
+            target: Box::new(target),
+            value: Box::new(value),
+        }
+    }
+
+    /// Helper: create a binary operation
+    fn bin_op(op: BinOpKind, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::BinOp {
+            span: d(),
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    // =========================================================================
+    // Existing tests
+    // =========================================================================
 
     #[test]
     fn test_cache_model_defaults() {
@@ -562,5 +1283,497 @@ mod tests {
     fn test_polyhedral_optimizer_creation() {
         let opt = PolyhedralOptimizer::new();
         assert_eq!(opt.loops_optimized, 0);
+    }
+
+    // =========================================================================
+    // Loop interchange tests
+    // =========================================================================
+
+    #[test]
+    fn test_extract_loop_nest_single() {
+        // for i in 0..10 { body }
+        let body_stmt = expr_stmt(add_assign_expr(
+            index_expr("C", vec![ident("i"), ident("i")]),
+            int_lit(1),
+        ));
+        let stmt = for_in("i", range(int_lit(0), int_lit(10)), vec![body_stmt]);
+
+        let result = PolyhedralOptimizer::extract_loop_nest(&stmt);
+        assert!(result.is_some());
+        let (layers, body) = result.unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].iter_var, "i");
+        assert_eq!(body.stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_loop_nest_triple() {
+        // for i in 0..M { for j in 0..N { for k in 0..K { C[i][j] += A[i][k] * B[k][j] } } }
+        let innermost = expr_stmt(add_assign_expr(
+            index_expr("C", vec![ident("i"), ident("j")]),
+            bin_op(BinOpKind::Mul,
+                index_expr("A", vec![ident("i"), ident("k")]),
+                index_expr("B", vec![ident("k"), ident("j")]),
+            ),
+        ));
+        let k_loop = for_in("k", range(int_lit(0), ident("K")), vec![innermost]);
+        let j_loop = for_in("j", range(int_lit(0), ident("N")), vec![k_loop]);
+        let i_loop = for_in("i", range(int_lit(0), ident("M")), vec![j_loop]);
+
+        let result = PolyhedralOptimizer::extract_loop_nest(&i_loop);
+        assert!(result.is_some());
+        let (layers, body) = result.unwrap();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0].iter_var, "i");
+        assert_eq!(layers[1].iter_var, "j");
+        assert_eq!(layers[2].iter_var, "k");
+        // Innermost body should contain the += statement
+        assert_eq!(body.stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_loop_interchange() {
+        // Build: for i in 0..M { for j in 0..N { body } }
+        let body_stmt = expr_stmt(add_assign_expr(
+            index_expr("C", vec![ident("i"), ident("j")]),
+            int_lit(1),
+        ));
+        let j_loop = for_in("j", range(int_lit(0), ident("N")), vec![body_stmt]);
+        let i_loop = for_in("i", range(int_lit(0), ident("M")), vec![j_loop]);
+
+        let mut stmt = i_loop;
+
+        let result = PolyhedralOptResult {
+            original: "i, j".to_string(),
+            optimized_order: vec!["j".to_string(), "i".to_string()],
+            tile_sizes: None,
+            interchange_applied: true,
+            tiling_applied: false,
+            fusion_applied: false,
+            cache_miss_reduction: 0.5,
+        };
+
+        let opt = PolyhedralOptimizer::new();
+        opt.apply_interchange(&mut stmt, &result);
+
+        // After interchange: outermost loop should be j, innermost i
+        match &stmt {
+            Stmt::ForIn { pattern, body, .. } => {
+                match pattern {
+                    Pattern::Ident { name, .. } => assert_eq!(name, "j"),
+                    _ => panic!("Expected Ident pattern"),
+                }
+                assert_eq!(body.stmts.len(), 1);
+                match &body.stmts[0] {
+                    Stmt::ForIn { pattern, .. } => {
+                        match pattern {
+                            Pattern::Ident { name, .. } => assert_eq!(name, "i"),
+                            _ => panic!("Expected Ident pattern"),
+                        }
+                    }
+                    _ => panic!("Expected inner ForIn"),
+                }
+            }
+            _ => panic!("Expected ForIn"),
+        }
+    }
+
+    #[test]
+    fn test_loop_interchange_triple() {
+        // Build: for i in 0..M { for j in 0..N { for k in 0..K { body } } }
+        let body_stmt = expr_stmt(add_assign_expr(
+            index_expr("C", vec![ident("i"), ident("j")]),
+            bin_op(BinOpKind::Mul,
+                index_expr("A", vec![ident("i"), ident("k")]),
+                index_expr("B", vec![ident("k"), ident("j")]),
+            ),
+        ));
+        let k_loop = for_in("k", range(int_lit(0), ident("K")), vec![body_stmt]);
+        let j_loop = for_in("j", range(int_lit(0), ident("N")), vec![k_loop]);
+        let i_loop = for_in("i", range(int_lit(0), ident("M")), vec![j_loop]);
+
+        let mut stmt = i_loop;
+
+        // Optimal order: i, k, j (k before j for sequential B access)
+        let result = PolyhedralOptResult {
+            original: "i, j, k".to_string(),
+            optimized_order: vec!["i".to_string(), "k".to_string(), "j".to_string()],
+            tile_sizes: None,
+            interchange_applied: true,
+            tiling_applied: false,
+            fusion_applied: false,
+            cache_miss_reduction: 0.5,
+        };
+
+        let opt = PolyhedralOptimizer::new();
+        opt.apply_interchange(&mut stmt, &result);
+
+        // Verify: outermost i, then k, then j innermost
+        match &stmt {
+            Stmt::ForIn { pattern, body, .. } => {
+                // Outermost: i
+                match pattern {
+                    Pattern::Ident { name, .. } => assert_eq!(name, "i"),
+                    _ => panic!("Expected Ident pattern"),
+                }
+                match &body.stmts[0] {
+                    Stmt::ForIn { pattern, body, .. } => {
+                        // Middle: k
+                        match pattern {
+                            Pattern::Ident { name, .. } => assert_eq!(name, "k"),
+                            _ => panic!("Expected Ident pattern"),
+                        }
+                        match &body.stmts[0] {
+                            Stmt::ForIn { pattern, .. } => {
+                                // Innermost: j
+                                match pattern {
+                                    Pattern::Ident { name, .. } => assert_eq!(name, "j"),
+                                    _ => panic!("Expected Ident pattern"),
+                                }
+                            }
+                            _ => panic!("Expected inner ForIn"),
+                        }
+                    }
+                    _ => panic!("Expected middle ForIn"),
+                }
+            }
+            _ => panic!("Expected ForIn"),
+        }
+    }
+
+    // =========================================================================
+    // Loop tiling tests
+    // =========================================================================
+
+    #[test]
+    fn test_loop_tiling_double() {
+        // Build: for i in 0..M { for j in 0..N { body } }
+        let body_stmt = expr_stmt(add_assign_expr(
+            index_expr("C", vec![ident("i"), ident("j")]),
+            int_lit(1),
+        ));
+        let j_loop = for_in("j", range(int_lit(0), ident("N")), vec![body_stmt]);
+        let i_loop = for_in("i", range(int_lit(0), ident("M")), vec![j_loop]);
+
+        let mut stmt = i_loop;
+
+        let result = PolyhedralOptResult {
+            original: "i, j".to_string(),
+            optimized_order: vec!["i".to_string(), "j".to_string()],
+            tile_sizes: Some(TileSizes { mc: 64, nc: 64, kc: 256, mr: 8, nr: 4 }),
+            interchange_applied: false,
+            tiling_applied: true,
+            fusion_applied: false,
+            cache_miss_reduction: 0.8,
+        };
+
+        let opt = PolyhedralOptimizer::new();
+        opt.apply_tiling(&mut stmt, &result);
+
+        // After tiling, we should have 4 nested loops:
+        // tile_i, i, tile_j, j
+        fn count_nested_forins(stmt: &Stmt) -> usize {
+            match stmt {
+                Stmt::ForIn { body, .. } => {
+                    1 + body.stmts.iter().map(count_nested_forins).sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
+        assert_eq!(count_nested_forins(&stmt), 4, "Expected 4 nested loops after tiling 2-loop nest");
+
+        // Outermost should be tile_i
+        match &stmt {
+            Stmt::ForIn { pattern, .. } => {
+                match pattern {
+                    Pattern::Ident { name, .. } => assert_eq!(name, "tile_i"),
+                    _ => panic!("Expected Ident pattern for tile_i"),
+                }
+            }
+            _ => panic!("Expected ForIn"),
+        }
+    }
+
+    // =========================================================================
+    // Loop fusion tests
+    // =========================================================================
+
+    #[test]
+    fn test_can_fuse_loops_safe() {
+        // for i in 0..N { A[i] = B[i] + 1 }   reads B, writes A
+        // for i in 0..N { C[i] = A[i] * 2 }    reads A, writes C
+        // Safe to fuse: loop2 writes C (not read by loop1), no shared writes
+        let loop1 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("A", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Add,
+                    index_expr("B", vec![ident("i")]),
+                    int_lit(1),
+                )),
+            }),
+        ]);
+        let loop2 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("C", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Mul,
+                    index_expr("A", vec![ident("i")]),
+                    int_lit(2),
+                )),
+            }),
+        ]);
+
+        let opt = PolyhedralOptimizer::new();
+        assert!(opt.can_fuse_loops(&loop1, &loop2));
+    }
+
+    #[test]
+    fn test_can_fuse_loops_unsafe_write_read_conflict() {
+        // for i in 0..N { A[i] = B[i] + 1 }   reads B, writes A
+        // for i in 0..N { B[i] = A[i] * 2 }    reads A, writes B
+        // UNSAFE: loop2 writes B, which loop1 reads
+        let loop1 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("A", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Add,
+                    index_expr("B", vec![ident("i")]),
+                    int_lit(1),
+                )),
+            }),
+        ]);
+        let loop2 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("B", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Mul,
+                    index_expr("A", vec![ident("i")]),
+                    int_lit(2),
+                )),
+            }),
+        ]);
+
+        let opt = PolyhedralOptimizer::new();
+        assert!(!opt.can_fuse_loops(&loop1, &loop2));
+    }
+
+    #[test]
+    fn test_can_fuse_loops_unsafe_write_write_conflict() {
+        // for i in 0..N { A[i] = B[i] + 1 }   writes A
+        // for i in 0..N { A[i] = C[i] * 2 }    writes A
+        // UNSAFE: both write to A
+        let loop1 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("A", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Add,
+                    index_expr("B", vec![ident("i")]),
+                    int_lit(1),
+                )),
+            }),
+        ]);
+        let loop2 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("A", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Mul,
+                    index_expr("C", vec![ident("i")]),
+                    int_lit(2),
+                )),
+            }),
+        ]);
+
+        let opt = PolyhedralOptimizer::new();
+        assert!(!opt.can_fuse_loops(&loop1, &loop2));
+    }
+
+    #[test]
+    fn test_can_fuse_loops_different_iter() {
+        // Different iterator variables → can't fuse
+        let loop1 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(add_assign_expr(index_expr("A", vec![ident("i")]), int_lit(1))),
+        ]);
+        let loop2 = for_in("j", range(int_lit(0), ident("N")), vec![
+            expr_stmt(add_assign_expr(index_expr("A", vec![ident("j")]), int_lit(1))),
+        ]);
+
+        let opt = PolyhedralOptimizer::new();
+        assert!(!opt.can_fuse_loops(&loop1, &loop2));
+    }
+
+    #[test]
+    fn test_fuse_loops_merges_bodies() {
+        let loop1 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("A", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Add,
+                    index_expr("B", vec![ident("i")]),
+                    int_lit(1),
+                )),
+            }),
+        ]);
+        let loop2 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("C", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Mul,
+                    index_expr("A", vec![ident("i")]),
+                    int_lit(2),
+                )),
+            }),
+        ]);
+
+        let opt = PolyhedralOptimizer::new();
+        let fused = opt.fuse_loops(&loop1, &loop2);
+
+        match &fused {
+            Stmt::ForIn { pattern, body, .. } => {
+                match pattern {
+                    Pattern::Ident { name, .. } => assert_eq!(name, "i"),
+                    _ => panic!("Expected Ident pattern"),
+                }
+                // Body should contain both statements
+                assert_eq!(body.stmts.len(), 2);
+            }
+            _ => panic!("Expected ForIn"),
+        }
+    }
+
+    #[test]
+    fn test_apply_fusion_on_block() {
+        let loop1 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("A", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Add,
+                    index_expr("B", vec![ident("i")]),
+                    int_lit(1),
+                )),
+            }),
+        ]);
+        let loop2 = for_in("i", range(int_lit(0), ident("N")), vec![
+            expr_stmt(Expr::Assign {
+                span: d(),
+                op: AssignOpKind::Assign,
+                target: Box::new(index_expr("C", vec![ident("i")])),
+                value: Box::new(bin_op(BinOpKind::Mul,
+                    index_expr("A", vec![ident("i")]),
+                    int_lit(2),
+                )),
+            }),
+        ]);
+
+        let mut block = Block {
+            span: d(),
+            stmts: vec![loop1, loop2],
+            tail: None,
+        };
+
+        let opt = PolyhedralOptimizer::new();
+        opt.apply_fusion(&mut block);
+
+        // Should be fused into a single loop
+        assert_eq!(block.stmts.len(), 1);
+        match &block.stmts[0] {
+            Stmt::ForIn { body, .. } => {
+                assert_eq!(body.stmts.len(), 2);
+            }
+            _ => panic!("Expected ForIn"),
+        }
+    }
+
+    // =========================================================================
+    // Extract upper bound tests
+    // =========================================================================
+
+    #[test]
+    fn test_extract_range_upper_bound_range() {
+        let iter = range(int_lit(0), ident("M"));
+        let ub = PolyhedralOptimizer::extract_range_upper_bound(&iter);
+        match ub {
+            Expr::Ident { name, .. } => assert_eq!(name, "M"),
+            _ => panic!("Expected Ident for upper bound"),
+        }
+    }
+
+    #[test]
+    fn test_extract_range_upper_bound_lt() {
+        let iter = Expr::BinOp {
+            span: d(),
+            op: BinOpKind::Lt,
+            lhs: Box::new(ident("i")),
+            rhs: Box::new(ident("M")),
+        };
+        let ub = PolyhedralOptimizer::extract_range_upper_bound(&iter);
+        match ub {
+            Expr::Ident { name, .. } => assert_eq!(name, "M"),
+            _ => panic!("Expected Ident for upper bound"),
+        }
+    }
+
+    // =========================================================================
+    // Build nested loop roundtrip test
+    // =========================================================================
+
+    #[test]
+    fn test_build_nested_loop_roundtrip() {
+        let body_stmt = expr_stmt(add_assign_expr(
+            index_expr("C", vec![ident("i"), ident("j")]),
+            int_lit(1),
+        ));
+
+        let layers = vec![
+            LoopLayer {
+                iter_var: "i".to_string(),
+                iter_expr: range(int_lit(0), ident("M")),
+                label: None,
+            },
+            LoopLayer {
+                iter_var: "j".to_string(),
+                iter_expr: range(int_lit(0), ident("N")),
+                label: None,
+            },
+        ];
+
+        let innermost_body = Block {
+            span: d(),
+            stmts: vec![body_stmt],
+            tail: None,
+        };
+
+        let stmt = PolyhedralOptimizer::build_nested_loop(&layers, innermost_body);
+
+        // Verify structure
+        match &stmt {
+            Stmt::ForIn { pattern, body, .. } => {
+                match pattern {
+                    Pattern::Ident { name, .. } => assert_eq!(name, "i"),
+                    _ => panic!("Expected Ident"),
+                }
+                assert_eq!(body.stmts.len(), 1);
+                match &body.stmts[0] {
+                    Stmt::ForIn { pattern, body, .. } => {
+                        match pattern {
+                            Pattern::Ident { name, .. } => assert_eq!(name, "j"),
+                            _ => panic!("Expected Ident"),
+                        }
+                        assert_eq!(body.stmts.len(), 1);
+                    }
+                    _ => panic!("Expected inner ForIn"),
+                }
+            }
+            _ => panic!("Expected ForIn"),
+        }
     }
 }

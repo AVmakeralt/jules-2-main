@@ -3,11 +3,25 @@
 // io_uring with SQPOLL for zero-syscall task notification
 // Intel UINTR (User Interrupts) for 9x faster inter-thread messaging
 // Falls back to futex when hardware features are unavailable
+// DPDK (Data Plane Development Kit) for userspace network driver bypass
 // =========================================================================
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::ptr;
+
+/// DPDK (Data Plane Development Kit) availability status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DpdkStatus {
+    /// DPDK is available and initialized
+    Available,
+    /// DPDK is not available (no supported NICs, not installed, or non-Linux)
+    Unavailable,
+    /// DPDK is available but insufficient hugepages are configured
+    InsufficientHugepages,
+    /// DPDK is available but no compatible NIC is bound to userspace driver
+    NoCompatibleNic,
+}
 
 /// Check if io_uring is available
 pub fn is_io_uring_available() -> bool {
@@ -31,6 +45,117 @@ pub fn is_io_uring_available() -> bool {
     #[cfg(not(target_os = "linux"))]
     {
         false
+    }
+}
+
+/// Get the io_uring backend status from the io_uring module
+pub fn io_uring_backend() -> crate::runtime::io_uring::IoUringStatus {
+    crate::runtime::io_uring::detect_io_uring()
+}
+
+/// Detect DPDK availability on this system
+pub fn detect_dpdk() -> DpdkStatus {
+    #[cfg(target_os = "linux")]
+    {
+        // Check if DPDK is available by looking for the DPDK runtime directory
+        // and sufficient hugepages
+        let dpdk_runtime = std::path::Path::new("/var/run/dpdk");
+        if dpdk_runtime.exists() {
+            // Check hugepages
+            if let Ok(hugepages) = std::fs::read_to_string("/proc/meminfo") {
+                let has_hugepages = hugepages.lines().any(|line| {
+                    line.starts_with("HugePages_Total:") && {
+                        let count: u64 = line
+                            .split(':')
+                            .nth(1)
+                            .map(|s| s.trim().parse().unwrap_or(0))
+                            .unwrap_or(0);
+                        count > 0
+                    }
+                });
+                if !has_hugepages {
+                    return DpdkStatus::InsufficientHugepages;
+                }
+            }
+            return DpdkStatus::Available;
+        }
+        
+        // Check if DPDK libraries are installed
+        let dpdk_lib_paths = [
+            "/usr/lib/x86_64-linux-gnu/librte_net.so",
+            "/usr/lib64/librte_net.so",
+            "/usr/local/lib/librte_net.so",
+        ];
+        
+        let lib_found = dpdk_lib_paths.iter().any(|p| std::path::Path::new(p).exists());
+        
+        if lib_found {
+            // Libraries exist but no runtime setup
+            DpdkStatus::NoCompatibleNic
+        } else {
+            DpdkStatus::Unavailable
+        }
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        DpdkStatus::Unavailable
+    }
+}
+
+/// Check all bypass fast paths and return a summary of what's available
+pub fn fast_path_available() -> FastPathStatus {
+    FastPathStatus {
+        io_uring: io_uring_backend(),
+        uintr: is_uintr_available(),
+        dpdk: detect_dpdk(),
+    }
+}
+
+/// Summary of all kernel-bypass fast path availability
+#[derive(Debug, Clone)]
+pub struct FastPathStatus {
+    /// io_uring availability
+    pub io_uring: crate::runtime::io_uring::IoUringStatus,
+    /// Intel UINTR availability
+    pub uintr: bool,
+    /// DPDK availability
+    pub dpdk: DpdkStatus,
+}
+
+impl FastPathStatus {
+    /// Check if any fast path is available
+    pub fn any_available(&self) -> bool {
+        self.io_uring == crate::runtime::io_uring::IoUringStatus::Available
+            || self.uintr
+            || self.dpdk == DpdkStatus::Available
+    }
+    
+    /// Check if the best possible fast path is available (io_uring + UINTR)
+    pub fn optimal_available(&self) -> bool {
+        self.io_uring == crate::runtime::io_uring::IoUringStatus::Available
+            && self.uintr
+    }
+    
+    /// Get a human-readable summary
+    pub fn summary(&self) -> String {
+        let io_uring_str = match self.io_uring {
+            crate::runtime::io_uring::IoUringStatus::Available => "available",
+            crate::runtime::io_uring::IoUringStatus::Unavailable => "unavailable",
+            crate::runtime::io_uring::IoUringStatus::BlockedBySeccomp => "blocked by seccomp",
+        };
+        let dpdk_str = match self.dpdk {
+            DpdkStatus::Available => "available",
+            DpdkStatus::Unavailable => "unavailable",
+            DpdkStatus::InsufficientHugepages => "insufficient hugepages",
+            DpdkStatus::NoCompatibleNic => "no compatible NIC",
+        };
+        format!(
+            "io_uring: {}, UINTR: {}, DPDK: {}",
+            io_uring_str,
+            if self.uintr { "available" } else { "unavailable" },
+            dpdk_str
+        )
     }
 }
 
@@ -561,5 +686,26 @@ mod tests {
         let receiver = UintrReceiver::new(1);
         let upid_addr = receiver.upid_addr();
         assert!(upid_addr != 0);
+    }
+
+    #[test]
+    fn test_io_uring_backend() {
+        let status = io_uring_backend();
+        // Should return a valid status without panicking
+        let _ = status;
+    }
+
+    #[test]
+    fn test_dpdk_detection() {
+        let status = detect_dpdk();
+        // Should return a valid status without panicking
+        let _ = status;
+    }
+
+    #[test]
+    fn test_fast_path_available() {
+        let status = fast_path_available();
+        // Summary should be a non-empty string
+        assert!(!status.summary().is_empty());
     }
 }

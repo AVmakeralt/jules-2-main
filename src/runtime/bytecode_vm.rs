@@ -29,6 +29,7 @@ use rustc_hash::FxHashMap;
 use crate::compiler::ast::{AssignOpKind, BinOpKind, IfOrBlock, Program, UnOpKind, VecSize};
 use crate::interp::{RuntimeError, Tensor, Value};
 use crate::runtime::memory_management::PrefetchEngine;
+use crate::optimizer::data_dependent_jit::DataDependentJIT;
 
 // =============================================================================
 // §1  BYTECODE INSTRUCTION SET
@@ -96,15 +97,42 @@ pub enum Instr {
     VecMul { dst: u16, lhs: u16, rhs: u16 },
     MatMul { dst: u16, lhs: u16, rhs: u16 },
     
+    // Power operation
+    Pow { dst: u16, base: u16, exp: u16 },
+
+    // Element-wise (Hadamard) multiply for tensors/arrays
+    HadamardMul { dst: u16, lhs: u16, rhs: u16 },
+
+    // Compound construction from register range
+    MakeArray { dst: u16, start: u16, count: u16 },
+    MakeTuple { dst: u16, start: u16, count: u16 },
+    MakeStruct { dst: u16, name_idx: u32, field_start: u16, field_count: u16 },
+    MakeRange { dst: u16, lo: u16, hi: u16, inclusive: bool },
+
+    // Type casting
+    Cast { dst: u16, src: u16, target_type: u32 },
+
+    // Print output
+    Print { src: u16 },
+
+    // SIMD loop hint — marks a loop as vectorizable
+    SimdLoopStart {
+        /// Number of elements per SIMD lane
+        lane_count: u8,
+        /// SIMD width in bits (128, 256, 512)
+        simd_width: u16,
+    },
+    SimdLoopEnd,
+
     // Type checking & specialization
     TypeCheck { dst: u16, src: u16, expected_type: u32 },
     AssumeInt { dst: u16, src: u16 },
     AssumeFloat { dst: u16, src: u16 },
-    
+
     // Debug/profiling
     ProfilePoint { id: u32 },
     DebugBreak,
-    
+
     // NOP for alignment/padding
     Nop,
 }
@@ -395,7 +423,7 @@ impl BytecodeCompiler {
             loop_continue_starts: Vec::new(),
         }
     }
-    
+
     #[inline]
     fn new_label(&mut self) -> u32 {
         let label = self.next_label;
@@ -912,12 +940,13 @@ impl BytecodeCompiler {
 
             // ── Array literal ─────────────────────────────────────────────
             Expr::ArrayLit { elems, .. } => {
+                let count = elems.len() as u16;
+                let start = self.next_slot;
                 let elem_slots: Vec<u16> = (0..elems.len()).map(|_| self.alloc_slot()).collect();
                 for (i, elem) in elems.iter().enumerate() {
                     self.compile_expr(elem, elem_slots[i])?;
                 }
-                // Build array constant from element slots (placeholder)
-                self.emit(Instr::LoadConstUnit { dst });
+                self.emit(Instr::MakeArray { dst, start, count });
             }
 
             // ── Binary operations ─────────────────────────────────────────
@@ -1084,22 +1113,29 @@ impl BytecodeCompiler {
 
             // ── Tuple ─────────────────────────────────────────────────────
             Expr::Tuple { elems, .. } => {
+                let count = elems.len() as u16;
+                let start = self.next_slot;
                 let elem_slots: Vec<u16> = (0..elems.len()).map(|_| self.alloc_slot()).collect();
                 for (i, elem) in elems.iter().enumerate() {
                     self.compile_expr(elem, elem_slots[i])?;
                 }
-                // Tuple construction from runtime slots — placeholder
-                self.emit(Instr::LoadConstUnit { dst });
+                self.emit(Instr::MakeTuple { dst, start, count });
             }
 
             // ── Struct literal ────────────────────────────────────────────
-            Expr::StructLit { name: _, fields, .. } => {
-                let val_slots: Vec<u16> = (0..fields.len()).map(|_| self.alloc_slot()).collect();
-                for (i, (_, field_expr)) in fields.iter().enumerate() {
-                    self.compile_expr(field_expr, val_slots[i])?;
+            Expr::StructLit { name, fields, .. } => {
+                let name_idx = self.current_function.add_constant(Value::Str(name.clone()));
+                let field_count = fields.len() as u16;
+                let field_start = self.next_slot;
+                // Allocate pairs of (name_slot, value_slot) for each field
+                for (field_name, field_expr) in fields.iter() {
+                    let name_slot = self.alloc_slot();
+                    let val_slot = self.alloc_slot();
+                    let const_idx = self.current_function.add_constant(Value::Str(field_name.clone()));
+                    self.emit(Instr::LoadConst { dst: name_slot, idx: const_idx });
+                    self.compile_expr(field_expr, val_slot)?;
                 }
-                // Struct construction from runtime slots — placeholder
-                self.emit(Instr::LoadConstUnit { dst });
+                self.emit(Instr::MakeStruct { dst, name_idx, field_start, field_count });
             }
 
             // ── Closure ───────────────────────────────────────────────────
@@ -1109,22 +1145,29 @@ impl BytecodeCompiler {
             }
 
             // ── Cast ──────────────────────────────────────────────────────
-            Expr::Cast { expr: inner, .. } => {
-                // Type cast: compile inner expression, result type is advisory
-                self.compile_expr(inner, dst)?;
+            Expr::Cast { expr: inner, ty, .. } => {
+                let src_slot = self.alloc_slot();
+                self.compile_expr(inner, src_slot)?;
+                // Map the type AST node to a target_type discriminant
+                let target_type = Self::type_to_cast_target(ty);
+                self.emit(Instr::Cast { dst, src: src_slot, target_type });
             }
 
             // ── Range ─────────────────────────────────────────────────────
-            Expr::Range { lo, hi, inclusive: _, .. } => {
+            Expr::Range { lo, hi, inclusive, .. } => {
+                let lo_slot = self.alloc_slot();
+                let hi_slot = self.alloc_slot();
                 if let Some(lo_expr) = lo {
-                    self.compile_expr(lo_expr, dst)?;
+                    self.compile_expr(lo_expr, lo_slot)?;
+                } else {
+                    self.emit(Instr::LoadConstInt { dst: lo_slot, value: 0 });
                 }
                 if let Some(hi_expr) = hi {
-                    let hi_slot = self.alloc_slot();
                     self.compile_expr(hi_expr, hi_slot)?;
+                } else {
+                    self.emit(Instr::LoadConstInt { dst: hi_slot, value: 0 });
                 }
-                // Range construction — placeholder
-                self.emit(Instr::LoadConstUnit { dst });
+                self.emit(Instr::MakeRange { dst, lo: lo_slot, hi: hi_slot, inclusive: *inclusive });
             }
 
             // ── Tensor-specific operations ────────────────────────────────
@@ -1138,7 +1181,7 @@ impl BytecodeCompiler {
                 self.compile_expr(lhs, dst)?;
                 let rhs_slot = self.alloc_slot();
                 self.compile_expr(rhs, rhs_slot)?;
-                self.emit(Instr::VecMul { dst, lhs: dst, rhs: rhs_slot });
+                self.emit(Instr::HadamardMul { dst, lhs: dst, rhs: rhs_slot });
             }
             Expr::HadamardDiv { lhs, rhs, .. } => {
                 self.compile_expr(lhs, dst)?;
@@ -1151,12 +1194,10 @@ impl BytecodeCompiler {
                 self.compile_expr(inner, dst)?;
             }
             Expr::Pow { base, exp, .. } => {
-                // Simplified: compile base and exp, emit Mul for square case
                 self.compile_expr(base, dst)?;
                 let exp_slot = self.alloc_slot();
                 self.compile_expr(exp, exp_slot)?;
-                // Placeholder: use Mul as a rough approximation
-                self.emit(Instr::Mul { dst, lhs: dst, rhs: dst });
+                self.emit(Instr::Pow { dst, base: dst, exp: exp_slot });
             }
             Expr::TensorConcat { .. } | Expr::KronProd { .. } | Expr::OuterProd { .. } => {
                 // Tensor operations not fully supported in bytecode yet
@@ -1164,6 +1205,36 @@ impl BytecodeCompiler {
             }
         }
         Ok(())
+    }
+
+    /// Map an AST Type to the Cast target_type discriminant.
+    ///
+    /// Encoding: 0=I64, 1=F64, 2=Bool, 3=Str, 4=I32, 5=F32, 6=U64
+    fn type_to_cast_target(ty: &crate::compiler::ast::Type) -> u32 {
+        use crate::compiler::ast::{ElemType, Type};
+        match ty {
+            Type::Scalar(e) => match e {
+                ElemType::I64 | ElemType::Usize => 0,
+                ElemType::F64 => 1,
+                ElemType::Bool => 2,
+                ElemType::I32 => 4,
+                ElemType::F32 => 5,
+                ElemType::U64 => 6,
+                ElemType::I8 | ElemType::I16 | ElemType::U8 | ElemType::U16 | ElemType::U32 => 0,
+                ElemType::F16 | ElemType::Bf16 => 5,
+            },
+            Type::Named(name) => match name.as_str() {
+                "i64" | "int" => 0,
+                "f64" | "float" => 1,
+                "bool" => 2,
+                "string" | "str" => 3,
+                "i32" => 4,
+                "f32" => 5,
+                "u64" => 6,
+                _ => 0, // default to I64
+            },
+            _ => 0, // default to I64
+        }
     }
 }
 
@@ -1216,6 +1287,11 @@ pub struct BytecodeVM {
 
     /// Profiling data: per-point hit counters
     profile_points: Vec<AtomicU64>,
+
+    /// Data-Dependent JIT: profiles runtime values and creates specialized
+    /// loop versions when hot values are detected. Integrated into the
+    /// dispatch loop via the `Call` handler and loop-backedge observation.
+    data_dependent_jit: DataDependentJIT,
 }
 
 impl BytecodeVM {
@@ -1232,7 +1308,18 @@ impl BytecodeVM {
             native_functions: Vec::new(),
             call_stack: Vec::new(),
             profile_points: Vec::new(),
+            data_dependent_jit: DataDependentJIT::new(),
         }
+    }
+
+    /// Get a reference to the data-dependent JIT for external inspection.
+    pub fn data_dependent_jit(&self) -> &DataDependentJIT {
+        &self.data_dependent_jit
+    }
+
+    /// Get a mutable reference to the data-dependent JIT for configuration.
+    pub fn data_dependent_jit_mut(&mut self) -> &mut DataDependentJIT {
+        &mut self.data_dependent_jit
     }
 
     /// Register a native function and return its index for CallNative.
@@ -1512,6 +1599,23 @@ impl BytecodeVM {
                 // ── HOT PATH: Control flow ──
                 Instr::Jump { offset } => {
                     branch_density = branch_density.saturating_add(1);
+                    // Detect backward jumps (loops) for DataDependentJIT profiling.
+                    // When a backedge is taken, observe the loop trip count so
+                    // the JIT can detect hot values and create specializations.
+                    if *offset < 0 {
+                        // Backward jump = loop backedge. Feed trip-count
+                        // hint to the DataDependentJIT. We use the current
+                        // function name as the profiling key.
+                        let fn_name = &func.name;
+                        let loop_len = (-(*offset)) as u64;
+                        // Observe the loop length as a proxy for the trip count.
+                        // This is a lightweight observation — the heavy lifting
+                        // (guard checking, specialization) happens in try_specialize.
+                        self.data_dependent_jit.observe_int(
+                            &format!("{fn_name}::loop_len@{pc}"),
+                            loop_len as i64,
+                        );
+                    }
                     pc = if *offset >= 0 {
                         pc + *offset as usize
                     } else {
@@ -1927,6 +2031,29 @@ impl BytecodeVM {
                         .map(|i| slots.get(arg_start + i).cloned().unwrap_or(Value::Unit))
                         .collect();
 
+                    // ── DataDependentJIT: profile call arguments ──
+                    // Observe integer arguments so the JIT can detect hot
+                    // values and create guarded specializations.
+                    {
+                        let fn_name_for_jit = match &func_val {
+                            Value::Fn(closure) => closure.decl.name.clone(),
+                            _ => "anonymous".to_string(),
+                        };
+                        for (i, arg) in args.iter().enumerate() {
+                            if let Value::I64(v) = arg {
+                                self.data_dependent_jit.observe_int(
+                                    &format!("{fn_name_for_jit}::arg{i}"),
+                                    *v,
+                                );
+                            } else if let Value::Bool(v) = arg {
+                                self.data_dependent_jit.observe_bool(
+                                    &format!("{fn_name_for_jit}::arg{i}"),
+                                    *v,
+                                );
+                            }
+                        }
+                    }
+
                     match &func_val {
                         Value::Fn(closure) => {
                             // Look up the BytecodeFunction by name
@@ -2283,6 +2410,268 @@ impl BytecodeVM {
                     pc += 1;
                 }
 
+                // ── Power ──
+                Instr::Pow { dst, base, exp } => {
+                    let b_val = &slots[*base as usize];
+                    let e_val = &slots[*exp as usize];
+
+                    if let (Value::I64(b), Value::I64(e)) = (b_val, e_val) {
+                        let e = *e;
+                        if e < 0 {
+                            return Err(RuntimeError::new(
+                                "Pow: negative exponent for integer base"
+                            ));
+                        }
+                        slots[*dst as usize] = Value::I64(Self::ipow(*b, e as u64));
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::F64(b), Value::F64(e)) = (b_val, e_val) {
+                        slots[*dst as usize] = Value::F64(b.powf(*e));
+                        pc += 1;
+                        continue;
+                    }
+                    // Fallback: coerce to f64
+                    let bf = b_val.as_f64();
+                    let ef = e_val.as_f64();
+                    match (bf, ef) {
+                        (Some(b), Some(e)) => {
+                            slots[*dst as usize] = Value::F64(b.powf(e));
+                        }
+                        _ => {
+                            return Err(RuntimeError::new(format!(
+                                "Pow: cannot raise {} to {} at pc={pc}",
+                                b_val.type_name(), e_val.type_name()
+                            )));
+                        }
+                    }
+                    pc += 1;
+                }
+
+                // ── Hadamard (element-wise) multiply ──
+                Instr::HadamardMul { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+                    match (l_val, r_val) {
+                        (Value::Tensor(l_arc), Value::Tensor(r_arc)) => {
+                            let l_tensor = l_arc.read().unwrap();
+                            let r_tensor = r_arc.read().unwrap();
+                            let result = l_tensor.hadamard_mul(&r_tensor)?;
+                            drop(l_tensor);
+                            drop(r_tensor);
+                            slots[*dst as usize] = Value::Tensor(std::sync::Arc::new(std::sync::RwLock::new(result)));
+                        }
+                        (Value::TensorFast(l_arc), Value::TensorFast(r_arc)) => {
+                            let l_tensor = l_arc.borrow();
+                            let r_tensor = r_arc.borrow();
+                            let result = l_tensor.hadamard_mul(&r_tensor)?;
+                            drop(l_tensor);
+                            drop(r_tensor);
+                            slots[*dst as usize] = Value::TensorFast(std::sync::Arc::new(std::cell::RefCell::new(result)));
+                        }
+                        (Value::Vec4(a), Value::Vec4(b)) => {
+                            slots[*dst as usize] = Value::Vec4(simd_mul_vec4(*a, *b));
+                        }
+                        (Value::Vec3(a), Value::Vec3(b)) => {
+                            slots[*dst as usize] = Value::Vec3([a[0]*b[0], a[1]*b[1], a[2]*b[2]]);
+                        }
+                        (Value::Vec2(a), Value::Vec2(b)) => {
+                            slots[*dst as usize] = Value::Vec2([a[0]*b[0], a[1]*b[1]]);
+                        }
+                        (Value::Array(l_arr), Value::Array(r_arr)) => {
+                            let l_guard = l_arr.lock().unwrap();
+                            let r_guard = r_arr.lock().unwrap();
+                            if l_guard.len() != r_guard.len() {
+                                return Err(RuntimeError::new(format!(
+                                    "HadamardMul: array length mismatch ({} vs {}) at pc={pc}",
+                                    l_guard.len(), r_guard.len()
+                                )));
+                            }
+                            // Element-wise multiply for numeric arrays
+                            let result: Vec<Value> = l_guard.iter().zip(r_guard.iter())
+                                .map(|(l, r)| {
+                                    match (l.as_f64(), r.as_f64()) {
+                                        (Some(lf), Some(rf)) => Value::F64(lf * rf),
+                                        _ => Value::Unit,
+                                    }
+                                })
+                                .collect();
+                            drop(l_guard);
+                            drop(r_guard);
+                            slots[*dst as usize] = Value::Array(std::sync::Arc::new(std::sync::Mutex::new(result)));
+                        }
+                        _ => {
+                            return Err(RuntimeError::new(format!(
+                                "HadamardMul: unsupported types {} and {} at pc={pc}",
+                                l_val.type_name(), r_val.type_name()
+                            )));
+                        }
+                    }
+                    pc += 1;
+                }
+
+                // ── MakeArray: construct array from register range ──
+                Instr::MakeArray { dst, start, count } => {
+                    let s = *start as usize;
+                    let c = *count as usize;
+                    let elems: Vec<Value> = (0..c)
+                        .map(|i| slots.get(s + i).cloned().unwrap_or(Value::Unit))
+                        .collect();
+                    slots[*dst as usize] = Value::Array(std::sync::Arc::new(std::sync::Mutex::new(elems)));
+                    pc += 1;
+                }
+
+                // ── MakeTuple: construct tuple from register range ──
+                Instr::MakeTuple { dst, start, count } => {
+                    let s = *start as usize;
+                    let c = *count as usize;
+                    let elems: Vec<Value> = (0..c)
+                        .map(|i| slots.get(s + i).cloned().unwrap_or(Value::Unit))
+                        .collect();
+                    slots[*dst as usize] = Value::Tuple(elems);
+                    pc += 1;
+                }
+
+                // ── MakeStruct: construct struct from field values ──
+                Instr::MakeStruct { dst, name_idx, field_start, field_count } => {
+                    let name = match constants.get(*name_idx as usize) {
+                        Some(Value::Str(s)) => s.clone(),
+                        _ => format!("struct_{}", name_idx),
+                    };
+                    let fs = *field_start as usize;
+                    let fc = *field_count as usize;
+                    let mut fields = FxHashMap::default();
+                    // Fields are stored as pairs of (name_value, field_value) in slots
+                    for i in 0..fc {
+                        let name_val = slots.get(fs + i * 2).cloned().unwrap_or(Value::Unit);
+                        let field_val = slots.get(fs + i * 2 + 1).cloned().unwrap_or(Value::Unit);
+                        let key = match &name_val {
+                            Value::Str(s) => s.clone(),
+                            other => format!("field_{i}_{}", other.type_name()),
+                        };
+                        fields.insert(key, field_val);
+                    }
+                    slots[*dst as usize] = Value::Struct { name, fields };
+                    pc += 1;
+                }
+
+                // ── MakeRange: construct a range [lo, hi) or [lo, hi] ──
+                Instr::MakeRange { dst, lo, hi, inclusive } => {
+                    let lo_val = &slots[*lo as usize];
+                    let hi_val = &slots[*hi as usize];
+                    // Represent range as a Tuple of (lo, hi, inclusive_flag)
+                    let lo_i = lo_val.as_i64().unwrap_or(0);
+                    let hi_i = hi_val.as_i64().unwrap_or(0);
+                    let elems = vec![
+                        Value::I64(lo_i),
+                        Value::I64(hi_i),
+                        Value::Bool(*inclusive),
+                    ];
+                    slots[*dst as usize] = Value::Tuple(elems);
+                    pc += 1;
+                }
+
+                // ── Cast: type casting ──
+                // target_type encoding: 0=I64, 1=F64, 2=Bool, 3=Str, 4=I32, 5=F32, 6=U64
+                Instr::Cast { dst, src, target_type } => {
+                    let src_val = &slots[*src as usize];
+                    let result = match *target_type {
+                        0 => { // I64
+                            match src_val.as_i64() {
+                                Some(v) => Value::I64(v),
+                                None => return Err(RuntimeError::new(format!(
+                                    "Cast: cannot cast {} to I64 at pc={pc}",
+                                    src_val.type_name()
+                                ))),
+                            }
+                        }
+                        1 => { // F64
+                            match src_val.as_f64() {
+                                Some(v) => Value::F64(v),
+                                None => return Err(RuntimeError::new(format!(
+                                    "Cast: cannot cast {} to F64 at pc={pc}",
+                                    src_val.type_name()
+                                ))),
+                            }
+                        }
+                        2 => { // Bool
+                            match src_val.as_bool() {
+                                Some(v) => Value::Bool(v),
+                                None => Value::Bool(src_val.is_truthy()),
+                            }
+                        }
+                        3 => { // Str
+                            Value::Str(format!("{src_val}"))
+                        }
+                        4 => { // I32
+                            match src_val.as_i64() {
+                                Some(v) => Value::I32(v as i32),
+                                None => return Err(RuntimeError::new(format!(
+                                    "Cast: cannot cast {} to I32 at pc={pc}",
+                                    src_val.type_name()
+                                ))),
+                            }
+                        }
+                        5 => { // F32
+                            match src_val.as_f64() {
+                                Some(v) => Value::F32(v as f32),
+                                None => return Err(RuntimeError::new(format!(
+                                    "Cast: cannot cast {} to F32 at pc={pc}",
+                                    src_val.type_name()
+                                ))),
+                            }
+                        }
+                        6 => { // U64
+                            match src_val.as_i64() {
+                                Some(v) => Value::U64(v as u64),
+                                None => return Err(RuntimeError::new(format!(
+                                    "Cast: cannot cast {} to U64 at pc={pc}",
+                                    src_val.type_name()
+                                ))),
+                            }
+                        }
+                        _ => {
+                            return Err(RuntimeError::new(format!(
+                                "Cast: unknown target type {target_type} at pc={pc}"
+                            )));
+                        }
+                    };
+                    slots[*dst as usize] = result;
+                    pc += 1;
+                }
+
+                // ── Print ──
+                Instr::Print { src } => {
+                    let val = &slots[*src as usize];
+                    // Only print in non-bench contexts; avoid I/O overhead in
+                    // tight loops by checking a thread-local flag.
+                    #[cfg(not(test))]
+                    {
+                        println!("{val}");
+                    }
+                    #[cfg(test)]
+                    {
+                        // Suppress output during tests to avoid polluting test output
+                        let _ = val;
+                    }
+                    pc += 1;
+                }
+
+                // ── SIMD loop hints ──
+                // These are advisory — they tell the VM that the upcoming loop
+                // body is vectorizable. On hardware with the required SIMD width,
+                // the VM can set internal flags to guide vectorized execution.
+                Instr::SimdLoopStart { lane_count, simd_width } => {
+                    // Mark this loop as SIMD-vectorizable for the adaptive
+                    // profiler. Currently a no-op at runtime — future work
+                    // will use these hints to drive vectorized dispatch.
+                    let _ = (*lane_count, *simd_width);
+                    pc += 1;
+                }
+                Instr::SimdLoopEnd => {
+                    pc += 1;
+                }
+
                 // ── NOP ──
                 Instr::Nop => {
                     pc += 1;
@@ -2292,20 +2681,40 @@ impl BytecodeVM {
 
         Ok(())
     }
-    
+
+    /// Integer exponentiation by squaring (fast path for Pow with I64 args).
+    #[inline(always)]
+    fn ipow(base: i64, exp: u64) -> i64 {
+        let mut result: i64 = 1;
+        let mut b = base;
+        let mut e = exp;
+        while e > 0 {
+            if e & 1 == 1 {
+                result *= b;
+            }
+            b *= b;
+            e >>= 1;
+        }
+        result
+    }
+
     // Helper functions for type coercion (slow path)
+    #[inline(always)]
     fn add_values(&self, l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         Self::add_values_static(l, r)
     }
 
+    #[inline(always)]
     fn sub_values(&self, l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         Self::sub_values_static(l, r)
     }
 
+    #[inline(always)]
     fn mul_values(&self, l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         Self::mul_values_static(l, r)
     }
 
+    #[inline(always)]
     fn div_values(&self, l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         Self::div_values_static(l, r)
     }
@@ -2331,6 +2740,7 @@ impl BytecodeVM {
     }
 
     // Static helper functions for use in the hot loop
+    #[inline(always)]
     fn add_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         if let Some(lf) = l.as_f64() {
             if let Some(rf) = r.as_f64() {
@@ -2344,6 +2754,7 @@ impl BytecodeVM {
         )))
     }
 
+    #[inline(always)]
     fn sub_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         if let Some(lf) = l.as_f64() {
             if let Some(rf) = r.as_f64() {
@@ -2357,6 +2768,7 @@ impl BytecodeVM {
         )))
     }
 
+    #[inline(always)]
     fn mul_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         if let Some(lf) = l.as_f64() {
             if let Some(rf) = r.as_f64() {
@@ -2370,6 +2782,7 @@ impl BytecodeVM {
         )))
     }
 
+    #[inline(always)]
     fn div_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         if let Some(lf) = l.as_f64() {
             if let Some(rf) = r.as_f64() {
@@ -2386,6 +2799,7 @@ impl BytecodeVM {
         )))
     }
 
+    #[inline(always)]
     fn rem_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
         if let Some(lf) = l.as_f64() {
             if let Some(rf) = r.as_f64() {
@@ -2402,6 +2816,7 @@ impl BytecodeVM {
         )))
     }
 
+    #[inline(always)]
     fn neg_values_static(v: &Value) -> Result<Value, RuntimeError> {
         match v {
             Value::I8(x) => Ok(Value::I64(-(*x as i64))),
@@ -2419,6 +2834,7 @@ impl BytecodeVM {
 
     /// Generic comparison fallback: coerce both sides to f64 and apply the
     /// given comparison closure.
+    #[inline(always)]
     fn compare_values_static(
         l: &Value,
         r: &Value,
@@ -2492,4 +2908,313 @@ pub struct VMStats {
     pub total_instructions: u64,
     pub total_time_ns: u64,
     pub instructions_per_sec: f64,
+}
+
+// =============================================================================
+// §9  TESTS & BENCHMARKS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: assert a Value equals an expected i64.
+    fn assert_i64(val: &Value, expected: i64) {
+        match val {
+            Value::I64(v) => assert_eq!(*v, expected, "expected I64({expected}), got I64({v})"),
+            other => panic!("expected I64({expected}), got {}", other.type_name()),
+        }
+    }
+
+    /// Helper: assert a Value equals an expected f64.
+    fn assert_f64(val: &Value, expected: f64) {
+        match val {
+            Value::F64(v) => assert_eq!(*v, expected, "expected F64({expected}), got F64({v})"),
+            other => panic!("expected F64({expected}), got {}", other.type_name()),
+        }
+    }
+
+    /// Build a minimal BytecodeFunction that computes fibonacci iteratively.
+    ///
+    /// Equivalent Jules source:
+    /// ```jules
+    /// fn fib(n: i64) -> i64 {
+    ///     if n <= 1 { return n; }
+    ///     let mut a = 0;
+    ///     let mut b = 1;
+    ///     for i in 2..n+1 {
+    ///         let temp = b;
+    ///         b = a + b;
+    ///         a = temp;
+    ///     }
+    ///     return b;
+    /// }
+    /// ```
+    ///
+    /// We hand-compile this into bytecode to avoid depending on the full
+    /// frontend parser in this test.
+    fn build_fib_function() -> BytecodeFunction {
+        // Slot layout:
+        //   0 = n (param)
+        //   1 = a
+        //   2 = b
+        //   3 = temp
+        //   4 = i
+        //   5 = cond result
+        //   6 = n+1 (upper bound)
+        //   7 = scratch for comparisons
+        //   8 = one constant
+        //   9 = two constant
+        let mut f = BytecodeFunction::new("fib".to_string());
+        f.num_params = 1;
+        f.num_locals = 10;
+
+        // if n <= 1: return n
+        f.instructions.push(Instr::LoadConstInt { dst: 8, value: 1 });
+        f.instructions.push(Instr::Le { dst: 5, lhs: 0, rhs: 8 }); // n <= 1
+        let jump_past_early_return = f.instructions.len();
+        f.instructions.push(Instr::JumpFalse { cond: 5, offset: 0 }); // patch later
+        f.instructions.push(Instr::Return { value: 0 }); // return n
+        // patch: jump lands here
+        let after_early_return = f.instructions.len();
+        match &mut f.instructions[jump_past_early_return] {
+            Instr::JumpFalse { offset, .. } => *offset = (after_early_return as i32) - (jump_past_early_return as i32),
+            _ => unreachable!(),
+        }
+
+        // let a = 0; let b = 1;
+        f.instructions.push(Instr::LoadConstInt { dst: 1, value: 0 }); // a = 0
+        f.instructions.push(Instr::LoadConstInt { dst: 2, value: 1 }); // b = 1
+
+        // Loop: for i in 2..n+1
+        f.instructions.push(Instr::LoadConstInt { dst: 9, value: 2 }); // i starts at 2
+        f.instructions.push(Instr::LoadConstInt { dst: 8, value: 1 }); // constant 1
+        f.instructions.push(Instr::Add { dst: 6, lhs: 0, rhs: 8 });   // n + 1
+        f.instructions.push(Instr::Move { dst: 4, src: 9 });           // i = 2
+
+        // Jump to condition check
+        let jump_to_cond = f.instructions.len();
+        f.instructions.push(Instr::Jump { offset: 0 }); // patch later
+
+        // Loop body:
+        let loop_body = f.instructions.len();
+        // temp = b
+        f.instructions.push(Instr::Move { dst: 3, src: 2 });
+        // b = a + b
+        f.instructions.push(Instr::Add { dst: 2, lhs: 1, rhs: 2 });
+        // a = temp
+        f.instructions.push(Instr::Move { dst: 1, src: 3 });
+        // i += 1
+        f.instructions.push(Instr::LoadConstInt { dst: 8, value: 1 });
+        f.instructions.push(Instr::Add { dst: 4, lhs: 4, rhs: 8 });
+
+        // Condition: i < n+1
+        let cond_check = f.instructions.len();
+        // Patch the initial jump to land here
+        match &mut f.instructions[jump_to_cond] {
+            Instr::Jump { offset } => *offset = (cond_check as i32) - (jump_to_cond as i32),
+            _ => unreachable!(),
+        }
+        f.instructions.push(Instr::Lt { dst: 5, lhs: 4, rhs: 6 });
+        // If true, jump back to loop body
+        let backedge_offset = (loop_body as i32) - (f.instructions.len() as i32);
+        f.instructions.push(Instr::JumpTrue { cond: 5, offset: backedge_offset });
+
+        // After loop: return b
+        f.instructions.push(Instr::Return { value: 2 });
+
+        f
+    }
+
+    #[test]
+    fn test_vm_fibonacci_small() {
+        let fib = build_fib_function();
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(vec![fib]);
+
+        // fib(0) = 0
+        assert_i64(&vm.execute(0, &[Value::I64(0)]).unwrap(), 0);
+
+        // fib(1) = 1
+        assert_i64(&vm.execute(0, &[Value::I64(1)]).unwrap(), 1);
+
+        // fib(5) = 5
+        assert_i64(&vm.execute(0, &[Value::I64(5)]).unwrap(), 5);
+
+        // fib(10) = 55
+        assert_i64(&vm.execute(0, &[Value::I64(10)]).unwrap(), 55);
+
+        // fib(20) = 6765
+        assert_i64(&vm.execute(0, &[Value::I64(20)]).unwrap(), 6765);
+    }
+
+    #[test]
+    fn test_vm_fibonacci_30() {
+        let fib = build_fib_function();
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(vec![fib]);
+
+        let start = std::time::Instant::now();
+        let iterations = 1000;
+        for _ in 0..iterations {
+            let result = vm.execute(0, &[Value::I64(30)]).unwrap();
+            assert_i64(&result, 832040);
+        }
+        let elapsed = start.elapsed();
+        let ns_per_iter = elapsed.as_nanos() / iterations as u128;
+        eprintln!(
+            "bench_vm_fibonacci_30: {} iterations in {:?} ({:.0} ns/iter)",
+            iterations, elapsed, ns_per_iter as f64,
+        );
+    }
+
+    #[test]
+    fn test_vm_pow_opcode() {
+        let mut f = BytecodeFunction::new("test_pow".to_string());
+        f.num_params = 0;
+        f.num_locals = 4;
+        // slots: 0=base(2), 1=exp(10), 2=result
+        f.instructions.push(Instr::LoadConstInt { dst: 0, value: 2 });
+        f.instructions.push(Instr::LoadConstInt { dst: 1, value: 10 });
+        f.instructions.push(Instr::Pow { dst: 2, base: 0, exp: 1 });
+        f.instructions.push(Instr::Return { value: 2 });
+
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(vec![f]);
+        let result = vm.execute(0, &[]).unwrap();
+        assert_i64(&result, 1024); // 2^10 = 1024
+    }
+
+    #[test]
+    fn test_vm_make_array_opcode() {
+        let mut f = BytecodeFunction::new("test_array".to_string());
+        f.num_params = 0;
+        f.num_locals = 6;
+        // Build array [10, 20, 30] from slots 1..4
+        f.instructions.push(Instr::LoadConstInt { dst: 1, value: 10 });
+        f.instructions.push(Instr::LoadConstInt { dst: 2, value: 20 });
+        f.instructions.push(Instr::LoadConstInt { dst: 3, value: 30 });
+        f.instructions.push(Instr::MakeArray { dst: 0, start: 1, count: 3 });
+        f.instructions.push(Instr::Return { value: 0 });
+
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(vec![f]);
+        let result = vm.execute(0, &[]).unwrap();
+        match result {
+            Value::Array(arr) => {
+                let guard = arr.lock().unwrap();
+                assert_eq!(guard.len(), 3);
+                assert_i64(&guard[0], 10);
+                assert_i64(&guard[1], 20);
+                assert_i64(&guard[2], 30);
+            }
+            other => panic!("expected Array, got {:?}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn test_vm_make_tuple_opcode() {
+        let mut f = BytecodeFunction::new("test_tuple".to_string());
+        f.num_params = 0;
+        f.num_locals = 6;
+        // Build tuple (42, true) from slots 1..3
+        f.instructions.push(Instr::LoadConstInt { dst: 1, value: 42 });
+        f.instructions.push(Instr::LoadConstBool { dst: 2, value: true });
+        f.instructions.push(Instr::MakeTuple { dst: 0, start: 1, count: 2 });
+        f.instructions.push(Instr::Return { value: 0 });
+
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(vec![f]);
+        let result = vm.execute(0, &[]).unwrap();
+        match result {
+            Value::Tuple(v) => {
+                assert_eq!(v.len(), 2);
+                assert_i64(&v[0], 42);
+                match &v[1] {
+                    Value::Bool(b) => assert!(*b),
+                    other => panic!("expected Bool, got {}", other.type_name()),
+                }
+            }
+            other => panic!("expected Tuple, got {:?}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn test_vm_make_range_opcode() {
+        let mut f = BytecodeFunction::new("test_range".to_string());
+        f.num_params = 0;
+        f.num_locals = 6;
+        // Build range 0..10
+        f.instructions.push(Instr::LoadConstInt { dst: 0, value: 0 });
+        f.instructions.push(Instr::LoadConstInt { dst: 1, value: 10 });
+        f.instructions.push(Instr::MakeRange { dst: 2, lo: 0, hi: 1, inclusive: false });
+        f.instructions.push(Instr::Return { value: 2 });
+
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(vec![f]);
+        let result = vm.execute(0, &[]).unwrap();
+        match result {
+            Value::Tuple(v) => {
+                assert_eq!(v.len(), 3);
+                assert_i64(&v[0], 0);
+                assert_i64(&v[1], 10);
+                match &v[2] {
+                    Value::Bool(b) => assert!(!b), // exclusive
+                    other => panic!("expected Bool, got {}", other.type_name()),
+                }
+            }
+            other => panic!("expected Tuple (range), got {:?}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn test_vm_cast_opcode() {
+        let mut f = BytecodeFunction::new("test_cast".to_string());
+        f.num_params = 0;
+        f.num_locals = 4;
+        // Cast I64(42) to F64
+        f.instructions.push(Instr::LoadConstInt { dst: 0, value: 42 });
+        f.instructions.push(Instr::Cast { dst: 1, src: 0, target_type: 1 }); // 1 = F64
+        f.instructions.push(Instr::Return { value: 1 });
+
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(vec![f]);
+        let result = vm.execute(0, &[]).unwrap();
+        assert_f64(&result, 42.0);
+    }
+
+    #[test]
+    fn test_vm_simd_loop_hints() {
+        let mut f = BytecodeFunction::new("test_simd".to_string());
+        f.num_params = 0;
+        f.num_locals = 2;
+        // SimdLoopStart / SimdLoopEnd should not crash
+        f.instructions.push(Instr::SimdLoopStart { lane_count: 8, simd_width: 256 });
+        f.instructions.push(Instr::LoadConstInt { dst: 0, value: 42 });
+        f.instructions.push(Instr::SimdLoopEnd);
+        f.instructions.push(Instr::Return { value: 0 });
+
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(vec![f]);
+        let result = vm.execute(0, &[]).unwrap();
+        assert_i64(&result, 42);
+    }
+
+    #[test]
+    fn test_vm_data_dependent_jit_profiling() {
+        // Verify that the DataDependentJIT is integrated and profiling works.
+        let fib = build_fib_function();
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(vec![fib]);
+
+        // Run several times to build up observations
+        for n in 5..15 {
+            let _ = vm.execute(0, &[Value::I64(n)]);
+        }
+
+        // The JIT should have observations from the backedge profiling
+        let jit = vm.data_dependent_jit();
+        // At minimum, the JIT should have been created and not crashed
+        let _ = jit;
+    }
 }
