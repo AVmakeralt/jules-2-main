@@ -21,6 +21,9 @@ mod random;
 mod spatial;
 pub mod sieve_210;
 pub mod prng_simd;
+pub mod morton;
+pub mod genesis_weave;
+pub mod collision;
 
 use crate::interp::{RuntimeError, Value};
 
@@ -40,6 +43,9 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         .or_else(|| collections::dispatch(name, args))
         .or_else(|| sieve_210::dispatch(name, args))
         .or_else(|| prng_simd::dispatch(name, args))
+        .or_else(|| morton::dispatch(name, args))
+        .or_else(|| genesis_weave::dispatch(name, args))
+        .or_else(|| collision::dispatch(name, args))
 }
 
 /// List all available stdlib modules and functions (for introspection).
@@ -346,6 +352,94 @@ pub fn modules_value() -> Value {
             coll_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("collections::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let sieve_fns = vec![
+        "prime_count",
+        "naive_prime_count",
+        "verify",
+    ];
+    out.insert(
+        "sieve_210".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            sieve_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("sieve_210::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let prng_fns = vec![
+        "squares_next",
+        "shishiua_next",
+        "simd8_batch",
+        "verify",
+    ];
+    out.insert(
+        "prng_simd".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            prng_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("prng_simd::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let morton_fns = vec![
+        "encode2d",
+        "decode2d",
+        "encode3d",
+        "decode3d",
+        "distance",
+        "tile_index",
+        "verify",
+    ];
+    out.insert(
+        "morton".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            morton_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("morton::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let genesis_fns = vec![
+        "terrain_height",
+        "biome_at",
+        "entity_at",
+        "check_exclusion",
+        "jittered_position",
+        "biome_weight",
+        "generate_structure",
+        "verify",
+    ];
+    out.insert(
+        "genesis".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            genesis_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("genesis::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let collision_fns = vec![
+        "probe",
+        "probe_8",
+        "resolve",
+        "probe_3d",
+        "morton_probe",
+        "verify",
+    ];
+    out.insert(
+        "collision".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            collision_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("collision::{}", s)))
                 .collect(),
         ))),
     );

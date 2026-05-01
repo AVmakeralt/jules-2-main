@@ -41,6 +41,10 @@ name = "bench-extreme"
 path = "src/tools/bench_extreme.rs"
 
 [[bin]]
+name = "bench-genesis-weave"
+path = "src/tools/bench_genesis_weave.rs"
+
+[[bin]]
 name = "bench-mcts-superopt"
 path = "src/tools/bench_mcts_superopt.rs"
 required-features = ["gnn-optimizer"]
