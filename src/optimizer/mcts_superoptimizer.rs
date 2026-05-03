@@ -100,6 +100,53 @@ impl MctsConfig {
             ..Default::default()
         }
     }
+
+    /// Local-only mode: limits search to single expressions/blocks.
+    /// Critical for large codebases (>50K LoC) where global search explodes.
+    /// This mode:
+    /// - Only optimizes within the current function scope
+    /// - No inter-procedural analysis
+    /// - No cross-block state tracking
+    /// - Reduced max_tree_size to prevent memory blowup
+    /// - Shorter time budgets per expression
+    pub fn local_only() -> Self {
+        Self {
+            max_simulations: 100,
+            max_depth: 4,
+            time_budget_ms: 20,
+            min_improvement: 2,          // Only accept significant improvements
+            use_hardware_cost: true,
+            microarch: None,
+            verif_inputs: 8,             // Fewer verification inputs
+            max_tree_size: 5_000,        // Prevent memory explosion
+        }
+    }
+
+    /// Very local mode: optimized for hot-path kernels only.
+    /// Use for tight loops and inner functions.
+    pub fn hotpath() -> Self {
+        Self {
+            max_simulations: 200,
+            max_depth: 6,
+            time_budget_ms: 50,
+            min_improvement: 1,
+            use_hardware_cost: true,
+            microarch: None,
+            verif_inputs: 16,
+            max_tree_size: 10_000,
+        }
+    }
+}
+
+/// Mode for controlling search scope to prevent explosion on large codebases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Full inter-procedural analysis (default, for small projects)
+    Global,
+    /// Local-only: within current function scope (for >50K LoC)
+    Local,
+    /// Hot-path: aggressive optimization for inner loops
+    HotPath,
 }
 
 // =============================================================================
