@@ -28,8 +28,10 @@ pub mod sdf_ray;
 pub mod gaussian_splat;
 pub mod vpl_lighting;
 pub mod sprite_pipe;
+pub mod simd_batch;
 pub mod voxel_mesh;
 pub mod aurora_flux;
+pub mod aurora_threading;
 
 use crate::interp::{RuntimeError, Value};
 
@@ -56,8 +58,10 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         .or_else(|| gaussian_splat::dispatch(name, args))
         .or_else(|| vpl_lighting::dispatch(name, args))
         .or_else(|| sprite_pipe::dispatch(name, args))
+        .or_else(|| simd_batch::dispatch(name, args))
         .or_else(|| voxel_mesh::dispatch(name, args))
         .or_else(|| aurora_flux::dispatch(name, args))
+        .or_else(|| aurora_threading::dispatch(name, args))
 }
 
 /// List all available stdlib modules and functions (for introspection).
@@ -535,6 +539,36 @@ pub fn modules_value() -> Value {
             voxel_mesh_fns
                 .into_iter()
                 .map(|s| Value::Str(format!("voxel_mesh::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let simd_batch_fns = vec![
+        "verify",
+        "benchmark_morton_uv",
+        "sprite_at_morton_8",
+    ];
+    out.insert(
+        "simd_batch".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            simd_batch_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("simd_batch::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let aurora_threading_fns = vec![
+        "verify",
+        "benchmark",
+        "director_info",
+    ];
+    out.insert(
+        "aurora_threading".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            aurora_threading_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("aurora_threading::{}", s)))
                 .collect(),
         ))),
     );
