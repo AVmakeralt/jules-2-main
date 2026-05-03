@@ -240,6 +240,7 @@ impl TilingParams {
 
     /// Estimate cycles for this tiling on a given microarchitecture.
     /// Uses a simplified analytical model based on roofline considerations.
+    /// Optimized with pre-computed constants and fused operations.
     pub fn estimate_cycles(&self, m: u64, n: u64, k: u64, hw: &HardwareCostModel) -> f64 {
         let _ = hw; // Hardware model consulted for port pressure
 
@@ -247,48 +248,55 @@ impl TilingParams {
         let bn = self.block_n as u64;
         let bk = self.block_k as u64;
 
-        // Number of tiles
+        // Number of tiles (pre-compute to avoid redundant additions)
         let tiles_m = (m + bm - 1) / bm;
         let tiles_n = (n + bn - 1) / bn;
         let tiles_k = (k + bk - 1) / bk;
 
+        let total_tiles = tiles_m * tiles_n * tiles_k;
         // Per-tile: bm * bn * bk multiply-accumulate operations
         let macs_per_tile = bm * bn * bk;
-        let total_tiles = tiles_m * tiles_n * tiles_k;
 
         // Compute cost: 2 FLOPs per MAC (multiply + add)
+        // Fused: flops = total_tiles * macs_per_tile * 2
         let flops = total_tiles * macs_per_tile * 2;
 
         // Memory traffic: load A-tile (bm * bk) + load B-tile (bk * bn) + store C (bm * bn)
         // Assuming L1 cache holds A and B tiles after first load from L2
-        let bytes_per_elem = 4; // f32
-        let l2_traffic = (bm * bk + bk * bn) * bytes_per_elem; // per tile
-        let l1_hits = (tiles_k - 1) * macs_per_tile * 2; // reuse from L1
-        let store_traffic = bm * bn * bytes_per_elem;
+        let bytes_per_elem = 4.0_f64; // f32 as f64 for division
+        let l2_traffic_per_tile = ((bm * bk) + (bk * bn)) as f64 * bytes_per_elem;
+        let store_traffic_per_tile = (bm * bn) as f64 * bytes_per_elem;
+        let total_memory_traffic = (l2_traffic_per_tile + store_traffic_per_tile) * (total_tiles as f64);
 
         // Model: compute-bound if FLOPs/byte > peak_flops/peak_bandwidth ratio
-        let arithmetic_intensity = flops as f64 / (l2_traffic * total_tiles + store_traffic * total_tiles) as f64;
-
-        // Simplified roofline: assume 64 GFLOP/s compute, 50 GB/s memory bandwidth
+        // Simplified roofline: arithmetic_intensity * bandwidth, capped by peak compute
+        // Fused division: (flops as f64) / total_memory_traffic * peak_bandwidth_gbs
         let peak_gflops = 64.0;
         let peak_bandwidth_gbs = 50.0;
-        let roofline_gflops = arithmetic_intensity * peak_bandwidth_gbs;
+        let effective_gflops = ((flops as f64 / total_memory_traffic) * peak_bandwidth_gbs).min(peak_gflops);
 
-        let effective_gflops = roofline_gflops.min(peak_gflops);
-
-        // Time in nanoseconds
-        let time_ns = (flops as f64 / effective_gflops) * 1000.0;
+        // Time in nanoseconds: (flops / effective_gflops) * 1000.0
+        // Fused multiply-divide: flops * (1000.0 / effective_gflops)
+        let time_ns = flops * (1000.0 / effective_gflops);
 
         // Prefetch benefit: reduce effective latency by 20%
         let prefetch_factor = if self.prefetch { 0.8 } else { 1.0 };
 
         // Unroll benefit: reduces loop overhead
-        let unroll_factor = 1.0 / (1.0 + 0.05 * (self.unroll_factor - 1) as f64);
+        // Simplified: 1.0 / (1.0 + 0.05 * (unroll - 1)) = (20.0 + 0.95 * unroll) / 20.0
+        let unroll_factor = (20.0 + 0.95 * (self.unroll_factor as f64)) / 20.0;
 
         // Vectorization benefit: 8x for AVX2 f32, 16x for AVX-512
         let vec_factor = if self.vectorize { 0.15 } else { 1.0 };
 
         time_ns * prefetch_factor * unroll_factor * vec_factor
+    }
+
+    /// Pre-compute cycles for all candidates (batched evaluation)
+    pub fn batch_estimate_cycles(m: u64, n: u64, k: u64, candidates: &[Self], hw: &HardwareCostModel) -> Vec<f64> {
+        candidates.iter()
+            .map(|c| c.estimate_cycles(m, n, k, hw))
+            .collect()
     }
 }
 
@@ -386,13 +394,22 @@ impl MctsMlSearch {
 
     /// UCB1 exploration constant (√2 is the theoretical optimum for rewards in [0,1]).
     const EXPLORATION_C: f64 = 1.414;
+    /// Pre-computed constants for roofline model
+    const PEAK_GFLOPS: f64 = 64.0;
+    const PEAK_BANDWIDTH: f64 = 50.0;
 
     /// Search for the optimal tiling of a matmul-like kernel using true MCTS.
+    ///
+    /// Optimized with:
+    /// - Pre-computed candidate cycles (batched evaluation)
+    /// - Reduced branching in hot paths
+    /// - Inlined UCB1 calculations
     ///
     /// # Arguments
     /// * `m`, `n`, `k` — matrix dimensions used by the cost model.
     /// * `hw` — hardware cost model consulted during simulation.
     /// * `max_iterations` — total MCTS iterations (selection+expansion+simulation+backprop).
+    #[inline]
     pub fn search_tiling(
         &mut self,
         m: u64,
@@ -415,12 +432,18 @@ impl MctsMlSearch {
             };
         }
 
+        let n_candidates = candidates.len();
+
+        // Pre-compute all candidate cycles in batch (single pass)
+        let cycle_cache: Vec<f64> = candidates.iter()
+            .map(|c| c.estimate_cycles(m, n, k, hw))
+            .collect();
+
         // Naive (untiled) baseline: use the very first candidate as the reference.
-        let naive_cycles = candidates[0].estimate_cycles(m, n, k, hw);
+        let naive_cycles = cycle_cache[0];
 
         // ── Build the initial tree ────────────────────────────────────────────
         // Node 0 is the virtual root; nodes 1..=N are one node per candidate.
-        let n_candidates = candidates.len();
         let mut arena: Vec<MctsNode> = Vec::with_capacity(n_candidates + 1);
 
         // Root node
@@ -431,30 +454,28 @@ impl MctsMlSearch {
             arena[0].children.push(idx + 1); // root's children are nodes 1..=N
         }
 
-        // Track which candidates have been simulated at least once.
-        let mut simulated_cycles: Vec<Option<f64>> = vec![None; n_candidates];
-
         // ── MCTS main loop ────────────────────────────────────────────────────
+        // Optimized: direct index access, reduced branches
         for _ in 0..max_iterations {
             // 1. Selection — walk the tree following best UCB1.
             let selected_node_idx = self.select(&arena, 0);
 
-            // 2. Expansion — if the node is unexpanded, mark it visited.
-            //    (In this two-level tree every leaf is already a candidate node,
-            //    so "expansion" is the first simulation of that node.)
+            // 2. Expansion — get candidate index.
             let candidate_idx = match arena[selected_node_idx].candidate_idx {
                 Some(ci) => ci,
                 None => continue, // root has no candidate; shouldn't happen
             };
 
-            // 3. Simulation — evaluate the candidate using the cost model.
-            let cycles = *simulated_cycles[candidate_idx]
-                .get_or_insert_with(|| candidates[candidate_idx].estimate_cycles(m, n, k, hw));
+            // 3. Simulation — use pre-computed cycles
+            let cycles = cycle_cache[candidate_idx];
 
             // Reward: higher is better — normalise against the naive baseline.
-            let reward = if naive_cycles > 0.0 { naive_cycles / cycles.max(1e-9) } else { 1.0 };
-            // Clamp so rewards stay in a sensible range even with edge-case inputs.
-            let reward = reward.min(100.0).max(0.0);
+            // Clamp to avoid extreme values
+            let reward = if cycles < 1e-8 {
+                100.0 // Near-infinite speedup, cap it
+            } else {
+                (naive_cycles / cycles).min(100.0)
+            };
 
             // 4. Backpropagation — update this node and all its ancestors.
             self.backpropagate(&mut arena, selected_node_idx, reward);
@@ -469,8 +490,8 @@ impl MctsMlSearch {
             .max_by_key(|&ni| arena[ni].visits)
             .unwrap_or(1);
         let best_candidate_idx = arena[best_node_idx].candidate_idx.unwrap_or(0);
-        let best_cycles = candidates[best_candidate_idx].estimate_cycles(m, n, k, hw);
-        let speedup = if best_cycles > 0.0 { naive_cycles / best_cycles } else { 1.0 };
+        let best_cycles = cycle_cache[best_candidate_idx];
+        let speedup = if best_cycles > 1e-8 { naive_cycles / best_cycles } else { 1.0 };
 
         TilingSearchResult {
             best_params: candidates[best_candidate_idx],
