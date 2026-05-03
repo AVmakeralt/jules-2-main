@@ -648,16 +648,39 @@ impl Pipeline {
         // This is what XLA/TensorRT/TVM do — but at the language level.
         #[cfg(feature = "gnn-optimizer")]
         if self.opt_level >= 2 {
-            let mut ml_opt = crate::optimizer::ml_superopt::MlSuperoptimizer::new();
-            ml_opt.optimize_program(&mut program);
-            if self.print_opt_stats && ml_opt.stats.patterns_matched > 0 {
-                eprintln!("[opt/ML] ml_patterns={} loop_to_kernel={} fusions={} stability={} mem_opt={} speedup={:.1}x",
-                    ml_opt.stats.patterns_matched,
-                    ml_opt.stats.loop_to_kernel,
-                    ml_opt.stats.kernel_fusions,
-                    ml_opt.stats.numerical_stability_fixes,
-                    ml_opt.stats.memory_optimizations,
-                    ml_opt.stats.total_estimated_speedup);
+            use crate::compiler::ast::SuperoptMode;
+            match program.superopt_mode {
+                SuperoptMode::None => {
+                    // Superoptimization disabled for this file
+                    if self.print_opt_stats {
+                        eprintln!("[opt] superoptimization disabled (@none)");
+                    }
+                }
+                SuperoptMode::MlSuperopt | SuperoptMode::All => {
+                    let mut ml_opt = crate::optimizer::ml_superopt::MlSuperoptimizer::new();
+                    ml_opt.optimize_program(&mut program);
+                    if self.print_opt_stats && ml_opt.stats.patterns_matched > 0 {
+                        eprintln!("[opt/ML] ml_patterns={} loop_to_kernel={} fusions={} stability={} mem_opt={} speedup={:.1}x",
+                            ml_opt.stats.patterns_matched,
+                            ml_opt.stats.loop_to_kernel,
+                            ml_opt.stats.kernel_fusions,
+                            ml_opt.stats.numerical_stability_fixes,
+                            ml_opt.stats.memory_optimizations,
+                            ml_opt.stats.total_estimated_speedup);
+                    }
+                }
+                SuperoptMode::MctsSuperopt => {
+                    // MCTS superoptimizer is handled separately in the JIT/AOT path
+                    if self.print_opt_stats {
+                        eprintln!("[opt] MCTS superoptimizer active (@mcts_superopt)");
+                    }
+                }
+                SuperoptMode::EGraph => {
+                    // E-graph superoptimizer is handled separately
+                    if self.print_opt_stats {
+                        eprintln!("[opt] E-graph superoptimizer active (@egraph)");
+                    }
+                }
             }
         }
 
