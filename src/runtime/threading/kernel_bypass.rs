@@ -485,14 +485,46 @@ impl UintrSender {
         if target_id >= self.num_targets {
             return Err("Target ID out of range".to_string());
         }
-        
+
         #[cfg(target_arch = "x86_64")]
         {
-            // In production, would use SENDUIPI instruction
-            // For now, stub implementation
+            let entry = &self.uitt[target_id];
+
+            // If the UITT entry has not been populated yet there is no
+            // real target to deliver the interrupt to.
+            if entry.upid_addr == 0 || entry.vector == 0 {
+                return Err("UINTR target not registered".to_string());
+            }
+
+            // Attempt to set the Pending Interrupt Request bit in the
+            // target's UPID, then send a notification vector.
+            // On hardware that supports SENDUIPI the CPU does this
+            // atomically; on older x86_64 we emulate via userspace.
+            //
+            // Safety: upid_addr was provided by the receiver and points
+            // to a valid, naturally-aligned `UintrUpid` allocation that
+            // outlives the sender.
+            unsafe {
+                let upid = entry.upid_addr as *const UintrUpid;
+                // Set PIR bit for the target vector.
+                let pir_ptr = std::ptr::addr_of!((*upid).pir) as *mut u64;
+                // Atomically OR the vector bit into PIR.
+                let pir_val = core::sync::atomic::AtomicU64::from_ptr(pir_ptr);
+                pir_val.fetch_or(1u64 << entry.vector, Ordering::SeqCst);
+
+                // Send the interrupt notification by writing to the
+                // notification-control word.  On real UINTR hardware
+                // this is done by SENDUIPI which triggers an IPI-like
+                // mechanism; we emulate by setting the ON (outstanding
+                // notification) bit.
+                let ncr_ptr = std::ptr::addr_of!((*upid).ncr) as *mut u64;
+                let ncr_val = core::sync::atomic::AtomicU64::from_ptr(ncr_ptr);
+                ncr_val.fetch_or(1, Ordering::SeqCst);
+            }
+
             Ok(())
         }
-        
+
         #[cfg(not(target_arch = "x86_64"))]
         {
             Err("UINTR only available on x86_64".to_string())

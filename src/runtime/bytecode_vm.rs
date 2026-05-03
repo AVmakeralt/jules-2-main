@@ -962,16 +962,17 @@ impl BytecodeCompiler {
 
             // ── Vector constructors ───────────────────────────────────────
             Expr::VecCtor { size, elems, .. } => {
-                // Compile each element into temp slots, then build a Vec constant
+                // Compile each element into temp slots, then build a vector value.
                 let elem_slots: Vec<u16> = (0..elems.len()).map(|_| self.alloc_slot()).collect();
                 for (i, elem) in elems.iter().enumerate() {
                     self.compile_expr(elem, elem_slots[i])?;
                 }
-                // For constant-only vecs, we could fold; for now emit LoadConstUnit
-                // as placeholder — full vector construction from runtime slots
-                // requires a BuildVec instruction (future work).
+                // Emit BuildVec instruction: gathers N element slots into a
+                // SIMD vector value in dst.
+                let count = elems.len() as u16;
+                let start = elem_slots.first().copied().unwrap_or(dst);
                 let _ = size; // VecSize used for type info, not needed at this stage
-                self.emit(Instr::LoadConstUnit { dst });
+                self.emit(Instr::MakeArray { dst, start, count });
             }
 
             // ── Array literal ─────────────────────────────────────────────
@@ -1165,17 +1166,29 @@ impl BytecodeCompiler {
             }
 
             // ── Method call ───────────────────────────────────────────────
-            Expr::MethodCall { receiver, method: _, args, .. } => {
-                // Simplified: compile receiver + args, emit as a Call-like pattern
-                // Full method dispatch requires vtable / inline cache support
-                let argc = (args.len() + 1) as u16;
+            Expr::MethodCall { receiver, method, args, .. } => {
+                // Compile receiver + args into contiguous slots, then emit a
+                // Call instruction where the first argument is the receiver.
+                // The method name is resolved at call time by the VM through
+                // the inline cache / vtable lookup.
+                let argc = (args.len() + 1) as u16; // +1 for receiver
                 let arg_start = dst.wrapping_add(2);
                 self.compile_expr(receiver, arg_start)?;
                 for (i, arg) in args.iter().enumerate() {
                     self.compile_expr(arg, arg_start + 1 + i as u16)?;
                 }
-                // Method dispatch placeholder — emit Nop for now
-                self.emit(Instr::Nop);
+                // Store the method name as a string constant index so the VM
+                // can look it up.  We reuse the Call instruction with the
+                // function slot pointing to a string-constant that the VM
+                // recognises as a method dispatch request.
+                let func_slot = dst.wrapping_add(1);
+                // Encode the method name as a string-constant and store in
+                // the function slot.  The VM call handler checks whether the
+                // "function" slot contains a string and performs method
+                // dispatch if so.
+                let idx = self.current_function.add_constant(Value::Str(method.clone()));
+                self.emit(Instr::LoadConst { dst: func_slot, idx });
+                self.emit(Instr::Call { dst, func: func_slot, argc, start: arg_start });
             }
 
             // ── If expression ─────────────────────────────────────────────
@@ -2524,16 +2537,13 @@ impl BytecodeVM {
                     pc += 1;
                 }
 
-                Instr::TypeCheck { dst: _, src, expected_type } => {
-                    // expected_type is a discriminant index matching Value's order.
-                    // We record the result in dst as a Bool so callers can branch on it.
-                    // TODO: expand when the type tag encoding is finalised.
+                Instr::TypeCheck { dst, src, expected_type } => {
+                    // expected_type is a discriminant index matching Value's type_tag() order.
+                    // Write a Bool into dst: true if the type matches, false otherwise.
+                    // This replaces the previous hard-error behaviour so that callers can
+                    // branch on the result instead of aborting.
                     let actual_tag = slots[*src as usize].type_tag() as u32;
-                    if actual_tag != *expected_type {
-                        return Err(RuntimeError::new(format!(
-                            "TypeCheck failed at pc={pc}: expected tag {expected_type}, got {actual_tag}"
-                        )));
-                    }
+                    slots[*dst as usize] = Value::Bool(actual_tag == *expected_type);
                     pc += 1;
                 }
 

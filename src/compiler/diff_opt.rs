@@ -391,21 +391,610 @@ impl DiffCompiler {
         }
         features[2] = (call_count as f32).log2().clamp(0.0, 8.0);
 
-        // Feature 3: Memory operations
-        features[3] = 0.0; // Would need deeper analysis
-
-        // Feature 4: Arithmetic intensity
-        features[4] = 0.5; // Default
-
-        // Feature 5-9: Zeros (placeholders for more features)
-        for i in 5..10 {
-            features[i] = 0.0;
+        // Feature 3: Memory operations (count Let bindings with array/tensor types)
+        let mut mem_ops = 0usize;
+        fn count_mem_ops(item: &Item, c: &mut usize) {
+            if let Item::Fn(f) = item {
+                if let Some(body) = &f.body {
+                    fn mem_ops_in_block(b: &Block, c: &mut usize) {
+                        for s in &b.stmts {
+                            match s {
+                                Stmt::Let { init: Some(e), .. } => {
+                                    // Count array indexing and field access as memory ops
+                                    Self::expr_mem_ops(e, c);
+                                }
+                                Stmt::Expr { expr: e, .. } => {
+                                    Self::expr_mem_ops(e, c);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    mem_ops_in_block(body, c);
+                }
+            }
         }
+        for item in &program.items {
+            count_mem_ops(item, &mut mem_ops);
+        }
+        features[3] = (mem_ops as f32).log2().clamp(0.0, 10.0);
+
+        // Feature 4: Arithmetic intensity (ratio of arithmetic ops to memory ops)
+        let mut arith_ops = 0usize;
+        fn count_arith(item: &Item, c: &mut usize) {
+            if let Item::Fn(f) = item {
+                if let Some(body) = &f.body {
+                    fn arith_in_block(b: &Block, c: &mut usize) {
+                        for s in &b.stmts {
+                            match s {
+                                Stmt::Let { init: Some(e), .. } => Self::expr_arith(e, c),
+                                Stmt::Expr { expr: e, .. } => Self::expr_arith(e, c),
+                                _ => {}
+                            }
+                        }
+                    }
+                    arith_in_block(body, c);
+                }
+            }
+        }
+        for item in &program.items {
+            count_arith(item, &mut arith_ops);
+        }
+        let arith_intensity = if mem_ops > 0 {
+            (arith_ops as f32) / (mem_ops as f32)
+        } else if arith_ops > 0 {
+            10.0 // very arithmetic-heavy, no memory ops
+        } else {
+            0.5 // default
+        };
+        features[4] = arith_intensity.clamp(0.0, 10.0);
+
+        // Feature 5: Branch density (if/match count per function)
+        let mut branch_count = 0usize;
+        fn count_branches(item: &Item, c: &mut usize) {
+            if let Item::Fn(f) = item {
+                if let Some(body) = &f.body {
+                    fn branches_in_block(b: &Block, c: &mut usize) {
+                        for s in &b.stmts {
+                            match s {
+                                Stmt::If { .. } | Stmt::Match { .. } => *c += 1,
+                                Stmt::While { body, .. } | Stmt::ForIn { body, .. } => {
+                                    *c += 1;
+                                    branches_in_block(body, c);
+                                }
+                                Stmt::Let { init: Some(e), .. } => Self::expr_branches(e, c),
+                                Stmt::Expr { expr: e, .. } => Self::expr_branches(e, c),
+                                _ => {}
+                            }
+                        }
+                    }
+                    branches_in_block(body, c);
+                }
+            }
+        }
+        for item in &program.items {
+            count_branches(item, &mut branch_count);
+        }
+        features[5] = (branch_count as f32).log2().clamp(0.0, 8.0);
+
+        // Feature 6: Nesting depth (max statement nesting level)
+        let mut max_depth = 0usize;
+        fn measure_depth(item: &Item, max: &mut usize) {
+            if let Item::Fn(f) = item {
+                if let Some(body) = &f.body {
+                    fn depth_in_block(b: &Block, depth: usize, max: &mut usize) {
+                        if depth > *max { *max = depth; }
+                        for s in &b.stmts {
+                            match s {
+                                Stmt::If { then, else_, .. } => {
+                                    depth_in_block(then, depth + 1, max);
+                                    if let Some(e) = else_ {
+                                        match e.as_ref() {
+                                            IfOrBlock::Block(blk) => depth_in_block(blk, depth + 1, max),
+                                            IfOrBlock::If(_) => depth_in_block(b, depth + 1, max),
+                                        }
+                                    }
+                                }
+                                Stmt::While { body, .. } | Stmt::ForIn { body, .. } => {
+                                    depth_in_block(body, depth + 1, max);
+                                }
+                                Stmt::Loop { body, .. } => {
+                                    depth_in_block(body, depth + 1, max);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    depth_in_block(body, 1, max);
+                }
+            }
+        }
+        for item in &program.items {
+            measure_depth(item, &mut max_depth);
+        }
+        features[6] = max_depth as f32;
+
+        // Feature 7: Average function size (statements per function)
+        let fn_count = program.items.iter().filter(|i| matches!(i, Item::Fn(_))).count();
+        let total_stmts: usize = program.items.iter().map(|i| {
+            if let Item::Fn(f) = i {
+                if let Some(body) = &f.body {
+                    body.stmts.len()
+                } else { 0 }
+            } else { 0 }
+        }).sum();
+        features[7] = if fn_count > 0 {
+            (total_stmts as f32 / fn_count as f32).log2().clamp(0.0, 10.0)
+        } else { 0.0 };
+
+        // Feature 8: Recursive call indicator (1.0 if any function calls itself)
+        let mut has_recursion = false;
+        fn detect_recursion(item: &Item, flag: &mut bool) {
+            if let Item::Fn(f) = item {
+                let fn_name = &f.name;
+                if let Some(body) = &f.body {
+                    fn recursion_in_block(b: &Block, name: &str, flag: &mut bool) {
+                        for s in &b.stmts {
+                            match s {
+                                Stmt::Let { init: Some(e), .. } => Self::expr_calls_self(e, name, flag),
+                                Stmt::Expr { expr: e, .. } => Self::expr_calls_self(e, name, flag),
+                                Stmt::If { then, else_, .. } => {
+                                    recursion_in_block(then, name, flag);
+                                    if let Some(e) = else_ {
+                                        match e.as_ref() {
+                                            IfOrBlock::Block(blk) => recursion_in_block(blk, name, flag),
+                                            IfOrBlock::If(_) => recursion_in_block(b, name, flag),
+                                        }
+                                    }
+                                }
+                                Stmt::While { body, .. } | Stmt::ForIn { body, .. } => {
+                                    recursion_in_block(body, name, flag);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    recursion_in_block(body, fn_name, flag);
+                }
+            }
+        }
+        for item in &program.items {
+            detect_recursion(item, &mut has_recursion);
+        }
+        features[8] = if has_recursion { 1.0 } else { 0.0 };
+
+        // Feature 9: Type complexity (count distinct types used in annotations)
+        let mut type_count = 0usize;
+        fn count_types(item: &Item, c: &mut usize) {
+            if let Item::Fn(f) = item {
+                for p in &f.params {
+                    if p.ty.is_some() { *c += 1; }
+                }
+                if f.ret_ty.is_some() { *c += 1; }
+            }
+        }
+        for item in &program.items {
+            count_types(item, &mut type_count);
+        }
+        features[9] = (type_count as f32).log2().clamp(0.0, 8.0);
 
         features
     }
 
-    fn expr_calls(_e: &Expr, _c: &mut usize) {}
+    /// Count function call sites within an expression (both direct `Call` and
+    /// method `MethodCall` variants).  Recursively visits sub-expressions.
+    fn expr_calls(e: &Expr, c: &mut usize) {
+        match e {
+            Expr::Call { func, args, .. } => {
+                *c += 1;
+                Self::expr_calls(func, c);
+                for a in args {
+                    Self::expr_calls(a, c);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                *c += 1;
+                Self::expr_calls(receiver, c);
+                for a in args {
+                    Self::expr_calls(a, c);
+                }
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::expr_calls(lhs, c);
+                Self::expr_calls(rhs, c);
+            }
+            Expr::UnOp { expr, .. } => {
+                Self::expr_calls(expr, c);
+            }
+            Expr::Assign { target, value, .. } => {
+                Self::expr_calls(target, c);
+                Self::expr_calls(value, c);
+            }
+            Expr::Field { object, .. } => {
+                Self::expr_calls(object, c);
+            }
+            Expr::Index { object, indices, .. } => {
+                Self::expr_calls(object, c);
+                for i in indices {
+                    Self::expr_calls(i, c);
+                }
+            }
+            Expr::VecCtor { elems, .. } | Expr::ArrayLit { elems, .. } => {
+                for el in elems {
+                    Self::expr_calls(el, c);
+                }
+            }
+            Expr::Tuple { elems, .. } => {
+                for el in elems {
+                    Self::expr_calls(el, c);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, v) in fields {
+                    Self::expr_calls(v, c);
+                }
+            }
+            Expr::IfExpr { cond, then, else_ } => {
+                Self::expr_calls(cond, c);
+                for s in &then.stmts {
+                    if let Stmt::Let { init: Some(e), .. } = s { Self::expr_calls(e, c); }
+                    if let Stmt::Expr { expr: e, .. } = s { Self::expr_calls(e, c); }
+                }
+                if let Some(else_block) = else_ {
+                    for s in &else_block.stmts {
+                        if let Stmt::Let { init: Some(e), .. } = s { Self::expr_calls(e, c); }
+                        if let Stmt::Expr { expr: e, .. } = s { Self::expr_calls(e, c); }
+                    }
+                }
+            }
+            Expr::Closure { body, .. } => {
+                Self::expr_calls(body, c);
+            }
+            Expr::Block(b) => {
+                for s in &b.stmts {
+                    if let Stmt::Let { init: Some(e), .. } = s { Self::expr_calls(e, c); }
+                    if let Stmt::Expr { expr: e, .. } = s { Self::expr_calls(e, c); }
+                }
+            }
+            Expr::Cast { expr, .. } | Expr::Grad { inner: expr, .. } => {
+                Self::expr_calls(expr, c);
+            }
+            Expr::MatMul { lhs, rhs, .. }
+            | Expr::HadamardMul { lhs, rhs, .. }
+            | Expr::HadamardDiv { lhs, rhs, .. }
+            | Expr::TensorConcat { lhs, rhs, .. }
+            | Expr::KronProd { lhs, rhs, .. }
+            | Expr::OuterProd { lhs, rhs, .. }
+            | Expr::Pow { base: lhs, exp: rhs, .. } => {
+                Self::expr_calls(lhs, c);
+                Self::expr_calls(rhs, c);
+            }
+            Expr::Range { lo, hi, .. } => {
+                if let Some(l) = lo { Self::expr_calls(l, c); }
+                if let Some(h) = hi { Self::expr_calls(h, c); }
+            }
+            // Leaf expressions — nothing to recurse into.
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. }
+            | Expr::Ident { .. }
+            | Expr::Path { .. } => {}
+        }
+    }
+
+    /// Count memory-operation expressions (field access, indexing).
+    fn expr_mem_ops(e: &Expr, c: &mut usize) {
+        match e {
+            Expr::Field { object, .. } => {
+                *c += 1;
+                Self::expr_mem_ops(object, c);
+            }
+            Expr::Index { object, indices, .. } => {
+                *c += 1;
+                Self::expr_mem_ops(object, c);
+                for i in indices {
+                    Self::expr_mem_ops(i, c);
+                }
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::expr_mem_ops(lhs, c);
+                Self::expr_mem_ops(rhs, c);
+            }
+            Expr::UnOp { expr, .. } => {
+                Self::expr_mem_ops(expr, c);
+            }
+            Expr::Call { func, args, .. } => {
+                Self::expr_mem_ops(func, c);
+                for a in args { Self::expr_mem_ops(a, c); }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                Self::expr_mem_ops(receiver, c);
+                for a in args { Self::expr_mem_ops(a, c); }
+            }
+            Expr::VecCtor { elems, .. } | Expr::ArrayLit { elems, .. } => {
+                for el in elems { Self::expr_mem_ops(el, c); }
+            }
+            Expr::Tuple { elems, .. } => {
+                for el in elems { Self::expr_mem_ops(el, c); }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, v) in fields { Self::expr_mem_ops(v, c); }
+            }
+            Expr::IfExpr { cond, then, else_ } => {
+                Self::expr_mem_ops(cond, c);
+                for s in &then.stmts {
+                    if let Stmt::Let { init: Some(e), .. } = s { Self::expr_mem_ops(e, c); }
+                    if let Stmt::Expr { expr: e, .. } = s { Self::expr_mem_ops(e, c); }
+                }
+                if let Some(else_block) = else_ {
+                    for s in &else_block.stmts {
+                        if let Stmt::Let { init: Some(e), .. } = s { Self::expr_mem_ops(e, c); }
+                        if let Stmt::Expr { expr: e, .. } = s { Self::expr_mem_ops(e, c); }
+                    }
+                }
+            }
+            Expr::Closure { body, .. } => { Self::expr_mem_ops(body, c); }
+            Expr::Block(b) => {
+                for s in &b.stmts {
+                    if let Stmt::Let { init: Some(e), .. } = s { Self::expr_mem_ops(e, c); }
+                    if let Stmt::Expr { expr: e, .. } = s { Self::expr_mem_ops(e, c); }
+                }
+            }
+            Expr::Cast { expr, .. } | Expr::Grad { inner: expr, .. } => { Self::expr_mem_ops(expr, c); }
+            Expr::MatMul { lhs, rhs, .. }
+            | Expr::HadamardMul { lhs, rhs, .. }
+            | Expr::HadamardDiv { lhs, rhs, .. }
+            | Expr::TensorConcat { lhs, rhs, .. }
+            | Expr::KronProd { lhs, rhs, .. }
+            | Expr::OuterProd { lhs, rhs, .. }
+            | Expr::Pow { base: lhs, exp: rhs, .. } => {
+                Self::expr_mem_ops(lhs, c);
+                Self::expr_mem_ops(rhs, c);
+            }
+            Expr::Assign { target, value, .. } => {
+                Self::expr_mem_ops(target, c);
+                Self::expr_mem_ops(value, c);
+            }
+            Expr::Range { lo, hi, .. } => {
+                if let Some(l) = lo { Self::expr_mem_ops(l, c); }
+                if let Some(h) = hi { Self::expr_mem_ops(h, c); }
+            }
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. }
+            | Expr::Ident { .. }
+            | Expr::Path { .. } => {}
+        }
+    }
+
+    /// Count arithmetic binary operations.
+    fn expr_arith(e: &Expr, c: &mut usize) {
+        match e {
+            Expr::BinOp { op, lhs, rhs, .. } => {
+                match op {
+                    BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul
+                    | BinOpKind::Div | BinOpKind::Mod | BinOpKind::Pow => *c += 1,
+                    _ => {}
+                }
+                Self::expr_arith(lhs, c);
+                Self::expr_arith(rhs, c);
+            }
+            Expr::UnOp { expr, .. } => { Self::expr_arith(expr, c); }
+            Expr::MatMul { lhs, rhs, .. }
+            | Expr::HadamardMul { lhs, rhs, .. }
+            | Expr::HadamardDiv { lhs, rhs, .. }
+            | Expr::KronProd { lhs, rhs, .. }
+            | Expr::OuterProd { lhs, rhs, .. }
+            | Expr::Pow { base: lhs, exp: rhs, .. } => {
+                *c += 1;
+                Self::expr_arith(lhs, c);
+                Self::expr_arith(rhs, c);
+            }
+            Expr::Call { func, args, .. } => {
+                Self::expr_arith(func, c);
+                for a in args { Self::expr_arith(a, c); }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                Self::expr_arith(receiver, c);
+                for a in args { Self::expr_arith(a, c); }
+            }
+            Expr::VecCtor { elems, .. } | Expr::ArrayLit { elems, .. } => {
+                for el in elems { Self::expr_arith(el, c); }
+            }
+            Expr::Tuple { elems, .. } => {
+                for el in elems { Self::expr_arith(el, c); }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, v) in fields { Self::expr_arith(v, c); }
+            }
+            Expr::Field { object, .. } => { Self::expr_arith(object, c); }
+            Expr::Index { object, indices, .. } => {
+                Self::expr_arith(object, c);
+                for i in indices { Self::expr_arith(i, c); }
+            }
+            Expr::IfExpr { cond, then, else_ } => {
+                Self::expr_arith(cond, c);
+                for s in &then.stmts {
+                    if let Stmt::Let { init: Some(e), .. } = s { Self::expr_arith(e, c); }
+                    if let Stmt::Expr { expr: e, .. } = s { Self::expr_arith(e, c); }
+                }
+                if let Some(else_block) = else_ {
+                    for s in &else_block.stmts {
+                        if let Stmt::Let { init: Some(e), .. } = s { Self::expr_arith(e, c); }
+                        if let Stmt::Expr { expr: e, .. } = s { Self::expr_arith(e, c); }
+                    }
+                }
+            }
+            Expr::Assign { target, value, .. } => {
+                Self::expr_arith(target, c);
+                Self::expr_arith(value, c);
+            }
+            Expr::Cast { expr, .. } | Expr::Grad { inner: expr, .. } => { Self::expr_arith(expr, c); }
+            Expr::Closure { body, .. } => { Self::expr_arith(body, c); }
+            Expr::Block(b) => {
+                for s in &b.stmts {
+                    if let Stmt::Let { init: Some(e), .. } = s { Self::expr_arith(e, c); }
+                    if let Stmt::Expr { expr: e, .. } = s { Self::expr_arith(e, c); }
+                }
+            }
+            Expr::Range { lo, hi, .. } => {
+                if let Some(l) = lo { Self::expr_arith(l, c); }
+                if let Some(h) = hi { Self::expr_arith(h, c); }
+            }
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. }
+            | Expr::Ident { .. }
+            | Expr::Path { .. } => {}
+        }
+    }
+
+    /// Count branch-like expressions (if expressions used as values).
+    fn expr_branches(e: &Expr, c: &mut usize) {
+        match e {
+            Expr::IfExpr { .. } => { *c += 1; }
+            Expr::BinOp { op, lhs, rhs, .. } => {
+                if matches!(op, BinOpKind::And | BinOpKind::Or) { *c += 1; }
+                Self::expr_branches(lhs, c);
+                Self::expr_branches(rhs, c);
+            }
+            Expr::Call { func, args, .. } => {
+                Self::expr_branches(func, c);
+                for a in args { Self::expr_branches(a, c); }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                Self::expr_branches(receiver, c);
+                for a in args { Self::expr_branches(a, c); }
+            }
+            Expr::UnOp { expr, .. } => { Self::expr_branches(expr, c); }
+            Expr::Field { object, .. } => { Self::expr_branches(object, c); }
+            Expr::Index { object, indices, .. } => {
+                Self::expr_branches(object, c);
+                for i in indices { Self::expr_branches(i, c); }
+            }
+            Expr::VecCtor { elems, .. } | Expr::ArrayLit { elems, .. } => {
+                for el in elems { Self::expr_branches(el, c); }
+            }
+            Expr::Tuple { elems, .. } => {
+                for el in elems { Self::expr_branches(el, c); }
+            }
+            Expr::Assign { target, value, .. } => {
+                Self::expr_branches(target, c);
+                Self::expr_branches(value, c);
+            }
+            Expr::Block(b) => {
+                for s in &b.stmts {
+                    if let Stmt::Let { init: Some(e), .. } = s { Self::expr_branches(e, c); }
+                    if let Stmt::Expr { expr: e, .. } = s { Self::expr_branches(e, c); }
+                }
+            }
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. }
+            | Expr::Ident { .. }
+            | Expr::Path { .. }
+            | Expr::Closure { .. }
+            | Expr::Cast { .. }
+            | Expr::Grad { .. }
+            | Expr::Range { .. }
+            | Expr::StructLit { .. }
+            | Expr::MatMul { .. }
+            | Expr::HadamardMul { .. }
+            | Expr::HadamardDiv { .. }
+            | Expr::TensorConcat { .. }
+            | Expr::KronProd { .. }
+            | Expr::OuterProd { .. }
+            | Expr::Pow { .. } => {}
+        }
+    }
+
+    /// Detect whether an expression contains a direct recursive call to `name`.
+    fn expr_calls_self(e: &Expr, name: &str, flag: &mut bool) {
+        if *flag { return; } // short-circuit
+        match e {
+            Expr::Call { func, args, .. } => {
+                if let Expr::Ident { name: n, .. } = func.as_ref() {
+                    if n == name { *flag = true; return; }
+                }
+                Self::expr_calls_self(func, name, flag);
+                for a in args { Self::expr_calls_self(a, name, flag); }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                Self::expr_calls_self(receiver, name, flag);
+                for a in args { Self::expr_calls_self(a, name, flag); }
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::expr_calls_self(lhs, name, flag);
+                Self::expr_calls_self(rhs, name, flag);
+            }
+            Expr::UnOp { expr, .. } => { Self::expr_calls_self(expr, name, flag); }
+            Expr::Field { object, .. } => { Self::expr_calls_self(object, name, flag); }
+            Expr::Index { object, indices, .. } => {
+                Self::expr_calls_self(object, name, flag);
+                for i in indices { Self::expr_calls_self(i, name, flag); }
+            }
+            Expr::VecCtor { elems, .. } | Expr::ArrayLit { elems, .. } => {
+                for el in elems { Self::expr_calls_self(el, name, flag); }
+            }
+            Expr::Tuple { elems, .. } => {
+                for el in elems { Self::expr_calls_self(el, name, flag); }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, v) in fields { Self::expr_calls_self(v, name, flag); }
+            }
+            Expr::IfExpr { cond, then, else_ } => {
+                Self::expr_calls_self(cond, name, flag);
+                for s in &then.stmts {
+                    if let Stmt::Let { init: Some(e), .. } = s { Self::expr_calls_self(e, name, flag); }
+                    if let Stmt::Expr { expr: e, .. } = s { Self::expr_calls_self(e, name, flag); }
+                }
+                if let Some(else_block) = else_ {
+                    for s in &else_block.stmts {
+                        if let Stmt::Let { init: Some(e), .. } = s { Self::expr_calls_self(e, name, flag); }
+                        if let Stmt::Expr { expr: e, .. } = s { Self::expr_calls_self(e, name, flag); }
+                    }
+                }
+            }
+            Expr::Assign { target, value, .. } => {
+                Self::expr_calls_self(target, name, flag);
+                Self::expr_calls_self(value, name, flag);
+            }
+            Expr::Block(b) => {
+                for s in &b.stmts {
+                    if let Stmt::Let { init: Some(e), .. } = s { Self::expr_calls_self(e, name, flag); }
+                    if let Stmt::Expr { expr: e, .. } = s { Self::expr_calls_self(e, name, flag); }
+                }
+            }
+            Expr::Closure { body, .. } => { Self::expr_calls_self(body, name, flag); }
+            Expr::Cast { expr, .. } | Expr::Grad { inner: expr, .. } => {
+                Self::expr_calls_self(expr, name, flag);
+            }
+            Expr::MatMul { lhs, rhs, .. }
+            | Expr::HadamardMul { lhs, rhs, .. }
+            | Expr::HadamardDiv { lhs, rhs, .. }
+            | Expr::TensorConcat { lhs, rhs, .. }
+            | Expr::KronProd { lhs, rhs, .. }
+            | Expr::OuterProd { lhs, rhs, .. }
+            | Expr::Pow { base: lhs, exp: rhs, .. } => {
+                Self::expr_calls_self(lhs, name, flag);
+                Self::expr_calls_self(rhs, name, flag);
+            }
+            Expr::Range { lo, hi, .. } => {
+                if let Some(l) = lo { Self::expr_calls_self(l, name, flag); }
+                if let Some(h) = hi { Self::expr_calls_self(h, name, flag); }
+            }
+            Expr::IntLit { .. }
+            | Expr::FloatLit { .. }
+            | Expr::BoolLit { .. }
+            | Expr::StrLit { .. }
+            | Expr::Ident { .. }
+            | Expr::Path { .. } => {}
+        }
+    }
 
     /// Compile with differentiable optimization
     pub fn compile_with_diff_opt(&mut self, program: &Program) -> OptConfig {

@@ -197,8 +197,12 @@ impl HwFeedbackCollector {
 
     /// Start profiling
     pub fn start_profiling(&mut self) -> Result<(), String> {
-        // TODO: fix perf event code — Linux perf_event_open integration disabled
-        // Simulate profiling on all platforms for now
+        // On Linux, open real perf_event file descriptors.
+        // On other platforms, fall back to simulated counters.
+        #[cfg(target_os = "linux")]
+        {
+            self.open_perf_events();
+        }
         self.profiling_active = true;
         self.profile_start = Some(Instant::now());
         Ok(())
@@ -214,45 +218,34 @@ impl HwFeedbackCollector {
             .map(|start| start.elapsed())
             .unwrap_or(Duration::from_secs(0));
 
-        // TODO: fix perf event code — Linux perf counter reading disabled
-        // Generate simulated profile on all platforms for now
+        // On Linux, try reading real hardware counters first.
+        // If that fails (or on non-Linux), fall back to simulated values.
         let mut counters = HashMap::new();
-        counters.insert(PerfEvent::Cycles, PerfCounterValue {
-            event: PerfEvent::Cycles,
-            value: 1_000_000,
-            time_enabled: duration.as_nanos() as u64,
-            time_running: duration.as_nanos() as u64,
-        });
-        counters.insert(PerfEvent::Instructions, PerfCounterValue {
-            event: PerfEvent::Instructions,
-            value: 2_000_000,
-            time_enabled: duration.as_nanos() as u64,
-            time_running: duration.as_nanos() as u64,
-        });
-        counters.insert(PerfEvent::CacheReferences, PerfCounterValue {
-            event: PerfEvent::CacheReferences,
-            value: 500_000,
-            time_enabled: duration.as_nanos() as u64,
-            time_running: duration.as_nanos() as u64,
-        });
-        counters.insert(PerfEvent::CacheMisses, PerfCounterValue {
-            event: PerfEvent::CacheMisses,
-            value: 50_000,
-            time_enabled: duration.as_nanos() as u64,
-            time_running: duration.as_nanos() as u64,
-        });
-        counters.insert(PerfEvent::BranchInstructions, PerfCounterValue {
-            event: PerfEvent::BranchInstructions,
-            value: 200_000,
-            time_enabled: duration.as_nanos() as u64,
-            time_running: duration.as_nanos() as u64,
-        });
-        counters.insert(PerfEvent::BranchMispredicts, PerfCounterValue {
-            event: PerfEvent::BranchMispredicts,
-            value: 10_000,
-            time_enabled: duration.as_nanos() as u64,
-            time_running: duration.as_nanos() as u64,
-        });
+
+        #[cfg(target_os = "linux")]
+        {
+            self.read_perf_counters(&mut counters, duration);
+            self.close_perf_events();
+        }
+
+        // Fill in any counters that we couldn't read from hardware.
+        let default_nanos = duration.as_nanos() as u64;
+        let defaults: &[(PerfEvent, u64)] = &[
+            (PerfEvent::Cycles,           1_000_000),
+            (PerfEvent::Instructions,     2_000_000),
+            (PerfEvent::CacheReferences,    500_000),
+            (PerfEvent::CacheMisses,         50_000),
+            (PerfEvent::BranchInstructions, 200_000),
+            (PerfEvent::BranchMispredicts,   10_000),
+        ];
+        for &(ref event, value) in defaults {
+            counters.entry(*event).or_insert(PerfCounterValue {
+                event: *event,
+                value,
+                time_enabled: default_nanos,
+                time_running: default_nanos,
+            });
+        }
 
         self.profiling_active = false;
         self.profile_start = None;
@@ -266,21 +259,115 @@ impl HwFeedbackCollector {
         })
     }
 
-    // TODO: fix perf event code
-    // The following Linux perf_event methods are commented out because:
-    //   - libc does not expose perf_event_attr on all platforms
-    //   - The disable_perf_event function was garbled beyond recovery
-    //   - IOCTL_PERF_EVENT_DISABLE / _IOC_NONE / _IOC_SIZE do not exist in libc
-    // Re-enable and implement properly when targeting a specific Linux version.
+    // ── Linux perf_event_open integration ──────────────────────────────────
     //
-    // #[cfg(target_os = "linux")]
-    // fn open_perf_event(&self, event: PerfEvent) -> Result<i32, String> { ... }
-    // #[cfg(target_os = "linux")]
-    // fn enable_perf_event(&self, fd: i32) -> Result<(), String> { ... }
-    // #[cfg(target_os = "linux")]
-    // fn disable_perf_event(&self, fd: i32) -> Result<(), String> { ... }
-    // #[cfg(target_os = "linux")]
-    // fn read_perf_counter(&self, fd: i32) -> Result<u64, String> { ... }
+    // We define `perf_event_attr` locally because libc does not expose it on
+    // all platforms.  The ioctl constants are computed inline rather than
+    // depending on libc macros that may be absent.
+
+    /// Open perf_event file descriptors for the standard counter set.
+    #[cfg(target_os = "linux")]
+    fn open_perf_events(&mut self) {
+        // perf_event_attr layout — only the fields we need.
+        #[repr(C)]
+        #[derive(Default)]
+        struct PerfEventAttr {
+            type_: u32,
+            size: u32,
+            config: u64,
+            sample_period_or_freq: u64,
+            sample_type: u64,
+            read_format: u64,
+            flags: u64,
+            wakeup_events_or_watermark: u32,
+            bp_type: u32,
+            bp_addr_or_config1: u64,
+            bp_len_or_config2: u64,
+            branch_sample_type: u64,
+            sample_regs_user: u64,
+            sample_stack_user: u32,
+            clockid: i32,
+            sample_regs_intr: u64,
+            aux_watermark: u32,
+            sample_max_stack: u16,
+            _pad: u16,
+        }
+
+        const PERF_TYPE_HARDWARE: u32 = 0;
+        const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
+        const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+        const PERF_COUNT_HW_CACHE_REFERENCES: u64 = 2;
+        const PERF_COUNT_HW_CACHE_MISSES: u64 = 3;
+        const PERF_COUNT_HW_BRANCH_INSTRUCTIONS: u64 = 4;
+        const PERF_COUNT_HW_BRANCH_MISSES: u64 = 5;
+
+        let event_map: Vec<(PerfEvent, u64)> = vec![
+            (PerfEvent::Cycles, PERF_COUNT_HW_CPU_CYCLES),
+            (PerfEvent::Instructions, PERF_COUNT_HW_INSTRUCTIONS),
+            (PerfEvent::CacheReferences, PERF_COUNT_HW_CACHE_REFERENCES),
+            (PerfEvent::CacheMisses, PERF_COUNT_HW_CACHE_MISSES),
+            (PerfEvent::BranchInstructions, PERF_COUNT_HW_BRANCH_INSTRUCTIONS),
+            (PerfEvent::BranchMispredicts, PERF_COUNT_HW_BRANCH_MISSES),
+        ];
+
+        for (event, config) in &event_map {
+            let mut attr = PerfEventAttr::default();
+            attr.type_ = PERF_TYPE_HARDWARE;
+            attr.size = std::mem::size_of::<PerfEventAttr>() as u32;
+            attr.config = *config;
+            attr.flags = 1; // disabled=1 so we can enable after grouping
+
+            let fd = unsafe {
+                libc::syscall(
+                    298, // __NR_perf_event_open on x86-64
+                    &attr as *const PerfEventAttr as *const libc::c_void,
+                    0,   // pid: 0 = current process
+                    -1i32 as libc::c_ulong, // cpu: -1 = any
+                    -1i32 as libc::c_ulong, // group_fd: -1 = no group
+                    0,   // flags
+                )
+            };
+
+            if fd >= 0 {
+                // Enable the counter immediately.
+                let _ = unsafe {
+                    libc::ioctl(fd as i32, 0x2401, 0) // PERF_EVENT_IOC_ENABLE
+                };
+                self.perf_fds.insert(*event, fd as i32);
+            }
+        }
+    }
+
+    /// Read current values from open perf file descriptors into `counters`.
+    #[cfg(target_os = "linux")]
+    fn read_perf_counters(&self, counters: &mut HashMap<PerfEvent, PerfCounterValue>, duration: Duration) {
+        // read_format = 0 means a single u64 value is returned.
+        for (&event, &fd) in &self.perf_fds {
+            let mut buf: u64 = 0;
+            let n = unsafe {
+                libc::read(fd, &mut buf as *mut u64 as *mut libc::c_void, 8)
+            };
+            if n == 8 {
+                counters.insert(event, PerfCounterValue {
+                    event,
+                    value: buf,
+                    time_enabled: duration.as_nanos() as u64,
+                    time_running: duration.as_nanos() as u64,
+                });
+            }
+        }
+    }
+
+    /// Close all open perf file descriptors.
+    #[cfg(target_os = "linux")]
+    fn close_perf_events(&mut self) {
+        for (_, &fd) in &self.perf_fds {
+            if fd >= 0 {
+                unsafe { libc::close(fd); }
+            }
+        }
+        self.perf_fds.clear();
+    }
 
     /// Get current counter values (without stopping profiling)
     pub fn snapshot_counters(&self) -> HashMap<PerfEvent, PerfCounterValue> {

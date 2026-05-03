@@ -1,6 +1,5 @@
 // Module declarations for the Jules compiler/interpreter.
 // In this repository layout the source files live in the crate root.
-#[allow(dead_code)]
 #[allow(unused_variables)]
 #[allow(unused_macros)]
 #[allow(clippy::drop_ref)]

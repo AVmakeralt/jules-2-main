@@ -1373,11 +1373,11 @@ pub fn run_algebra_simplify(func: &mut IRFunction) {
 /// Group constants together to enable constant folding.
 pub fn run_reassociate(func: &mut IRFunction) {
     // Build value map for substitution
-    let value_map: HashMap<VarId, &IRInstr> = func.blocks.values()
+    let value_map: HashMap<VarId, IRInstr> = func.blocks.values()
         .flat_map(|b| b.instrs.iter())
         .filter_map(|i| {
             if let Some(d) = instr_def(i) {
-                Some((d, i))
+                Some((d, i.clone()))
             } else {
                 None
             }
@@ -1395,7 +1395,7 @@ pub fn run_reassociate(func: &mut IRFunction) {
                         if let Some(&IRInstr::Const { value: c1, .. }) = value_map.get(&inner_rhs) {
                             if let IRInstr::Const { value: c2, .. } = instr {
                                 // Fold: (a + c1) + c2 = a + (c1 + c2)
-                                let new_const = c1.wrapping_add(c2);
+                                let new_const = c1.wrapping_add(*c2);
                                 let new_lhs = inner_lhs;
                                 let new_rhs_var = func.next_var;
                                 func.next_var += 1;
@@ -1407,7 +1407,7 @@ pub fn run_reassociate(func: &mut IRFunction) {
                         // Same for (c1 + a) + c2 = c1 + (a + c2)
                         if let Some(&IRInstr::Const { value: c1, .. }) = value_map.get(&inner_lhs) {
                             if let IRInstr::Const { value: c2, .. } = instr {
-                                let new_const = c1.wrapping_add(c2);
+                                let new_const = c1.wrapping_add(*c2);
                                 let new_lhs = inner_rhs;
                                 let new_rhs_var = func.next_var;
                                 func.next_var += 1;
@@ -1424,7 +1424,7 @@ pub fn run_reassociate(func: &mut IRFunction) {
                     if let Some(&IRInstr::Mul { lhs: inner_lhs, rhs: inner_rhs, .. }) = value_map.get(lhs) {
                         if let Some(&IRInstr::Const { value: c1, .. }) = value_map.get(&inner_rhs) {
                             if let IRInstr::Const { value: c2, .. } = instr {
-                                let new_const = c1.wrapping_mul(c2);
+                                let new_const = c1.wrapping_mul(*c2);
                                 let new_lhs = inner_lhs;
                                 let new_rhs_var = func.next_var;
                                 func.next_var += 1;

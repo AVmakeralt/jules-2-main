@@ -508,13 +508,40 @@ pub struct Tensor {
 #[derive(Debug, Clone)]
 pub enum TensorStorage {
     Cpu(Vec<f32>),
-    /// Placeholder for a GPU buffer handle (wgpu BufferId / CUDA pointer).
+    /// GPU buffer handle backed by the wgpu / CUDA runtime.
+    /// The `GpuBufferHandle` stores an opaque ID assigned by the GPU backend
+    /// when the tensor was uploaded.  Operations on `Gpu` tensors delegate
+    /// to the `GpuBackend` trait through the interpreter's `gpu` field.
+    /// When no GPU backend is configured, attempting to read data from a
+    /// `Gpu` tensor will return an error.
     Gpu(GpuBufferHandle),
 }
 
-/// Opaque handle to a GPU buffer.  Filled in by the GPU backend.
+/// Opaque handle to a GPU buffer.
+///
+/// The `u64` inner value is an ID assigned by the GPU backend when a tensor
+/// is uploaded to the device.  It can be used with `GpuBackend::download` to
+/// retrieve the data, or with `GpuBackend::matmul` / `elementwise` to perform
+/// compute operations on the GPU without round-tripping through CPU memory.
 #[derive(Debug, Clone)]
 pub struct GpuBufferHandle(pub u64);
+
+impl GpuBufferHandle {
+    /// Create a new GPU buffer handle with the given ID.
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Get the underlying buffer ID.
+    pub fn id(&self) -> u64 {
+        self.0
+    }
+
+    /// Check whether this handle refers to a valid (non-null) GPU buffer.
+    pub fn is_valid(&self) -> bool {
+        self.0 != 0
+    }
+}
 
 impl Tensor {
     #[inline]
@@ -7355,10 +7382,9 @@ impl Interpreter {
                     args.get(2).and_then(|v| v.as_f64()),
                     args.get(3).and_then(|v| v.as_f64()),
                 ) {
-                    let _world = self.physics_world.as_ref().unwrap().lock().unwrap();
-                    // Placeholder: force integration API is not currently exposed.
-                    let _ = (body_id, fx, fy, fz);
-                    Ok(Value::Bool(false))
+                    let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    let applied = world.apply_force(body_id as u32, fx as f32, fy as f32, fz as f32);
+                    Ok(Value::Bool(applied))
                 } else {
                     rt_err!("physics::apply_force requires (body_id, fx, fy, fz)")
                 }

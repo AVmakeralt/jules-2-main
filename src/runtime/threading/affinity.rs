@@ -30,9 +30,61 @@ pub fn set_thread_affinity(cpu_id: usize) -> Result<(), String> {
     }
     
     #[cfg(not(feature = "numa"))]
+    #[cfg(target_os = "linux")]
     {
-        // Stub implementation when NUMA feature is disabled
-        Ok(())
+        // When the NUMA feature is disabled we still provide a working
+        // affinity implementation on Linux using raw libc syscalls.
+        // We define a minimal cpu_set_t layout inline so that we do not
+        // depend on the `numa` feature flag.
+        #[repr(C)]
+        struct RawCpuSet {
+            bits: [u64; 16], // enough for up to 1024 CPUs
+        }
+
+        unsafe fn raw_cpu_zero(set: &mut RawCpuSet) {
+            set.bits.fill(0);
+        }
+
+        unsafe fn raw_cpu_set(cpu: usize, set: &mut RawCpuSet) {
+            let word = cpu / 64;
+            let bit = cpu % 64;
+            if word < set.bits.len() {
+                set.bits[word] |= 1u64 << bit;
+            }
+        }
+
+        unsafe fn raw_sched_setaffinity(pid: libc::pid_t, set: &RawCpuSet) -> i32 {
+            libc::syscall(
+                libc::SYS_sched_setaffinity,
+                pid as libc::c_ulong,
+                std::mem::size_of::<RawCpuSet>() as libc::c_ulong,
+                set as *const RawCpuSet as *const libc::c_void,
+            ) as i32
+        }
+
+        unsafe {
+            let mut set: RawCpuSet = std::mem::zeroed();
+            raw_cpu_zero(&mut set);
+            raw_cpu_set(cpu_id, &mut set);
+
+            let pid = libc::getpid();
+            let result = raw_sched_setaffinity(pid, &set);
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Failed to set thread affinity: errno {}",
+                    *libc::__errno_location()
+                ))
+            }
+        }
+    }
+
+    #[cfg(not(feature = "numa"))]
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Non-Linux, non-NUMA: no affinity support available.
+        Err("CPU affinity not supported on this platform without the NUMA feature".to_string())
     }
     
     #[cfg(feature = "numa")]

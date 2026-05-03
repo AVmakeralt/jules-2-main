@@ -437,31 +437,12 @@ impl MatmulKernel for Bf16Avx512Kernel {
         // BF16 conversion followed by AVX-512 BF16 matmul
         // AVX-512 BF16 provides _mm256_cvtne2ps_pbh for converting float to bf16
         // and _mm256_dpbf16_ps for dot product of bf16 vectors
+        // BF16 kernel: requires avx512bf16 intrinsics with proper __m256bh types.
+        // Fall back to FP32 AVX-512 for now; full BF16 implementation would use
+        // _mm256_cvtne2ps_pbh for float-to-bf16 and _mm256_dpbf16_ps for dot product.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if is_x86_feature_detected!("avx512bf") {
-            unsafe {
-                use std::arch::x86_64::*;
-                // Convert to bf16 and use _mm512_dpbf16_ps
-                // This is a simplified implementation - full version would pack properly
-                for i in 0..m {
-                    for j in 0..n {
-                        let mut sum = 0.0f32;
-                        for p in (0..k).step_by(8) {
-                            // Pack 8 floats to 8 bf16
-                            let a_blk = _mm256_loadu_ps(a.as_ptr().add(i * k + p));
-                            let b_blk = _mm256_loadu_ps(b.as_ptr().add(p * n + j));
-                            // Convert and compute using VNNI-style BF16
-                            let result = _mm256_dpbf16_ps(
-                                _mm256_setzero_ps(),
-                                _mm256_cvtps_ph(a_blk, 0), // Round to nearest
-                                _mm256_cvtps_ph(b_blk, 0),
-                            );
-                            sum += _mm256_cvtss_f32(result);
-                        }
-                        c[i * ldc + j] += sum;
-                    }
-                }
-            }
+        if is_x86_feature_detected!("avx512f") {
+            Fp32Avx512Kernel.gemm(a, b, c, m, k, n, _lda, _ldb, ldc);
         } else {
             Fp32Avx512Kernel.gemm(a, b, c, m, k, n, _lda, _ldb, ldc);
         }
@@ -479,25 +460,12 @@ pub struct Fp16Avx512Kernel;
 impl MatmulKernel for Fp16Avx512Kernel {
     fn gemm(&self, a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize, _lda: usize, _ldb: usize, ldc: usize) {
         // Similar to BF16 but using standard FP16 conversion
+        // FP16 kernel: _mm256_cvtph_ps expects __m128i (not __m256i from _mm256_castps_si256).
+        // Fall back to FP32 AVX-512 for now; full FP16 implementation would use proper
+        // 128-bit loads and _mm256_cvtph_ps for half-to-float conversion.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if is_x86_feature_detected!("avx512f") {
-            unsafe {
-                use std::arch::x86_64::*;
-                for i in 0..m {
-                    for j in 0..n {
-                        let mut sum = 0.0f32;
-                        for p in (0..k).step_by(16) {
-                            let a_lo = _mm256_cvtph_ps(_mm256_castps_si256(_mm256_loadu_ps(a.as_ptr().add(i * k + p))));
-                            let a_hi = _mm256_cvtph_ps(_mm256_castps_si256(_mm256_loadu_ps(a.as_ptr().add(i * k + p + 8))));
-                            let b_lo = _mm256_cvtph_ps(_mm256_castps_si256(_mm256_loadu_ps(b.as_ptr().add(p * n + j))));
-                            let b_hi = _mm256_cvtph_ps(_mm256_castps_si256(_mm256_loadu_ps(b.as_ptr().add((p + 8) * n + j))));
-                            sum += _mm256_cvtss_f32(_mm256_mul_ps(a_lo, b_lo));
-                            sum += _mm256_cvtss_f32(_mm256_mul_ps(a_hi, b_hi));
-                        }
-                        c[i * ldc + j] += sum;
-                    }
-                }
-            }
+            Fp32Avx512Kernel.gemm(a, b, c, m, k, n, _lda, _ldb, ldc);
         } else {
             Fp32Avx512Kernel.gemm(a, b, c, m, k, n, _lda, _ldb, ldc);
         }
@@ -524,37 +492,12 @@ impl QuantizedKernel for Int8Avx2Kernel {
         k: usize,
         n: usize,
     ) {
+        // INT8 AVX2 kernel: _mm256_cvtepi8_ps does not exist; proper approach uses
+        // _mm_cvtepi8_epi32 (_mm128i -> _mm256i) then _mm256_cvtepi32_ps.
+        // Fall back to scalar for now.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if is_x86_feature_detected!("avx2") {
-            unsafe {
-                use std::arch::x86_64::*;
-                for i in 0..m {
-                    for o in 0..n {
-                        let scale = scales[o];
-                        let mut acc = 0.0f32;
-                        let mut idx = 0usize;
-                        
-                        // Process 8 elements at a time with AVX2
-                        while idx + 8 <= k {
-                            let a_vals = _mm256_loadu_ps(a.as_ptr().add(i * k + idx));
-                            // Load quantized weights and convert
-                            let w_lo = _mm256_cvtepi8_ps(_mm256_loadu_si256(qweight.as_ptr().add(idx * n + o) as *const __m256i));
-                            let w_hi = _mm256_cvtepi8_ps(_mm256_loadu_si256(qweight.as_ptr().add((idx + 4) * n + o) as *const __m256i));
-                            
-                            let mul_lo = _mm256_mul_ps(a_vals, _mm256_set1_ps(w_lo));
-                            let mul_hi = _mm256_mul_ps(a_vals, _mm256_set1_ps(w_hi));
-                            acc += _mm256_cvtss_f32(_mm256_hadd_ps(mul_lo, mul_hi));
-                            idx += 8;
-                        }
-                        
-                        acc *= scale;
-                        if let Some(b) = bias {
-                            acc += b[o];
-                        }
-                        c[i * n + o] = acc;
-                    }
-                }
-            }
+            Self::scalar_fallback(a, qweight, scales, bias, c, m, k, n);
         } else {
             // Fallback to scalar
             Self::scalar_fallback(a, qweight, scales, bias, c, m, k, n);
@@ -614,35 +557,11 @@ impl QuantizedKernel for Int8Avx512VnniKernel {
         k: usize,
         n: usize,
     ) {
+        // INT8 AVX512-VNNI kernel: _mm256_dpbusd_epi32 expects (__m256i, __m256i, __m256i)
+        // but we have __m256 and __m512i args. Fall back to INT8 AVX2 scalar for now.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if is_x86_feature_detected!("avx512vnni") {
-            unsafe {
-                use std::arch::x86_64::*;
-                for i in 0..m {
-                    for o in (0..n).step_by(4) {
-                        let scale = scales[o];
-                        let mut acc = [_mm256_setzero_ps(); 4];
-                        
-                        let mut idx = 0usize;
-                        while idx + 16 <= k {
-                            let a_vec = _mm512_loadu_ps(a.as_ptr().add(i * k + idx));
-                            // Use VPDPBSSDs for INT8 VNNI
-                            for sub_o in 0..4 {
-                                let w_ptr = qweight.as_ptr().add(idx * n + o + sub_o);
-                                let w_vec = _mm512_loadu_si512(w_ptr as *const _);
-                                acc[sub_o] = _mm256_dpbusd_epi32(acc[sub_o], _mm256_castps_si256(a_vec), w_vec);
-                            }
-                            idx += 16;
-                        }
-                        
-                        for sub_o in 0..4 {
-                            let val = _mm256_cvtepi32_ps(_mm256_set1_epi32(0)); // Convert from epi32
-                            let out = _mm256_mul_ps(val, _mm256_set1_ps(scale));
-                            c[i * n + o + sub_o] = _mm256_cvtss_f32(out);
-                        }
-                    }
-                }
-            }
+            Int8Avx2Kernel.gemm_quantized(a, qweight, scales, bias, c, m, k, n);
         } else {
             Int8Avx2Kernel.gemm_quantized(a, qweight, scales, bias, c, m, k, n);
         }
@@ -788,27 +707,15 @@ impl ActivationKernel for SiluGeluAvx512Kernel {
                 let mut i = 0usize;
                 
                 while i + 16 <= data.len() {
-                    let x = _mm512_loadu_ps(data.as_ptr().add(i));
-                    
-                    // SiLU: x * sigmoid(x)
-                    let sigmoid = _mm512_div_ps(
-                        _mm512_set1_ps(1.0),
-                        _mm512_add_ps(_mm512_set1_ps(1.0), _mm512_exp_ps(_mm512_neg_ps(x)))
-                    );
-                    let silu = _mm512_mul_ps(x, sigmoid);
-                    
-                    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-                    let k = (2.0 / std::f32::consts::PI).sqrt();
-                    let cubic = _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(0.044715), x), _mm512_mul_ps(x, x));
-                    let inner = _mm512_mul_ps(_mm512_set1_ps(k), _mm512_add_ps(x, cubic));
-                    let tanh_val = _mm512_tanh_ps(inner);
-                    let gelu = _mm512_mul_ps(
-                        _mm512_mul_ps(_mm512_set1_ps(0.5), x),
-                        _mm512_add_ps(_mm512_set1_ps(1.0), tanh_val)
-                    );
-                    
-                    // Return GELU result (SiLU would require sigmoid)
-                    _mm512_storeu_ps(output.as_mut_ptr().add(i), gelu);
+                    // AVX-512 does not provide _mm512_exp_ps, _mm512_neg_ps, or _mm512_tanh_ps.
+                    // Use scalar computation for each element in the 16-wide chunk.
+                    for j in 0..16 {
+                        let x = *data.as_ptr().add(i + j);
+                        let k = (2.0 / std::f32::consts::PI).sqrt();
+                        let cubic = 0.044715 * x * x * x;
+                        let inner = k * (x + cubic);
+                        output[i + j] = 0.5 * x * (1.0 + inner.tanh());
+                    }
                     i += 16;
                 }
                 
@@ -1035,9 +942,48 @@ impl KernelTensorConversion for Vec<f32> {
                     fp16.to_le_bytes().to_vec()
                 }).flatten().collect()
             }
-            _ => unimplemented!(),
+            DataType::Int8 => {
+                // INT8 quantization: scale float values to [-128, 127] range
+                // Per-tensor quantization with a single scale factor
+                let max_abs = self.iter().map(|f| f.abs()).fold(0.0f32, f32::max);
+                let scale = max_abs / 127.0;
+                if scale > 0.0 {
+                    self.iter().flat_map(|&f| {
+                        let q = (f / scale).round().clamp(-128.0, 127.0) as i8;
+                        q.to_le_bytes().to_vec()
+                    }).collect()
+                } else {
+                    self.iter().flat_map(|_| 0i8.to_le_bytes().to_vec()).collect()
+                }
+            }
+            DataType::Int4 => {
+                // INT4 quantization: pack two values per byte
+                let max_abs = self.iter().map(|f| f.abs()).fold(0.0f32, f32::max);
+                let scale = max_abs / 7.0;
+                let mut packed = Vec::with_capacity((self.len() + 1) / 2);
+                for chunk in self.chunks(2) {
+                    let lo = if scale > 0.0 {
+                        ((chunk[0] / scale).round().clamp(-8.0, 7.0) as i8 & 0x0F) as u8
+                    } else { 0 };
+                    let hi = if chunk.len() > 1 && scale > 0.0 {
+                        ((chunk[1] / scale).round().clamp(-8.0, 7.0) as i8 & 0x0F) as u8
+                    } else { 0 };
+                    packed.push(lo | (hi << 4));
+                }
+                packed
+            }
+            DataType::UInt8 => {
+                // UInt8 quantization: scale to [0, 255] range
+                let min_val = self.iter().cloned().fold(f32::MAX, f32::min);
+                let max_val = self.iter().cloned().fold(f32::MIN, f32::max);
+                let range = max_val - min_val;
+                let scale = if range > 0.0 { range / 255.0 } else { 1.0 };
+                self.iter().flat_map(|&f| {
+                    let q = ((f - min_val) / scale).round().clamp(0.0, 255.0) as u8;
+                    q.to_le_bytes().to_vec()
+                }).collect()
+            }
         };
-        
         KernelBuffer {
             data: packed_data,
             dtype,
@@ -1049,14 +995,36 @@ impl KernelTensorConversion for Vec<f32> {
     fn from_kernel_buffer(buffer: &KernelBuffer) -> Vec<f32> {
         match buffer.dtype {
             DataType::Fp32 => {
-                let mut result = Vec::with_capacity(buffer.data.len() / 4);
-                for chunk in buffer.data.chunks(4) {
-                    let bits = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    result.push(f32::from_bits(bits));
-                }
-                result
+                buffer.data.chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect()
             }
-            _ => unimplemented!(),
+            DataType::Fp16 | DataType::Bf16 => {
+                buffer.data.chunks_exact(2)
+                    .map(|chunk| {
+                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        f32::from_bits((bits as u32) << 16)
+                    })
+                    .collect()
+            }
+            DataType::Int8 => {
+                let max_abs = buffer.data.iter().map(|&b| (b as i8).abs() as f32).fold(0.0f32, f32::max);
+                let scale = max_abs / 127.0;
+                buffer.data.iter().map(|&b| (b as i8) as f32 * scale).collect()
+            }
+            DataType::Int4 => {
+                let scale = 1.0 / 7.0;
+                buffer.data.iter().flat_map(|&byte| {
+                    let lo = ((byte & 0x0F) as i8) as f32 * scale;
+                    let hi = (((byte >> 4) & 0x0F) as i8) as f32 * scale;
+                    vec![lo, hi]
+                }).collect()
+            }
+            DataType::UInt8 => {
+                let min_val = 0.0f32;
+                let scale = 1.0f32;
+                buffer.data.iter().map(|&b| min_val + b as f32 * scale).collect()
+            }
         }
     }
 }

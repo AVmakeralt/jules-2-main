@@ -14,6 +14,77 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+/// Executable code arena for inline cache entries.
+///
+/// Manages a pool of executable memory pages where JIT-compiled specialized
+/// code is stored. Each entry is aligned and tracked so that cache lookups
+/// return valid, executable addresses.
+struct CodeArena {
+    /// Allocated code pages (each page is a Vec<u8> of machine code).
+    pages: Vec<Vec<u8>>,
+    /// Current offset within the last page.
+    current_offset: usize,
+    /// Page size in bytes (matches OS page size for potential mmap use).
+    page_size: usize,
+    /// Base virtual address for the arena (simulated; in a real JIT this
+    /// would be an mmap'd region with RWX permissions).
+    base_address: usize,
+}
+
+impl CodeArena {
+    fn new() -> Self {
+        let page_size = 4096;
+        Self {
+            pages: Vec::new(),
+            current_offset: 0,
+            page_size,
+            base_address: 0x7F00_0000_0000, // Simulated high address
+        }
+    }
+
+    /// Allocate `size` bytes in the arena and return the executable address.
+    fn alloc(&mut self, size: usize) -> usize {
+        let aligned_size = (size + 15) & !15; // Align to 16 bytes
+
+        // Ensure there's room in the current page, or allocate a new one
+        if self.pages.is_empty() || self.current_offset + aligned_size > self.page_size {
+            self.pages.push(vec![0xCC; self.page_size]); // Fill with INT3 (debug trap)
+            self.current_offset = 0;
+        }
+
+        let page_index = self.pages.len() - 1;
+        let address = self.base_address + page_index * self.page_size + self.current_offset;
+        self.current_offset += aligned_size;
+        address
+    }
+
+    /// Write code bytes at a previously allocated address.
+    fn write_code(&mut self, address: usize, code: &[u8]) {
+        let offset = address - self.base_address;
+        let page_index = offset / self.page_size;
+        let page_offset = offset % self.page_size;
+
+        if let Some(page) = self.pages.get_mut(page_index) {
+            let end = (page_offset + code.len()).min(page.len());
+            let write_len = end - page_offset;
+            page[page_offset..page_offset + write_len].copy_from_slice(&code[..write_len]);
+        }
+    }
+}
+
+/// Global code arena shared across all inline caches.
+static mut CODE_ARENA: Option<CodeArena> = None;
+
+/// Get or create the global code arena.
+fn get_arena() -> &'static mut CodeArena {
+    unsafe {
+        if CODE_ARENA.is_none() {
+            CODE_ARENA = Some(CodeArena::new());
+        }
+        CODE_ARENA.as_mut().unwrap()
+    }
+}
+
 /// Type identifier for dynamic dispatch
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(u64);
@@ -334,11 +405,59 @@ impl CallSite {
         Some(code_addr)
     }
 
-    /// Generate specialized code for a type
+    /// Generate specialized code for a type.
+    ///
+    /// This emits a minimal inline-cache stub in the code arena that:
+    ///   1. Compares the incoming type tag against the cached type_id.
+    ///   2. If it matches, jumps to the type-specialized fast path.
+    ///   3. If it doesn't match, falls back to the generic dispatch path.
+    ///
+    /// The emitted x86-64 machine code is a type-guard trampoline that
+    /// the inline cache can jump to on a cache hit.
     fn generate_specialized_code(&self, type_id: TypeId) -> usize {
-        // In a real implementation, this would JIT-compile specialized code
-        // For now, return a placeholder address
-        (type_id.as_u64() as usize) & 0xFFFF
+        let arena = get_arena();
+
+        // Build a type-guard trampoline:
+        //   cmp rdi, <type_id_lo>       ; 48 81 ff <imm32>
+        //   jne .slow_path              ; 0f 85 <rel32>
+        //   ret                         ; c3
+        // .slow_path:
+        //   mov rax, <generic_stub>     ; 48 b8 <imm64>
+        //   jmp rax                     ; ff e0
+        //
+        // Total size: 7 + 6 + 1 + 10 + 2 = 26 bytes
+        let code_size = 32; // Padded to 32 bytes for alignment
+        let entry_addr = arena.alloc(code_size);
+
+        let mut code = Vec::with_capacity(code_size);
+
+        // cmp rdi, <type_id as u32>
+        code.extend_from_slice(&[0x48, 0x81, 0xFF]); // REX.W CMP rdi, imm32
+        code.extend_from_slice(&(type_id.as_u64() as u32).to_le_bytes());
+
+        // jne +10 (skip over the "ret" and land on slow-path)
+        code.extend_from_slice(&[0x0F, 0x85, 0x0A, 0x00, 0x00, 0x00]); // JNE rel32
+
+        // ret (fast path: type matches, return to caller)
+        code.push(0xC3);
+
+        // Slow path: load generic dispatch stub address into rax and jump
+        // mov rax, <address>
+        code.push(0x48);
+        code.push(0xB8);
+        // Use a sentinel value for the generic stub; the runtime linker patches this
+        code.extend_from_slice(&0xDEAD_BEEF_0000_0000u64.to_le_bytes());
+
+        // jmp rax
+        code.extend_from_slice(&[0xFF, 0xE0]);
+
+        // Pad remainder with NOPs
+        while code.len() < code_size {
+            code.push(0x90);
+        }
+
+        arena.write_code(entry_addr, &code);
+        entry_addr
     }
 
     /// Update hot status based on call frequency

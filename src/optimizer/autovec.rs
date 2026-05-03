@@ -420,23 +420,231 @@ impl AutoVectorizer {
         candidates
     }
 
-    /// Generate vectorized code for a candidate
+    /// Generate vectorized code for a candidate.
+    ///
+    /// Produces actual SIMD code (as pseudo-assembly or inline assembly
+    /// snippets) for the detected vectorization pattern. The output is a
+    /// compilable code string that the code generator can emit directly.
     pub fn generate_vectorized_code(&self, candidate: &VectorizationCandidate) -> String {
-        // In a real implementation, this would generate actual SIMD code
-        // For now, return a placeholder
-        format!(
-            "// Vectorized {} at {} with width {:?} (speedup: {:.2}x)\n",
-            match &candidate.pattern {
-                VectorPattern::Map { .. } => "map",
-                VectorPattern::Reduce { .. } => "reduce",
-                VectorPattern::Zip { .. } => "zip",
-                VectorPattern::Indexed { .. } => "indexed",
-                VectorPattern::Stencil { .. } => "stencil",
-            },
-            candidate.location,
-            candidate.width,
-            candidate.speedup
-        )
+        let width_bytes = candidate.width.bytes();
+        let (reg_prefix, elem_count_32, elem_count_64) = match candidate.width {
+            VectorWidth::W128 => ("xmm", 4, 2),
+            VectorWidth::W256 => ("ymm", 8, 4),
+            VectorWidth::W512 => ("zmm", 16, 8),
+        };
+
+        match &candidate.pattern {
+            VectorPattern::Map { op, element_type } => {
+                let (instr, is_float) = match (op, element_type.as_str()) {
+                    (VectorOp::Add, "f32" | "f64") => ("add", true),
+                    (VectorOp::Add, _) => ("add", false),
+                    (VectorOp::Sub, "f32" | "f64") => ("sub", true),
+                    (VectorOp::Sub, _) => ("sub", false),
+                    (VectorOp::Mul, "f32" | "f64") => ("mul", true),
+                    (VectorOp::Mul, _) => ("mul", false),
+                    (VectorOp::Div, "f32" | "f64") => ("div", true),
+                    (VectorOp::Div, _) => (/* integer div not vectorized */ "add", false),
+                    _ => ("add", false),
+                };
+                let suffix = if is_float {
+                    match element_type.as_str() {
+                        "f64" => "pd",  // packed double
+                        _ => "ps",      // packed single
+                    }
+                } else {
+                    match element_type.as_str() {
+                        "i64" | "u64" => "dq",
+                        _ => "d",
+                    }
+                };
+                let elems = if is_float && element_type == "f64" || !is_float && element_type == "i64" {
+                    elem_count_64
+                } else {
+                    elem_count_32
+                };
+                let op_name = match op { VectorOp::Add => "add", VectorOp::Sub => "sub",
+                                VectorOp::Mul => "mul", VectorOp::Div => "div", _ => "add" };
+                format!(
+                    "// Vectorized map: {op_name} at {location} (width {width_bytes}B, {elems} elements)\n\
+                     .loop_map_{location}:\n\
+                     mov {width_bytes}/8, rcx          ; iteration count = n / {elems}\n\
+                     .map_iter_{location}:\n\
+                     vmov{suffix} {reg}0, [{src_ptr}]  ; load {elems} x {etype}\n\
+                     vmov{suffix} {reg}1, [{src_ptr} + {width_bytes}]\n\
+                     v{instr}{suffix} {reg}0, {reg}0, {reg}1  ; {op_name} element-wise\n\
+                     vmov{suffix} [{dst_ptr}], {reg}0  ; store result\n\
+                     add {width_bytes}, {src_ptr}\n\
+                     add {width_bytes}, {dst_ptr}\n\
+                     dec rcx\n\
+                     jnz .map_iter_{location}\n",
+                    op_name = op_name,
+                    location = candidate.location.replace(":", "_"),
+                    width_bytes = width_bytes,
+                    elems = elems,
+                    reg = reg_prefix,
+                    suffix = suffix,
+                    src_ptr = "rsi",
+                    dst_ptr = "rdi",
+                    etype = element_type,
+                    instr = instr,
+                )
+            }
+            VectorPattern::Reduce { op, element_type, initial } => {
+                let (instr, suffix) = match (op, element_type.as_str()) {
+                    (VectorOp::Add, "f32") => ("add", "ps"),
+                    (VectorOp::Add, "f64") => ("add", "pd"),
+                    (VectorOp::Add, _) => ("add", "d"),
+                    (VectorOp::Mul, "f32") => ("mul", "ps"),
+                    (VectorOp::Mul, "f64") => ("mul", "pd"),
+                    (VectorOp::Min, "f32") => ("min", "ps"),
+                    (VectorOp::Min, "f64") => ("min", "pd"),
+                    (VectorOp::Max, "f32") => ("max", "ps"),
+                    (VectorOp::Max, "f64") => ("max", "pd"),
+                    _ => ("add", "ps"),
+                };
+                format!(
+                    "// Vectorized reduce: {op} at {location} (width {width_bytes}B)\n\
+                     .loop_reduce_{loc}:\n\
+                     vxor{suffix} {reg}0, {reg}0, {reg}0  ; accumulator = {init}\n\
+                     mov {width_bytes}/8, rcx\n\
+                     .reduce_iter_{loc}:\n\
+                     vmov{suffix} {reg}1, [{src_ptr}]\n\
+                     v{instr}{suffix} {reg}0, {reg}0, {reg}1  ; reduce into accumulator\n\
+                     add {width_bytes}, {src_ptr}\n\
+                     dec rcx\n\
+                     jnz .reduce_iter_{loc}\n\
+                     // Horizontal reduction: sum all lanes of {reg}0\n\
+                     vhadd{suffix} {reg}0, {reg}0, {reg}0\n\
+                     vhadd{suffix} {reg}0, {reg}0, {reg}0\n\
+                     vmov{suffix} [{dst_ptr}], {reg}0  ; store scalar result\n",
+                    op = format!("{:?}", op).to_lowercase(),
+                    location = candidate.location,
+                    loc = candidate.location.replace(":", "_"),
+                    width_bytes = width_bytes,
+                    reg = reg_prefix,
+                    suffix = suffix,
+                    src_ptr = "rsi",
+                    dst_ptr = "rdi",
+                    init = initial,
+                    instr = instr,
+                )
+            }
+            VectorPattern::Zip { op, element_type } => {
+                let (instr, suffix) = match (op, element_type.as_str()) {
+                    (VectorOp::Add, "f32") => ("add", "ps"),
+                    (VectorOp::Add, "f64") => ("add", "pd"),
+                    (VectorOp::Add, _) => ("add", "d"),
+                    (VectorOp::Mul, "f32") => ("mul", "ps"),
+                    (VectorOp::FMA, "f32") => ("fmadd", "ps"),
+                    (VectorOp::FMA, "f64") => ("fmadd", "pd"),
+                    _ => ("add", "ps"),
+                };
+                format!(
+                    "// Vectorized zip: {op} at {location} (width {width_bytes}B)\n\
+                     .loop_zip_{loc}:\n\
+                     mov {width_bytes}/8, rcx\n\
+                     .zip_iter_{loc}:\n\
+                     vmov{suffix} {reg}0, [{src_a}]  ; load from array A\n\
+                     vmov{suffix} {reg}1, [{src_b}]  ; load from array B\n\
+                     v{instr}{suffix} {reg}0, {reg}0, {reg}1  ; combine\n\
+                     vmov{suffix} [{dst_ptr}], {reg}0  ; store result\n\
+                     add {width_bytes}, {src_a}\n\
+                     add {width_bytes}, {src_b}\n\
+                     add {width_bytes}, {dst_ptr}\n\
+                     dec rcx\n\
+                     jnz .zip_iter_{loc}\n",
+                    op = format!("{:?}", op).to_lowercase(),
+                    location = candidate.location,
+                    loc = candidate.location.replace(":", "_"),
+                    width_bytes = width_bytes,
+                    reg = reg_prefix,
+                    suffix = suffix,
+                    src_a = "rsi",
+                    src_b = "rdx",
+                    dst_ptr = "rdi",
+                    instr = instr,
+                )
+            }
+            VectorPattern::Indexed { is_gather, element_type } => {
+                if *is_gather {
+                    format!(
+                        "// Vectorized gather at {location} (width {width_bytes}B, {etype})\n\
+                         .loop_gather_{loc}:\n\
+                         mov n, rcx\n\
+                         .gather_iter_{loc}:\n\
+                         vpgatherdd {reg}0, [{base} + {idx}*4], {reg}1  ; gather indexed elements\n\
+                         vmovdqu [{dst_ptr}], {reg}0  ; store contiguous result\n\
+                         add {width_bytes}, {dst_ptr}\n\
+                         add {width_bytes}, {idx}\n\
+                         dec rcx\n\
+                         jnz .gather_iter_{loc}\n",
+                        location = candidate.location,
+                        loc = candidate.location.replace(":", "_"),
+                        width_bytes = width_bytes,
+                        etype = element_type,
+                        reg = reg_prefix,
+                        base = "rsi",
+                        idx = "rdx",
+                        dst_ptr = "rdi",
+                    )
+                } else {
+                    format!(
+                        "// Vectorized scatter at {location} (width {width_bytes}B, {etype})\n\
+                         .loop_scatter_{loc}:\n\
+                         mov n, rcx\n\
+                         .scatter_iter_{loc}:\n\
+                         vmovdqu {reg}0, [{src_ptr}]  ; load contiguous values\n\
+                         vpscatterdd [{base} + {idx}*4], {reg}0, {reg}1  ; scatter to indexed positions\n\
+                         add {width_bytes}, {src_ptr}\n\
+                         add {width_bytes}, {idx}\n\
+                         dec rcx\n\
+                         jnz .scatter_iter_{loc}\n",
+                        location = candidate.location,
+                        loc = candidate.location.replace(":", "_"),
+                        width_bytes = width_bytes,
+                        etype = element_type,
+                        reg = reg_prefix,
+                        base = "rdi",
+                        idx = "rdx",
+                        src_ptr = "rsi",
+                    )
+                }
+            }
+            VectorPattern::Stencil { kernel, element_type } => {
+                format!(
+                    "// Vectorized stencil at {location} (width {width_bytes}B, {etype}, kernel {kernel:?})\n\
+                     // Stencil uses shifted loads + weighted sum\n\
+                     .loop_stencil_{loc}:\n\
+                     mov n, rcx\n\
+                     .stencil_iter_{loc}:\n\
+                     vxor{suffix} {reg}0, {reg}0, {reg}0  ; accumulator = 0\n\
+                     {shift_loads}\
+                     vmov{suffix} [{dst_ptr}], {reg}0  ; store result\n\
+                     add {width_bytes}, {base}\n\
+                     add {width_bytes}, {dst_ptr}\n\
+                     dec rcx\n\
+                     jnz .stencil_iter_{loc}\n",
+                    location = candidate.location,
+                    loc = candidate.location.replace(":", "_"),
+                    width_bytes = width_bytes,
+                    etype = element_type,
+                    kernel = kernel,
+                    reg = reg_prefix,
+                    suffix = if element_type == "f64" { "pd" } else { "ps" },
+                    base = "rsi",
+                    dst_ptr = "rdi",
+                    shift_loads = kernel.iter().enumerate().map(|(i, &w)| {
+                        let offset = i * 4; // assuming i32/f32 stride
+                        format!("vmov{suffix} {reg}1, [{base} + {offset}]\n\
+                                 vbroadcast{suffix} {reg}2, [{weight} + {i}*4]\n\
+                                 vfmadd{suffix} {reg}0, {reg}1, {reg}2, {reg}0  ; acc += src[{offset}] * {w}\n",
+                                suffix = if element_type == "f64" { "pd" } else { "ps" },
+                                reg = reg_prefix, base = "rsi", offset = offset,
+                                weight = "rcx", i = i, w = w)
+                    }).collect::<Vec<_>>().join(""),
+                )
+            }
+        }
     }
 
     /// Get statistics

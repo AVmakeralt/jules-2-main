@@ -89,6 +89,24 @@ impl PhysicsWorld {
         }
     }
 
+    /// Apply an instantaneous force to a rigid body.
+    /// The force is converted to a velocity change via impulse:
+    ///   Δv = F / mass
+    /// Returns `true` if the body was found, `false` otherwise.
+    pub fn apply_force(&mut self, body_id: u32, fx: f32, fy: f32, fz: f32) -> bool {
+        if let Some(body) = self.bodies.get_mut(&body_id) {
+            if body.mass > 0.0 {
+                let inv_mass = 1.0 / body.mass;
+                body.velocity[0] += fx * inv_mass;
+                body.velocity[1] += fy * inv_mass;
+                body.velocity[2] += fz * inv_mass;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn get_position(&self, body_id: u32) -> Option<[f32; 3]> {
         self.bodies.get(&body_id).map(|b| b.position)
     }
