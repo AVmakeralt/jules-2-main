@@ -306,6 +306,34 @@ impl Parser {
         let start = self.current_span();
         let mut items = Vec::new();
 
+        // Parse file-level superoptimizer directive if present
+        let mut superopt_mode = SuperoptMode::All;
+        while !self.at_eof() {
+            match &self.peek().kind {
+                TokenKind::AtMlSuperopt => {
+                    self.advance();
+                    superopt_mode = SuperoptMode::MlSuperopt;
+                }
+                TokenKind::AtMctsSuperopt => {
+                    self.advance();
+                    superopt_mode = SuperoptMode::MctsSuperopt;
+                }
+                TokenKind::AtEGraph => {
+                    self.advance();
+                    superopt_mode = SuperoptMode::EGraph;
+                }
+                TokenKind::AtNone => {
+                    self.advance();
+                    superopt_mode = SuperoptMode::None;
+                }
+                TokenKind::AtAll => {
+                    self.advance();
+                    superopt_mode = SuperoptMode::All;
+                }
+                _ => break,
+            }
+        }
+
         while !self.at_eof() {
             // Skip stray semicolons at top level.
             if self.eat(&TokenKind::Semicolon) {
@@ -322,6 +350,7 @@ impl Parser {
         Program {
             span: start.merge(end),
             items,
+            superopt_mode,
         }
     }
 
@@ -388,6 +417,27 @@ impl Parser {
                 TokenKind::AtSeq => {
                     self.advance();
                     Attribute::Seq
+                }
+                // Superoptimizer selection directives
+                TokenKind::AtMlSuperopt => {
+                    self.advance();
+                    Attribute::MlSuperopt
+                }
+                TokenKind::AtMctsSuperopt => {
+                    self.advance();
+                    Attribute::MctsSuperopt
+                }
+                TokenKind::AtEGraph => {
+                    self.advance();
+                    Attribute::EGraph
+                }
+                TokenKind::AtNone => {
+                    self.advance();
+                    Attribute::None
+                }
+                TokenKind::AtAll => {
+                    self.advance();
+                    Attribute::All
                 }
                 // Named annotations with optional args
                 TokenKind::AtKernel

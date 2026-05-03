@@ -237,8 +237,30 @@ pub enum Attribute {
     Seq, // force sequential execution for determinism
     // Gradient tracking
     Grad,
-    // Free-form for future extensibility: `@inline`, `@deprecated(…)`, etc.
+    // Superoptimizer selection (file-level directives)
+    MlSuperopt,    // @ml_superopt — use ML superoptimizer
+    MctsSuperopt,  // @mcts_superopt — use MCTS superoptimizer
+    EGraph,         // @egraph — use e-graph superoptimizer
+    None,           // @none — disable superoptimization
+    All,             // @all — enable all superoptimizers
+    // Free-form for future extensibility: `@inline`, `@deprecated(...)`, etc.
     Named { name: String, args: Vec<Expr> },
+}
+
+/// Superoptimizer mode for a file or module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SuperoptMode {
+    /// No superoptimizer (pass-through)
+    None,
+    /// ML-based superoptimizer
+    MlSuperopt,
+    /// MCTS-based tiling superoptimizer
+    MctsSuperopt,
+    /// E-graph superoptimizer
+    EGraph,
+    /// All superoptimizers enabled
+    #[default]
+    All,
 }
 
 // =============================================================================
@@ -2045,6 +2067,9 @@ pub struct Program {
     pub span: Span,
     /// All top-level items in declaration order.
     pub items: Vec<Item>,
+    /// Superoptimizer mode for this file (set by @ directive at top of file).
+    /// Defaults to `All` if no directive is specified.
+    pub superopt_mode: SuperoptMode,
 }
 
 impl Program {
@@ -2052,6 +2077,7 @@ impl Program {
         Program {
             span: Span::dummy(),
             items: vec![],
+            superopt_mode: SuperoptMode::All,
         }
     }
 

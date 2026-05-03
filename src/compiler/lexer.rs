@@ -337,6 +337,13 @@ pub enum TokenKind {
     AtAi,          // @ai          — neural network injection into agent
     AtCustom(String), // @PPO, @DQN, @SAC, etc.
 
+    // ── Superoptimizer selection (file-level directives) ─────────────────
+    AtMlSuperopt,      // @ml_superopt   — use ML superoptimizer for this file
+    AtMctsSuperopt,    // @mcts_superopt  — use MCTS superoptimizer for this file
+    AtEGraph,          // @egraph         — use e-graph superoptimizer for this file
+    AtNone,            // @none           — disable superoptimization for this file
+    AtAll,             // @all            — enable all superoptimizers
+
     // ── Operators ─────────────────────────────────────────────────────────
 
     // Arithmetic
@@ -1058,16 +1065,19 @@ impl<'src> Lexer<'src> {
         }
         let span = self.span_from(start, line, col);
         let kind = match name.as_str() {
+            // Device placement
             "gpu"         => TokenKind::AtGpu,
             "cpu"         => TokenKind::AtCpu,
             "tpu"         => TokenKind::AtTpu,
             "grad"        => TokenKind::AtGrad,
+            // Performance hints
             "simd"        => TokenKind::AtSimd,
             "parallel"    => TokenKind::AtParallel,
             "seq"         => TokenKind::AtSeq,
             "unroll"      => TokenKind::AtUnroll,
             "inline"      => TokenKind::AtInline,
             "noinline"    => TokenKind::AtNoInline,
+            // GPU/ML specific
             "kernel"      => TokenKind::AtKernel,
             "jit"         => TokenKind::AtJit,
             "vmap"        => TokenKind::AtVmap,
@@ -1075,10 +1085,17 @@ impl<'src> Lexer<'src> {
             "quantize"    => TokenKind::AtQuantize,
             "prune"       => TokenKind::AtPrune,
             "profile"     => TokenKind::AtProfile,
+            // Testing/annotation
             "test"        => TokenKind::AtTest,
             "benchmark"   => TokenKind::AtBenchmark,
             "deprecated"  => TokenKind::AtDeprecated,
             "ai"          => TokenKind::AtAi,
+            // ── Superoptimizer selection ──────────────────────────────────
+            "ml_superopt"   => TokenKind::AtMlSuperopt,
+            "mcts_superopt" => TokenKind::AtMctsSuperopt,
+            "egraph"        => TokenKind::AtEGraph,
+            "none"          => TokenKind::AtNone,
+            "all"           => TokenKind::AtAll,
             // Plain `@` with no recognised name is the MatMul operator.
             "" => TokenKind::MatMul,
             _ => TokenKind::AtCustom(name.clone()),
