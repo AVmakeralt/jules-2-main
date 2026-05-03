@@ -1686,8 +1686,51 @@ impl EcsWorld {
 
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         {
-            let _ = (pos_set, vel_set, slots, dt);
-            false
+            // Portable scalar fallback — performs the same computation without SIMD.
+            let pos_ptr = pos_set.dense_vals.as_mut_ptr();
+            let vel_ptr = vel_set.dense_vals.as_ptr();
+
+            // SAFETY: indices are distinct (checked above), in-bounds (checked above),
+            // and pos_ptr/vel_ptr are non-overlapping (different fields).
+            unsafe {
+                let p0 = &mut *pos_ptr.add(pi0);
+                let p1 = &mut *pos_ptr.add(pi1);
+                let p2 = &mut *pos_ptr.add(pi2);
+                let p3 = &mut *pos_ptr.add(pi3);
+                let v0 = &*vel_ptr.add(vi0);
+                let v1 = &*vel_ptr.add(vi1);
+                let v2 = &*vel_ptr.add(vi2);
+                let v3 = &*vel_ptr.add(vi3);
+
+                let (
+                    Value::Vec3(p0),
+                    Value::Vec3(v0),
+                    Value::Vec3(p1),
+                    Value::Vec3(v1),
+                    Value::Vec3(p2),
+                    Value::Vec3(v2),
+                    Value::Vec3(p3),
+                    Value::Vec3(v3),
+                ) = (p0, v0, p1, v1, p2, v2, p3, v3)
+                else {
+                    return false;
+                };
+
+                // Scalar integration: p += v * dt
+                p0[0] = v0[0].mul_add(dt, p0[0]);
+                p0[1] = v0[1].mul_add(dt, p0[1]);
+                p0[2] = v0[2].mul_add(dt, p0[2]);
+                p1[0] = v1[0].mul_add(dt, p1[0]);
+                p1[1] = v1[1].mul_add(dt, p1[1]);
+                p1[2] = v1[2].mul_add(dt, p1[2]);
+                p2[0] = v2[0].mul_add(dt, p2[0]);
+                p2[1] = v2[1].mul_add(dt, p2[1]);
+                p2[2] = v2[2].mul_add(dt, p2[2]);
+                p3[0] = v3[0].mul_add(dt, p3[0]);
+                p3[1] = v3[1].mul_add(dt, p3[1]);
+                p3[2] = v3[2].mul_add(dt, p3[2]);
+                return true;
+            }
         }
     }
 

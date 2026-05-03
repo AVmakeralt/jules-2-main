@@ -973,6 +973,21 @@ fn microkernel_8x4(
                 _mm_prefetch(bt_data.as_ptr().add(bt_pref).cast::<i8>(), _MM_HINT_T0);
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let a_pref = (i + 7) * k + p + 16;
+            if a_pref < a_data.len() {
+                core::arch::asm!("prfm pldl1keep, [{addr}]",
+                    addr = in(reg) a_data.as_ptr().add(a_pref),
+                    options(nostack, readonly, preserves_flags));
+            }
+            let bt_pref = (j + 3) * k + p + 16;
+            if bt_pref < bt_data.len() {
+                core::arch::asm!("prfm pldl1keep, [{addr}]",
+                    addr = in(reg) bt_data.as_ptr().add(bt_pref),
+                    options(nostack, readonly, preserves_flags));
+            }
+        }
         for u in 0..4 {
             let pp = p + u;
             let b0 = bt_data[(j + 0) * k + pp];

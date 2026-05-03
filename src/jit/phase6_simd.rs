@@ -26,9 +26,16 @@
 // │  store_* are exact inverses of their load_* counterparts, same cost.      │
 // └────────────────────────────────────────────────────────────────────────────┘
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(always)]
 pub fn simd_available() -> bool {
     true
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline(always)]
+pub fn simd_available() -> bool {
+    false
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -489,9 +496,16 @@ mod tests {
     use super::*;
 
     // ── Smoke ─────────────────────────────────────────────────────────────────
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn module_active() {
         assert!(simd_available());
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn module_active() {
+        assert!(!simd_available());
     }
 
     #[test]

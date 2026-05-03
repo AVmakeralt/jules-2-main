@@ -32,6 +32,7 @@ pub mod simd_batch;
 pub mod voxel_mesh;
 pub mod aurora_flux;
 pub mod aurora_threading;
+pub mod simd_math;
 
 use crate::interp::{RuntimeError, Value};
 
