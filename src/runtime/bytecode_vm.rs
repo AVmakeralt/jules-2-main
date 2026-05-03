@@ -3027,7 +3027,17 @@ fn simd_add_vec4(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
         _mm_storeu_ps(out.as_mut_ptr(), sum);
         return out;
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::{vld1q_f32, vaddq_f32, vst1q_f32};
+        let va = vld1q_f32(a.as_ptr());
+        let vb = vld1q_f32(b.as_ptr());
+        let sum = vaddq_f32(va, vb);
+        let mut out = [0.0f32; 4];
+        vst1q_f32(out.as_mut_ptr(), sum);
+        return out;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
     }
@@ -3045,7 +3055,17 @@ fn simd_mul_vec4(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
         _mm_storeu_ps(out.as_mut_ptr(), prod);
         return out;
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+        let va = vld1q_f32(a.as_ptr());
+        let vb = vld1q_f32(b.as_ptr());
+        let prod = vmulq_f32(va, vb);
+        let mut out = [0.0f32; 4];
+        vst1q_f32(out.as_mut_ptr(), prod);
+        return out;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         [a[0] * b[0], a[1] * b[1], a[2] * b[2], a[3] * b[3]]
     }

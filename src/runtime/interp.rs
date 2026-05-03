@@ -1684,7 +1684,77 @@ impl EcsWorld {
             return true;
         }
 
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use core::arch::aarch64::{vld1q_f32, vmlaq_f32, vst1q_f32, vdupq_n_f32, vgetq_lane_f32};
+
+            let pos_ptr = pos_set.dense_vals.as_mut_ptr();
+            let vel_ptr = vel_set.dense_vals.as_ptr();
+
+            let p0 = &mut *pos_ptr.add(pi0);
+            let p1 = &mut *pos_ptr.add(pi1);
+            let p2 = &mut *pos_ptr.add(pi2);
+            let p3 = &mut *pos_ptr.add(pi3);
+            let v0 = &*vel_ptr.add(vi0);
+            let v1 = &*vel_ptr.add(vi1);
+            let v2 = &*vel_ptr.add(vi2);
+            let v3 = &*vel_ptr.add(vi3);
+
+            let (
+                Value::Vec3(p0),
+                Value::Vec3(v0),
+                Value::Vec3(p1),
+                Value::Vec3(v1),
+                Value::Vec3(p2),
+                Value::Vec3(v2),
+                Value::Vec3(p3),
+                Value::Vec3(v3),
+            ) = (p0, v0, p1, v1, p2, v2, p3, v3)
+            else {
+                return false;
+            };
+
+            let dtv = vdupq_n_f32(dt);
+            let px = core::arch::aarch64::vcombine_f32(
+                core::arch::aarch64::vld1_f32(&p0[0]),
+                core::arch::aarch64::vld1_f32(&p2[0]),
+            );
+            let vx = core::arch::aarch64::vcombine_f32(
+                core::arch::aarch64::vld1_f32(&v0[0]),
+                core::arch::aarch64::vld1_f32(&v2[0]),
+            );
+            let ox = vmlaq_f32(px, vx, dtv);
+
+            let py = core::arch::aarch64::vcombine_f32(
+                core::arch::aarch64::vld1_f32(&p0[1]),
+                core::arch::aarch64::vld1_f32(&p2[1]),
+            );
+            let vy = core::arch::aarch64::vcombine_f32(
+                core::arch::aarch64::vld1_f32(&v0[1]),
+                core::arch::aarch64::vld1_f32(&v2[1]),
+            );
+            let oy = vmlaq_f32(py, vy, dtv);
+
+            let pz = core::arch::aarch64::vcombine_f32(
+                core::arch::aarch64::vld1_f32(&p0[2]),
+                core::arch::aarch64::vld1_f32(&p2[2]),
+            );
+            let vz = core::arch::aarch64::vcombine_f32(
+                core::arch::aarch64::vld1_f32(&v0[2]),
+                core::arch::aarch64::vld1_f32(&v2[2]),
+            );
+            let oz = vmlaq_f32(pz, vz, dtv);
+
+            p0[0] = vgetq_lane_f32(ox, 0); p1[0] = vgetq_lane_f32(ox, 1);
+            p2[0] = vgetq_lane_f32(ox, 2); p3[0] = vgetq_lane_f32(ox, 3);
+            p0[1] = vgetq_lane_f32(oy, 0); p1[1] = vgetq_lane_f32(oy, 1);
+            p2[1] = vgetq_lane_f32(oy, 2); p3[1] = vgetq_lane_f32(oy, 3);
+            p0[2] = vgetq_lane_f32(oz, 0); p1[2] = vgetq_lane_f32(oz, 1);
+            p2[2] = vgetq_lane_f32(oz, 2); p3[2] = vgetq_lane_f32(oz, 3);
+            return true;
+        }
+
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
         {
             // Portable scalar fallback — performs the same computation without SIMD.
             let pos_ptr = pos_set.dense_vals.as_mut_ptr();

@@ -988,6 +988,10 @@ fn microkernel_8x4(
                     options(nostack, readonly, preserves_flags));
             }
         }
+        // Portable fallback for all other architectures (RISC-V, MIPS, etc.)
+        // Prefetch is only a performance hint — no-op is semantically correct.
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+        { let _ = (a_data.as_ptr(), bt_data.as_ptr(), i, j, k, p); }
         for u in 0..4 {
             let pp = p + u;
             let b0 = bt_data[(j + 0) * k + pp];

@@ -107,8 +107,10 @@ pub enum BoolExpr {
 pub enum ArithExpr {
     /// Constant
     Const(i64),
-    /// Variable
+    /// Variable (by VarId)
     Var(VarId),
+    /// Named variable (by string name — used by DCE)
+    NamedVar(String),
     /// Add
     Add(Box<ArithExpr>, Box<ArithExpr>),
     /// Subtract
@@ -121,6 +123,17 @@ pub enum ArithExpr {
     Mod(Box<ArithExpr>, Box<ArithExpr>),
     /// Negate
     Neg(Box<ArithExpr>),
+}
+
+/// Comparison operator for convenience constraint construction
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComparisonOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// SMT constraint
@@ -140,6 +153,23 @@ pub enum Constraint {
     Ne(Box<ArithExpr>, Box<ArithExpr>),
     /// Boolean constraint
     Bool(BoolExpr),
+}
+
+impl Constraint {
+    /// Convenience constructor: compare a named variable against a constant.
+    /// Used by the DCE symbolic executor to build constraints from AST conditions.
+    pub fn comparison(var_name: String, value: i64, op: ComparisonOp) -> Self {
+        let var = ArithExpr::NamedVar(var_name);
+        let val = ArithExpr::Const(value);
+        match op {
+            ComparisonOp::Eq => Constraint::Eq(Box::new(var), Box::new(val)),
+            ComparisonOp::Ne => Constraint::Ne(Box::new(var), Box::new(val)),
+            ComparisonOp::Lt => Constraint::Lt(Box::new(var), Box::new(val)),
+            ComparisonOp::Le => Constraint::Le(Box::new(var), Box::new(val)),
+            ComparisonOp::Gt => Constraint::Gt(Box::new(var), Box::new(val)),
+            ComparisonOp::Ge => Constraint::Ge(Box::new(var), Box::new(val)),
+        }
+    }
 }
 
 /// SMT solver result
@@ -357,6 +387,7 @@ impl SatSmtSolver {
                     ArithExpr::Var(*v)
                 }
             }
+            ArithExpr::NamedVar(_) => expr.clone(), // Named variables pass through unchanged
             ArithExpr::Add(a, b) => {
                 let a_simplified = self.simplify_expr(a);
                 let b_simplified = self.simplify_expr(b);
@@ -504,6 +535,7 @@ impl SatSmtSolver {
         match expr {
             ArithExpr::Const(c) => ValueRange::new(*c, *c),
             ArithExpr::Var(v) => self.get_range(*v),
+            ArithExpr::NamedVar(_) => ValueRange::unknown(), // Named vars have unknown ranges
             ArithExpr::Add(a, b) => {
                 let a_range = self.eval_range(a);
                 let b_range = self.eval_range(b);
