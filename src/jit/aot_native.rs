@@ -83,6 +83,100 @@ mod cc {
     pub const BE: u8 = 0x86; // CF=1 ∨ ZF=1    unsigned ≤
 }
 
+/// AoT compilation optimization level — controls which passes run.
+///
+/// This allows explicit selection between compilation speed and code quality:
+/// - `Fast`: Minimal optimization for rapid development iteration
+/// - `Standard`: Balanced optimization (default)
+/// - `Thorough`: Maximum optimization for release builds
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AotOptLevel {
+    /// Minimal passes: SCCP + peephole only. Ideal for rapid development iteration.
+    Fast,
+    /// Balanced optimization: enables GVN, copy-prop, DCE, and peephole.
+    #[default]
+    Standard,
+    /// Maximum optimization: all 20 phases including VRP, LICM, inlining, and scheduling.
+    Thorough,
+}
+
+impl AotOptLevel {
+    /// Convert AotOptLevel to OptConfig
+    pub fn to_config(self) -> OptConfig {
+        match self {
+            AotOptLevel::Fast => OptConfig {
+                sccp: true,
+                gvn: false,
+                copy_prop: false,
+                vrp: false,
+                licm: false,
+                strength_reduce: false,
+                dce: true,
+                peephole: true,
+                tco: false,
+                jump_threading: false,
+                inlining: false,
+                max_inline_size: 0,
+                loop_unrolling: false,
+                max_unroll: 0,
+                sched: false,
+            },
+            AotOptLevel::Standard => OptConfig {
+                sccp: true,
+                gvn: true,
+                copy_prop: true,
+                vrp: false,
+                licm: false,
+                strength_reduce: true,
+                dce: true,
+                peephole: true,
+                tco: true,
+                jump_threading: true,
+                inlining: true,
+                max_inline_size: 32,
+                loop_unrolling: false,
+                max_unroll: 0,
+                sched: true,
+            },
+            AotOptLevel::Thorough => OptConfig {
+                sccp: true,
+                gvn: true,
+                copy_prop: true,
+                vrp: true,
+                licm: true,
+                strength_reduce: true,
+                dce: true,
+                peephole: true,
+                tco: true,
+                jump_threading: true,
+                inlining: true,
+                max_inline_size: 64,
+                loop_unrolling: true,
+                max_unroll: 4,
+                sched: true,
+            },
+        }
+    }
+
+    /// Create from a u8 for backwards compatibility (0=Fast, 1=Standard, 2+=Thorough)
+    pub fn from_u8(level: u8) -> Self {
+        match level {
+            0 => AotOptLevel::Fast,
+            1 => AotOptLevel::Standard,
+            _ => AotOptLevel::Thorough,
+        }
+    }
+
+    /// Get a display name for logging
+    pub fn name(&self) -> &'static str {
+        match self {
+            AotOptLevel::Fast => "Fast",
+            AotOptLevel::Standard => "Standard",
+            AotOptLevel::Thorough => "Thorough",
+        }
+    }
+}
+
 /// Per-level optimisation configuration
 #[derive(Debug, Clone, Copy)]
 pub struct OptConfig {
@@ -105,28 +199,7 @@ pub struct OptConfig {
 
 impl OptConfig {
     pub fn from_level(level: u8) -> Self {
-        match level {
-            0 => Self { sccp: true, peephole: true, ..Self::none() },
-            1 => Self { sccp: true, gvn: true, copy_prop: true, dce: true,
-                        peephole: true, ..Self::none() },
-            2 => Self { sccp: true, gvn: true, copy_prop: true, vrp: true,
-                        licm: true, strength_reduce: true, dce: true,
-                        peephole: true, tco: true, jump_threading: true,
-                        inlining: true, max_inline_size: 32,
-                        loop_unrolling: true, max_unroll: 4, sched: true },
-            _ => Self { sccp: true, gvn: true, copy_prop: true, vrp: true,
-                        licm: true, strength_reduce: true, dce: true,
-                        peephole: true, tco: true, jump_threading: true,
-                        inlining: true, max_inline_size: 64,
-                        loop_unrolling: true, max_unroll: 8, sched: true },
-        }
-    }
-    fn none() -> Self {
-        Self { sccp: false, gvn: false, copy_prop: false, vrp: false,
-               licm: false, strength_reduce: false, dce: false, peephole: false,
-               tco: false, jump_threading: false, inlining: false,
-               max_inline_size: 0, loop_unrolling: false, max_unroll: 0,
-               sched: false }
+        AotOptLevel::from_u8(level).to_config()
     }
 }
 
@@ -2930,13 +3003,25 @@ fn emit_elf(code: &[u8], symbols: &[(String, usize)], output_path: &str) -> Resu
 // §12  PUBLIC API — FULL 20-PHASE COMPILATION PIPELINE
 // =============================================================================
 
+/// Compile a Jules program to a native ELF executable.
+///
+/// # Arguments
+/// * `program` - The parsed AST program
+/// * `output_path` - Where to write the ELF binary
+/// * `opt_level` - Optimization level: `AotOptLevel::Fast`, `AotOptLevel::Standard`, or `AotOptLevel::Thorough`
+///
+/// # Example
+/// ```ignore
+/// use jules::jit::aot_native::{compile_to_native, AotOptLevel};
+/// compile_to_native(&program, "out.o", AotOptLevel::Standard)?;
+/// ```
 pub fn compile_to_native(
     program:     &Program,
     output_path: &str,
-    opt_level:   u8,
+    opt_level:   AotOptLevel,
 ) -> Result<(), String> {
-    let cfg = OptConfig::from_level(opt_level);
-    eprintln!("AoT v2.0 — compiling at -O{}", opt_level);
+    let cfg = opt_level.to_config();
+    eprintln!("AoT v2.0 — compiling at -O{} ({})", opt_level as u8, opt_level.name());
 
     // ── Phase 1: Call graph ──────────────────────────────────────────────
     let cg = CallGraph::build(program);

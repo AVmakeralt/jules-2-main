@@ -2331,7 +2331,8 @@ fn cmd_compile(args: &CliArgs) -> i32 {
 
     // AOT compile to native ELF binary
     let start = std::time::Instant::now();
-    match crate::jit::aot_native::compile_to_native(&program, &output_path, args.opt_level) {
+    let aot_opt = crate::jit::aot_native::AotOptLevel::from_u8(args.opt_level);
+    match crate::jit::aot_native::compile_to_native(&program, &output_path, aot_opt) {
         Ok(()) => {
             let elapsed = start.elapsed();
             if !args.quiet {
