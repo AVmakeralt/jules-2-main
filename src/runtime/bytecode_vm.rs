@@ -530,9 +530,7 @@ impl BytecodeCompiler {
     }
     
     fn compile_block(&mut self, block: &crate::compiler::ast::Block, dst: u16) -> Result<(), String> {
-        eprintln!("[bc-compiler] compile_block: {} stmts, tail={}, dst={}", block.stmts.len(), block.tail.is_some(), dst);
         for stmt in &block.stmts {
-            eprintln!("[bc-compiler]   stmt: {:?}", std::mem::discriminant(stmt));
             self.compile_stmt(stmt)?;
         }
         if let Some(tail) = &block.tail {
@@ -757,7 +755,6 @@ impl BytecodeCompiler {
                 }
             }
             Stmt::While { cond, body, .. } => {
-                eprintln!("[bc-compiler] WHILE: body has {} stmts, tail={}", body.stmts.len(), body.tail.is_some());
                 let loop_start = self.current_function.instructions.len();
                 self.loop_starts.push(loop_start);
 

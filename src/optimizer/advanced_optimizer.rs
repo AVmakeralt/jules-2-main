@@ -346,6 +346,78 @@ impl ConstantPropagator {
                         *expr = self.substitute(old, &env);
                     }
                 }
+                Stmt::If { cond, then, else_, .. } => {
+                    // Substitute into the condition.
+                    if !env.is_empty() {
+                        let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        *cond = self.substitute(old, &env);
+                    }
+                    // Propagate into branches.
+                    self.propagate_block(then);
+                    if let Some(eb) = else_ {
+                        match &mut **eb {
+                            IfOrBlock::If(ref mut if_stmt) => {
+                                // Create a temporary block to recurse into the else-if.
+                                let mut fake_block = Block { stmts: vec![if_stmt.clone()], tail: None, span: Span::dummy() };
+                                self.propagate_block(&mut fake_block);
+                                if let Some(s) = fake_block.stmts.into_iter().next() {
+                                    *if_stmt = s;
+                                }
+                            }
+                            IfOrBlock::Block(ref mut b) => {
+                                self.propagate_block(b);
+                            }
+                        }
+                    }
+                    // Any variable written inside either branch is no longer a known constant.
+                    let mut written = std::collections::HashSet::<String>::default();
+                    Self::collect_writes_block(then, &mut written);
+                    if let Some(eb) = else_ {
+                        match &**eb {
+                            IfOrBlock::Block(b) => Self::collect_writes_block(b, &mut written),
+                            IfOrBlock::If(s) => Self::collect_writes_stmt(s, &mut written),
+                        }
+                    }
+                    for name in &written {
+                        env.remove(name.as_str());
+                    }
+                }
+                Stmt::While { cond, body, .. } => {
+                    // Do NOT substitute into the condition if any variable read in
+                    // the condition is written in the loop body — the variable changes
+                    // across iterations, so substituting its pre-loop value is wrong.
+                    let mut cond_reads = std::collections::HashSet::<String>::default();
+                    DeadCodeEliminator::collect_reads_expr(cond, &mut cond_reads);
+                    let mut body_writes = std::collections::HashSet::<String>::default();
+                    Self::collect_writes_block(body, &mut body_writes);
+                    let cond_substitutable = !cond_reads.iter().any(|v| body_writes.contains(v));
+
+                    if !env.is_empty() && cond_substitutable {
+                        let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        *cond = self.substitute(old, &env);
+                    }
+                    self.propagate_block(body);
+                    // Evict any variables written in the loop body.
+                    for name in &body_writes {
+                        env.remove(name.as_str());
+                    }
+                }
+                Stmt::ForIn { body, .. } | Stmt::EntityFor { body, .. } => {
+                    self.propagate_block(body);
+                    let mut written = std::collections::HashSet::<String>::default();
+                    Self::collect_writes_block(body, &mut written);
+                    for name in &written {
+                        env.remove(name.as_str());
+                    }
+                }
+                Stmt::Loop { body, .. } => {
+                    self.propagate_block(body);
+                    let mut written = std::collections::HashSet::<String>::default();
+                    Self::collect_writes_block(body, &mut written);
+                    for name in &written {
+                        env.remove(name.as_str());
+                    }
+                }
                 _ => {}
             }
         }
@@ -365,6 +437,54 @@ impl ConstantPropagator {
             Expr::UnOp { expr, .. } => Self::is_constant_expr(expr),
             Expr::Tuple { elems, .. } => elems.iter().all(|e| Self::is_constant_expr(e)),
             _ => false,
+        }
+    }
+
+    /// Collect every variable name that is *written* (assigned) in a block.
+    fn collect_writes_block(block: &Block, out: &mut std::collections::HashSet<String>) {
+        for stmt in &block.stmts {
+            Self::collect_writes_stmt(stmt, out);
+        }
+        if let Some(tail) = &block.tail {
+            Self::collect_writes_expr(tail, out);
+        }
+    }
+
+    fn collect_writes_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
+        match stmt {
+            Stmt::Let { pattern, .. } => {
+                if let Pattern::Ident { name, .. } = pattern {
+                    out.insert(name.clone());
+                }
+            }
+            Stmt::Expr { expr, .. } => Self::collect_writes_expr(expr, out),
+            Stmt::If { then, else_, .. } => {
+                Self::collect_writes_block(then, out);
+                if let Some(eb) = else_ {
+                    match eb.as_ref() {
+                        IfOrBlock::Block(b) => Self::collect_writes_block(b, out),
+                        IfOrBlock::If(s) => Self::collect_writes_stmt(s, out),
+                    }
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body, .. }
+            | Stmt::ForIn { body, .. }
+            | Stmt::EntityFor { body, .. } => {
+                Self::collect_writes_block(body, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_writes_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::Assign { target, .. } => {
+                if let Expr::Ident { name, .. } = target.as_ref() {
+                    out.insert(name.clone());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1657,7 +1777,13 @@ impl DeadStoreEliminator {
         Self { eliminated: 0 }
     }
 
-    fn eliminate_block(&mut self, block: &mut Block) {
+    /// Eliminate dead stores within `block`.
+    ///
+    /// `external_reads` contains variable names that are read *outside* this
+    /// block but whose values may be set inside it (e.g. a while-loop
+    /// condition reads variables that are written in the loop body).  Stores
+    /// to any name in `external_reads` are never eliminated.
+    fn eliminate_block(&mut self, block: &mut Block, external_reads: &std::collections::HashSet<String>) {
         // ── Step 1: Build a read-set for everything AFTER each write ─────────
         // Walk forwards: for each `let x = …` or `x = …` assignment, record the
         // index.  Then walk the remainder to see whether `x` is ever read before
@@ -1685,6 +1811,12 @@ impl DeadStoreEliminator {
             };
 
             let name = match written_name { Some(n) => n, None => continue };
+
+            // If the variable is read externally (e.g. in a while condition
+            // that re-evaluates on the next iteration), never eliminate it.
+            if external_reads.contains(&name) {
+                continue;
+            }
 
             // Scan stmts after i: is `name` read before it is written again?
             let mut read_before_next_write = false;
@@ -1733,20 +1865,54 @@ impl DeadStoreEliminator {
         });
 
         // ── Step 3: Recurse into nested blocks ────────────────────────────────
-        for stmt in &mut block.stmts {
+        //
+        // For while/for/loop bodies we must consider loop-carried
+        // dependencies: a store in the body may be observed on the next
+        // iteration (via the condition) or after the loop.  We collect the
+        // loop condition's reads and pass them as `external_reads` so that
+        // stores to those variables are never eliminated.
+        //
+        // For if-then/else blocks, we need to consider that variables written
+        // inside may be read after the if statement in the parent block.
+        // We collect reads from ALL subsequent statements + tail.
+        let empty_reads = std::collections::HashSet::<String>::default();
+        // Pre-compute post-reads for each statement index to avoid borrow conflicts.
+        let n = block.stmts.len();
+        let mut post_reads_cache: Vec<std::collections::HashSet<String>> = Vec::with_capacity(n);
+        for idx in 0..n {
+            let mut reads = external_reads.clone();
+            for j in (idx + 1)..n {
+                DeadCodeEliminator::collect_reads_stmt(&block.stmts[j], &mut reads);
+            }
+            if let Some(tail) = &block.tail {
+                DeadCodeEliminator::collect_reads_expr(tail, &mut reads);
+            }
+            post_reads_cache.push(reads);
+        }
+        for idx in 0..block.stmts.len() {
+            let stmt = &mut block.stmts[idx];
+            let post_reads = &post_reads_cache[idx];
             match stmt {
+                Stmt::While { cond, body, .. } => {
+                    // Variables read in the condition are live across iterations.
+                    let mut all_reads = post_reads.clone();
+                    DeadCodeEliminator::collect_reads_expr(cond, &mut all_reads);
+                    self.eliminate_block(body, &all_reads);
+                }
                 Stmt::ForIn { body, .. }
-                | Stmt::While { body, .. }
                 | Stmt::EntityFor { body, .. } => {
-                    self.eliminate_block(body);
+                    self.eliminate_block(body, post_reads);
                 }
                 Stmt::If { then, else_, .. } => {
-                    self.eliminate_block(then);
+                    self.eliminate_block(then, post_reads);
                     if let Some(eb) = else_ {
                         if let IfOrBlock::Block(b) = &mut **eb {
-                            self.eliminate_block(b);
+                            self.eliminate_block(b, post_reads);
                         }
                     }
+                }
+                Stmt::Loop { body, .. } => {
+                    self.eliminate_block(body, post_reads);
                 }
                 _ => {}
             }
@@ -4702,7 +4868,8 @@ impl Superoptimizer {
             // Pass 10: Dead store elimination
             if self.config.enable_dse {
                 let mut dse = DeadStoreEliminator::new();
-                dse.eliminate_block(body);
+                let no_external = std::collections::HashSet::<String>::default();
+                dse.eliminate_block(body, &no_external);
             }
 
             // Pass 11: Peephole optimization

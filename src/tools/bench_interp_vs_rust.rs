@@ -36,22 +36,22 @@ fn main() {
 
     println!("bench-interp-vs-rust n={n} iters={iters} mode={mode:?} seed={seed}");
 
+    let seed_i32 = (seed & 0xFFFFFFFF) as i32;
     let jules_src = if mode == BenchMode::TieredTracing {
         format!(
             r#"
 fn bench() -> i32 {{
-  let s = {seed};
+  let s: i32 = {seed_i32};
   s * 1664525 + 97
 }}
 "#,
-            seed = seed
         )
     } else {
         format!(
             r#"
 fn bench() -> i32 {{
-  let mut s = {seed};
-  let mut i = 0;
+  let mut s: i32 = {seed_i32};
+  let mut i: i32 = 0;
   while i < {n} {{
     s = s * 1664525 + (i * 1013904223) + 97;
     i = i + 1;
@@ -59,7 +59,6 @@ fn bench() -> i32 {{
   s
 }}
 "#,
-            seed = seed,
             n = n
         )
     };
@@ -299,8 +298,8 @@ fn native_jit_available() -> bool {
 fn run_native_probe() -> i32 {
     let src = r#"
 fn bench() -> i32 {
-  let mut s = 1;
-  let mut i = 0;
+  let mut s: i32 = 1;
+  let mut i: i32 = 0;
   while i < 32 {
     s = s * 1664525 + i + 97;
     i = i + 1;

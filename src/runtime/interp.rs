@@ -369,8 +369,21 @@ impl Value {
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Bool(b) => *b,
+            Value::I8(x) => *x != 0,
+            Value::I16(x) => *x != 0,
             Value::I32(x) => *x != 0,
+            Value::I64(x) => *x != 0,
+            Value::U8(x) => *x != 0,
+            Value::U16(x) => *x != 0,
+            Value::U32(x) => *x != 0,
+            Value::U64(x) => *x != 0,
             Value::F32(x) => *x != 0.0,
+            Value::F64(x) => *x != 0.0,
+            Value::Unit => false,
+            Value::None => false,
+            Value::Str(s) => !s.is_empty(),
+            Value::Array(a) => !a.borrow().is_empty(),
+            Value::Tuple(v) => !v.is_empty(),
             _ => true,
         }
     }
@@ -2546,8 +2559,14 @@ struct Compiler {
     next_slot: u16,
     /// Next available temporary register (above all slots).
     next_tmp: u16,
+    /// Peak temporary register ever allocated (tracks high-water mark).
+    peak_tmp: u16,
     /// Captured closure variables from outer scope.
     captures: FxHashMap<String, u16>,
+    /// Break label positions for the current loop (for jump-based break).
+    break_labels: Vec<usize>,
+    /// Loop start instruction positions (for jump-based continue).
+    loop_starts: Vec<usize>,
 }
 
 impl Compiler {
@@ -2561,7 +2580,10 @@ impl Compiler {
             next_slot: param_count,
             // Temporaries live immediately above slots to keep register files compact.
             next_tmp: param_count,
+            peak_tmp: param_count,
             captures: FxHashMap::default(),
+            break_labels: Vec::new(),
+            loop_starts: Vec::new(),
         }
     }
 
@@ -2580,6 +2602,7 @@ impl Compiler {
     fn tmp(&mut self) -> u16 {
         let r = self.next_tmp;
         self.next_tmp += 1;
+        self.peak_tmp = self.peak_tmp.max(self.next_tmp);
         r
     }
 
@@ -2640,6 +2663,17 @@ impl Compiler {
         }
     }
 
+    /// Patch a jump at `pos` to jump to a specific instruction index `target_pos`.
+    fn patch_jump_to(&mut self, pos: usize, target_pos: usize) {
+        let offset = target_pos as i32 - pos as i32 - 1;
+        match &mut self.instrs[pos] {
+            Instr::Jump(ref mut o) => *o = offset,
+            Instr::JumpFalse(_, ref mut o) => *o = offset,
+            Instr::JumpTrue(_, ref mut o) => *o = offset,
+            _ => {}
+        }
+    }
+
     /// Compile a block, returning the register holding the tail value.
     fn compile_block(&mut self, block: &Block, dst: u16) {
         let block_tmp_base = self.next_slot;
@@ -2685,36 +2719,54 @@ impl Compiler {
                     self.emit(Instr::ReturnUnit);
                 }
             }
-            Stmt::Break { value, .. } => {
-                if let Some(e) = value {
-                    let r = self.tmp();
-                    self.compile_expr_into(e, r);
-                    self.emit(Instr::BreakValSignal(r));
-                } else {
-                    self.emit(Instr::BreakSignal);
-                }
+            Stmt::Break { .. } => {
+                // Emit a placeholder jump; position recorded for patching after loop.
+                let pos = self.emit_jump();
+                self.break_labels.push(pos);
             }
             Stmt::Continue { .. } => {
-                self.emit(Instr::ContinueSignal);
+                // Jump back to the loop condition (loop start).
+                if let Some(&loop_start) = self.loop_starts.last() {
+                    let offset = loop_start as i32 - self.instrs.len() as i32 - 1;
+                    self.emit(Instr::Jump(offset));
+                }
             }
             Stmt::While { cond, body, .. } => {
-                let loop_start = self.instrs.len() as i32;
+                let loop_start = self.instrs.len();
+                self.loop_starts.push(loop_start);
                 let cond_reg = self.tmp();
                 self.compile_expr_into(cond, cond_reg);
                 let exit_jump = self.emit_jump_false(cond_reg);
+                let break_count_before = self.break_labels.len();
                 let body_dst = self.tmp();
                 self.compile_block(body, body_dst);
                 // Jump back to condition
-                let back_offset = loop_start - self.instrs.len() as i32 - 1;
+                let back_offset = loop_start as i32 - self.instrs.len() as i32 - 1;
                 self.emit(Instr::Jump(back_offset));
+                // Patch the exit jump to here (after the loop)
                 self.patch_jump(exit_jump);
+                let loop_end = self.instrs.len();
+                // Patch all break jumps from this loop to jump to loop_end
+                let labels: Vec<usize> = self.break_labels.drain(break_count_before..).collect();
+                for pos in labels {
+                    self.patch_jump_to(pos, loop_end);
+                }
+                self.loop_starts.pop();
             }
             Stmt::Loop { body, .. } => {
-                let loop_start = self.instrs.len() as i32;
+                let loop_start = self.instrs.len();
+                self.loop_starts.push(loop_start);
+                let break_count_before = self.break_labels.len();
                 let body_dst = self.tmp();
                 self.compile_block(body, body_dst);
-                let back_offset = loop_start - self.instrs.len() as i32 - 1;
+                let back_offset = loop_start as i32 - self.instrs.len() as i32 - 1;
                 self.emit(Instr::Jump(back_offset));
+                let loop_end = self.instrs.len();
+                let labels: Vec<usize> = self.break_labels.drain(break_count_before..).collect();
+                for pos in labels {
+                    self.patch_jump_to(pos, loop_end);
+                }
+                self.loop_starts.pop();
             }
             Stmt::If {
                 cond, then, else_, ..
@@ -3096,7 +3148,7 @@ impl Compiler {
     }
 
     fn finish(self, name: String, param_count: u16) -> CompiledFn {
-        let slot_count = self.next_tmp.max(self.next_slot);
+        let slot_count = self.peak_tmp.max(self.next_slot);
         CompiledFn {
             name,
             param_count,
@@ -3433,12 +3485,18 @@ pub fn vm_exec(
                 return Ok(Value::Unit);
             }
             Instr::BreakSignal => {
+                // Should not be emitted by the new compiler; kept as fallback
+                // for nested function calls that return break signals.
+                // In the compiled VM, break is handled via jump patching.
                 return Ok(Value::Break(None));
             }
             Instr::BreakValSignal(r) => {
                 return Ok(Value::Break(Some(Box::new(reg!(*r).clone()))));
             }
             Instr::ContinueSignal => {
+                // Should not be emitted by the new compiler; kept as fallback
+                // for nested function calls that return continue signals.
+                // In the compiled VM, continue is handled via jump patching.
                 return Ok(Value::Continue);
             }
 
