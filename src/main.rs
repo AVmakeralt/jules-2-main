@@ -683,6 +683,57 @@ impl Pipeline {
             }
         }
 
+        // ── Pass 10: Partial Evaluation / Futamura Projections ─────────────────
+        // Specializes functions by evaluating static (compile-time known) arguments
+        // and building residual programs for dynamic parts.  This is distinct from
+        // inlining — it works across module boundaries and unrolls static loops.
+        if self.opt_level >= 2 {
+            use crate::optimizer::partial_eval::{PartialEvaluator, PartialEvalConfig};
+            let config = match self.opt_level {
+                1 => PartialEvalConfig::default(),
+                2 => PartialEvalConfig { max_unroll: 32, ..PartialEvalConfig::default() },
+                _ => PartialEvalConfig { max_unroll: 128, futamura_1: true, ..PartialEvalConfig::default() },
+            };
+            let mut pe = PartialEvaluator::new(config);
+            pe.optimize_program(&mut program);
+            if self.print_opt_stats {
+                let s = pe.stats();
+                if s.expressions_folded > 0 || s.branches_eliminated > 0 {
+                    eprintln!("[opt/PE] folds={} branches_elim={} loops_unrolled={} calls_spec={} speedup={:.1}x",
+                        s.expressions_folded, s.branches_eliminated, s.loops_unrolled,
+                        s.calls_specialized, s.estimated_speedup);
+                }
+            }
+        }
+
+        // ── Pass 11: Alias-Aware Memory Layout via Ownership Proofs ────────────
+        // Uses the borrow checker's lifetime graph to prove noalias relationships,
+        // reorder struct fields for cache locality, and suggest AoS→SoA conversions.
+        if self.opt_level >= 2 {
+            use crate::optimizer::alias_layout::LayoutOptimizer;
+            let mut layout = LayoutOptimizer::default();
+            let result = layout.optimize_program(&program);
+            if self.print_opt_stats && (result.noalias_pairs_proven > 0 || !result.field_reorder_suggestions.is_empty()) {
+                eprintln!("[opt/Layout] noalias_pairs={} reorders={} soa_suggestions={} speedup={:.1}x",
+                    result.noalias_pairs_proven, result.field_reorder_suggestions.len(),
+                    result.soa_conversion_suggestions.len(), result.estimated_speedup);
+            }
+        }
+
+        // ── Pass 12: Profile-Guided Dead Struct Field Elimination ──────────────
+        // Detects struct fields that are written but never read in hot paths,
+        // removes dead writes, and shrinks struct sizes for better cache utilization.
+        if self.opt_level >= 2 {
+            use crate::optimizer::dead_field_elim::DeadFieldEliminator;
+            let mut elim = DeadFieldEliminator::default();
+            let result = elim.optimize_program(&mut program);
+            if self.print_opt_stats && result.dead_fields_removed > 0 {
+                eprintln!("[opt/DeadField] fields_removed={} dead_writes_elim={} bytes_saved={} speedup={:.1}x",
+                    result.dead_fields_removed, result.dead_writes_eliminated,
+                    result.bytes_saved, result.estimated_speedup);
+            }
+        }
+
         // ── Promote warnings to errors if requested ───────────────────────────
         if self.warn_as_error {
             for d in &mut unit.diags {

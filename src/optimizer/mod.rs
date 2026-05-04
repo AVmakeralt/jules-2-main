@@ -26,3 +26,7 @@ pub mod semantic_superopt;
 pub mod soa_optimizer;
 #[cfg(feature = "phase3-jit")]
 pub mod tiered_compilation;
+pub mod partial_eval;
+pub mod learned_scheduler;
+pub mod alias_layout;
+pub mod dead_field_elim;
