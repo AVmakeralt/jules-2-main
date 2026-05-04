@@ -2,7 +2,7 @@
 //! 
 //! Static tile descriptors that map to physical memory for zero-copy operations.
 
-use super::{FluxError, SANCTUARY_SIZE, CACHE_LINE_SIZE};
+use super::{SANCTUARY_SIZE, CACHE_LINE_SIZE};
 
 /// Precision types for tile data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

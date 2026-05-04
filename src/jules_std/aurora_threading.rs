@@ -563,7 +563,7 @@ impl AuroraFiberPool {
         for worker_id in 0..num_workers {
             let queues = queues.clone();
             let completed = completed.clone();
-            let finished = finished.clone();
+            let _finished = finished.clone();
             let stats = stats_refs[worker_id].clone();
 
             let handle = thread::spawn(move || {
@@ -1362,7 +1362,7 @@ impl AuroraRayBatch {
     /// Returns hit distances and Morton codes for hit positions.
     pub fn trace(&self) -> Vec<RayTraceResult> {
         let mut results = Vec::with_capacity(self.ray_count as usize);
-        let mut prng = ShishiuaRng::new(self.seed);
+        let prng = ShishiuaRng::new(self.seed);
 
         for i in 0..self.ray_count as usize {
             let (ox, oy, oz) = self.origins[i];

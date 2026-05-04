@@ -99,7 +99,7 @@ impl WorkStealingDeque {
 
     /// Pop a task from the bottom (owner only)
     /// Implements the corrected Le et al. algorithm
-    pub fn pop(&self, guard: &Guard) -> Option<TaskPtr> {
+    pub fn pop(&self, _guard: &Guard) -> Option<TaskPtr> {
         let buffer = self.load_buffer();
         let bottom = self.bottom.load(Ordering::Acquire);
         
@@ -145,7 +145,7 @@ impl WorkStealingDeque {
 
     /// Steal a task from the top (thief only)
     /// SeqCst on CAS is critical for correctness on weak memory models
-    pub fn steal(&self, guard: &Guard) -> Option<TaskPtr> {
+    pub fn steal(&self, _guard: &Guard) -> Option<TaskPtr> {
         let buffer = self.load_buffer();
         let top = self.top.load(Ordering::Acquire);
         
@@ -170,7 +170,7 @@ impl WorkStealingDeque {
 
     /// Steal half the tasks (batch stealing)
     /// Amortizes cache invalidation cost across multiple tasks
-    pub fn steal_half(&self, guard: &Guard) -> Vec<TaskPtr> {
+    pub fn steal_half(&self, _guard: &Guard) -> Vec<TaskPtr> {
         let buffer = self.load_buffer();
         let top = self.top.load(Ordering::Acquire);
         
@@ -224,7 +224,7 @@ impl WorkStealingDeque {
     /// This is the critical path for safe memory reclamation
     fn grow(&self, bottom: usize, top: usize, old_buffer: &Buffer, guard: &Guard) {
         let new_capacity = old_buffer.capacity * 2;
-        let mut new_buffer = Buffer::new(new_capacity);
+        let new_buffer = Buffer::new(new_capacity);
         
         // Copy elements from old buffer to new buffer
         let size = bottom.wrapping_sub(top);

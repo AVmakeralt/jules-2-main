@@ -6,7 +6,6 @@
 // =========================================================================
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 /// Task node in the e-graph
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

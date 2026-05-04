@@ -966,6 +966,7 @@ thread_local! {
 ///   component_name → (dense vec of EntityId, dense vec of component Value)
 /// The two vecs stay in sync: `dense_ids[i]` owns `dense_vals[i]`.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct EcsWorld {
     next_id: EntityId,
     alive: std::collections::HashSet<EntityId>,
@@ -987,6 +988,7 @@ type ArchetypeId = u32;
 /// Archetype: Struct-of-Arrays storage for efficient cache utilization
 /// Stores all entities with the same component set in SoA format
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct Archetype {
     /// Component name → column (SoA storage)
     columns: FxHashMap<String, ArchetypeColumn>,
@@ -998,6 +1000,7 @@ struct Archetype {
 
 /// Single column in an archetype (SoA storage for one component type)
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ArchetypeColumn {
     /// Raw unboxed data (no Value enum overhead)
     data: Vec<u8>,
@@ -1009,6 +1012,7 @@ struct ArchetypeColumn {
 
 /// ValueType for unboxed storage
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum ValueType {
     F32,
     F64,
@@ -3295,6 +3299,7 @@ pub fn compile_fn(decl: &FnDecl) -> CompiledFn {
 }
 
 // ── Shorthand runtime error macro ────────────────────────────────────────────
+#[allow(unused_macros)]
 macro_rules! rt_err {
     ($msg:expr) => { Err(RuntimeError::new($msg)) };
     ($fmt:literal $(, $arg:expr)*) => { Err(RuntimeError::new(format!($fmt $(, $arg)*))) };
@@ -3397,6 +3402,7 @@ pub fn vm_exec(
             }
         }};
     }
+    #[allow(unused_macros)]
     macro_rules! str_c {
         ($i:expr) => {
             str_pool
@@ -3799,7 +3805,7 @@ pub fn vm_exec(
 /// Fast integer-only VM. Uses raw i32 arrays, zero Value allocations per instruction.
 /// Returns None if non-i32 values are encountered (caller should fall back to vm_exec).
 pub fn vm_exec_i32(
-    interp: &mut Interpreter,
+    _interp: &mut Interpreter,
     func: &CompiledFn,
     args: &[Value],
 ) -> Option<Result<Value, RuntimeError>> {
@@ -3815,8 +3821,11 @@ pub fn vm_exec_i32(
         .collect::<Option<Vec<_>>>()?;
 
     let needed = func.slot_count as usize + 32;
-    let mut slots = vec![0i32; needed];
-    let regs = &mut vec![0i32; needed];
+    // IMPORTANT: slots and regs must be the SAME array in the i32 VM,
+    // because Store writes to slots[slot] and Load reads from slots[slot],
+    // while BinOp etc. use regs[]. If they are separate arrays, values
+    // stored via Store are invisible to subsequent BinOp reads.
+    let mut regs = vec![0i32; needed];
 
     // Load arguments.
     for (i, &arg) in i32_args.iter().enumerate() {
@@ -3826,8 +3835,8 @@ pub fn vm_exec_i32(
     }
 
     let instrs = &func.instrs;
-    let const_pool = &func.const_pool;
-    let str_pool = &func.str_pool;
+    let _const_pool = &func.const_pool;
+    let _str_pool = &func.str_pool;
     let mut pc = 0usize;
 
     macro_rules! reg {
@@ -3842,14 +3851,15 @@ pub fn vm_exec_i32(
     }
     macro_rules! slot {
         ($i:expr) => {
-            unsafe { *slots.get_unchecked($i as usize) }
+            unsafe { *regs.get_unchecked($i as usize) }
         };
     }
     macro_rules! slot_mut {
         ($i:expr) => {
-            unsafe { slots.get_unchecked_mut($i as usize) }
+            unsafe { regs.get_unchecked_mut($i as usize) }
         };
     }
+    #[allow(unused_macros)]
     macro_rules! str_c {
         ($i:expr) => {
             str_pool
@@ -3858,6 +3868,7 @@ pub fn vm_exec_i32(
                 .as_str()
         };
     }
+    #[allow(unused_macros)]
     macro_rules! rt_err {
         ($($arg:tt)*) => {{
             return Some(Err(RuntimeError {
@@ -5313,6 +5324,7 @@ impl Interpreter {
     }
 
     /// Helper: extract CPU data from a tensor guard (RwLock or RefCell)
+    #[allow(dead_code)]
     fn tensor_cpu_data(tensor: &Tensor) -> (Vec<usize>, Vec<f32>) {
         let shape = tensor.shape.clone();
         let data = match &tensor.data {

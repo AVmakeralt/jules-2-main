@@ -282,6 +282,7 @@ struct Emitter {
     buf: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl Emitter {
     fn new() -> Self {
         Self {
@@ -926,6 +927,7 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
 // Fix #3: Loop Vectorizer Pass
 // ─────────────────────────────────────────────────────────────────────────────
 /// Detects vectorizable loops and widens operations to SIMD
+#[allow(dead_code)]
 struct LoopVectorizer {
     loop_start: Option<usize>,
     loop_end: Option<usize>,
@@ -933,6 +935,7 @@ struct LoopVectorizer {
     is_vectorizable: bool,
 }
 
+#[allow(dead_code)]
 impl LoopVectorizer {
     fn new() -> Self {
         Self {
@@ -1480,6 +1483,42 @@ fn peephole_optimize(instrs: &mut Vec<Instr>) {
 #[must_use]
 pub fn is_available() -> bool {
     cfg!(target_arch = "x86_64")
+}
+
+/// Compile a sequence of instructions into a `CompiledFn`.
+///
+/// This is a convenience wrapper used by the AMX kernel generator and
+/// other subsystems that build instruction streams programmatically.
+/// It scans the instructions to determine the required slot count,
+/// then packages them into a `CompiledFn` ready for the VM or JIT.
+pub fn compile_ops(name: &str, ops: &[Instr]) -> Option<CompiledFn> {
+    // Determine the maximum slot index referenced by any instruction
+    // so we can set slot_count correctly.
+    let mut max_slot: u16 = 0;
+    for instr in ops {
+        match instr {
+            Instr::LoadI32(d, _) | Instr::LoadI64(d, _) | Instr::LoadBool(d, _) | Instr::LoadUnit(d) => max_slot = max_slot.max(*d),
+            Instr::LoadF32(d, _) | Instr::LoadF64(d, _) => max_slot = max_slot.max(*d),
+            Instr::LoadStr(d, _) | Instr::LoadConst(d, _) | Instr::LoadFn(d, _) => max_slot = max_slot.max(*d),
+            Instr::Move(d, s) | Instr::Load(d, s) => { max_slot = max_slot.max(*d).max(*s); }
+            Instr::Store(slot, s) => { max_slot = max_slot.max(*slot).max(*s); }
+            Instr::BinOp(d, _, l, r) => { max_slot = max_slot.max(*d).max(*l).max(*r); }
+            Instr::UnOp(d, _, s) => { max_slot = max_slot.max(*d).max(*s); }
+            Instr::PowOp(d, b, e) | Instr::MatMulInstr(d, b, e) => { max_slot = max_slot.max(*d).max(*b).max(*e); }
+            Instr::Call(d, _, _, _) | Instr::CallBuiltin(d, _, _, _) => max_slot = max_slot.max(*d),
+            Instr::Return(s) | Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) => max_slot = max_slot.max(*s),
+            _ => {}
+        }
+    }
+
+    Some(CompiledFn {
+        name: name.to_string(),
+        param_count: 0,
+        slot_count: max_slot + 1,
+        instrs: ops.to_vec(),
+        str_pool: Vec::new(),
+        const_pool: Vec::new(),
+    })
 }
 
 pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {

@@ -5,11 +5,10 @@
 // =========================================================================
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use super::affinity::set_thread_affinity;
 use super::deque::WorkStealingDeque;
 use super::epoch::{Guard, Participant};
 use super::numa::{NumaTopology, num_cores};
@@ -64,7 +63,7 @@ impl MpmcQueue {
                     Ordering::Release,
                     Ordering::Acquire,
                 ).is_ok() {
-                    self.tail.compare_exchange_weak(
+                    let _ = self.tail.compare_exchange_weak(
                         tail,
                         node,
                         Ordering::Release,
@@ -73,7 +72,7 @@ impl MpmcQueue {
                     return;
                 }
             } else {
-                self.tail.compare_exchange_weak(
+                let _ = self.tail.compare_exchange_weak(
                     tail,
                     next,
                     Ordering::Release,
@@ -94,7 +93,7 @@ impl MpmcQueue {
                 if next.is_null() {
                     return None;
                 }
-                self.tail.compare_exchange_weak(
+                let _ = self.tail.compare_exchange_weak(
                     tail,
                     next,
                     Ordering::Release,
@@ -109,7 +108,7 @@ impl MpmcQueue {
                     Ordering::Acquire,
                 ).is_ok() {
                     // Free the dummy node
-                    unsafe { Box::from_raw(head); }
+                    let _ = unsafe { Box::from_raw(head) };
                     return Some(data);
                 }
             }
@@ -118,10 +117,12 @@ impl MpmcQueue {
 }
 
 /// Notification mechanism for waking workers using futex-like semantics
+#[allow(dead_code)]
 struct Notify {
     flag: AtomicBool,
 }
 
+#[allow(dead_code)]
 impl Notify {
     fn new() -> Self {
         Self {
@@ -387,6 +388,7 @@ pub struct WorkerStats {
 }
 
 /// Thread pool for managing workers
+#[allow(dead_code)]
 pub struct ThreadPool {
     workers: Arc<Vec<Arc<Worker>>>,
     injector: Arc<Injector>,

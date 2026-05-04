@@ -260,9 +260,9 @@ impl WatchdogSensitivity {
     pub fn max_iterations(&self) -> Option<u64> {
         match self {
             WatchdogSensitivity::Disabled => None,
-            WatchdogSensitivity::Relaxed => Some(100_000_000),
-            WatchdogSensitivity::Normal => Some(10_000_000),
-            WatchdogSensitivity::Aggressive => Some(1_000_000),
+            WatchdogSensitivity::Relaxed => Some(1_000_000_000),
+            WatchdogSensitivity::Normal => Some(100_000_000),
+            WatchdogSensitivity::Aggressive => Some(10_000_000),
         }
     }
 
@@ -729,9 +729,9 @@ mod tests {
     #[test]
     fn test_watchdog_sensitivity_thresholds() {
         assert!(WatchdogSensitivity::Disabled.max_iterations().is_none());
-        assert_eq!(WatchdogSensitivity::Relaxed.max_iterations(), Some(100_000_000));
-        assert_eq!(WatchdogSensitivity::Normal.max_iterations(), Some(10_000_000));
-        assert_eq!(WatchdogSensitivity::Aggressive.max_iterations(), Some(1_000_000));
+        assert_eq!(WatchdogSensitivity::Relaxed.max_iterations(), Some(1_000_000_000));
+        assert_eq!(WatchdogSensitivity::Normal.max_iterations(), Some(100_000_000));
+        assert_eq!(WatchdogSensitivity::Aggressive.max_iterations(), Some(10_000_000));
     }
 
     #[test]

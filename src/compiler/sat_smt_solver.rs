@@ -5,7 +5,6 @@
 // =========================================================================
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 
 /// Variable identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -357,7 +356,7 @@ impl SatSmtSolver {
 
     /// Propagate inequality constraint
     fn propagate_inequality(&self, left: &ArithExpr, right: &ArithExpr) -> Option<HashMap<VarId, ValueRange>> {
-        let mut new_ranges = HashMap::new();
+        let new_ranges = HashMap::new();
 
         if let (ArithExpr::Var(var), ArithExpr::Const(const_val)) = (left, right) {
             let range = self.get_range(*var);

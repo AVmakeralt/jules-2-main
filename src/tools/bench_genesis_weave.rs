@@ -15,6 +15,8 @@
 //  11. Aurora Flux Unified Pipeline (retro vs modern, temporal reprojection)
 // =============================================================================
 
+#![allow(unused_assignments)]
+#![allow(unused_variables)]
 use std::time::Instant;
 
 fn main() {
@@ -811,7 +813,7 @@ fn main() {
     // ── Benchmark 12: SIMD Batch (Morton-to-UV Sprite Pipeline) ──────
     println!("▶ Benchmark 12: SIMD Batch — Morton-to-UV Sprite Pipeline Fix");
     {
-        use jules::jules_std::simd_batch::{SimdMortonDecoder, SimdUvMapper, SimdBranchless, SimdSpritePacket};
+        use jules::jules_std::simd_batch::{SimdMortonDecoder, SimdUvMapper, SimdBranchless};
 
         // Scalar Morton decode baseline (1-at-a-time)
         let n_scalar = 1_000_000u64;
@@ -832,7 +834,7 @@ fn main() {
         for i in 0..n_simd {
             let codes = [(i * 8) as u64, (i * 8 + 1) as u64, (i * 8 + 2) as u64, (i * 8 + 3) as u64,
                          (i * 8 + 4) as u64, (i * 8 + 5) as u64, (i * 8 + 6) as u64, (i * 8 + 7) as u64];
-            let (xs, ys) = SimdMortonDecoder::decode_8x_2d(codes);
+            let (xs, _ys) = SimdMortonDecoder::decode_8x_2d(codes);
             sum_x = sum_x.wrapping_add(xs[0]);
         }
         let elapsed = t.elapsed();
@@ -892,7 +894,7 @@ fn main() {
     println!("▶ Benchmark 13: Aurora Threading — Director Engine + Fiber Pool");
     {
         use jules::jules_std::aurora_threading::{
-            AuroraDirector, WorkloadLevel, AuroraFiberPool,
+            AuroraDirector, AuroraFiberPool,
             verify_aurora_threading,
         };
 

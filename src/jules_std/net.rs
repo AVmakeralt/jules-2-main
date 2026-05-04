@@ -151,10 +151,10 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         }
         "net::tcp_send" => {
             if args.len() < 2 { return Some(Err(rt_err!("net::tcp_send() requires client_handle, data"))); }
-            if let (Some(h), Value::Str(data)) = (i64_arg(args,0), &args[1]) {
+            if let (Some(h), Value::Str(_data)) = (i64_arg(args,0), &args[1]) {
                 TCP_SERVERS.with(|s| {
                     let s = s.borrow();
-                    if let Some(server) = s.get(h as usize - 1) {
+                    if let Some(_server) = s.get(h as usize - 1) {
                         // This sends to all clients — for per-client use tcp_client_send
                         Some(Ok(Value::Unit))
                     } else { Some(Err(rt_err!("net::tcp_send: invalid handle"))) }

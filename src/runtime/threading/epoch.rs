@@ -4,8 +4,6 @@
 // =========================================================================
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
 
 /// Global epoch counter
 static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -33,7 +31,7 @@ impl Participant {
     }
 
     /// Pin the current epoch
-    pub fn pin(&self) -> Guard {
+    pub fn pin(&self) -> Guard<'_> {
         let current = self.local_epoch.load(Ordering::Acquire);
         let global = GLOBAL_EPOCH.load(Ordering::Acquire);
         
@@ -47,7 +45,7 @@ impl Participant {
 
     /// Try to collect garbage from old epochs
     fn try_collect(&self, current_epoch: u64) {
-        let epoch_idx = (current_epoch as usize) % NUM_EPOCHS;
+        let _epoch_idx = (current_epoch as usize) % NUM_EPOCHS;
         let old_epoch_idx = ((current_epoch as usize).wrapping_sub(1)) % NUM_EPOCHS;
         
         // Collect from two epochs ago
@@ -125,7 +123,7 @@ pub fn advance_epoch() {
     let next = current + 1;
     
     // Collect from the epoch that's now two old
-    let old_epoch = if next >= 2 { next - 2 } else { 0 };
+    let _old_epoch = if next >= 2 { next - 2 } else { 0 };
     // In a real implementation, we'd notify participants to collect
 }
 

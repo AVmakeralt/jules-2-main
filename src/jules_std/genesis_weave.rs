@@ -23,8 +23,7 @@
 #![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
-use crate::compiler::lexer::Span;
-use crate::jules_std::prng_simd::{SquaresRng, ShishiuaRng, SimdPrng8};
+use crate::jules_std::prng_simd::SquaresRng;
 
 // ─── Dispatch for stdlib integration ────────────────────────────────────────
 

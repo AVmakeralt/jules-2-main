@@ -94,14 +94,14 @@ impl DataRegion {
     pub fn determine_strategy(&mut self, num_numa_nodes: usize) {
         self.strategy = if self.is_hot && self.size >= 2 * 1024 * 1024 {
             // Hot and large: use huge pages
-            if let Some(node) = self.preferred_numa_node {
+            if let Some(_node) = self.preferred_numa_node {
                 AllocationStrategy::NumaHuge
             } else {
                 AllocationStrategy::HugePages
             }
         } else if self.pattern == AccessPattern::Random && num_numa_nodes > 1 {
             // Random access on multi-NUMA: use local allocation
-            if let Some(node) = self.preferred_numa_node {
+            if let Some(_node) = self.preferred_numa_node {
                 AllocationStrategy::NumaLocal
             } else {
                 AllocationStrategy::Standard
@@ -311,6 +311,7 @@ pub struct MemoryOptimizer {
     /// Huge page size (in bytes)
     huge_page_size: usize,
     /// Whether huge pages are available
+    #[allow(dead_code)]
     huge_pages_available: bool,
 }
 
@@ -531,7 +532,7 @@ impl AlignmentOptimizer {
         }
     }
 
-    fn alignment_reason(&self, size: usize, pattern: AccessPattern, alignment: usize) -> String {
+    fn alignment_reason(&self, _size: usize, pattern: AccessPattern, alignment: usize) -> String {
         if alignment == self.cache_line_size {
             format!(
                 "Cache-line alignment ({} bytes) prevents false sharing and improves prefetching for {} access",

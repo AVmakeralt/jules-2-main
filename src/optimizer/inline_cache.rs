@@ -12,7 +12,7 @@
 // =============================================================================
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+// use std::sync::{Arc, RwLock};
 
 /// Executable code arena for inline cache entries.
 ///
@@ -84,6 +84,7 @@ pub struct RuntimeLinker {
     /// Map from (call_site, type_id) to optimized handler address
     type_handlers: HashMap<(u64, u64), u64>,
     /// Address of the generic dispatch trampoline
+    #[allow(dead_code)]
     trampoline_addr: u64,
 }
 
@@ -124,6 +125,7 @@ impl Default for RuntimeLinker {
 static mut CODE_ARENA: Option<CodeArena> = None;
 
 /// Get or create the global code arena.
+#[allow(static_mut_refs)]
 fn get_arena() -> &'static mut CodeArena {
     unsafe {
         if CODE_ARENA.is_none() {

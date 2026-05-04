@@ -4,10 +4,10 @@
 // Implements crossbeam-style atomic operations for thread safety
 // =========================================================================
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::epoch::{Guard, Participant};
+use super::epoch::Participant;
 
 /// Entity ID type
 pub type EntityId = u64;
@@ -22,6 +22,7 @@ pub trait ComponentStorageTrait: Send + Sync {
 
 /// Sparse set for component storage with epoch protection
 /// Fixed: Uses Vec instead of FxHashMap for 3-5x faster lookup
+#[allow(dead_code)]
 pub struct SparseSet {
     /// Sparse array: entity ID -> index into dense. usize::MAX = not present.
     sparse: Vec<usize>,

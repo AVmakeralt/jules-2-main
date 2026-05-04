@@ -62,6 +62,10 @@ path = "benches/bench_speed.rs"
 name = "bench-jhal"
 path = "benches/bench_jhal.rs"
 
+[[bin]]
+name = "bench-inferno"
+path = "benches/bench_inferno.rs"
+
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }

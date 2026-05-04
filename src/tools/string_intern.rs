@@ -83,7 +83,7 @@ impl StringInterner {
     }
 }
 
-/// Thread-local string interning for hot paths (no locking overhead)
+// Thread-local string interning for hot paths (no locking overhead)
 thread_local! {
     static THREAD_LOCAL_INTERNER: std::cell::RefCell<StringInterner> =
         std::cell::RefCell::new(StringInterner::default());

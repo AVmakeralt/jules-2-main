@@ -30,11 +30,10 @@
 #![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
-use crate::compiler::lexer::Span;
-use crate::jules_std::prng_simd::{SquaresRng, ShishiuaRng, SimdPrng8};
-use crate::jules_std::genesis_weave::{GenesisWeave, hash_coord_2d, hash_to_f64, EntityType, Biome};
-use crate::jules_std::morton::{encode_2d, decode_2d, encode_3d, decode_3d, simd_tile_index, BitPlane};
-use crate::jules_std::collision::{probe_collision, probe_collision_8, batch_collision_8, CollisionResult};
+use crate::jules_std::prng_simd::{ShishiuaRng, SimdPrng8};
+use crate::jules_std::genesis_weave::{GenesisWeave, hash_coord_2d, hash_to_f64, EntityType};
+use crate::jules_std::morton::{encode_2d, decode_2d, simd_tile_index};
+use crate::jules_std::collision::{probe_collision, batch_collision_8, CollisionResult};
 use crate::jules_std::sdf_ray::Vec3;
 
 // ─── Dispatch for stdlib integration ────────────────────────────────────────

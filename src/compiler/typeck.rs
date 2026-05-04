@@ -502,6 +502,7 @@ pub struct TypeCk {
     pub infer: InferCtx,
 }
 
+#[allow(dead_code)]
 impl TypeCk {
     fn is_runtime_builtin_path(name: &str) -> bool {
         const PREFIXES: &[&str] = &[

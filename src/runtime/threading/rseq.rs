@@ -5,12 +5,13 @@
 // =========================================================================
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::ptr;
 
 /// rseq ABI version (from Linux kernel)
+#[allow(dead_code)]
 const RSEQ_ABI_VERSION: u32 = 0;
 
 /// rseq flags
+#[allow(dead_code)]
 const RSEQ_FLAG_UNREGISTER: u32 = 1;
 
 /// rseq CPU ID flags
@@ -48,7 +49,7 @@ pub struct RseqCs {
     _pad: [u8; 32 - 3 * std::mem::size_of::<u64>() - std::mem::size_of::<u32>()],
 }
 
-/// Thread-local rseq state
+// Thread-local rseq state
 thread_local! {
     static RSEQ_STATE: RseqState = RseqState::new();
 }
@@ -117,10 +118,10 @@ pub fn register_rseq() -> bool {
             // Register rseq via syscall
             // On glibc 2.35+, registration happens automatically
             // We simulate the registration here
-            let rseq_ptr = &state.rseq as *const Rseq as *const libc::c_void;
-            let rseq_size = std::mem::size_of::<Rseq>() as libc::size_t;
-            let flags = 0;
-            let sig = 0;
+            let _rseq_ptr = &state.rseq as *const Rseq as *const libc::c_void;
+            let _rseq_size = std::mem::size_of::<Rseq>() as libc::size_t;
+            let _flags = 0;
+            let _sig = 0;
             
             // syscall(__NR_rseq, &rseq, sizeof(rseq), flags, sig)
             // Use libc::syscall if available, otherwise mark as registered

@@ -12,9 +12,9 @@
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
-use super::rseq::{PerCpu, PerCpuCounter, Rseq};
+use super::rseq::{PerCpu, PerCpuCounter};
 
 /// Global rseq manager for runtime-wide integration
 pub struct RseqManager {
@@ -104,7 +104,7 @@ impl<T> RseqMutex<T> {
     }
 
     /// Lock the mutex
-    pub fn lock(&self) -> RseqMutexGuard<T> {
+    pub fn lock(&self) -> RseqMutexGuard<'_, T> {
         if self.use_fallback.load(Ordering::Acquire) {
             // Fallback path
             let guard = self.data.lock().unwrap();
@@ -155,7 +155,7 @@ impl<'a, T> Drop for RseqMutexGuard<'a, T> {
     fn drop(&mut self) {
         if self.rseq {
             // Release the per-CPU lock flag
-            if let Some(cpu_id) = super::rseq::get_cpu_id() {
+            if let Some(_cpu_id) = super::rseq::get_cpu_id() {
                 // Note: This is simplified - in real implementation, we'd need
                 // to track which CPU acquired the lock
             }

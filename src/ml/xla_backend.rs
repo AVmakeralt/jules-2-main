@@ -239,7 +239,7 @@ impl XlaBackend {
         };
 
         #[cfg(not(feature = "xla"))]
-        let native_handle: Option<*mut std::ffi::c_void> = None;
+        let _native_handle: Option<*mut std::ffi::c_void> = None;
 
         let computation = XlaComputation {
             id,

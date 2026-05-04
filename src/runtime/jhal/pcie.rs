@@ -42,6 +42,7 @@
 //      static array with a fixed maximum.
 // =========================================================================
 
+#![allow(dead_code)]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::cell::UnsafeCell;
 use super::io_port::{outl, inl};
@@ -75,18 +76,22 @@ const ECAM_BASE: usize = 0xE000_0000;
 /// Offset 0x00: Vendor ID (bits 15:0) / Device ID (bits 31:16)
 const REG_VENDOR_DEVICE: u8 = 0x00;
 /// Offset 0x02: Device ID (upper 16 bits of offset 0x00 DWORD)
+#[allow(dead_code)]
 const REG_DEVICE_ID_SHIFT: u8 = 16;
 /// Offset 0x08: Revision ID (bits 7:0) / Class Code (bits 31:8)
 const REG_CLASS_REV: u8 = 0x08;
 /// Offset 0x0C: Cache Line Size / Latency Timer / Header Type / BIST
 const REG_HEADER_TYPE: u8 = 0x0C;
 /// Offset 0x0E: Header Type (bits 6:0) / Multi-function (bit 7)
+#[allow(dead_code)]
 const HEADER_TYPE_OFFSET: u8 = 0x0E;
 /// Offset 0x18: Primary Bus Number (header type 1, PCI-to-PCI bridge)
 const REG_PRIMARY_BUS: u8 = 0x18;
 /// Offset 0x19: Secondary Bus Number (header type 1)
+#[allow(dead_code)]
 const REG_SECONDARY_BUS: u8 = 0x19;
 /// Offset 0x1A: Subordinate Bus Number (header type 1)
+#[allow(dead_code)]
 const REG_SUBORDINATE_BUS: u8 = 0x1A;
 
 /// Invalid vendor ID — indicates no device present at this BDF.

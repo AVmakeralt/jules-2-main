@@ -202,6 +202,7 @@ enum BufferState {
 }
 
 /// Double-buffered GPU buffer
+#[allow(dead_code)]
 struct GpuBuffer {
     /// Buffer ID
     id: usize,

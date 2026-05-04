@@ -5,7 +5,6 @@
 // =========================================================================
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 
 /// Basic block identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

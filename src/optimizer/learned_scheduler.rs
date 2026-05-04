@@ -34,7 +34,6 @@
 //                          using the predicted per-instruction cost
 // =============================================================================
 
-use std::collections::HashMap;
 
 // ─── Instruction Features ─────────────────────────────────────────────────────
 

@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::ptr;
 use std::alloc::{Layout, alloc, dealloc};
-use super::rseq::{rseq_begin, rseq_end, get_cpu_id};
+use super::rseq::{rseq_begin, rseq_end};
 
 /// Page size for slab allocation (4KB)
 const PAGE_SIZE: usize = 4096;

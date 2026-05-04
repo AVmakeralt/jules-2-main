@@ -144,7 +144,7 @@ impl HwCounterFeedback {
     }
     
     /// Determine if precision should be reduced based on feedback
-    pub fn should_reduce_precision(&self, current_precision: PrecisionLevel) -> bool {
+    pub fn should_reduce_precision(&self, _current_precision: PrecisionLevel) -> bool {
         // Reduce precision if cache miss rate is high or IPC is low
         let cache_miss = self.cache_miss_rate();
         let ipc = self.ipc();
@@ -153,7 +153,7 @@ impl HwCounterFeedback {
     }
     
     /// Determine if precision should be increased based on feedback
-    pub fn should_increase_precision(&self, current_precision: PrecisionLevel) -> bool {
+    pub fn should_increase_precision(&self, _current_precision: PrecisionLevel) -> bool {
         // Increase precision if cache miss rate is low and IPC is high
         let cache_miss = self.cache_miss_rate();
         let ipc = self.ipc();

@@ -4,8 +4,7 @@
 // Bridges mathematical model with physical CPU reality
 // =========================================================================
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -169,6 +168,7 @@ pub enum SuggestionType {
 }
 
 /// Hardware feedback collector
+#[allow(dead_code)]
 pub struct HwFeedbackCollector {
     /// Performance counter file descriptors (Linux perf_event)
     perf_fds: HashMap<PerfEvent, i32>,

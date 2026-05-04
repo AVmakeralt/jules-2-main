@@ -629,7 +629,7 @@ pub fn dispatch(
 
 fn dispatch_scalar(
     name: &str,
-    args: &[crate::interp::Value],
+    _args: &[crate::interp::Value],
     num_arg: &impl Fn(usize) -> Option<f64>,
 ) -> Option<Result<crate::interp::Value, crate::interp::RuntimeError>> {
     macro_rules! rt_err {

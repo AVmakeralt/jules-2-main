@@ -21,10 +21,8 @@
 #![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
-use crate::compiler::lexer::Span;
-use crate::jules_std::prng_simd::SimdPrng8;
 use crate::jules_std::genesis_weave::{GenesisWeave, hash_coord_2d, hash_to_f64};
-use crate::jules_std::morton::{encode_2d, decode_2d, simd_tile_index};
+use crate::jules_std::morton::encode_2d;
 
 // ─── Dispatch for stdlib integration ────────────────────────────────────────
 

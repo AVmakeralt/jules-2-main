@@ -69,8 +69,8 @@ impl IdentityMap {
     /// Map a 4KB page as identity: VA = PA.
     pub fn map_4kb(&mut self, phys_addr: u64, flags: u64) {
         let pml4_idx = ((phys_addr >> PML4_SHIFT) & 0x1FF) as usize;
-        let pdpt_idx = ((phys_addr >> PDPT_SHIFT) & 0x1FF) as usize;
-        let pd_idx = ((phys_addr >> PD_SHIFT) & 0x1FF) as usize;
+        let _pdpt_idx = ((phys_addr >> PDPT_SHIFT) & 0x1FF) as usize;
+        let _pd_idx = ((phys_addr >> PD_SHIFT) & 0x1FF) as usize;
 
         // Ensure PML4 entry points to our PDPT
         if self.pml4[pml4_idx] == 0 {
@@ -295,6 +295,7 @@ pub const NMI_DEFAULT_INTERVAL: u32 = 62_500;
 /// NMI Watchdog: detects deadlocks by checking an epoch counter.
 /// If the epoch hasn't advanced after 2 consecutive NMI checks,
 /// assumes the core is deadlocked and forces a restart.
+#[allow(dead_code)]
 pub struct NmiWatchdog {
     epoch: AtomicU64,
     last_epoch: u64,

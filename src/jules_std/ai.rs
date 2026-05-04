@@ -102,7 +102,7 @@ pub fn steer_avoid(pos: [f32;2], vel: [f32;2], obstacles: &[[f32;3]], avoidance_
     let mut count = 0;
     for obs in obstacles {
         let [ox, oy, or] = *obs;
-        let mut closest = [ox - pos[0], oy - pos[1]];
+        let closest = [ox - pos[0], oy - pos[1]];
         let dx = pos[0] - ox; let dy = pos[1] - oy;
         let dist = (dx*dx + dy*dy).sqrt();
         let combined_r = avoidance_radius + or;

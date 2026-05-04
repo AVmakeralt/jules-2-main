@@ -131,7 +131,7 @@ fn bench() -> i32 {{
     interp.load_program(&program);
     interp.reset_jit_counters();
 
-    let (mut check_jules, effective_mode, mut jules_runtime_s, mut jules_checksum, jit_counts) = if mode == BenchMode::TieredTracing {
+    let (check_jules, effective_mode, jules_runtime_s, jules_checksum, jit_counts) = if mode == BenchMode::TieredTracing {
         let mut tiered = jules::tiered_compilation::TieredExecutionManager::new(
             jules::tiered_compilation::PromotionPolicy::max_performance(),
         );

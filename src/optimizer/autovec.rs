@@ -13,7 +13,6 @@
 // - Guaranteed SIMD for provably-safe operations
 // =============================================================================
 
-use std::collections::HashMap;
 
 /// SIMD vector width
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

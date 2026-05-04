@@ -1135,7 +1135,7 @@ impl EGraphSynthesizer {
             }
 
             // Redundant branch elimination: Branch to the next instruction → nop
-            PatchInstr::Branch { target } => {
+            PatchInstr::Branch { target: _ } => {
                 // We can't resolve target indices without more context,
                 // but we can remove unconditional branches to block 0
                 // that appear at the end of patches (they're unreachable)

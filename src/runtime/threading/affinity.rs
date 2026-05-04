@@ -5,7 +5,6 @@
 // Windows: SetThreadAffinityMask via winapi
 // =========================================================================
 
-use std::thread;
 
 #[cfg(feature = "numa")]
 #[cfg(target_os = "linux")]
@@ -238,7 +237,7 @@ fn get_thread_affinity_windows() -> Result<Vec<usize>, String> {
 }
 
 /// Set CPU affinity for a mask of CPUs
-pub fn set_thread_affinity_mask(mask: u64) -> Result<(), String> {
+pub fn set_thread_affinity_mask(_mask: u64) -> Result<(), String> {
     #[cfg(feature = "numa")]
     #[cfg(target_os = "linux")]
     {

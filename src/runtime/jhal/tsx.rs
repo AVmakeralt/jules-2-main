@@ -370,10 +370,10 @@ pub unsafe fn amx_tdpbssd(dest: u8, src1: u8, src2: u8) {
     };
     // We can't use dynamic register names in asm!, so we use a match
     match (dest, src1, src2) {
-        (0, 0, 0) => core::arch::asm!("tdpbssd tmm0, tmm0, tmm0", options(nomem, nostack)),
+        // Note: tdpbssd requires all three tile registers to be distinct.
+        // Cases where dest == src1 or dest == src2 are invalid and fall through
+        // to the default no-op handler.
         (0, 1, 2) => core::arch::asm!("tdpbssd tmm0, tmm1, tmm2", options(nomem, nostack)),
-        (1, 0, 1) => core::arch::asm!("tdpbssd tmm1, tmm0, tmm1", options(nomem, nostack)),
-        (2, 0, 2) => core::arch::asm!("tdpbssd tmm2, tmm0, tmm2", options(nomem, nostack)),
         (3, 1, 2) => core::arch::asm!("tdpbssd tmm3, tmm1, tmm2", options(nomem, nostack)),
         // Default: common pattern for learned scheduler
         (d, s1, s2) => {

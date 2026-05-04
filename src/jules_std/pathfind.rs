@@ -101,7 +101,7 @@ fn is_walkable(grid: &[bool], w: usize, h: usize, x: i32, y: i32) -> bool {
     grid[(y as usize) * w + (x as usize)]
 }
 
-fn get_neighbors(p: Pos, w: usize, h: usize, diagonal: bool) -> Vec<Pos> {
+fn get_neighbors(p: Pos, _w: usize, _h: usize, diagonal: bool) -> Vec<Pos> {
     let mut n = Vec::with_capacity(8);
     n.push(Pos(p.0 + 1, p.1));
     n.push(Pos(p.0 - 1, p.1));

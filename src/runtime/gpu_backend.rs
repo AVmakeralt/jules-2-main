@@ -551,8 +551,8 @@ fn batched_matmul(
         for chunk_idx in 0..num_chunks {
             let batch_start = chunk_idx * batches_per_chunk;
             let batch_end = (batch_start + batches_per_chunk).min(batch);
-            let a_data = a_data.clone();
-            let b_data = b_data.clone();
+            let a_data = a_data;
+            let b_data = b_data;
             let chunk_len = (batch_end - batch_start) * batch_mat_size;
 
             let local_out = join(

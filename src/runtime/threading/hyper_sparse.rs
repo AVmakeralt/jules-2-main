@@ -8,7 +8,7 @@
 // =========================================================================
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Bit segment for hyper-sparse representation
 #[derive(Debug)]

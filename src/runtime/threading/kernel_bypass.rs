@@ -6,7 +6,7 @@
 // DPDK (Data Plane Development Kit) for userspace network driver bypass
 // =========================================================================
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::ptr;
 
@@ -197,6 +197,7 @@ pub fn is_uintr_available() -> bool {
 /// io_uring submission queue entry (simplified)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct IoUringSqe {
     /// Opcode
     pub opcode: u8,
@@ -242,6 +243,7 @@ pub struct IoUring {
     /// Completion queue
     cq: *mut u8,
     /// Ring buffer size
+    #[allow(dead_code)]
     ring_size: usize,
     /// SQPOLL mode enabled
     sqpoll: bool,
@@ -544,7 +546,7 @@ pub struct UintrReceiver {
 
 impl UintrReceiver {
     /// Create a new UINTR receiver
-    pub fn new(vector: u64) -> Self {
+    pub fn new(_vector: u64) -> Self {
         Self {
             upid: UintrUpid {
                 ndst: 0,

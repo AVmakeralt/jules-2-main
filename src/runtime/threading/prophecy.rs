@@ -228,6 +228,7 @@ pub enum ProphecyResult<T: Clone> {
 
 /// The execution context for a single speculative prophecy.
 /// Holds the predicted state and a rollback mechanism.
+#[allow(dead_code)]
 pub struct ProphecyContext<T: Clone + Send + 'static> {
     /// The prophecy variable being tested.
     prophecy: ProphecyVariable,

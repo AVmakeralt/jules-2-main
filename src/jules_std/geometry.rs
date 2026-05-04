@@ -415,7 +415,7 @@ fn frustum_planes(fov_y: f32, aspect: f32, near: f32, far: f32) -> [([f32;3], f3
     let near_h = near * tan_half_fov;
     let near_w = near_h * aspect;
     let far_h = far * tan_half_fov;
-    let far_w = far_h * aspect;
+    let _far_w = far_h * aspect;
 
     // Normalized normals for each plane
     let near_plane = ([0.0, 0.0, 1.0], -near);

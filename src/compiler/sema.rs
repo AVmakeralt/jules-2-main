@@ -293,6 +293,7 @@ struct CfStack {
     frames: Vec<CfFrame>,
 }
 
+#[allow(dead_code)]
 impl CfStack {
     fn push(&mut self, f: CfFrame) {
         self.frames.push(f);
@@ -343,6 +344,7 @@ impl CfStack {
 // =============================================================================
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct DeclRecord {
     span: Span,
     use_count: u32,
@@ -351,6 +353,7 @@ struct DeclRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum DeclKind {
     Function,
     System,
@@ -372,6 +375,7 @@ struct DeclRegistry {
     records: FxHashMap<String, DeclRecord>,
 }
 
+#[allow(dead_code)]
 impl DeclRegistry {
     fn register(&mut self, name: impl Into<String>, span: Span, kind: DeclKind) {
         self.records.insert(

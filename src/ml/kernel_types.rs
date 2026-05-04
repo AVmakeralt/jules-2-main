@@ -114,7 +114,7 @@ impl KernelRegistry {
     }
 
     /// Select best attention kernel based on sequence length and hardware.
-    pub fn select_attention_kernel(&self, seq_len: usize, dtype: DataType) -> &dyn AttentionKernel {
+    pub fn select_attention_kernel(&self, seq_len: usize, _dtype: DataType) -> &dyn AttentionKernel {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if is_x86_feature_detected!("avx512f") && seq_len <= 4096 {
@@ -739,7 +739,7 @@ impl Int8Avx2Kernel {
                     for jj in 0..16.min(n - o) {
                         for off in 0..remaining {
                             let a_val = a[i * k + idx + off];
-                            a_u8_arr[off * 16 + jj] = ((a_val * a_scale).round().clamp(0.0, 255.0) as u8);
+                            a_u8_arr[off * 16 + jj] = (a_val * a_scale).round().clamp(0.0, 255.0) as u8;
                             b_i8_arr[off * 16 + jj] = qweight[(idx + off) * n + o + jj];
                         }
                     }
@@ -801,7 +801,7 @@ impl Int8Avx2Kernel {
                     for jj in 0..8.min(n - o) {
                         for off in 0..remaining {
                             let a_val = a[i * k + idx + off];
-                            a_u8_arr[off * 8 + jj] = ((a_val * a_scale).round().clamp(0.0, 255.0) as u8);
+                            a_u8_arr[off * 8 + jj] = (a_val * a_scale).round().clamp(0.0, 255.0) as u8;
                             b_i8_arr[off * 8 + jj] = qweight[(idx + off) * n + o + jj];
                         }
                     }
@@ -863,12 +863,12 @@ impl Int8Avx2Kernel {
 
                     for jj in 0..8.min(n - o) {
                         let a0 = a[i * k + idx];
-                        a_u8_arr[jj] = ((a0 * a_scale).round().clamp(0.0, 255.0) as u8);
+                        a_u8_arr[jj] = (a0 * a_scale).round().clamp(0.0, 255.0) as u8;
                         b_i8_arr[jj] = qweight[idx * n + o + jj];
 
                         if idx + 1 < k {
                             let a1 = a[i * k + idx + 1];
-                            a_u8_arr[16 + jj] = ((a1 * a_scale).round().clamp(0.0, 255.0) as u8);
+                            a_u8_arr[16 + jj] = (a1 * a_scale).round().clamp(0.0, 255.0) as u8;
                             b_i8_arr[16 + jj] = qweight[(idx + 1) * n + o + jj];
                         }
                     }
@@ -1083,7 +1083,7 @@ impl ActivationKernel for SiluGeluAvx512Kernel {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if is_x86_feature_detected!("avx512f") {
             unsafe {
-                use std::arch::x86_64::*;
+                // use std::arch::x86_64::*;
                 let mut output = vec![0.0f32; data.len()];
                 let mut i = 0usize;
                 
@@ -1131,7 +1131,7 @@ impl ActivationKernel for SiluGeluAvx512Kernel {
     }
 
     fn backward(&self, data: &[f32], output: &[f32], upstream_grad: &[f32]) -> Vec<f32> {
-        data.iter().zip(output).zip(upstream_grad).map(|((&x, &out), &g)| {
+        data.iter().zip(output).zip(upstream_grad).map(|((&x, &_out), &g)| {
             // GELU gradient: 0.5 * tanh + 0.5 * x * (1 - tanh^2) * (sqrt(2/pi) * (1 + 3*0.044715*x^2))
             let k = (2.0 / std::f32::consts::PI).sqrt();
             let x2 = x * x;
@@ -1162,7 +1162,7 @@ pub struct KernelBuffer {
 impl KernelBuffer {
     /// Pack weights for optimized GEMM execution.
     /// Reorganizes weight matrix for better cache behavior.
-    pub fn pack_weights_fp32(weights: &[f32], m: usize, k: usize, n: usize) -> Self {
+    pub fn pack_weights_fp32(weights: &[f32], m: usize, _k: usize, n: usize) -> Self {
         // Pack in register blocks (e.g., 8x4 for AVX-512)
         let block_m = 8;
         let block_n = 4;
@@ -1195,7 +1195,7 @@ impl KernelBuffer {
     }
 
     /// Pack weights for INT4 quantized execution.
-    pub fn pack_weights_int4(weights: &[f32], scales: &[f32], m: usize, k: usize, n: usize) -> Self {
+    pub fn pack_weights_int4(weights: &[f32], scales: &[f32], m: usize, _k: usize, n: usize) -> Self {
         let mut packed = vec![0u8; m * ((n + 1) / 2)];
         
         for row in 0..m {

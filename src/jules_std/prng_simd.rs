@@ -18,7 +18,6 @@
 #![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
-use crate::compiler::lexer::Span;
 
 // ─── Dispatch for stdlib integration ────────────────────────────────────────
 
@@ -143,6 +142,7 @@ impl SquaresRng {
 /// Uses 4 rounds of mixing with shifts, XORs, and rotations.
 /// No multiplication, no modulo — just the cheapest operations.
 #[inline(always)]
+#[allow(unused_assignments)]
 fn squares_hash(key: u64, counter: u64) -> u64 {
     let mut x = key;
     let mut y = counter;

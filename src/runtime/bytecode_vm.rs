@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bumpalo::Bump;
 use rustc_hash::FxHashMap;
 
-use crate::compiler::ast::{AssignOpKind, BinOpKind, IfOrBlock, Program, UnOpKind, VecSize};
+use crate::compiler::ast::{BinOpKind, IfOrBlock, Program, UnOpKind};
 use crate::compiler::formal_verify::{ArithmeticMode, EntropyWatchdog, OsrEngine, OsrOutcome, OsrTrigger, TrustTier, WatchdogSensitivity};
-use crate::interp::{RuntimeError, StructData, Tensor, Value};
+use crate::interp::{RuntimeError, StructData, Value};
 #[cfg(feature = "gnn-optimizer")]
 use crate::runtime::memory_management::PrefetchEngine;
 use crate::optimizer::data_dependent_jit::DataDependentJIT;
@@ -674,7 +674,7 @@ impl BytecodeCompiler {
         // after the current loop's loop_start was pushed.  Since we haven't
         // popped loop_starts yet, the count of break labels to patch equals
         // the total minus those that existed before this loop started.
-        let depth = self.loop_starts.len();
+        let _depth = self.loop_starts.len();
         // Collect the break positions that belong to this loop.
         let split_point = {
             // We track how many break labels were already present when we
@@ -1582,7 +1582,7 @@ impl BytecodeVM {
         // Sampling counter: profile every 256 instructions instead of every one.
         let mut profile_counter: u8 = 0;
         // Pre-compute slot pointer for write-intent prefetch in the dispatch loop.
-        let slot_ptr = slots.as_mut_ptr();
+        let _slot_ptr = slots.as_mut_ptr();
 
         // ── Entropy Watchdog ──────────────────────────────────────────────────
         // Replaces the naive PC-counter safety mechanism. Instead of counting
@@ -1594,43 +1594,44 @@ impl BytecodeVM {
         // Main dispatch loop
         while pc < func_len {
             // ── Entropy Watchdog Check ──────────────────────────────────────────
-            // Instead of the old naive PC-counter that just counted instructions,
-            // we monitor whether the program state is changing. Only truly
-            // stagnant loops (where state is unchanged) trigger the watchdog.
+            // The sampled check here is for a HARD INSTRUCTION LIMIT only.
+            // The actual entropy-based loop detection happens at real backedges
+            // (Jump with negative offset). This avoids false positives from
+            // counting every 256 instructions as a "backedge observation".
             // The watchdog is disabled for TIER_0_TRUSTED functions.
             if entropy_watchdog.active {
-                // Sampled check: only run the fingerprint every 256 iterations
-                // to avoid the hashing overhead on every instruction.
                 profile_counter = profile_counter.wrapping_add(1);
-                if profile_counter == 0 && entropy_watchdog.observe_backedge(slots) {
-                    // OSR de-optimization: instead of panicking, de-optimize.
-                    let trigger = OsrTrigger::WatchdogTimeout {
-                        pc,
-                        iterations: entropy_watchdog.total_backedges,
-                    };
-                    match self.osr_engine.deoptimize(trigger, &func.name, pc) {
-                        OsrOutcome::Deoptimized { .. } => {
-                            // Successfully de-optimized: execution continues in
-                            // interpreted mode with full safety monitoring.
-                            // For now, we return an error since we don't have
-                            // a separate interpreter to fall back to.
-                            return Err(RuntimeError::new(format!(
-                                "watchdog: potential infinite loop in '{}' at pc={} \
-                                 (entropy ratio: {:.2}%, {} backedges observed). \
-                                 OSR de-optimization engaged.",
-                                func.name, pc,
-                                entropy_watchdog.entropy_ratio() * 100.0,
-                                entropy_watchdog.total_backedges
-                            )));
-                        }
-                        OsrOutcome::Unavailable { .. } => {
-                            return Err(RuntimeError::new(format!(
-                                "watchdog: potential infinite loop in '{}' at pc={} \
-                                 (entropy ratio: {:.2}%, {} backedges observed)",
-                                func.name, pc,
-                                entropy_watchdog.entropy_ratio() * 100.0,
-                                entropy_watchdog.total_backedges
-                            )));
+                if profile_counter == 0 {
+                    // Only check hard instruction limit here — entropy check
+                    // is at actual backward jumps. Scale by 256 because we
+                    // only sample every 256 instructions.
+                    if let Some(max_backedges) = entropy_watchdog.sensitivity.max_iterations_scaled(entropy_watchdog.complexity_factor) {
+                        if entropy_watchdog.total_backedges > max_backedges {
+                            let trigger = OsrTrigger::WatchdogTimeout {
+                                pc,
+                                iterations: entropy_watchdog.total_backedges,
+                            };
+                            match self.osr_engine.deoptimize(trigger, &func.name, pc) {
+                                OsrOutcome::Deoptimized { .. } => {
+                                    return Err(RuntimeError::new(format!(
+                                        "watchdog: instruction limit exceeded in '{}' at pc={} \
+                                         (entropy ratio: {:.2}%, {} backedges observed). \
+                                         OSR de-optimization engaged.",
+                                        func.name, pc,
+                                        entropy_watchdog.entropy_ratio() * 100.0,
+                                        entropy_watchdog.total_backedges
+                                    )));
+                                }
+                                OsrOutcome::Unavailable { .. } => {
+                                    return Err(RuntimeError::new(format!(
+                                        "watchdog: instruction limit exceeded in '{}' at pc={} \
+                                         (entropy ratio: {:.2}%, {} backedges observed)",
+                                        func.name, pc,
+                                        entropy_watchdog.entropy_ratio() * 100.0,
+                                        entropy_watchdog.total_backedges
+                                    )));
+                                }
+                            }
                         }
                     }
                 }
@@ -2498,7 +2499,7 @@ impl BytecodeVM {
                             // Slow path: iterate to field_idx, then update cache
                             let fidx = *field_idx as usize;
                             let mut iter = data.fields.iter();
-                            let result = if let Some((key, v)) = iter.nth(fidx) {
+                            let result = if let Some((_key, v)) = iter.nth(fidx) {
                                 // Update inline cache for next time
                                 if self.inline_caches.is_empty() {
                                     self.inline_caches.push(InlineCache::new());
@@ -2548,7 +2549,7 @@ impl BytecodeVM {
                                 let fidx = *field_idx as usize;
                                 let key = data.fields.iter().nth(fidx).map(|(k, _)| k.clone());
                                 // Update inline cache
-                                if let Some(ref k) = key {
+                                if let Some(ref _k) = key {
                                     if self.inline_caches.is_empty() {
                                         self.inline_caches.push(InlineCache::new());
                                     }

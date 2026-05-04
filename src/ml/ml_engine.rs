@@ -4,7 +4,7 @@
 // =========================================================================
 
 use crate::runtime::gpu_backend::GpuMemoryManager;
-use crate::ml::xla_backend::{compile_and_execute, XlaBackend, XlaConfig, XlaDevice};
+use crate::ml::xla_backend::{compile_and_execute, XlaBackend, XlaConfig};
 use rustc_hash::FxHashMap;
 use std::thread;
 use std::time::Instant;
@@ -80,6 +80,7 @@ impl Int8LinearWeights {
     }
 }
 
+#[allow(dead_code)]
 impl Tensor {
     const PARALLEL_MATMUL_MIN_OPS: usize = 2_000_000;
 

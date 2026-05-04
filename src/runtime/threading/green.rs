@@ -6,7 +6,6 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::ptr;
 
 /// Green thread ID
 pub type GreenThreadId = u64;
@@ -85,6 +84,7 @@ impl Drop for GreenContext {
 
 /// Context switch function (x86-64)
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 extern "C" fn context_switch(
     old_sp: *mut usize,
     new_sp: usize,
@@ -221,6 +221,7 @@ extern "C" fn context_switch(
 }
 
 /// Green thread scheduler
+#[allow(dead_code)]
 pub struct GreenScheduler {
     /// Ready queue of green threads
     ready_queue: Arc<std::sync::Mutex<Vec<GreenThreadId>>>,
@@ -249,7 +250,7 @@ impl GreenScheduler {
     }
 
     /// Spawn a new green thread
-    pub fn spawn<F>(&self, f: F) -> GreenThreadId
+    pub fn spawn<F>(&self, _f: F) -> GreenThreadId
     where
         F: FnOnce() + Send + 'static,
     {
@@ -292,7 +293,7 @@ impl GreenScheduler {
         
         if let Some(next_id) = ready_queue.pop() {
             let contexts = self.contexts.lock().unwrap();
-            if let Some(context) = contexts.get(&next_id) {
+            if let Some(_context) = contexts.get(&next_id) {
                 // Switch to next thread
                 // In a real implementation, this would use context_switch
                 let current_id = self.current.load(Ordering::Acquire);

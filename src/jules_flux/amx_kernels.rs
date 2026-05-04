@@ -3,8 +3,8 @@
 //! Generates AMX matrix multiplication kernels that integrate with the Phase 3 JIT
 //! and Prophetic Prefetch Engine.
 
-use super::{FluxError, Tile, Precision, TILE_ROWS, TILE_COLS, CACHE_LINE_SIZE};
-use crate::jit::phase3_jit::{compile_ops, NativeCode};
+use super::{Tile, Precision};
+use crate::jit::phase3_jit::compile_ops;
 use crate::interp::{Instr, CompiledFn};
 use crate::runtime::threading::prophetic_prefetch::{PrefetchHint, PrefetchLevel, AccessPattern};
 
@@ -13,10 +13,8 @@ pub fn amx_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::__cpuid;
-        unsafe {
-            let cpuid = __cpuid(7);
-            (cpuid.edx & (1 << 24)) != 0  // AMX-TILE bit
-        }
+        let cpuid = __cpuid(7);
+        (cpuid.edx & (1 << 24)) != 0  // AMX-TILE bit
     }
     #[cfg(not(target_arch = "x86_64"))]
     false
@@ -39,37 +37,37 @@ pub enum TmmReg {
 /// Generate JIT instructions for AMX tile load
 /// 
 /// This creates bytecode that the Phase 3 JIT will compile to native AMX instructions
-pub fn emit_tile_load(tmm: TmmReg, tile: &Tile) -> Vec<Instr> {
+pub fn emit_tile_load(_tmm: TmmReg, tile: &Tile) -> Vec<Instr> {
     // The JIT will inline the actual AMX instruction
     vec![
-        Instr::LoadI(0, tile.phys_addr as i64),  // Load address to slot 0
-        Instr::LoadI(1, tile.stride as i64),     // Load stride to slot 1
-        Instr::NativeCall(0x100 + tmm as u8, vec![0, 1]), // AMX load call
+        Instr::LoadI64(0, tile.phys_addr as i64),  // Load address to slot 0
+        Instr::LoadI64(1, tile.stride as i64),     // Load stride to slot 1
+        Instr::Nop, // TODO: AMX tile load call (0x100 + tmm) — stubbed, VM has no NativeCall
     ]
 }
 
 /// Generate JIT instructions for AMX tile store
-pub fn emit_tile_store(tmm: TmmReg, tile: &Tile) -> Vec<Instr> {
+pub fn emit_tile_store(_tmm: TmmReg, tile: &Tile) -> Vec<Instr> {
     vec![
-        Instr::LoadI(0, tile.phys_addr as i64),
-        Instr::LoadI(1, tile.stride as i64),
-        Instr::NativeCall(0x200 + tmm as u8, vec![0, 1]),
+        Instr::LoadI64(0, tile.phys_addr as i64),
+        Instr::LoadI64(1, tile.stride as i64),
+        Instr::Nop, // TODO: AMX tile store call (0x200 + tmm) — stubbed
     ]
 }
 
 /// Generate JIT instructions for AMX matrix multiply: C = A * B
-pub fn emit_matmul_f32(dst: TmmReg, a: TmmReg, b: TmmReg) -> Vec<Instr> {
+pub fn emit_matmul_f32(_dst: TmmReg, _a: TmmReg, _b: TmmReg) -> Vec<Instr> {
     // TDPF32PS - dot product of FP32 tiles
     vec![
-        Instr::NativeCall(0x300 | ((dst as u8) << 4) | ((a as u8) << 2) | (b as u8), vec![]),
+        Instr::Nop, // TODO: AMX matmul f32 (0x300 | regs) — stubbed
     ]
 }
 
 /// Generate JIT instructions for AMX matrix multiply: C = A * B (INT8)
-pub fn emit_matmul_int8(dst: TmmReg, a: TmmReg, b: TmmReg) -> Vec<Instr> {
+pub fn emit_matmul_int8(_dst: TmmReg, _a: TmmReg, _b: TmmReg) -> Vec<Instr> {
     // TDPBSSD - dot product of signed bytes to signed dwords
     vec![
-        Instr::NativeCall(0x400 | ((dst as u8) << 4) | ((a as u8) << 2) | (b as u8), vec![]),
+        Instr::Nop, // TODO: AMX matmul int8 (0x400 | regs) — stubbed
     ]
 }
 
@@ -86,7 +84,7 @@ pub fn compile_matmul_kernel(name: &str, a: &Tile, b: &Tile, c: &mut Tile) -> Op
     ops.extend(emit_tile_load(TmmReg::TMM1, b));
     
     // Zero accumulator C
-    ops.push(Instr::NativeCall(0x500, vec![])); // tilezero TMM2
+    ops.push(Instr::Nop); // TODO: AMX tilezero (0x500) — stubbed
     
     // Matrix multiply based on precision
     match a.precision {
@@ -106,7 +104,7 @@ pub fn compile_matmul_kernel(name: &str, a: &Tile, b: &Tile, c: &mut Tile) -> Op
     ops.extend(emit_tile_store(TmmReg::TMM2, c));
     
     // Release AMX
-    ops.push(Instr::NativeCall(0x600, vec![])); // tilerelease
+    ops.push(Instr::Nop); // TODO: AMX tilerelease (0x600) — stubbed
 
     compile_ops(name, &ops)
 }
@@ -117,14 +115,14 @@ pub fn compile_fused_matmul_relu(name: &str, a: &Tile, b: &Tile, c: &mut Tile) -
 
     ops.extend(emit_tile_load(TmmReg::TMM0, a));
     ops.extend(emit_tile_load(TmmReg::TMM1, b));
-    ops.push(Instr::NativeCall(0x500, vec![])); // tilezero
+    ops.push(Instr::Nop); // TODO: AMX tilezero (0x500) — stubbed
     ops.extend(emit_matmul_f32(TmmReg::TMM2, TmmReg::TMM0, TmmReg::TMM1));
     
     // Apply ReLU while in registers (native call with RELU flag)
-    ops.push(Instr::NativeCall(0x700, vec![])); // tile_relu TMM2
+    ops.push(Instr::Nop); // TODO: AMX tile_relu (0x700) — stubbed
     
     ops.extend(emit_tile_store(TmmReg::TMM2, c));
-    ops.push(Instr::NativeCall(0x600, vec![])); // tilerelease
+    ops.push(Instr::Nop); // TODO: AMX tilerelease (0x600) — stubbed
 
     compile_ops(name, &ops)
 }
@@ -146,8 +144,8 @@ impl AmxKernelBuilder {
         self
     }
 
-    pub fn zero(mut self, tmm: TmmReg) -> Self {
-        self.ops.push(Instr::NativeCall(0x500 | (tmm as u8) as i64, vec![]));
+    pub fn zero(mut self, _tmm: TmmReg) -> Self {
+        self.ops.push(Instr::Nop); // TODO: AMX tilezero (0x500 | tmm) — stubbed
         self
     }
 
@@ -161,8 +159,8 @@ impl AmxKernelBuilder {
         self
     }
 
-    pub fn relu(mut self, tmm: TmmReg) -> Self {
-        self.ops.push(Instr::NativeCall(0x700 | (tmm as u8) as i64, vec![]));
+    pub fn relu(mut self, _tmm: TmmReg) -> Self {
+        self.ops.push(Instr::Nop); // TODO: AMX tile_relu (0x700 | tmm) — stubbed
         self
     }
 
@@ -172,7 +170,7 @@ impl AmxKernelBuilder {
     }
 
     pub fn release(mut self) -> Self {
-        self.ops.push(Instr::NativeCall(0x600, vec![]));
+        self.ops.push(Instr::Nop); // TODO: AMX tilerelease (0x600) — stubbed
         self
     }
 
@@ -182,10 +180,10 @@ impl AmxKernelBuilder {
 
     /// Add prefetch hint for a tile using the Prophetic Prefetch Engine
     pub fn prefetch_tile(mut self, tile: &Tile, level: PrefetchLevel) -> Self {
-        let hint = create_tile_prefetch_hint(tile, level);
+        let _hint = create_tile_prefetch_hint(tile, level);
         // Emit prefetch as native call with hint data
-        self.ops.push(Instr::LoadI(0, tile.phys_addr as i64));
-        self.ops.push(Instr::NativeCall(0x800 | (level as i64), vec![0]));
+        self.ops.push(Instr::LoadI64(0, tile.phys_addr as i64));
+        self.ops.push(Instr::Nop); // TODO: AMX prefetch (0x800 | level) — stubbed
         self
     }
 }

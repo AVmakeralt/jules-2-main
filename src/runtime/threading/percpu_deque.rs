@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
 use std::ptr;
 use std::alloc::{Layout, alloc, dealloc};
 
-use super::rseq::{rseq_begin, rseq_end, rseq_validate, get_cpu_id};
+use super::rseq::{rseq_begin, rseq_end};
 use super::epoch::{Guard, Participant};
 
 /// Cache line size for alignment
@@ -114,6 +114,7 @@ impl Drop for PerCpuDequeState {
 
 /// Per-CPU deque manager
 /// Manages per-CPU deques with rseq-based wait-free local operations
+#[allow(dead_code)]
 pub struct PerCpuDeque {
     /// Array of per-CPU deque states
     deques: Vec<PerCpuDequeState>,

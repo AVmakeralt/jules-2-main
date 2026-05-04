@@ -161,7 +161,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             // Create test frame buffers for the reprojection demo
             let w = config.screen_width / config.pixel_downsample;
             let h = config.screen_height / config.pixel_downsample;
-            let mut prev = FrameBuffer::new(w, h);
+            let prev = FrameBuffer::new(w, h);
             let mut curr = FrameBuffer::new(w, h);
 
             let recycled = temporal_reproject(&prev, &mut curr, &camera_delta);
@@ -884,7 +884,7 @@ pub fn sieve_traverse(
 pub fn procedural_surface(
     config: &AuroraConfig,
     camera_pos: &Vec3,
-    camera_dir: &Vec3,
+    _camera_dir: &Vec3,
 ) -> SurfaceResult {
     let voxel_ctx = config.voxel_context();
     let splat_ctx = config.splat_context();
@@ -1062,8 +1062,8 @@ pub fn simd_shadow_shade(
 /// Returns statistics about the compositing process.
 pub fn gaussian_composite(
     config: &AuroraConfig,
-    camera_pos: &Vec3,
-    camera_dir: &Vec3,
+    _camera_pos: &Vec3,
+    _camera_dir: &Vec3,
 ) -> CompositeResult {
     let w = config.render_width();
     let h = config.render_height();
@@ -1131,9 +1131,9 @@ pub fn aurora_render(
 ) -> FrameBuffer {
     let w = config.render_width();
     let h = config.render_height();
-    let sdf_ctx = config.sdf_context();
-    let splat_ctx = config.splat_context();
-    let vpl_ctx = config.vpl_context();
+    let _sdf_ctx = config.sdf_context();
+    let _splat_ctx = config.splat_context();
+    let _vpl_ctx = config.vpl_context();
 
     // ── Stage I: Cull ──
     let _cull_result = morton_frustum_cull(config, camera_pos, camera_dir);

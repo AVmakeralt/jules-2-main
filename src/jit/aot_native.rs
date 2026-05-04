@@ -1389,7 +1389,7 @@ pub fn run_reassociate(func: &mut IRFunction) {
         for instr in &block.instrs {
             // Try to fold (a + c1) + c2 → a + (c1 + c2)
             let simplified = match instr {
-                IRInstr::Add { dst, lhs, rhs } => {
+                IRInstr::Add { dst, lhs, rhs: _ } => {
                     if let Some(&IRInstr::Add { lhs: inner_lhs, rhs: inner_rhs, .. }) = value_map.get(lhs) {
                         // lhs is (inner_lhs + inner_rhs), try to push constant up
                         if let Some(&IRInstr::Const { value: c1, .. }) = value_map.get(&inner_rhs) {
@@ -1419,7 +1419,7 @@ pub fn run_reassociate(func: &mut IRFunction) {
                     }
                     instr.clone()
                 }
-                IRInstr::Mul { dst, lhs, rhs } => {
+                IRInstr::Mul { dst, lhs, rhs: _ } => {
                     // Similar for multiplication: (a * c1) * c2 = a * (c1 * c2)
                     if let Some(&IRInstr::Mul { lhs: inner_lhs, rhs: inner_rhs, .. }) = value_map.get(lhs) {
                         if let Some(&IRInstr::Const { value: c1, .. }) = value_map.get(&inner_rhs) {
@@ -1584,7 +1584,7 @@ pub fn dominates(idom: &HashMap<BlockId, BlockId>, a: BlockId, b: BlockId) -> bo
 
 fn rpo_order(func: &IRFunction) -> Vec<BlockId> {
     let mut visited = HashSet::new();
-    let mut order: Vec<BlockId>   = Vec::new();
+    let mut _order: Vec<BlockId>   = Vec::new();
     let mut stack   = vec![func.entry_block];
     // Post-order DFS
     let mut post    = Vec::new();
@@ -1802,7 +1802,7 @@ pub fn run_strength_reduction(func: &mut IRFunction, loops: &[NaturalLoop]) {
                 if let IRInstr::Mul { dst, lhs, rhs } = instr {
                     let rhs_const = find_const_def(func, *rhs, &lp.body);
                     if let Some(factor) = rhs_const {
-                        if let Some(&(base, step)) = ivs.get(lhs) {
+                        if let Some(&(_base, _step)) = ivs.get(lhs) {
                             // Replace mul with: dst_accum = base * factor (pre-header)
                             // and dst_accum += step * factor (in increment block)
                             // For simplicity, convert mul by power-of-2 to shl
@@ -3262,7 +3262,7 @@ pub fn compile_to_native(
         // Multi-pass optimization loop
         let passes = cfg.max_passes;
         for pass in 0..passes {
-            let is_final_pass = pass == passes - 1;
+            let _is_final_pass = pass == passes - 1;
 
             // Hot path tracking: estimate frequencies on first pass
             if pass == 0 {

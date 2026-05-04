@@ -33,11 +33,9 @@
 // =============================================================================
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::prophecy::{ProphecyKind, ProphecyOracle, ProphecyVariable};
-use super::soa_queue;
+use super::prophecy::{ProphecyKind, ProphecyOracle};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -318,6 +316,7 @@ impl PrefetchTracker {
 
 /// Snapshot of instruction access state, used to avoid borrow conflicts
 /// when generating prefetch hints.
+#[allow(dead_code)]
 struct StateSnapshot {
     last_address: usize,
     stride: Option<isize>,

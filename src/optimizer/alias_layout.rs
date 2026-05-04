@@ -37,7 +37,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::compiler::ast::*;
-use crate::compiler::lexer::Span;
 
 // ─── Alias Analysis ───────────────────────────────────────────────────────────
 
@@ -384,7 +383,7 @@ impl LayoutOptimizer {
         }
 
         // Phase 3: Generate noalias hints from proven relationships.
-        for (a, b) in self.analyzer.noalias_pairs() {
+        for (a, _b) in self.analyzer.noalias_pairs() {
             if let MemoryRegion::StructField { struct_name, field_name } = a {
                 result.noalias_hints.push(NoaliasHint {
                     name: format!("{}.{}", struct_name, field_name),
@@ -624,7 +623,7 @@ impl LayoutOptimizer {
             if offset + size > cacheline_size {
                 break;
             }
-            let key = format!("xxx.{}", field_name); // We don't know struct name here
+            let _key = format!("xxx.{}", field_name); // We don't know struct name here
             offset += size;
             count += 1;
         }
@@ -637,7 +636,7 @@ impl LayoutOptimizer {
             Type::Scalar(e) => e.byte_size(),
             Type::Ref { .. } => 8,
             Type::Tuple(ts) => ts.iter().map(Self::type_size).sum(),
-            Type::Array { elem, .. } => 16, // conservative
+            Type::Array { elem: _, .. } => 16, // conservative
             Type::Named(_) => 16,           // conservative
             _ => 8,
         }

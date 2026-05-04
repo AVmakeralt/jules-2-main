@@ -315,7 +315,7 @@ impl Bvh {
 
     pub fn query(&self, q_min: [f32;3], q_max: [f32;3]) -> Vec<u64> {
         let mut results = Vec::new();
-        if let Some(root) = self.nodes.first() {
+        if let Some(_root) = self.nodes.first() {
             self.query_recursive(0, q_min, q_max, &mut results);
         }
         results
@@ -347,7 +347,7 @@ thread_local! {
     static BVHS: std::cell::RefCell<Vec<Bvh>> = std::cell::RefCell::new(Vec::new());
 }
 
-fn new_handle<T>(tl: &impl Fn(&std::cell::RefCell<Vec<T>>) -> std::cell::RefCell<Vec<T>>, value: T) -> u64 {
+fn new_handle<T>(_tl: &impl Fn(&std::cell::RefCell<Vec<T>>) -> std::cell::RefCell<Vec<T>>, _value: T) -> u64 {
     // We can't pass closures like this. Use direct access.
     0
 }

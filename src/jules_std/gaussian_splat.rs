@@ -34,11 +34,10 @@
 #![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
-use crate::compiler::lexer::Span;
-use crate::jules_std::prng_simd::{SquaresRng, ShishiuaRng, SimdPrng8};
-use crate::jules_std::genesis_weave::{GenesisWeave, hash_coord_2d, hash_to_f64, Biome};
-use crate::jules_std::morton::{encode_2d, decode_2d};
-use crate::jules_std::sdf_ray::{Vec3, Ray, HitInfo, SdfContext, compute_normal, sdf_world};
+use crate::jules_std::prng_simd::{SquaresRng, SimdPrng8};
+use crate::jules_std::genesis_weave::{hash_coord_2d, hash_to_f64, Biome};
+use crate::jules_std::morton::encode_2d;
+use crate::jules_std::sdf_ray::{Vec3, Ray, HitInfo, SdfContext};
 
 // ─── Dispatch for stdlib integration ────────────────────────────────────────
 
@@ -988,7 +987,7 @@ pub fn god_rays(ctx: &SplatContext, ray: &Ray, light_dir: &Vec3) -> f64 {
 /// A Vec of Splat2D values, sorted by depth, ready for `composite_splats`.
 pub fn generate_surface_splats(
     ctx: &SplatContext,
-    sdf_ctx: &SdfContext,
+    _sdf_ctx: &SdfContext,
     hit: &HitInfo,
 ) -> Vec<Splat2D> {
     if !hit.hit {
@@ -1571,11 +1570,11 @@ pub fn verify_gaussian_splat() -> bool {
     // ── Test: Splat bounds are reasonable ──
 
     let bounds = splat_bounds(&test_splat2d);
-    let (min_x, min_y, max_x, max_y) = bounds;
-    if min_x > test_splat2d.screen_x || max_x < test_splat2d.screen_x {
+    let (_min_x, _min_y, _max_x, _max_y) = bounds;
+    if _min_x > test_splat2d.screen_x || _max_x < test_splat2d.screen_x {
         eprintln!(
             "FAIL: splat_bounds X doesn't contain center: ({}, {}) vs {}",
-            min_x, max_x, test_splat2d.screen_x
+            _min_x, _max_x, test_splat2d.screen_x
         );
         all_pass = false;
     }

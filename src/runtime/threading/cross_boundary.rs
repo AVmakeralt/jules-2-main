@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 use crate::runtime::threading::lossy_computation::{
-    LossyComputationContext, PrecisionLevel, TaskPriority, HwCounterFeedback,
+    LossyComputationContext, PrecisionLevel,
 };
 use crate::runtime::threading::hyper_sparse::{
-    HyperSparseMap, HyperSparseSoA, SegmentedSieve,
+    HyperSparseMap, HyperSparseSoA,
 };
 use crate::runtime::threading::hw_optimizations::CatManager;
 
@@ -65,6 +65,7 @@ impl FusedOperation {
 }
 
 /// Zero-copy data transfer between lossy and hyper-sparse
+#[allow(dead_code)]
 pub struct ZeroCopyTransfer {
     /// Source data pointer
     source: *mut u8,

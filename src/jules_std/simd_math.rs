@@ -52,7 +52,7 @@ pub fn fast_exp_f32(x: f32) -> f32 {
     // Degree-6 minimax polynomial for exp(r) on [-0.347, 0.347]
     // exp(r) ≈ 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120 + r⁶/720
     // Horner form: 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r*(1/120 + r/720)))))
-    let r2 = r * r;
+    let _r2 = r * r;
     let p = 1.0 + r * (1.0 + r * (0.5 + r * (0.1666666666666666
         + r * (0.041666666666666664
         + r * (0.008333333333333333

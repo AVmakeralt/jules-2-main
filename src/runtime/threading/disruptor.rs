@@ -5,7 +5,7 @@
 // Ownership transfer without data movement
 // =========================================================================
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::ptr;
 
@@ -16,6 +16,7 @@ const CACHE_LINE_SIZE: usize = 64;
 const RING_CAPACITY: usize = 1024;
 
 /// Sequence number type
+#[allow(dead_code)]
 type Sequence = u64;
 
 /// Ring buffer entry

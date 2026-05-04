@@ -701,7 +701,7 @@ impl Loss {
         stable_logits.iter()
             .zip(&targets.data)
             .enumerate()
-            .map(|(i, (logit, target))| {
+            .map(|(_i, (logit, target))| {
                 let p = (logit - sum_exp.ln()).exp();
                 -target * (1.0 - p).powf(gamma) * (p + 1e-12).ln()
             })

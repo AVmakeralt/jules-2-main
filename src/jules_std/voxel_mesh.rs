@@ -39,12 +39,10 @@
 #![allow(unused_imports)]
 
 use crate::interp::{RuntimeError, Value};
-use crate::compiler::lexer::Span;
-use crate::jules_std::prng_simd::{SquaresRng, ShishiuaRng, SimdPrng8};
-use crate::jules_std::genesis_weave::{GenesisWeave, hash_coord_3d, hash_to_f64, terrain_height, Biome};
-use crate::jules_std::sieve_210::{sieve_210_wheel, WHEEL_RESIDUES, n_to_candidate_index, candidate_index_to_n};
-use crate::jules_std::morton::{encode_2d, decode_2d, encode_3d, decode_3d, BitPlane, WorldBitPlane};
-use crate::jules_std::sdf_ray::{Vec3, SdfContext, sdf_world, HitInfo};
+use crate::jules_std::genesis_weave::{hash_coord_3d, hash_to_f64, terrain_height, Biome};
+use crate::jules_std::sieve_210::n_to_candidate_index;
+use crate::jules_std::morton::{encode_2d, encode_3d, decode_3d};
+use crate::jules_std::sdf_ray::{Vec3, SdfContext, HitInfo};
 use crate::jules_std::gaussian_splat::{Gaussian3D, SplatContext, generate_splats};
 
 // ─── Dispatch for stdlib integration ────────────────────────────────────────
@@ -452,7 +450,7 @@ pub fn is_voxel_solid(ctx: &VoxelContext, x: i64, y: i64, z: i64) -> bool {
     // if the Morton index is "prime-like" (coprime to 210), we place a
     // micro-structure. This is extremely sparse (~0.5% of voxels).
     let candidate = n_to_candidate_index(morton);
-    if let Some(idx) = candidate {
+    if let Some(_idx) = candidate {
         // Check if the sieve index is "active" — this creates a sparse
         // pattern of micro-structures that is deterministic and spatially
         // coherent thanks to the Morton encoding
@@ -1394,7 +1392,7 @@ pub fn seam_stitch(
 /// organic detail (moss, grass, leaves, dust) comes from Gaussian splats.
 pub fn voxel_to_splat(
     ctx: &SplatContext,
-    chunk: &VoxelChunk,
+    _chunk: &VoxelChunk,
     mesh: &[MeshTriangle],
 ) -> Vec<Gaussian3D> {
     let mut all_splats = Vec::new();
@@ -1458,9 +1456,9 @@ pub fn destroy_voxel(
     for dy in y_min..y_max {
         for dz in z_min..z_max {
             for dx in x_min..x_max {
-                let dist_x = (dx as f64 - x as f64);
-                let dist_y = (dy as f64 - y as f64);
-                let dist_z = (dz as f64 - z as f64);
+                let dist_x = dx as f64 - x as f64;
+                let dist_y = dy as f64 - y as f64;
+                let dist_z = dz as f64 - z as f64;
                 let dist_sq = dist_x * dist_x + dist_y * dist_y + dist_z * dist_z;
 
                 if dist_sq <= r_sq {
@@ -1524,7 +1522,7 @@ pub fn mesh_performance_estimate(volume_size: u32) -> (f64, f64) {
 /// Returns true if the fractal consistency is maintained for a sample
 /// of test positions.
 pub fn fractal_consistency(ctx: &VoxelContext, x: i64, y: i64, z: i64) -> bool {
-    let detail_solid = is_voxel_solid(ctx, x, y, z);
+    let _detail_solid = is_voxel_solid(ctx, x, y, z);
 
     // Check consistency across all LOD levels
     for lod in 1..=ctx.max_lod {

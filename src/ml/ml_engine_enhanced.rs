@@ -627,7 +627,7 @@ impl Tensor {
     // Normalization Operations
     // =========================================================================
 
-    pub fn batch_norm(&self, gamma: &Tensor, beta: &Tensor, momentum: f32, epsilon: f32) -> (Tensor, f32, f32) {
+    pub fn batch_norm(&self, gamma: &Tensor, beta: &Tensor, _momentum: f32, epsilon: f32) -> (Tensor, f32, f32) {
         let mean = self.mean();
         let variance = self.variance();
 
@@ -768,7 +768,7 @@ impl Tensor {
             new_shape[axis] = idx - start;
 
             let elements_per_chunk = self.numel() / self.shape[axis];
-            let chunk_size = (idx - start) * elements_per_chunk;
+            let _chunk_size = (idx - start) * elements_per_chunk;
 
             let data = self.data[start * elements_per_chunk..(start + idx - start) * elements_per_chunk]
                 .to_vec();
@@ -952,7 +952,7 @@ impl LossFunctions {
         logits.data.iter()
             .zip(&targets.data)
             .enumerate()
-            .map(|(i, (logit, target))| {
+            .map(|(i, (_logit, target))| {
                 let prob = exp_logits[i] / sum_exp;
                 -target * (prob.max(1e-12).ln())
             })

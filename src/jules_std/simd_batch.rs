@@ -74,7 +74,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         }
         "simd_batch::sprite_at_morton_8" => {
             // Expects: seed (i64), array of 8 morton codes, atlas_w, atlas_h, tile_size
-            let seed = args.first().and_then(|v| v.as_i64()).unwrap_or(42) as u64;
+            let _seed = args.first().and_then(|v| v.as_i64()).unwrap_or(42) as u64;
             let codes_arr = args.get(1);
             let atlas_w = args.get(2).and_then(|v| v.as_i64()).unwrap_or(1024) as u32;
             let atlas_h = args.get(3).and_then(|v| v.as_i64()).unwrap_or(1024) as u32;
@@ -1872,7 +1872,7 @@ pub fn benchmark_sprite_at_morton_8() -> u64 {
         let (xs, ys) = SimdMortonDecoder::decode_8x_2d(codes);
 
         // Step 2: Batch map to UV
-        let (us, vs) = SimdUvMapper::morton_to_uv_8(&codes, 1024, 1024, 16);
+        let (us, _vs) = SimdUvMapper::morton_to_uv_8(&codes, 1024, 1024, 16);
 
         // Step 3: Build sprite packets
         let mut batch = SimdSpriteBatch::default();

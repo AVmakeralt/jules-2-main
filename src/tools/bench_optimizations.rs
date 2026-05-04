@@ -5,6 +5,7 @@
 // Tests: Bytecode VM, TensorFast, Tracing JIT, Symbol interning, SIMD ops.
 // =============================================================================
 
+#![allow(dead_code)]
 use std::time::Instant;
 
 fn main() {
@@ -35,7 +36,7 @@ fn main() {
         let size = 10_000;
         let iterations = 1_000;
         let mut a = vec![1.0_f32; size];
-        let mut b = vec![2.0_f32; size];
+        let b = vec![2.0_f32; size];
 
         let start = Instant::now();
         for _ in 0..iterations {

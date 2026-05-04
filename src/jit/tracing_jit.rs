@@ -38,7 +38,7 @@ extern "C" {
     fn munmap(addr: *mut c_void, len: usize) -> i32;
 }
 
-use crate::compiler::ast::{BinOpKind, UnOpKind};
+use crate::compiler::ast::BinOpKind;
 use crate::interp::{Instr, RuntimeError, Value};
 
 // =============================================================================
@@ -523,7 +523,7 @@ impl NativeCodeGenerator {
         Ok(())
     }
 
-    fn emit_unboxed_load(&mut self, offset: u32, vtype: ValueType, buffer: *mut u8, reg: Reg) -> Result<(), String> {
+    fn emit_unboxed_load(&mut self, offset: u32, _vtype: ValueType, _buffer: *mut u8, reg: Reg) -> Result<(), String> {
         // Load from unboxed buffer at [buffer + offset]
         // For now, use r8 as the buffer base register (passed in via calling convention)
         let reg_code = reg as u8;
@@ -541,7 +541,7 @@ impl NativeCodeGenerator {
         self.emit_unboxed_store_reg(offset, Reg::RAX, vtype, buffer);
     }
 
-    fn emit_unboxed_store_reg(&mut self, offset: u32, reg: Reg, vtype: ValueType, buffer: *mut u8) {
+    fn emit_unboxed_store_reg(&mut self, offset: u32, reg: Reg, _vtype: ValueType, _buffer: *mut u8) {
         // Store register to unboxed buffer at [r8 + offset]
         let reg_code = reg as u8;
         let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
@@ -565,8 +565,8 @@ impl NativeCodeGenerator {
         // Evict
         let victim = if let Some(RegState::Dirty(v)) = self.reg_map.get(&preferred) { *v } else {
             // Find any occupant
-            for (reg, state) in &self.reg_map {
-                if let RegState::Occupied(s) = state { return self.spill_and_evict(slot, preferred); }
+            for (_reg, state) in &self.reg_map {
+                if let RegState::Occupied(_s) = state { return self.spill_and_evict(slot, preferred); }
             }
             return Err("No registers available".into());
         };
@@ -582,7 +582,7 @@ impl NativeCodeGenerator {
             reg
         } else {
             // Pick a victim register
-            if let Some(RegState::Dirty(v)) = self.reg_map.get(&target) {
+            if let Some(RegState::Dirty(_v)) = self.reg_map.get(&target) {
                 target
             } else {
                 // Find any occupant
@@ -805,7 +805,7 @@ impl TracingJIT {
     pub fn should_start_tracing(&self, c: u64) -> bool { c == self.trace_trigger }
     pub fn should_compile(&self, t: &Trace) -> bool { t.execution_count >= self.compile_trigger }
 
-    pub fn execute_with_jit(&mut self, entry_pc: usize, slots: &mut [Value], types: &mut [u8], instructions: &[Instr]) -> Result<Value, RuntimeError> {
+    pub fn execute_with_jit(&mut self, entry_pc: usize, slots: &mut [Value], types: &mut [u8], _instructions: &[Instr]) -> Result<Value, RuntimeError> {
         if let Some(tid) = self.recorder.find_trace(entry_pc) {
             if let Some(trace) = self.recorder.get_trace(tid) {
                 if self.should_compile(trace) && !trace.instructions.is_empty() {

@@ -179,7 +179,7 @@ impl JitFunction {
     }
 
     /// Check if this function should be promoted to the next tier
-    pub fn should_promote(&self, threshold: u64) -> bool {
+    pub fn should_promote(&self, _threshold: u64) -> bool {
         // Promote if hot and not at max tier
         self.stats.is_hot && self.stats.tier < JitTier::EGraph
     }

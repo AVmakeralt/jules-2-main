@@ -5,8 +5,6 @@
 // =========================================================================
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 
 /// Speculative task execution
 /// Executes tasks before dependencies are fully resolved
@@ -83,7 +81,7 @@ impl SpeculativeExecutor {
     }
     
     /// Confirm a speculative execution was correct
-    pub fn confirm(&mut self, task_id: usize) {
+    pub fn confirm(&mut self, _task_id: usize) {
         // Task was correct, keep in completed
     }
     

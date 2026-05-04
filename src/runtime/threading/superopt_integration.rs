@@ -6,24 +6,17 @@
 // =========================================================================
 
 use crate::compiler::ast::{Expr, BinOpKind};
-use crate::compiler::lexer::Span;
 use crate::runtime::threading::gpu_pipeline::{GpuOpType, GpuPipeline, GpuTaskDescriptor};
 use crate::runtime::threading::hw_optimizations::{CatManager, HugePageAllocator};
 use crate::runtime::threading::{
-    ThreadPool, Worker,
-    PerCpuDeque, PerCpuCounter, get_cpu_id, is_rseq_available, register_rseq,
-    HybridNotify, IoUring, UintrReceiver, UintrSender, is_io_uring_available, is_uintr_available,
-    AmxContext, Avx512Mask, CompareOp, HwCapabilities, TsxTransaction,
+    ThreadPool,
+    is_rseq_available, register_rseq,
+    HybridNotify, is_io_uring_available, is_uintr_available,
+    AmxContext, HwCapabilities, TsxTransaction,
     is_amx_available, is_avx512_available, is_cat_available, is_tsx_available,
-    SoaScheduler, SoaTaskQueue, warm_function_cache, warm_task_cache,
-    StackTask, TaskBatch, TaskCache, TASK_TYPE_COMPUTE, TASK_TYPE_IO, TASK_TYPE_GPU, TASK_TYPE_SYNC,
-    JitSchedulerCompiler, RuntimeStats, SchedulingStrategy, SelfOptimizingRuntime, TraceBasedScheduler, WorkloadPhase,
-    HwCounter, HwCounterReader, HwCounterValue,
-    PrecisionLevel, TaskPriority, LossyComputationContext, LossyComputationManager,
-    HyperSparseMap, HyperSparseSoA, SegmentedSieve,
-    CrossBoundaryOptimizer, FusedOperation,
-    PropheticPrefetchEngine, PrefetchEmitter, PrefetchHint, PrefetchLevel, AccessPattern,
-    prefetch_hypersparse_next, prefetch_soa_gather, prefetch_soa_queue_next,
+    SoaScheduler,
+    JitSchedulerCompiler, SelfOptimizingRuntime,
+    PropheticPrefetchEngine,
 };
 
 /// Scheduling hint from superoptimizer (extended)
@@ -537,6 +530,7 @@ pub fn generate_rewrite_rules() -> Vec<RewriteRule> {
 }
 
 /// Superoptimizer integration for threading (extended)
+#[allow(dead_code)]
 pub struct SuperoptThreadingIntegration {
     /// Thread pool for task execution
     pool: ThreadPool,
@@ -783,7 +777,7 @@ impl SuperoptThreadingIntegration {
                         analysis.locality = DataLocality::SameNuma;
                         analysis
                     }
-                    BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul | BinOpKind::Div => {
+                    BinOpKind::Add | BinOpKind::Sub | BinOpKind::Div => {
                         // Arithmetic operations: use rseq if available, otherwise parallel
                         let mut analysis = ExpressionAnalysis::new(
                             if is_rseq_available() { SchedulingHint::RseqWaitFree } else { SchedulingHint::Parallel },

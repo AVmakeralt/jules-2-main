@@ -5,9 +5,8 @@
 // Includes software prefetching and cache warming
 // =========================================================================
 
-use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ptr;
-use std::alloc::{Layout, alloc, dealloc};
 
 /// Cache line size
 const CACHE_LINE_SIZE: usize = 64;
@@ -265,6 +264,7 @@ impl DataAffinityMap {
 }
 
 /// SoA scheduler with cache warming
+#[allow(dead_code)]
 pub struct SoaScheduler {
     /// Ready queue (SoA layout)
     ready_queue: SoaTaskQueue,

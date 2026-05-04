@@ -31,13 +31,12 @@
 #![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
-use crate::compiler::lexer::Span;
-use crate::jules_std::prng_simd::{SquaresRng, ShishiuaRng, SimdPrng8};
-use crate::jules_std::genesis_weave::{GenesisWeave, hash_coord_2d, hash_to_f64, Biome, terrain_height};
-use crate::jules_std::sieve_210::{sieve_210_wheel, primes_up_to, WHEEL_RESIDUES};
-use crate::jules_std::morton::{encode_2d, decode_2d, simd_tile_index};
-use crate::jules_std::collision::{probe_collision_8, PROBE_OFFSETS_8, batch_collision_8, CollisionResult};
-use crate::jules_std::sdf_ray::{Vec3, Ray, SdfContext, sdf_world, compute_normal, ray_march, HitInfo};
+use crate::jules_std::prng_simd::{SquaresRng, SimdPrng8};
+use crate::jules_std::genesis_weave::{hash_coord_2d, hash_to_f64, Biome, terrain_height};
+use crate::jules_std::sieve_210::primes_up_to;
+use crate::jules_std::morton::encode_2d;
+use crate::jules_std::collision::PROBE_OFFSETS_8;
+use crate::jules_std::sdf_ray::{Vec3, Ray, SdfContext, compute_normal, ray_march, HitInfo};
 
 // ─── Dispatch for stdlib integration ────────────────────────────────────────
 
@@ -321,7 +320,7 @@ pub fn generate_vpl_positions(
     // For each light seed, derive a 3D position
     let mut lights: Vec<(u64, VirtualPointLight)> = Vec::with_capacity(light_seeds.len());
 
-    for (idx, &prime_val) in light_seeds.iter().enumerate() {
+    for (_idx, &prime_val) in light_seeds.iter().enumerate() {
         // Use the prime as a PRNG seed to derive position offset
         let mut rng = SquaresRng::new(prime_val.wrapping_add(ctx.seed));
 
@@ -1049,7 +1048,7 @@ pub fn god_rays_intensity(
     let mut intensity = 0.0f64;
     let mut transmittance = 1.0f64;
 
-    let mut simd_rng = SimdPrng8::new(seed.wrapping_add(0x60DA7E5_u64));
+    let _simd_rng = SimdPrng8::new(seed.wrapping_add(0x60DA7E5_u64));
 
     for i in 0..steps {
         let t = (i as f64 + 0.5) * step_size;

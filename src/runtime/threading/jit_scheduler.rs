@@ -5,11 +5,11 @@
 // Trace-based scheduling for steady-state optimization
 // =========================================================================
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
 
 /// Task function pointer type
+#[allow(dead_code)]
 type TaskFn = fn(*mut ());
 
 /// Hardware performance counter types
@@ -424,6 +424,7 @@ impl TraceBasedScheduler {
 
 /// Self-optimizing runtime
 /// Combines JIT compilation with hardware counter feedback
+#[allow(dead_code)]
 pub struct SelfOptimizingRuntime {
     /// JIT scheduler compiler
     jit: JitSchedulerCompiler,

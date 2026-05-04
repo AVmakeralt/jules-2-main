@@ -13,30 +13,25 @@
 // =========================================================================
 
 use std::hint::black_box;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use jules::runtime::jhal::{
-    SerialRingBuffer, Console, BaudRate,
+    SerialRingBuffer, Console,
     DeviceRegistry, PciDevice, PciBdf, PciHeaderType,
     BoundedBus, BoundedDevice, BoundedFunction,
-    MAX_BUS, MAX_DEVICE, MAX_FUNCTION, MAX_BARS,
-    ApicTimerConfig, TimerDivide,
-    LVT_TIMER_VECTOR, LVT_TIMER_MODE_PERIODIC, LVT_TIMER_MASKED,
-    SVR_ENABLE,
+    MAX_BARS,
+    ApicTimerConfig,
     SfiConfig, DEFAULT_SANCTUARY_BASE, DEFAULT_SANCTUARY_SIZE,
-    verify_sfi_invariant, verify_sfi_config,
-    TsxStatus, prove_transaction_bound, L1D_CACHE_SIZE,
-    AmxTileConfig, scheduler_matmul_fallback,
+    verify_sfi_invariant,
+    TsxStatus, prove_transaction_bound, scheduler_matmul_fallback,
     verify_register_partition,
-    IdtEntry, Idt, IDT_ENTRIES, FIRST_USER_VECTOR,
-    GATE_TYPE_INTERRUPT, GATE_TYPE_TRAP,
-    FastIrqVectorTable,
-    IrqProphecy, IrqPredictor, CONFIDENCE_THRESHOLD,
+    IdtEntry, Idt,
+    FIRST_USER_VECTOR,
+    IrqPredictor,
     IdentityMap, HugePageAllocator, HugePageSize,
     IommuDropZone, NmiWatchdog,
-    CfiJumpTable, verify_cfi_compliance,
-    PTE_PRESENT, PTE_WRITABLE, PTE_HUGE_PAGE, PTE_NO_EXECUTE,
-    SANCTUARY_SIZE,
+    CfiJumpTable,
+    PTE_PRESENT, PTE_WRITABLE,
 };
 
 fn main() {
@@ -307,7 +302,7 @@ fn bench_formatting_decimal(iters: usize) -> u64 {
     for i in 0..iters {
         buf.fill(0);
         let val = black_box((i as u32).wrapping_mul(7919));
-        let mut pos = 0;
+        let pos = 0;
         count += black_box(write_u32_decimal_bench(&mut buf, pos, val)) as u64;
     }
     count
@@ -319,7 +314,7 @@ fn bench_formatting_hex(iters: usize) -> u64 {
     for i in 0..iters {
         buf.fill(0);
         let val = black_box((i as u32).wrapping_mul(7919));
-        let mut pos = 0;
+        let pos = 0;
         count += black_box(write_u32_hex_bench(&mut buf, pos, val)) as u64;
     }
     count
@@ -594,8 +589,8 @@ fn bench<F: FnMut() -> R, R>(name: &str, iterations: usize, mut f: F) {
 
     times.sort_unstable();
     let min = times[0];
-    let median = times[5];
-    let max = times[9];
+    let _median = times[5];
+    let _max = times[9];
 
     let ns_per_iter = min.as_nanos() as f64 / iterations as f64;
     let throughput = if ns_per_iter > 0.0 { 1_000_000_000.0 / ns_per_iter } else { f64::INFINITY };

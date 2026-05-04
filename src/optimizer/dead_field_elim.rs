@@ -526,7 +526,7 @@ impl DeadFieldEliminator {
 
     fn eliminate_writes_stmt(&mut self, stmt: &mut Stmt, dead_field_set: &HashSet<String>) {
         match stmt {
-            Stmt::If { cond, then, else_, .. } => {
+            Stmt::If { cond: _, then, else_, .. } => {
                 self.eliminate_writes_block(then, dead_field_set);
                 if let Some(eb) = else_ {
                     match &mut **eb {
@@ -612,7 +612,7 @@ fn type_size(ty: &Type) -> usize {
         Type::Scalar(e) => e.byte_size(),
         Type::Ref { .. } => 8,
         Type::Tuple(ts) => ts.iter().map(type_size).sum(),
-        Type::Array { elem, .. } => 16,
+        Type::Array { elem: _, .. } => 16,
         Type::Named(_) => 16,
         _ => 8,
     }

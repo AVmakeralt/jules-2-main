@@ -125,6 +125,7 @@ use crate::compiler::lexer::{LexError, Lexer, Span};
 
 struct Ansi;
 
+#[allow(dead_code)]
 impl Ansi {
     const RESET: &'static str = "\x1b[0m";
     const BOLD: &'static str = "\x1b[1m";
@@ -254,6 +255,7 @@ impl Default for RenderCfg {
 
 /// Renders a slice of diagnostics to a `String` using Rust-compiler-style
 /// formatting with source squiggles.
+#[allow(dead_code)]
 pub struct DiagRenderer<'src> {
     source: &'src str,
     filename: &'src str,

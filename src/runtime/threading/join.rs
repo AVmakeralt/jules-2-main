@@ -4,11 +4,11 @@
 // Implements vtable pattern for type-erased execution
 // =========================================================================
 
+#![allow(static_mut_refs)]
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::Arc;
 use std::mem::ManuallyDrop;
 
-use super::epoch::{Guard, Participant};
+use super::epoch::Participant;
 use crate::runtime::threading::ThreadResult;
 use super::slab::SlabAllocator;
 use super::worker::ThreadPool;
@@ -20,6 +20,7 @@ static mut GLOBAL_SLAB: Option<SlabAllocator> = None;
 static POOL_INIT: std::sync::Once = std::sync::Once::new();
 
 /// Get or create the global thread pool
+#[allow(static_mut_refs)]
 fn get_pool() -> &'static ThreadPool {
     unsafe {
         POOL_INIT.call_once(|| {
@@ -32,6 +33,7 @@ fn get_pool() -> &'static ThreadPool {
 }
 
 /// Get the global slab allocator
+#[allow(static_mut_refs)]
 fn get_slab() -> &'static SlabAllocator {
     unsafe {
         POOL_INIT.call_once(|| {
@@ -44,6 +46,8 @@ fn get_slab() -> &'static SlabAllocator {
 }
 
 /// Get the global epoch participant
+#[allow(dead_code)]
+#[allow(static_mut_refs)]
 fn get_participant() -> &'static Participant {
     unsafe {
         POOL_INIT.call_once(|| {
@@ -56,6 +60,7 @@ fn get_participant() -> &'static Participant {
 }
 
 /// Vtable for task execution
+#[allow(dead_code)]
 struct TaskVtable {
     /// Run the task
     run: unsafe fn(*mut ()),
@@ -65,6 +70,7 @@ struct TaskVtable {
 
 /// Stack-allocated task descriptor with vtable
 #[repr(C)]
+#[allow(dead_code)]
 struct StackTask {
     /// Vtable pointer
     vtable: *const TaskVtable,
@@ -76,6 +82,7 @@ struct StackTask {
     completed: AtomicBool,
 }
 
+#[allow(dead_code)]
 impl StackTask {
     /// Create a new stack task
     fn new(vtable: *const TaskVtable) -> Self {
@@ -112,6 +119,7 @@ impl StackTask {
 }
 
 /// Slab-allocated task descriptor
+#[allow(dead_code)]
 struct SlabTask {
     /// Vtable pointer
     vtable: *const TaskVtable,
@@ -123,6 +131,7 @@ struct SlabTask {
     result_ptr: AtomicPtr<()>,
 }
 
+#[allow(dead_code)]
 impl SlabTask {
     fn new(vtable: *const TaskVtable) -> Self {
         Self {
