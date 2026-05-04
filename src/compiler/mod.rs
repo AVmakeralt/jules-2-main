@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod borrowck;
+pub mod formal_verify;
 pub mod lexer;
 pub mod parser;
 pub mod sema;
