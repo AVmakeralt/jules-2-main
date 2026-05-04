@@ -9,6 +9,9 @@ pub mod compiler;
 // ML/AI modules
 pub mod ml;
 
+// Jules-Flux: Zero-Copy Tiled-Graph Compiler (XLA/Triton equivalent)
+pub mod jules_flux;
+
 // Optimizer modules
 pub mod optimizer;
 
