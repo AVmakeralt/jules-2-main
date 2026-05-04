@@ -2174,8 +2174,31 @@ impl BytecodeVM {
 
                     match &func_val {
                         Value::Fn(closure) => {
-                            // Look up the BytecodeFunction by name
                             let fn_name = closure.decl.name.clone();
+
+                            // ── Optimizer annotation builtins (identity functions) ──
+                            // These are inserted by the superoptimizer during compilation.
+                            // At runtime they are identity functions — return the first argument.
+                            if matches!(
+                                fn_name.as_str(),
+                                "fused_elementwise"
+                                | "exact_div_restore"
+                                | "matmul_elemwise"
+                                | "scaled_matmul"
+                            ) {
+                                let ret = args.into_iter().next().ok_or_else(|| {
+                                    RuntimeError::new(format!(
+                                        "{fn_name}() requires at least 1 argument"
+                                    ))
+                                })?;
+                                unsafe {
+                                    (&mut (*vm_ptr).memory_pool.slots)[dst_idx] = ret;
+                                }
+                                pc += 1;
+                                continue;
+                            }
+
+                            // Look up the BytecodeFunction by name
                             let callee_idx = self.functions.iter().position(|f| f.name == fn_name);
                             match callee_idx {
                                 Some(idx) => {
@@ -2209,6 +2232,26 @@ impl BytecodeVM {
                             }
                         }
                         Value::Str(fn_name) => {
+                            // ── Optimizer annotation builtins (identity functions) ──
+                            if matches!(
+                                fn_name.as_str(),
+                                "fused_elementwise"
+                                | "exact_div_restore"
+                                | "matmul_elemwise"
+                                | "scaled_matmul"
+                            ) {
+                                let ret = args.into_iter().next().ok_or_else(|| {
+                                    RuntimeError::new(format!(
+                                        "{fn_name}() requires at least 1 argument"
+                                    ))
+                                })?;
+                                unsafe {
+                                    (&mut (*vm_ptr).memory_pool.slots)[dst_idx] = ret;
+                                }
+                                pc += 1;
+                                continue;
+                            }
+
                             // Function referenced by name (from BytecodeCompiler)
                             let callee_idx = self.functions.iter().position(|f| f.name == *fn_name);
                             match callee_idx {

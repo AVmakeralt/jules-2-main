@@ -8107,6 +8107,40 @@ impl Interpreter {
                 })
             }
 
+            // ── Optimizer annotation builtins (identity functions) ─────────────
+            // These are inserted by the superoptimizer during compilation.
+            // At runtime they are identity functions — the optimization is the
+            // annotation itself, telling the JIT/backend to apply a fused kernel.
+            "fused_elementwise" => {
+                // Elementwise chain fusion annotation: just return the argument.
+                args.into_iter().next().ok_or_else(|| RuntimeError {
+                    message: "fused_elementwise() requires exactly 1 argument".into(),
+                    span: None,
+                })
+            }
+            "exact_div_restore" => {
+                // (x / y) * y → exact_div_restore(x): identity, assumes exact division.
+                args.into_iter().next().ok_or_else(|| RuntimeError {
+                    message: "exact_div_restore() requires exactly 1 argument".into(),
+                    span: None,
+                })
+            }
+            "matmul_elemwise" => {
+                // HadamardMul(MatMul(a,b), c) fused — identity for scalar,
+                // full tensor eval would need backend support.
+                args.into_iter().next().ok_or_else(|| RuntimeError {
+                    message: "matmul_elemwise() requires at least 1 argument".into(),
+                    span: None,
+                })
+            }
+            "scaled_matmul" => {
+                // alpha * MatMul(a, b) fused — identity for scalar.
+                args.into_iter().next().ok_or_else(|| RuntimeError {
+                    message: "scaled_matmul() requires at least 1 argument".into(),
+                    span: None,
+                })
+            }
+
             // Not a built-in
             _ => Err(RuntimeError {
                 message: format!("unknown function: {}", name),

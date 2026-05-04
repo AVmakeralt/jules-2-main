@@ -1794,36 +1794,36 @@ impl AuroraSimdBatch {
     ///
     /// For each of 8 entities, determines if it collides with a surface.
     /// The test is:
-    ///   collision = min(1.0, max(0.0, depth - threshold))
+    ///   collision = max(0.0, min(1.0, depth) - threshold)
     /// If the result is 0.0, no collision. Otherwise, the value is the
-    /// penetration depth.
+    /// penetration depth clamped to [0, 1].
     ///
     /// This is entirely branchless: no if-statements in the hot path.
     pub fn branchless_collision(
         depths: [f32; 8],
         threshold: f32,
     ) -> [f32; 8] {
-        let thresholds = Self::splat(threshold);
         let ones = Self::splat(1.0);
         let zeros = Self::splat(0.0);
 
-        // depth - threshold
+        // Clamp depth to [0, 1] first, then subtract threshold
+        let clamped_high = Self::simd_min(depths, ones);
+        let clamped_depth = Self::simd_max(clamped_high, zeros);
+
+        // clamped_depth - threshold
         let diff = [
-            depths[0] - threshold,
-            depths[1] - threshold,
-            depths[2] - threshold,
-            depths[3] - threshold,
-            depths[4] - threshold,
-            depths[5] - threshold,
-            depths[6] - threshold,
-            depths[7] - threshold,
+            clamped_depth[0] - threshold,
+            clamped_depth[1] - threshold,
+            clamped_depth[2] - threshold,
+            clamped_depth[3] - threshold,
+            clamped_depth[4] - threshold,
+            clamped_depth[5] - threshold,
+            clamped_depth[6] - threshold,
+            clamped_depth[7] - threshold,
         ];
 
-        // max(0, depth - threshold) — no negative values
-        let clamped_low = Self::simd_max(diff, zeros);
-
-        // min(1, max(0, depth - threshold)) — cap at 1.0
-        Self::simd_min(clamped_low, ones)
+        // max(0, clamped_depth - threshold) — no negative values
+        Self::simd_max(diff, zeros)
     }
 
     /// SIMD bilateral denoising on a 4×4 pixel neighborhood.

@@ -49,13 +49,27 @@ fn main() {
     println!();
 
     println!("─── Round 3: Rust 6k±1 trial division (showcase) ───");
+    // Trial division is O(n√n) — at 1B it takes hours.  Cap at 10M so the
+    // benchmark finishes in reasonable time and extrapolate the speedup.
+    let trial_cap = showcase_limit.min(10_000_000);
     let trial_start = Instant::now();
-    let trial_count = rust_trial_division_6k(showcase_limit);
+    let trial_count = rust_trial_division_6k(trial_cap);
     let trial_runtime = trial_start.elapsed();
-    let trial_tp = showcase_limit as f64 / trial_runtime.as_secs_f64().max(1e-12);
-    println!("  Runtime:        {:.3} s", trial_runtime.as_secs_f64());
+    let trial_tp = trial_cap as f64 / trial_runtime.as_secs_f64().max(1e-12);
+    println!("  Runtime:        {:.3} s  (capped at {})", trial_runtime.as_secs_f64(), trial_cap);
     println!("  Primes found:   {}", trial_count);
     println!("  Throughput:     {:.0} numbers/s", trial_tp);
+    println!();
+
+    // Also run the segmented sieve at the full showcase limit to prove it scales.
+    println!("─── Round 3b: Rust segmented sieve (showcase {}) ───", showcase_limit);
+    let big_start = Instant::now();
+    let big_count = rust_segmented_sieve(showcase_limit);
+    let big_runtime = big_start.elapsed();
+    let big_tp = showcase_limit as f64 / big_runtime.as_secs_f64().max(1e-12);
+    println!("  Runtime:        {:.3} s", big_runtime.as_secs_f64());
+    println!("  Primes found:   {}", big_count);
+    println!("  Throughput:     {:.0} numbers/s", big_tp);
     println!();
 
     let slowdown = jules_runtime.as_secs_f64() / rust_runtime.as_secs_f64().max(1e-12);
@@ -188,7 +202,6 @@ fn rust_trial_division_6k(limit: usize) -> usize {
             count += 1;
         }
         n += 2;
-        black_box(());
     }
     black_box(count)
 }
