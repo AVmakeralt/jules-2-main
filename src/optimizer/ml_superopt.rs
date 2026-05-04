@@ -222,8 +222,6 @@ impl MlArenaPlan {
         }
     }
 }
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pillar 1: MCTS-ML Tiling Search
@@ -308,7 +306,7 @@ impl TilingParams {
 
         // Time in nanoseconds: (flops / effective_gflops) * 1000.0
         // Fused multiply-divide: flops * (1000.0 / effective_gflops)
-        let time_ns = flops * (1000.0 / effective_gflops);
+        let time_ns = (flops as f64) * (1000.0 / effective_gflops);
 
         // Prefetch benefit: reduce effective latency by 20%
         let prefetch_factor = if self.prefetch { 0.8 } else { 1.0 };
@@ -699,7 +697,7 @@ impl StabilityChecker {
     #[inline]
     fn stable_softmax(values: &[f64]) -> Vec<f64> {
         let n = values.len();
-        let max_val = values.iter().fold(f64::NEG_INFINITY, f64::max);
+        let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let mut shifted = Vec::with_capacity(n);
         let mut sum = 0.0_f64;
 
@@ -1016,11 +1014,11 @@ impl MlSuperoptimizer {
     /// symbolic names ("A", "B", "C") when the operands cannot be inferred.
     fn try_matmul_loop(&mut self, stmts: &[Stmt]) -> Option<Stmt> {
         let stmt = stmts.first()?;
-        if let Stmt::ForIn { var: _outer_var, iter: outer_iter, body: outer_body, span } = stmt {
+        if let Stmt::ForIn { pattern: _, iter: outer_iter, body: outer_body, span, label: _ } = stmt {
             for inner_stmt in &outer_body.stmts {
-                if let Stmt::ForIn { var: _mid_var, iter: mid_iter, body: mid_body, .. } = inner_stmt {
+                if let Stmt::ForIn { pattern: _, iter: mid_iter, body: mid_body, .. } = inner_stmt {
                     for innermost_stmt in &mid_body.stmts {
-                        if let Stmt::ForIn { var: _inner_var, iter: inner_iter, body: innermost_body, .. } = innermost_stmt {
+                        if let Stmt::ForIn { pattern: _, iter: inner_iter, body: innermost_body, .. } = innermost_stmt {
                             if self.is_matmul_accumulation(innermost_body) {
                                 // --- extract loop-bound dimensions for the cost model ---
                                 let dim_m = Self::loop_bound_hint(outer_iter).unwrap_or(128);
@@ -1065,9 +1063,9 @@ impl MlSuperoptimizer {
     /// Try to read a literal loop-bound hint from a range expression like `0..N`
     /// or `0..=N`.  Returns `None` when the bound is a non-literal expression.
     fn loop_bound_hint(iter: &Expr) -> Option<u64> {
-        // Match `lo..hi` or `lo..=hi` — look for the rhs of a Range BinOp.
-        if let Expr::BinOp { op: BinOpKind::Range | BinOpKind::RangeInclusive, rhs, .. } = iter {
-            match rhs.as_ref() {
+        // Match `lo..hi` or `lo..=hi` — look for Expr::Range variant.
+        if let Expr::Range { hi: Some(hi), .. } = iter {
+            match hi.as_ref() {
                 Expr::IntLit { value, .. } => return Some(*value as u64),
                 _ => {}
             }
@@ -1273,7 +1271,7 @@ impl MlSuperoptimizer {
         let span = stmt.span();
         if let Stmt::ForIn { iter, body, .. } = stmt {
             // Capture the actual iterated collection for use in the replacement call.
-            let iter_name = match iter.as_ref() {
+            let iter_name = match iter {
                 Expr::Ident { name, .. } => name.clone(),
                 // Handle `x.iter()` / `x.into_iter()` etc.
                 Expr::MethodCall { receiver, .. } => {

@@ -113,6 +113,7 @@ impl MctsConfig {
         Self {
             max_simulations: 100,
             max_depth: 4,
+            exploration_constant: 1.414,
             time_budget_ms: 20,
             min_improvement: 2,          // Only accept significant improvements
             use_hardware_cost: true,
@@ -128,6 +129,7 @@ impl MctsConfig {
         Self {
             max_simulations: 200,
             max_depth: 6,
+            exploration_constant: 1.414,
             time_budget_ms: 50,
             min_improvement: 1,
             use_hardware_cost: true,
