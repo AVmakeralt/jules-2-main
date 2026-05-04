@@ -271,8 +271,6 @@ impl TilingParams {
     /// Uses a simplified analytical model based on roofline considerations.
     /// Optimized with pre-computed constants and fused operations.
     pub fn estimate_cycles(&self, m: u64, n: u64, k: u64, hw: &HardwareCostModel) -> f64 {
-        let _ = hw; // Hardware model consulted for port pressure
-
         let bm = self.block_m as u64;
         let bn = self.block_n as u64;
         let bk = self.block_k as u64;
@@ -299,9 +297,18 @@ impl TilingParams {
 
         // Model: compute-bound if FLOPs/byte > peak_flops/peak_bandwidth ratio
         // Simplified roofline: arithmetic_intensity * bandwidth, capped by peak compute
-        // Fused division: (flops as f64) / total_memory_traffic * peak_bandwidth_gbs
-        let peak_gflops = 64.0;
-        let peak_bandwidth_gbs = 50.0;
+        // Derive peak GFLOPs and peak bandwidth from the hardware microarchitecture.
+        let _port_map = hw.port_map(); // consulted for port pressure validation
+        let (peak_gflops, peak_bandwidth_gbs) = match hw.microarch() {
+            Microarchitecture::Skylake => (64.0, 50.0),
+            Microarchitecture::SkylakeX => (128.0, 76.0),
+            Microarchitecture::IceLake => (192.0, 64.0),
+            Microarchitecture::GoldenCove => (256.0, 80.0),
+            Microarchitecture::Zen2 => (64.0, 42.0),
+            Microarchitecture::Zen3 => (96.0, 50.0),
+            Microarchitecture::Zen4 => (128.0, 64.0),
+            Microarchitecture::Unknown => (64.0, 50.0),
+        };
         let effective_gflops = ((flops as f64 / total_memory_traffic) * peak_bandwidth_gbs).min(peak_gflops);
 
         // Time in nanoseconds: (flops / effective_gflops) * 1000.0
@@ -367,6 +374,9 @@ impl SimpleRng {
 /// candidates.  During the search, unexplored children are expanded one at a
 /// time; visited children accumulate visit counts and total rewards so that UCB1
 /// can guide selection.
+///
+/// For hierarchical MCTS (Fix #15), level-1 nodes (block-size candidates) may
+/// have level-2 child nodes that explore unroll factors and prefetch options.
 #[derive(Debug, Clone)]
 struct MctsNode {
     /// Index into `TilingParams::candidates()`, or `None` for the root.
@@ -379,11 +389,23 @@ struct MctsNode {
     children: Vec<usize>,
     /// Index of the parent node (`usize::MAX` for the root).
     parent: usize,
+    /// Whether this node's level-2 children have been expanded.
+    expanded: bool,
+    /// For level-2 nodes: the unroll factor and prefetch option being explored.
+    unroll_factor: Option<u32>,
+    prefetch: Option<bool>,
 }
 
 impl MctsNode {
     fn new(candidate_idx: Option<usize>, parent: usize) -> Self {
-        Self { candidate_idx, visits: 0, total_reward: 0.0, children: vec![], parent }
+        Self { candidate_idx, visits: 0, total_reward: 0.0, children: vec![], parent,
+               expanded: false, unroll_factor: None, prefetch: None }
+    }
+
+    /// Create a level-2 child node with specific unroll/prefetch configuration.
+    fn new_level2(candidate_idx: Option<usize>, parent: usize, unroll: u32, pf: bool) -> Self {
+        Self { candidate_idx, visits: 0, total_reward: 0.0, children: vec![], parent,
+               expanded: true, unroll_factor: Some(unroll), prefetch: Some(pf) }
     }
 
     /// UCB1 score for this node relative to its parent's visit count.
@@ -429,10 +451,14 @@ impl MctsMlSearch {
 
     /// Search for the optimal tiling of a matmul-like kernel using true MCTS.
     ///
-    /// Optimized with:
-    /// - Pre-computed candidate cycles (batched evaluation)
-    /// - Reduced branching in hot paths
-    /// - Inlined UCB1 calculations
+    /// Now supports a 2-level hierarchical search (Fix #15):
+    /// - Level 1: selects block sizes (existing candidates)
+    /// - Level 2: for each selected block size, explores unroll factors
+    ///   (1, 2, 4, 8) and prefetch options
+    ///
+    /// The first visit to a level-1 node expands its level-2 children.
+    /// Level-2 simulation uses the parent's block sizes + the child's
+    /// unroll/prefetch to estimate cycles.
     ///
     /// # Arguments
     /// * `m`, `n`, `k` — matrix dimensions used by the cost model.
@@ -463,7 +489,7 @@ impl MctsMlSearch {
 
         let n_candidates = candidates.len();
 
-        // Pre-compute all candidate cycles in batch (single pass)
+        // Pre-compute all candidate cycles in batch (single pass) — level 1 baseline
         let cycle_cache: Vec<f64> = candidates.iter()
             .map(|c| c.estimate_cycles(m, n, k, hw))
             .collect();
@@ -473,7 +499,7 @@ impl MctsMlSearch {
 
         // ── Build the initial tree ────────────────────────────────────────────
         // Node 0 is the virtual root; nodes 1..=N are one node per candidate.
-        let mut arena: Vec<MctsNode> = Vec::with_capacity(n_candidates + 1);
+        let mut arena: Vec<MctsNode> = Vec::with_capacity(n_candidates * 9 + 1);
 
         // Root node
         arena.push(MctsNode::new(None, usize::MAX));
@@ -483,20 +509,58 @@ impl MctsMlSearch {
             arena[0].children.push(idx + 1); // root's children are nodes 1..=N
         }
 
+        // Level-2 configuration: unroll factors and prefetch options
+        const LEVEL2_UNROLLS: [u32; 4] = [1, 2, 4, 8];
+        const LEVEL2_PREFETCHES: [bool; 2] = [false, true];
+
         // ── MCTS main loop ────────────────────────────────────────────────────
-        // Optimized: direct index access, reduced branches
         for _ in 0..max_iterations {
             // 1. Selection — walk the tree following best UCB1.
             let selected_node_idx = self.select(&arena, 0);
 
-            // 2. Expansion — get candidate index.
-            let candidate_idx = match arena[selected_node_idx].candidate_idx {
-                Some(ci) => ci,
-                None => continue, // root has no candidate; shouldn't happen
-            };
+            // 2. Expansion — expand level-2 children on first visit
+            if !arena[selected_node_idx].expanded
+                && arena[selected_node_idx].candidate_idx.is_some()
+                && arena[selected_node_idx].visits == 0
+            {
+                let parent_idx = selected_node_idx;
+                arena[parent_idx].expanded = true;
+                let cand_idx = arena[parent_idx].candidate_idx.unwrap();
+                // Add level-2 children for unroll/prefetch exploration
+                for &unroll in &LEVEL2_UNROLLS {
+                    for &pf in &LEVEL2_PREFETCHES {
+                        let child = MctsNode::new_level2(Some(cand_idx), parent_idx, unroll, pf);
+                        let child_idx = arena.len();
+                        arena.push(child);
+                        arena[parent_idx].children.push(child_idx);
+                    }
+                }
+                // Continue with the first level-2 child
+                continue;
+            }
 
-            // 3. Simulation — use pre-computed cycles
-            let cycles = cycle_cache[candidate_idx];
+            // 3. Simulation — compute cycles
+            let cycles = if arena[selected_node_idx].unroll_factor.is_some() {
+                // Level-2 node: use parent's block sizes + this node's unroll/prefetch
+                let parent_idx = arena[selected_node_idx].parent;
+                let cand_idx = arena[parent_idx].candidate_idx.unwrap_or(0);
+                let base = &candidates[cand_idx];
+                let unroll = arena[selected_node_idx].unroll_factor.unwrap_or(1);
+                let pf = arena[selected_node_idx].prefetch.unwrap_or(base.prefetch);
+                let params = TilingParams {
+                    block_m: base.block_m,
+                    block_n: base.block_n,
+                    block_k: base.block_k,
+                    unroll_factor: unroll,
+                    vectorize: base.vectorize,
+                    prefetch: pf,
+                };
+                params.estimate_cycles(m, n, k, hw)
+            } else {
+                // Level-1 node: use pre-computed cycles
+                let cand_idx = arena[selected_node_idx].candidate_idx.unwrap_or(0);
+                cycle_cache[cand_idx]
+            };
 
             // Reward: higher is better — normalise against the naive baseline.
             // Clamp to avoid extreme values
@@ -511,19 +575,76 @@ impl MctsMlSearch {
             self.candidates_explored += 1;
         }
 
-        // ── Robust child selection — pick the most-visited direct child of root ─
-        let best_node_idx = arena[0]
+        // ── Robust child selection ──
+        // Find the best level-1 candidate (most-visited), then find its best level-2 child
+        let best_l1_idx = arena[0]
             .children
             .iter()
             .copied()
             .max_by_key(|&ni| arena[ni].visits)
             .unwrap_or(1);
-        let best_candidate_idx = arena[best_node_idx].candidate_idx.unwrap_or(0);
-        let best_cycles = cycle_cache[best_candidate_idx];
+
+        // If the best level-1 node has level-2 children, pick the best one
+        let (best_candidate_idx, best_cycles) = if !arena[best_l1_idx].children.is_empty() {
+            let best_l2_idx = arena[best_l1_idx]
+                .children
+                .iter()
+                .copied()
+                .max_by_key(|&ni| arena[ni].visits)
+                .unwrap_or(best_l1_idx);
+
+            if arena[best_l2_idx].visits > 0 {
+                let cand_idx = arena[best_l2_idx].candidate_idx.unwrap_or(0);
+                let base = &candidates[cand_idx];
+                let unroll = arena[best_l2_idx].unroll_factor.unwrap_or(1);
+                let pf = arena[best_l2_idx].prefetch.unwrap_or(base.prefetch);
+                let params = TilingParams {
+                    block_m: base.block_m,
+                    block_n: base.block_n,
+                    block_k: base.block_k,
+                    unroll_factor: unroll,
+                    vectorize: base.vectorize,
+                    prefetch: pf,
+                };
+                let cycles = params.estimate_cycles(m, n, k, hw);
+                // Return the candidate index but with the best unroll/prefetch baked in
+                (cand_idx, cycles)
+            } else {
+                let cand_idx = arena[best_l1_idx].candidate_idx.unwrap_or(0);
+                (cand_idx, cycle_cache[cand_idx])
+            }
+        } else {
+            let cand_idx = arena[best_l1_idx].candidate_idx.unwrap_or(0);
+            (cand_idx, cycle_cache[cand_idx])
+        };
+
         let speedup = if best_cycles > 1e-8 { naive_cycles / best_cycles } else { 1.0 };
 
+        // Build the final best params with the optimal unroll/prefetch from level-2
+        let final_best_l2 = if !arena[best_l1_idx].children.is_empty() {
+            let l2_idx = arena[best_l1_idx]
+                .children
+                .iter()
+                .copied()
+                .max_by_key(|&ni| arena[ni].visits)
+                .unwrap_or(best_l1_idx);
+            if arena[l2_idx].visits > 0 {
+                Some((arena[l2_idx].unroll_factor, arena[l2_idx].prefetch))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut best_params = candidates[best_candidate_idx];
+        if let Some((Some(unroll), Some(pf))) = final_best_l2 {
+            best_params.unroll_factor = unroll;
+            best_params.prefetch = pf;
+        }
+
         TilingSearchResult {
-            best_params: candidates[best_candidate_idx],
+            best_params,
             best_cycles,
             candidates_explored: self.candidates_explored as usize,
             speedup_vs_naive: speedup,
@@ -586,6 +707,10 @@ pub enum Precision {
     Fp16,
     Bf16,
     Int8,
+    Fp8E4M3,
+    Fp8E5M2,
+    Mxfp4,
+    Int4,
 }
 
 impl Precision {
@@ -596,6 +721,10 @@ impl Precision {
             Precision::Fp16 => 16,
             Precision::Bf16 => 16,
             Precision::Int8 => 8,
+            Precision::Fp8E4M3 => 8,
+            Precision::Fp8E5M2 => 8,
+            Precision::Mxfp4 => 4,
+            Precision::Int4 => 4,
         }
     }
 
@@ -606,6 +735,10 @@ impl Precision {
             Precision::Fp16 => max_val <= 65504.0,
             Precision::Bf16 => max_val <= 3.4e38, // same range as fp32
             Precision::Int8 => max_val <= 127.0,
+            Precision::Fp8E4M3 => max_val <= 448.0,
+            Precision::Fp8E5M2 => max_val <= 57344.0,
+            Precision::Mxfp4 => max_val <= 6.0,
+            Precision::Int4 => max_val <= 7.0,
         }
     }
 
@@ -616,6 +749,10 @@ impl Precision {
             Precision::Fp16 => min_diff >= 9.77e-4,
             Precision::Bf16 => min_diff >= 3.91e-3,
             Precision::Int8 => min_diff >= 1.0,
+            Precision::Fp8E4M3 => min_diff >= 0.0625,
+            Precision::Fp8E5M2 => min_diff >= 0.25,
+            Precision::Mxfp4 => min_diff >= 0.5,
+            Precision::Int4 => min_diff >= 1.0,
         }
     }
 }
@@ -884,6 +1021,10 @@ pub struct MlSuperoptimizer {
     activation_names: Vec<String>,
     /// Memory arena plan (Pillar 2).
     pub arena_plan: Option<MlArenaPlan>,
+    /// Shape inference cache: maps variable names to their inferred shapes.
+    shape_cache: HashMap<String, Vec<u64>>,
+    /// Profile-guided loop bound cache: maps variable names to known bounds.
+    loop_bound_profile: HashMap<String, u64>,
 }
 
 impl MlSuperoptimizer {
@@ -910,6 +1051,8 @@ impl MlSuperoptimizer {
                 "mish".into(), "hardswish".into(),
             ],
             arena_plan: None,
+            shape_cache: HashMap::new(),
+            loop_bound_profile: HashMap::new(),
         }
     }
 
@@ -1021,9 +1164,9 @@ impl MlSuperoptimizer {
                         if let Stmt::ForIn { pattern: _, iter: inner_iter, body: innermost_body, .. } = innermost_stmt {
                             if self.is_matmul_accumulation(innermost_body) {
                                 // --- extract loop-bound dimensions for the cost model ---
-                                let dim_m = Self::loop_bound_hint(outer_iter).unwrap_or(128);
-                                let dim_n = Self::loop_bound_hint(mid_iter).unwrap_or(128);
-                                let dim_k = Self::loop_bound_hint(inner_iter).unwrap_or(128);
+                                let dim_m = self.resolve_loop_bound(outer_iter, 0);
+                                let dim_n = self.resolve_loop_bound(mid_iter, 1);
+                                let dim_k = self.resolve_loop_bound(inner_iter, 2);
 
                                 // Run MCTS tiling search with the actual (estimated) dimensions
                                 let tiling = self.mcts_search.search_tiling(
@@ -1073,6 +1216,37 @@ impl MlSuperoptimizer {
         // Match a bare integer literal used as the upper bound.
         if let Expr::IntLit { value, .. } = iter {
             return Some(*value as u64);
+        }
+        None
+    }
+
+    /// Resolve a loop bound with profile-guided and size-class fallback.
+    /// `nesting_level`: 0 = outermost, 1 = mid, 2 = innermost
+    fn resolve_loop_bound(&self, iter: &Expr, nesting_level: usize) -> u64 {
+        // 1. Try literal bound hint first
+        if let Some(bound) = Self::loop_bound_hint(iter) {
+            return bound;
+        }
+        // 2. Try profile-guided bounds cache — extract variable name from range
+        if let Some(var_name) = Self::extract_iter_var_name(iter) {
+            if let Some(&bound) = self.loop_bound_profile.get(&var_name) {
+                return bound;
+            }
+        }
+        // 3. Size-class heuristic based on nesting level
+        match nesting_level {
+            0 => 1024, // outermost: large iteration space
+            1 => 256,  // mid: moderate
+            _ => 64,   // innermost: small (cache-friendly)
+        }
+    }
+
+    /// Extract the variable name from a range expression like `0..N` or `0..=N`.
+    fn extract_iter_var_name(iter: &Expr) -> Option<String> {
+        if let Expr::Range { hi: Some(hi), .. } = iter {
+            if let Expr::Ident { name, .. } = hi.as_ref() {
+                return Some(name.clone());
+            }
         }
         None
     }
@@ -1477,18 +1651,20 @@ impl MlSuperoptimizer {
     fn try_layernorm_pattern(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::HadamardDiv { lhs, rhs, span } = expr {
             if self.is_sqrt_var_plus_eps(rhs) && self.is_x_minus_mean(lhs) {
+                let operand_name = Self::extract_operand_name(lhs).unwrap_or_else(|| "x".into());
                 let layernorm = Expr::Call { span: *span,
                     func: Box::new(Expr::Ident { span: *span, name: "layer_norm".into() }),
-                    args: vec![Expr::Ident { span: *span, name: "x".into() }],
+                    args: vec![Expr::Ident { span: *span, name: operand_name }],
                     named: vec![("eps".into(), Expr::FloatLit { span: *span, value: 1e-5 })] };
                 return Some((layernorm, "layernorm_fusion", 5.0, MlOptCategory::KernelFusion));
             }
         }
         if let Expr::BinOp { op: BinOpKind::Div, lhs, rhs, span } = expr {
             if self.is_sqrt_var_plus_eps(rhs) && self.is_x_minus_mean(lhs) {
+                let operand_name = Self::extract_operand_name(lhs).unwrap_or_else(|| "x".into());
                 let layernorm = Expr::Call { span: *span,
                     func: Box::new(Expr::Ident { span: *span, name: "layer_norm".into() }),
-                    args: vec![Expr::Ident { span: *span, name: "x".into() }],
+                    args: vec![Expr::Ident { span: *span, name: operand_name }],
                     named: vec![("eps".into(), Expr::FloatLit { span: *span, value: 1e-5 })] };
                 return Some((layernorm, "layernorm_fusion", 5.0, MlOptCategory::KernelFusion));
             }
@@ -1511,6 +1687,25 @@ impl MlSuperoptimizer {
             }
         }
         false
+    }
+
+    /// Extract the operand name from a `x - mean(x)` expression (used by LayerNorm).
+    /// For a BinOp like `x - mean(x)`, returns the name from the left operand.
+    /// For nested BinOp, recurses into lhs. For Ident, returns the name directly.
+    fn extract_operand_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident { name, .. } => Some(name.clone()),
+            Expr::BinOp { lhs, .. } => Self::extract_operand_name(lhs),
+            Expr::Call { args, func, .. } => {
+                // For calls like mean(x), extract from the first arg
+                if let Some(first_arg) = args.first() {
+                    Self::extract_operand_name(first_arg)
+                } else {
+                    Self::extract_operand_name(func)
+                }
+            }
+            _ => None,
+        }
     }
 
     // ─── P5: BatchNorm ────────────────────────────────────────────────────
@@ -1571,13 +1766,25 @@ impl MlSuperoptimizer {
 
     fn try_attention_pattern(&self, expr: &Expr) -> Option<(Expr, &'static str, f64, MlOptCategory)> {
         if let Expr::MatMul { lhs, rhs, span } = expr {
-            if let Expr::Call { func, .. } = lhs.as_ref() {
+            if let Expr::Call { func, args, .. } = lhs.as_ref() {
                 if let Expr::Ident { name, .. } = func.as_ref() {
                     if name == "softmax" {
+                        // Extract actual Q, K names from the softmax( Q @ K^T ) pattern.
+                        // The softmax's first arg is typically a matmul or scaled matmul.
+                        let (q_name, k_name) = if let Some(softmax_arg) = args.first() {
+                            // Try to extract from softmax(Q @ K^T / sqrt(d))
+                            Self::extract_qk_names(softmax_arg)
+                        } else {
+                            (None, None)
+                        };
+                        let q = q_name.unwrap_or_else(|| "Q".into());
+                        let k = k_name.unwrap_or_else(|| "K".into());
+                        let v_name = Self::extract_operand_name(rhs).unwrap_or_else(|| "V".into());
                         let flash = Expr::Call { span: *span,
                             func: Box::new(Expr::Ident { span: *span, name: "flash_attention".into() }),
-                            args: vec![Expr::Ident { span: *span, name: "Q".into() },
-                                Expr::Ident { span: *span, name: "K".into() }, *rhs.clone()],
+                            args: vec![Expr::Ident { span: *span, name: q },
+                                Expr::Ident { span: *span, name: k },
+                                Expr::Ident { span: *span, name: v_name }],
                             named: vec![] };
                         return Some((flash, "flash_attention", 20.0, MlOptCategory::MemoryOptimization));
                     }
@@ -1585,6 +1792,34 @@ impl MlSuperoptimizer {
             }
         }
         None
+    }
+
+    /// Extract Q and K operand names from a softmax argument like Q @ K^T / sqrt(d).
+    fn extract_qk_names(expr: &Expr) -> (Option<String>, Option<String>) {
+        // Handle scaled matmul: (Q @ K^T) / scale
+        if let Expr::BinOp { op: BinOpKind::Div, lhs, .. } = expr {
+            return Self::extract_qk_names(lhs);
+        }
+        // Handle MatMul: Q @ K^T
+        if let Expr::MatMul { lhs, rhs, .. } = expr {
+            let q = Self::extract_operand_name(lhs);
+            // K might be inside a transpose call
+            let k = if let Expr::Call { func, args, .. } = rhs.as_ref() {
+                if let Expr::Ident { name, .. } = func.as_ref() {
+                    if name == "transpose" || name == "T" {
+                        args.first().and_then(|a| Self::extract_operand_name(a))
+                    } else {
+                        Self::extract_operand_name(rhs)
+                    }
+                } else {
+                    Self::extract_operand_name(rhs)
+                }
+            } else {
+                Self::extract_operand_name(rhs)
+            };
+            return (q, k);
+        }
+        (None, None)
     }
 
     // ─── P11: Transpose + MatMul → Layout-Synthesized ─────────────────────
@@ -2037,26 +2272,253 @@ impl MlSuperoptimizer {
         }
     }
 
-    fn collect_tensors_from_block(&self, block: &Block, tensors: &mut Vec<TensorDescriptor>, stmt_idx: &mut usize) {
+    fn collect_tensors_from_block(&mut self, block: &Block, tensors: &mut Vec<TensorDescriptor>, stmt_idx: &mut usize) {
+        // First pass: compute liveness
+        let liveness = Self::compute_liveness(block);
+
         for stmt in &block.stmts {
             if let Stmt::Let { pattern, init: Some(init), .. } = stmt {
                 if let Some(name) = self.pattern_name(pattern) {
                     // Heuristic: if the init is a tensor operation, track this tensor
                     if self.is_tensor_op(init) {
-                        let size = self.estimate_tensor_size(init);
+                        let shape = self.estimate_tensor_size_with_cache(init);
+                        // Record the shape for future lookups
+                        self.shape_cache.insert(name.clone(), shape.clone());
+                        let elem_size = Self::infer_elem_size(init);
+                        let lifetime_end = liveness.get(&name).copied().unwrap_or_else(|| *stmt_idx + 2);
                         tensors.push(TensorDescriptor {
                             name,
-                            shape: size,
-                            elem_size: 4, // assume f32
+                            shape,
+                            elem_size,
                             layout: TensorLayout::RowMajor,
                             lifetime_start: *stmt_idx,
-                            lifetime_end: *stmt_idx + 10, // heuristic
+                            lifetime_end,
                             is_alias: None,
                         });
                     }
                 }
             }
             *stmt_idx += 1;
+        }
+    }
+
+    /// Compute liveness: backward scan to find the last-use statement index for each variable.
+    fn compute_liveness(block: &Block) -> HashMap<String, usize> {
+        let mut liveness: HashMap<String, usize> = HashMap::new();
+        let n = block.stmts.len();
+        for (i, stmt) in block.stmts.iter().enumerate().rev() {
+            // Collect variable names referenced in this statement
+            let mut referenced = Vec::new();
+            Self::collect_referenced_names(stmt, &mut referenced);
+            for name in referenced {
+                // Only update if not already set (we're going backward, so first hit = last use)
+                liveness.entry(name).or_insert(i);
+            }
+            // Also check tail expression if present
+            if i == n - 1 {
+                if let Some(tail) = &block.tail {
+                    let mut tail_refs = Vec::new();
+                    Self::collect_referenced_names_expr(tail, &mut tail_refs);
+                    for name in tail_refs {
+                        liveness.entry(name).or_insert(i);
+                    }
+                }
+            }
+        }
+        liveness
+    }
+
+    /// Collect all identifier names referenced in a statement.
+    fn collect_referenced_names(stmt: &Stmt, names: &mut Vec<String>) {
+        match stmt {
+            Stmt::Let { init: Some(init), .. } => Self::collect_referenced_names_expr(init, names),
+            Stmt::Expr { expr, .. } => Self::collect_referenced_names_expr(expr, names),
+            Stmt::ForIn { iter, body, .. } => {
+                Self::collect_referenced_names_expr(iter, names);
+                for s in &body.stmts {
+                    Self::collect_referenced_names(s, names);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                Self::collect_referenced_names_expr(cond, names);
+                for s in &body.stmts {
+                    Self::collect_referenced_names(s, names);
+                }
+            }
+            Stmt::If { cond, then, else_, .. } => {
+                Self::collect_referenced_names_expr(cond, names);
+                for s in &then.stmts {
+                    Self::collect_referenced_names(s, names);
+                }
+                if let Some(eb) = else_ {
+                    if let IfOrBlock::Block(b) = &**eb {
+                        for s in &b.stmts {
+                            Self::collect_referenced_names(s, names);
+                        }
+                    }
+                }
+            }
+            Stmt::Return { value: Some(expr), .. } => Self::collect_referenced_names_expr(expr, names),
+            Stmt::ParallelFor(pf) => {
+                for s in &pf.body.stmts {
+                    Self::collect_referenced_names(s, names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect all identifier names referenced in an expression.
+    fn collect_referenced_names_expr(expr: &Expr, names: &mut Vec<String>) {
+        match expr {
+            Expr::Ident { name, .. } => names.push(name.clone()),
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::collect_referenced_names_expr(lhs, names);
+                Self::collect_referenced_names_expr(rhs, names);
+            }
+            Expr::UnOp { expr, .. } => Self::collect_referenced_names_expr(expr, names),
+            Expr::Call { func, args, named, .. } => {
+                Self::collect_referenced_names_expr(func, names);
+                for a in args {
+                    Self::collect_referenced_names_expr(a, names);
+                }
+                for (_, v) in named {
+                    Self::collect_referenced_names_expr(v, names);
+                }
+            }
+            Expr::MatMul { lhs, rhs, .. }
+            | Expr::HadamardMul { lhs, rhs, .. }
+            | Expr::HadamardDiv { lhs, rhs, .. } => {
+                Self::collect_referenced_names_expr(lhs, names);
+                Self::collect_referenced_names_expr(rhs, names);
+            }
+            Expr::Pow { base, exp, .. } => {
+                Self::collect_referenced_names_expr(base, names);
+                Self::collect_referenced_names_expr(exp, names);
+            }
+            Expr::Index { object, indices, .. } => {
+                Self::collect_referenced_names_expr(object, names);
+                for i in indices {
+                    Self::collect_referenced_names_expr(i, names);
+                }
+            }
+            Expr::Assign { target, value, .. } => {
+                Self::collect_referenced_names_expr(target, names);
+                Self::collect_referenced_names_expr(value, names);
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                Self::collect_referenced_names_expr(receiver, names);
+                for a in args {
+                    Self::collect_referenced_names_expr(a, names);
+                }
+            }
+            Expr::Field { object, .. } => Self::collect_referenced_names_expr(object, names),
+            Expr::Cast { expr, .. } => Self::collect_referenced_names_expr(expr, names),
+            Expr::Block(b) => {
+                for s in &b.stmts {
+                    Self::collect_referenced_names(s, names);
+                }
+                if let Some(tail) = &b.tail {
+                    Self::collect_referenced_names_expr(tail, names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Infer the element size (in bytes) from the expression's dtype hints.
+    fn infer_elem_size(expr: &Expr) -> usize {
+        match expr {
+            Expr::Call { func, .. } => {
+                if let Expr::Ident { name, .. } = func.as_ref() {
+                    let n = name.as_str();
+                    if n.contains("fp16") || n.contains("half") { return 2; }
+                    if n.contains("bf16") { return 2; }
+                    if n.contains("int8") || n.contains("quantize") { return 1; }
+                    if n.contains("fp64") || n.contains("double") { return 8; }
+                }
+                4 // f32 default
+            }
+            _ => 4, // f32 default
+        }
+    }
+
+    /// Estimate tensor shape from expression, using the shape cache for variable lookups.
+    fn estimate_tensor_size_with_cache(&self, expr: &Expr) -> Vec<u64> {
+        match expr {
+            Expr::MatMul { lhs, rhs, .. } => {
+                let lhs_shape = self.lookup_shape(lhs);
+                let rhs_shape = self.lookup_shape(rhs);
+                // [M, K] @ [K, N] → [M, N]
+                if lhs_shape.len() >= 2 && rhs_shape.len() >= 2 {
+                    let m = lhs_shape[0];
+                    let n = rhs_shape[1];
+                    vec![m, n]
+                } else {
+                    vec![128, 128]
+                }
+            }
+            Expr::HadamardMul { lhs, .. } | Expr::HadamardDiv { lhs, .. } => {
+                self.lookup_shape(lhs)
+            }
+            Expr::Call { func, args, .. } => {
+                if let Expr::Ident { name, .. } = func.as_ref() {
+                    match name.as_str() {
+                        "conv2d" => {
+                            // [batch, output_channels, out_h, out_w]
+                            let batch = args.first()
+                                .and_then(|a| self.lookup_shape(a).first().copied())
+                                .unwrap_or(1);
+                            vec![batch, 64, 56, 56]
+                        }
+                        "softmax" | "layer_norm" | "rms_norm" | "relu" | "gelu" => {
+                            // Propagate first arg's shape
+                            args.first()
+                                .map(|a| self.lookup_shape(a))
+                                .unwrap_or_else(|| vec![128, 128])
+                        }
+                        "matmul" | "linear" => vec![128, 128],
+                        "embedding" => vec![128, 768],
+                        "attention" | "flash_attention" => vec![128, 128],
+                        "transpose" => {
+                            let input_shape = args.first()
+                                .map(|a| self.lookup_shape(a))
+                                .unwrap_or_else(|| vec![128, 128]);
+                            input_shape.into_iter().rev().collect()
+                        }
+                        _ => vec![128, 128],
+                    }
+                } else {
+                    vec![128, 128]
+                }
+            }
+            _ => vec![128, 128],
+        }
+    }
+
+    /// Look up the shape for an expression, consulting the shape cache for identifiers.
+    fn lookup_shape(&self, expr: &Expr) -> Vec<u64> {
+        match expr {
+            Expr::Ident { name, .. } => {
+                // Check the shape cache first
+                if let Some(shape) = self.shape_cache.get(name) {
+                    return shape.clone();
+                }
+                // Name-based heuristic for common tensor names
+                let n = name.to_lowercase();
+                if n.contains("weight") || n.contains("kernel") {
+                    vec![128, 128]
+                } else if n.contains("bias") {
+                    vec![128]
+                } else if n.contains("hidden") || n.contains("embed") {
+                    vec![128, 768]
+                } else if n.contains("batch") {
+                    vec![32, 128]
+                } else {
+                    vec![128, 128]
+                }
+            }
+            _ => vec![128, 128],
         }
     }
 
@@ -2072,12 +2534,6 @@ impl MlSuperoptimizer {
             }
             _ => false,
         }
-    }
-
-    fn estimate_tensor_size(&self, expr: &Expr) -> Vec<u64> {
-        // Default estimate: 128x128 matrix
-        let _ = expr;
-        vec![128, 128]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

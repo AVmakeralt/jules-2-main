@@ -47,9 +47,81 @@ pub struct ValueObservation {
     /// Drift detector for this variable
     drift_detector: DriftDetector,
     /// Whether this has been observed as a boolean variable (only 0/1)
-    is_boolean: bool,
+    /// Defaults to false — we require evidence before assuming boolean.
+    pub is_boolean: bool,
     /// If boolean, what constant value has been observed
-    bool_constant: Option<bool>,
+    pub bool_constant: Option<bool>,
+    /// Minimum observed value (tracks the smallest int seen)
+    pub observed_min: i64,
+    /// Maximum observed value (tracks the largest int seen)
+    pub observed_max: i64,
+}
+
+/// The kind of specialization that can be applied to a profiled variable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpecializationKind {
+    /// No specialization justified yet
+    None,
+    /// Variable is boolean (only 0/1 seen)
+    Boolean,
+    /// Variable is almost always a single constant value
+    Constant(i64),
+    /// Variable falls within a small integer range suitable for a switch table
+    SmallRange { min: i64, max: i64 },
+}
+
+impl ValueObservation {
+    /// Create a new, empty observation with the given drift window size
+    pub fn new(drift_window_size: usize) -> Self {
+        Self {
+            var_name: String::new(),
+            int_values: HashMap::new(),
+            float_buckets: HashMap::new(),
+            total_observations: 0,
+            hot_value: None,
+            drift_detector: DriftDetector::new(drift_window_size),
+            is_boolean: false, // Don't assume boolean — require evidence
+            bool_constant: None,
+            observed_min: i64::MAX,
+            observed_max: i64::MIN,
+        }
+    }
+
+    /// Infer the best specialization strategy based on accumulated observations
+    pub fn infer_specialization(&self) -> SpecializationKind {
+        if self.total_observations < 3 {
+            return SpecializationKind::None;
+        }
+
+        // Check for boolean (all observed values are 0 or 1)
+        if self.is_boolean {
+            if let Some(c) = self.bool_constant {
+                return SpecializationKind::Constant(if c { 1 } else { 0 });
+            }
+            return SpecializationKind::Boolean;
+        }
+
+        // Check for constant value (dominant > 90%)
+        if let Some(val) = self.hot_value.as_ref().map(|h| h.value) {
+            let count = self.int_values.get(&val).copied().unwrap_or(0);
+            if (count as f64 / self.total_observations as f64) > 0.9 {
+                return SpecializationKind::Constant(val);
+            }
+        }
+
+        // Check for small range (good for switch tables)
+        if self.observed_min <= self.observed_max {
+            let range = self.observed_max - self.observed_min;
+            if range <= 8 && self.int_values.len() <= 8 {
+                return SpecializationKind::SmallRange {
+                    min: self.observed_min,
+                    max: self.observed_max,
+                };
+            }
+        }
+
+        SpecializationKind::None
+    }
 }
 
 /// A detected hot value for specialization
@@ -349,8 +421,10 @@ impl DataDependentJIT {
                 total_observations: 0,
                 hot_value: None,
                 drift_detector: DriftDetector::new(self.drift_window_size),
-                is_boolean: true, // assume boolean until proven otherwise
+                is_boolean: false, // don't assume boolean — require evidence
                 bool_constant: None,
+                observed_min: i64::MAX,
+                observed_max: i64::MIN,
             });
         }
 
@@ -359,11 +433,16 @@ impl DataDependentJIT {
         obs.total_observations += 1;
         *obs.int_values.entry(value).or_insert(0) += 1;
 
-        // Track boolean-ness
+        // Track observed min/max for range inference
+        obs.observed_min = obs.observed_min.min(value);
+        obs.observed_max = obs.observed_max.max(value);
+
+        // Track boolean-ness: require evidence, don't assume
         if value != 0 && value != 1 {
             obs.is_boolean = false;
             obs.bool_constant = None;
         } else if obs.is_boolean {
+            // Already confirmed boolean — track constant value
             let bool_val = value != 0;
             match obs.bool_constant {
                 None => obs.bool_constant = Some(bool_val),
@@ -371,6 +450,22 @@ impl DataDependentJIT {
                     obs.bool_constant = None; // Not a constant
                 }
                 _ => {}
+            }
+        } else {
+            // Value is 0 or 1 but we haven't confirmed boolean yet.
+            // Check if ALL observed values so far are 0 or 1 — if so,
+            // we have evidence this is a boolean variable.
+            let all_boolean = obs.int_values.keys().all(|&v| v == 0 || v == 1);
+            if all_boolean {
+                obs.is_boolean = true;
+                let bool_val = value != 0;
+                match obs.bool_constant {
+                    None => obs.bool_constant = Some(bool_val),
+                    Some(ref existing) if *existing != bool_val => {
+                        obs.bool_constant = None;
+                    }
+                    _ => {}
+                }
             }
         }
 

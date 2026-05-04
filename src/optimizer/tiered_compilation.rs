@@ -449,7 +449,11 @@ impl TieredExecutionManager {
         // Compile on first call to this tier.
         let needs_compile = !self.live_native_codes.contains_key(&(name.to_string(), Tier::Tier1_BaselineJIT));
         if needs_compile {
-            let _ = self.compile_baseline(name);
+            if let Err(e) = self.compile_baseline(name) {
+                // Log the compilation failure, fall back to interpreter
+                eprintln!("[tiered] baseline JIT compilation failed for '{}': {:?}", name, e);
+                return self.execute_tier0(name, args);
+            }
         }
 
         // Execute the cached native code if available.
@@ -470,7 +474,11 @@ impl TieredExecutionManager {
     fn execute_tier2(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         let needs_compile = !self.live_native_codes.contains_key(&(name.to_string(), Tier::Tier2_OptimizingJIT));
         if needs_compile {
-            let _ = self.compile_optimizing(name);
+            if let Err(e) = self.compile_optimizing(name) {
+                // Fall back to baseline JIT
+                eprintln!("[tiered] optimizing JIT compilation failed for '{}': {:?}", name, e);
+                return self.execute_tier1(name, args);
+            }
         }
 
         if let Some(native) = self.live_native_codes.get(&(name.to_string(), Tier::Tier2_OptimizingJIT)) {

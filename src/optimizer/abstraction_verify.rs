@@ -376,17 +376,88 @@ impl EquivalenceProver {
     /// Prove equivalence between two code snippets
     pub fn prove_equivalence(&self, code1: &str, code2: &str) -> bool {
         if !self.enabled {
-            return true; // Assume equivalent if proving disabled
+            return true;
         }
 
-        // In a real implementation, this would:
-        // 1. Parse both code snippets into AST
-        // 2. Build e-graphs for both
-        // 3. Run equality saturation
-        // 4. Check if the roots are in the same e-class
+        // Quick exact match first
+        if code1 == code2 {
+            return true;
+        }
 
-        // For now, use simple string comparison as a proxy
-        code1 == code2
+        // Normalize both code snippets and compare
+        let norm1 = Self::normalize_code(code1);
+        let norm2 = Self::normalize_code(code2);
+        norm1 == norm2
+    }
+
+    /// Normalize a code snippet for structural comparison
+    fn normalize_code(code: &str) -> String {
+        let mut normalized = code.to_string();
+
+        // 1. Normalize whitespace
+        normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // 2. Alpha-rename: replace local variable names with canonical names
+        normalized = Self::alpha_rename(&normalized);
+
+        // 3. Sort commutative operands (e.g., "a + b" vs "b + a")
+        normalized = Self::sort_commutative(&normalized);
+
+        normalized
+    }
+
+    /// Alpha-rename variables to canonical names (v0, v1, v2, ...)
+    fn alpha_rename(code: &str) -> String {
+        let mut name_map = HashMap::new();
+        let mut counter = 0usize;
+        let tokens: Vec<&str> = code.split(' ').collect();
+        let result: Vec<String> = tokens.iter().map(|tok| {
+            // Check if this looks like a variable name (starts with letter/underscore, not a keyword)
+            if tok.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+                && !Self::is_keyword(tok)
+            {
+                let canonical = name_map.entry(tok.to_string())
+                    .or_insert_with(|| {
+                        let name = format!("v{}", counter);
+                        counter += 1;
+                        name
+                    });
+                canonical.clone()
+            } else {
+                tok.to_string()
+            }
+        }).collect();
+        result.join(" ")
+    }
+
+    /// Check if a token is a keyword
+    fn is_keyword(tok: &str) -> bool {
+        matches!(tok, "if" | "else" | "for" | "while" | "let" | "fn" | "return"
+            | "true" | "false" | "map" | "filter" | "reduce" | "sum" | "avg"
+            | "min" | "max" | "len" | "iter" | "collect" | "into" | "in")
+    }
+
+    /// Sort commutative operands (very simplified: handles "a op b" → sorted)
+    fn sort_commutative(code: &str) -> String {
+        let commutative_ops = ["+", "*"];
+        let mut result = code.to_string();
+        for op in &commutative_ops {
+            // Look for patterns like "a + b" and normalize to alphabetical order
+            let pattern = format!(" {} ", op);
+            if let Some(idx) = result.find(&pattern) {
+                let before = &result[..idx];
+                let after = &result[idx + pattern.len()..];
+                let left = before.trim().split(' ').last().unwrap_or("");
+                let right = after.trim().split(' ').next().unwrap_or("");
+                if left > right {
+                    // Swap: right op left
+                    let new_pattern = format!("{} {} {}", right, op, left);
+                    let old_pattern = format!("{} {} {}", left, op, right);
+                    result = result.replace(&old_pattern, &new_pattern);
+                }
+            }
+        }
+        result
     }
 
     /// Enable or disable proving

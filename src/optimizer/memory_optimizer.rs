@@ -129,13 +129,140 @@ pub struct NumaTopology {
 }
 
 impl NumaTopology {
-    /// Detect the NUMA topology
+    /// Detect the NUMA topology from the OS
     pub fn detect() -> Self {
-        // In a real implementation, this would query the OS via libnuma or similar
-        // For now, provide a reasonable default
-        let num_nodes = num_cpus::get();
-        let cpus_per_node = vec![1; num_nodes];
-        let memory_per_node = vec![16 * 1024 * 1024 * 1024; num_nodes]; // 16GB per node
+        // Try Linux sysfs first
+        if let Some(topo) = Self::detect_linux_sysfs() {
+            return topo;
+        }
+        // Fallback: reasonable heuristic
+        Self::detect_fallback()
+    }
+
+    /// Detect from Linux /sys/devices/system/node/
+    fn detect_linux_sysfs() -> Option<Self> {
+        // Read /sys/devices/system/node/online to get node count
+        let online = std::fs::read_to_string("/sys/devices/system/node/online")
+            .ok()?;
+
+        // Parse range like "0-3" or "0,2-4"
+        let max_node = Self::parse_range_max(&online)?;
+        let num_nodes = max_node + 1;
+
+        let mut cpus_per_node = Vec::with_capacity(num_nodes);
+        let mut memory_per_node = Vec::with_capacity(num_nodes);
+
+        for i in 0..num_nodes {
+            // Read /sys/devices/system/node/node{i}/cpulist
+            let cpulist = std::fs::read_to_string(
+                format!("/sys/devices/system/node/node{}/cpulist", i)
+            ).unwrap_or_default();
+            let cpu_count = Self::parse_cpulist_count(&cpulist).max(1);
+            cpus_per_node.push(cpu_count);
+
+            // Read /sys/devices/system/node/node{i}/meminfo
+            // Look for "MemTotal:   XXXX kB"
+            let meminfo = std::fs::read_to_string(
+                format!("/sys/devices/system/node/node{}/meminfo", i)
+            ).unwrap_or_default();
+            let mem_bytes = Self::parse_meminfo_kb(&meminfo)
+                .unwrap_or(16 * 1024 * 1024 * 1024);
+            memory_per_node.push(mem_bytes);
+        }
+
+        let distance_matrix = Self::read_distance_matrix(num_nodes);
+
+        Some(Self {
+            num_nodes,
+            cpus_per_node,
+            memory_per_node,
+            distance_matrix,
+        })
+    }
+
+    /// Parse a range string like "0-3" or "0,2-4" and return the maximum value
+    fn parse_range_max(s: &str) -> Option<usize> {
+        let s = s.trim();
+        let mut max_val = 0usize;
+        for part in s.split(',') {
+            let part = part.trim();
+            if let Some(dash) = part.find('-') {
+                let high: usize = part[dash+1..].parse().ok()?;
+                max_val = max_val.max(high);
+            } else {
+                let val: usize = part.parse().ok()?;
+                max_val = max_val.max(val);
+            }
+        }
+        Some(max_val)
+    }
+
+    /// Parse a cpulist like "0-7,16-23" and count CPUs
+    fn parse_cpulist_count(s: &str) -> usize {
+        let s = s.trim();
+        let mut count = 0usize;
+        for part in s.split(',') {
+            let part = part.trim();
+            if part.is_empty() { continue; }
+            if let Some(dash) = part.find('-') {
+                let lo: usize = part[..dash].parse().unwrap_or(0);
+                let hi: usize = part[dash+1..].parse().unwrap_or(lo);
+                count += hi.saturating_sub(lo) + 1;
+            } else {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Parse meminfo to get total memory in bytes
+    fn parse_meminfo_kb(s: &str) -> Option<usize> {
+        for line in s.lines() {
+            if line.contains("MemTotal") {
+                // Format: "Node 0 MemTotal:   16384000 kB"
+                let kb: usize = line.split_whitespace()
+                    .filter_map(|w| w.parse::<usize>().ok())
+                    .next()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+
+    /// Read NUMA distance matrix from sysfs
+    fn read_distance_matrix(num_nodes: usize) -> Vec<Vec<u32>> {
+        let mut matrix = Self::default_distance_matrix(num_nodes);
+        for i in 0..num_nodes {
+            if let Ok(data) = std::fs::read_to_string(
+                format!("/sys/devices/system/node/node{}/distance", i)
+            ) {
+                let distances: Vec<u32> = data.split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                for (j, &d) in distances.iter().enumerate() {
+                    if j < num_nodes {
+                        matrix[i][j] = d;
+                    }
+                }
+            }
+        }
+        matrix
+    }
+
+    /// Fallback when sysfs is not available
+    fn detect_fallback() -> Self {
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        // Heuristic: assume 2 NUMA nodes for >= 16 CPUs, 1 otherwise
+        let num_nodes = if num_cpus >= 16 { 2 } else { 1 };
+        let cpus_per_node = if num_nodes > 1 {
+            vec![num_cpus / 2, num_cpus - num_cpus / 2]
+        } else {
+            vec![num_cpus]
+        };
+        let memory_per_node = vec![16 * 1024 * 1024 * 1024; num_nodes];
         let distance_matrix = Self::default_distance_matrix(num_nodes);
 
         Self {

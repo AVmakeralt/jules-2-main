@@ -270,19 +270,18 @@ impl CycleCounter {
         }
     }
 
-    /// Read the current cycle count
+    /// Read the current cycle count with lfence serialization
     pub fn read_cycles(&self) -> u64 {
         if !self.available {
             return 0;
         }
 
-        // In a real implementation, use RDTSC or similar
-        // For now, return a mock value
         #[cfg(target_arch = "x86_64")]
         unsafe {
             let mut high: u32;
             let mut low: u32;
             std::arch::asm!(
+                "lfence",  // Serialize: prevent out-of-order execution before RDTSC
                 "rdtsc",
                 out("eax") low,
                 out("edx") high,
@@ -292,11 +291,57 @@ impl CycleCounter {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            // Fallback for non-x86: use a monotonic counter
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as u64
+        }
+    }
+
+    /// Serializing cycle read (more accurate but slower)
+    pub fn read_cycles_serializing(&self) -> u64 {
+        if !self.available {
+            return 0;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let mut high: u32;
+            let mut low: u32;
+            std::arch::asm!(
+                "push rbx",     // Save RBX (reserved by LLVM for GOT in PIC)
+                "cpuid",        // Full serialization barrier (writes EAX, EBX, ECX, EDX)
+                "pop rbx",      // Restore RBX
+                "rdtsc",
+                out("eax") low,
+                out("edx") high,
+                out("ecx") _,
+                options(nostack)
+            );
+            ((high as u64) << 32) | (low as u64)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.read_cycles()
+        }
+    }
+
+    /// Estimate CPU frequency in GHz by measuring TSC over a known sleep duration
+    pub fn estimate_frequency_ghz(&self) -> f64 {
+        let start = self.read_cycles();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let end = self.read_cycles();
+        let cycles = end.wrapping_sub(start) as f64;
+        cycles / 10_000_000.0  // 10ms = 10,000,000 ns
+    }
+
+    /// Convert cycles to nanoseconds using estimated CPU frequency
+    pub fn cycles_to_ns(&self, cycles: u64) -> f64 {
+        let freq = self.estimate_frequency_ghz();
+        if freq > 0.0 {
+            cycles as f64 / freq
+        } else {
+            cycles as f64  // Fallback: assume 1 GHz
         }
     }
 

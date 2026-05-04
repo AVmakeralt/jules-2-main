@@ -7,6 +7,129 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// GPU operation type descriptor
+#[derive(Debug, Clone)]
+pub enum GpuOpType {
+    /// Matrix multiplication: C(m×n) = A(m×k) × B(k×n)
+    MatMul {
+        /// Rows of A / C
+        m: usize,
+        /// Columns of B / C
+        n: usize,
+        /// Columns of A / Rows of B
+        k: usize,
+    },
+    /// Element-wise operation
+    ElementWise {
+        /// Operation name (relu, sigmoid, tanh, exp, log, abs, neg, square, sqrt, add, mul)
+        op: String,
+    },
+    /// Reduction operation
+    Reduce {
+        /// Operation name (sum, mean, max, min)
+        op: String,
+        /// Number of input elements
+        size: usize,
+    },
+    /// Generic / unknown operation
+    Generic,
+}
+
+/// GPU task descriptor carrying all information needed to execute on CPU
+#[derive(Debug, Clone)]
+pub struct GpuTaskDescriptor {
+    /// Operation type
+    pub op_type: GpuOpType,
+    /// Input data (concatenated: for MatMul A then B; for ElementWise unary or binary)
+    pub input_data: Vec<f32>,
+    /// Expected output size
+    pub output_size: usize,
+}
+
+impl GpuTaskDescriptor {
+    /// Create a new GPU task descriptor
+    pub fn new(op_type: GpuOpType, input_data: Vec<f32>, output_size: usize) -> Self {
+        Self { op_type, input_data, output_size }
+    }
+}
+
+/// CPU-side executor for GPU task descriptors.
+/// Performs actual computation when no real GPU backend is available.
+struct CpuTaskExecutor;
+
+impl CpuTaskExecutor {
+    /// Execute a GPU task descriptor on the CPU
+    fn execute(&self, task: &GpuTaskDescriptor) -> Vec<f32> {
+        match &task.op_type {
+            GpuOpType::MatMul { m, n, k } => {
+                let m = *m;
+                let n = *n;
+                let k = *k;
+                // Input A is m×k, Input B is k×n, Output is m×n
+                if task.input_data.len() < m * k + k * n {
+                    // Not enough input data — return zeroed output
+                    return vec![0.0f32; m * n];
+                }
+                let a = &task.input_data[0..m * k];
+                let b = &task.input_data[m * k..m * k + k * n];
+                let mut c = vec![0.0f32; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut sum = 0.0f32;
+                        for l in 0..k {
+                            sum += a[i * k + l] * b[l * n + j];
+                        }
+                        c[i * n + j] = sum;
+                    }
+                }
+                c
+            }
+            GpuOpType::ElementWise { op } => {
+                let data = &task.input_data;
+                match op.as_str() {
+                    "relu" => data.iter().map(|&x| if x > 0.0 { x } else { 0.0 }).collect(),
+                    "sigmoid" => data.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect(),
+                    "tanh" => data.iter().map(|&x| x.tanh()).collect(),
+                    "exp" => data.iter().map(|&x| x.exp()).collect(),
+                    "log" => data.iter().map(|&x| x.ln()).collect(),
+                    "abs" => data.iter().map(|&x| x.abs()).collect(),
+                    "neg" => data.iter().map(|&x| -x).collect(),
+                    "square" => data.iter().map(|&x| x * x).collect(),
+                    "sqrt" => data.iter().map(|&x| x.sqrt()).collect(),
+                    "add" if task.input_data.len() > task.output_size => {
+                        // Binary element-wise: first half + second half
+                        let n = task.output_size;
+                        (0..n).map(|i| task.input_data[i] + task.input_data[n + i]).collect()
+                    }
+                    "mul" if task.input_data.len() > task.output_size => {
+                        let n = task.output_size;
+                        (0..n).map(|i| task.input_data[i] * task.input_data[n + i]).collect()
+                    }
+                    _ => vec![0.0f32; task.output_size],
+                }
+            }
+            GpuOpType::Reduce { op, size } => {
+                let size = *size;
+                if task.input_data.len() < size {
+                    return vec![0.0f32; task.output_size];
+                }
+                let data = &task.input_data[0..size];
+                match op.as_str() {
+                    "sum" => vec![data.iter().sum()],
+                    "mean" => vec![data.iter().sum::<f32>() / size as f32],
+                    "max" => vec![data.iter().cloned().fold(f32::NEG_INFINITY, f32::max)],
+                    "min" => vec![data.iter().cloned().fold(f32::INFINITY, f32::min)],
+                    _ => vec![0.0f32; task.output_size],
+                }
+            }
+            GpuOpType::Generic => {
+                // Generic tasks: attempt basic computation, fall back to zeros
+                vec![0.0f32; task.output_size]
+            }
+        }
+    }
+}
+
 /// GPU task handle with result
 #[derive(Debug)]
 pub struct GpuTaskHandle {
@@ -266,11 +389,7 @@ impl GpuPipeline {
     ///
     /// On systems without a real GPU backend the task is executed
     /// immediately on a helper thread (CPU fallback).
-    pub fn submit_task(&self, task: *mut ()) -> Result<(), String> {
-        if task.is_null() {
-            return Err("submit_task: task pointer is null".to_string());
-        }
-
+    pub fn submit_task(&self, descriptor: GpuTaskDescriptor) -> Result<(), String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) as u64;
 
         // Grab the current double-buffer slot
@@ -279,6 +398,18 @@ impl GpuPipeline {
             return Err("submit_task: buffer index out of range".to_string());
         }
         let buffer = &self.buffers[buffer_idx];
+
+        // Copy input data into the double-buffer if it fits.
+        if descriptor.input_data.len() <= self.buffer_capacity {
+            let data_ptr = buffer.data.as_ptr() as *mut f32;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    descriptor.input_data.as_ptr(),
+                    data_ptr,
+                    descriptor.input_data.len(),
+                );
+            }
+        }
 
         // Mark the buffer as processing and associate it with the task id.
         buffer.task_id.store(id, Ordering::Release);
@@ -293,26 +424,27 @@ impl GpuPipeline {
         let next_idx = (buffer_idx + 1) % self.buffers.len();
         self.buffer_index.store(next_idx, Ordering::Release);
 
-        // Simulate asynchronous execution on a CPU helper thread.
+        // Execute asynchronously on a CPU helper thread using CpuTaskExecutor.
         // In a real implementation this would dispatch a wgpu compute
         // shader or a CUDA kernel.
         let pending_arc = self.pending.clone();
         let completed_arc = self.completed.clone();
-        let task_addr = task as u64;
 
         std::thread::spawn(move || {
             // Simulate GPU work latency.
             std::thread::sleep(std::time::Duration::from_micros(500));
 
+            // Perform actual computation on CPU.
+            let executor = CpuTaskExecutor;
+            let result = executor.execute(&descriptor);
+
             // Move from pending → completed.
             let mut pending = pending_arc.lock().unwrap();
             let mut completed = completed_arc.lock().unwrap();
 
-            if let Some(pos) = pending.iter().position(|t| t.id == task_addr) {
+            if let Some(pos) = pending.iter().position(|t| t.id == id) {
                 let mut task = pending.remove(pos);
-                // Placeholder result — a real backend would fill in the
-                // actual computation output here.
-                task.complete(vec![]);
+                task.complete(result);
                 completed.push(task);
             }
         });

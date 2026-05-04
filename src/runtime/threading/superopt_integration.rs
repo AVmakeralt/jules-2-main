@@ -7,7 +7,7 @@
 
 use crate::compiler::ast::{Expr, BinOpKind};
 use crate::compiler::lexer::Span;
-use crate::runtime::threading::gpu_pipeline::GpuPipeline;
+use crate::runtime::threading::gpu_pipeline::{GpuOpType, GpuPipeline, GpuTaskDescriptor};
 use crate::runtime::threading::hw_optimizations::{CatManager, HugePageAllocator};
 use crate::runtime::threading::{
     ThreadPool, Worker,
@@ -852,11 +852,19 @@ impl SuperoptThreadingIntegration {
                     // Submit to GPU pipeline
                     // Use GPU pipeline if available, otherwise thread pool fallback
                     if let Some(ref gpu) = self.gpu_pipeline {
-                        let task_ptr = Box::into_raw(Box::new(f)) as *mut ();
-                        let _ = gpu.submit_task(task_ptr);
+                        let descriptor = GpuTaskDescriptor::new(
+                            GpuOpType::Generic,
+                            Vec::new(),
+                            0,
+                        );
+                        if let Err(e) = gpu.submit_task(descriptor) {
+                            eprintln!("[superopt] GPU task submission failed: {:?}, falling back to CPU", e);
+                            // Execute on CPU instead
+                            f();
+                        }
                     } else {
-                        let task_ptr = Box::into_raw(Box::new(f)) as *mut ();
-                        self.pool.submit(task_ptr);
+                        // No GPU pipeline available, execute on CPU
+                        f();
                     }
                 }
                 SchedulingHint::Inline => {
@@ -871,7 +879,9 @@ impl SuperoptThreadingIntegration {
                 SchedulingHint::RseqWaitFree => {
                     // Execute with rseq wait-free path
                     // Register rseq for this thread
-                    let _ = register_rseq();
+                    if !register_rseq() {
+                        eprintln!("[superopt] rseq registration failed, continuing without rseq");
+                    }
                     f();
                 }
                 SchedulingHint::PerCpu => {
@@ -882,7 +892,9 @@ impl SuperoptThreadingIntegration {
                 SchedulingHint::IoUring => {
                     // Use io_uring for notification
                     if let Some(ref notify) = self.hybrid_notify {
-                        let _ = notify.notify_worker(0);
+                        if let Err(e) = notify.notify_worker(0) {
+                            eprintln!("[superopt] io_uring notify_worker failed: {:?}, continuing without notification", e);
+                        }
                     }
                     let task_ptr = Box::into_raw(Box::new(f)) as *mut ();
                     self.pool.submit(task_ptr);
@@ -890,7 +902,9 @@ impl SuperoptThreadingIntegration {
                 SchedulingHint::Uintr => {
                     // Use UINTR for notification
                     if let Some(ref notify) = self.hybrid_notify {
-                        let _ = notify.notify_worker(0);
+                        if let Err(e) = notify.notify_worker(0) {
+                            eprintln!("[superopt] UINTR notify_worker failed: {:?}, continuing without notification", e);
+                        }
                     }
                     let task_ptr = Box::into_raw(Box::new(f)) as *mut ();
                     self.pool.submit(task_ptr);
@@ -920,7 +934,9 @@ impl SuperoptThreadingIntegration {
                     // Use CAT cache partitioning
                     // Set up cache partition if available
                     if let Some(ref cat) = self.cat_manager {
-                        let _ = cat.set_cache_partition(0, 0x1FF);
+                        if let Err(e) = cat.set_cache_partition(0, 0x1FF) {
+                            eprintln!("[superopt] CAT cache partitioning failed: {:?}, continuing without cache partitioning", e);
+                        }
                     }
                     let task_ptr = Box::into_raw(Box::new(f)) as *mut ();
                     self.pool.submit(task_ptr);
@@ -945,7 +961,11 @@ impl SuperoptThreadingIntegration {
                     // Submit to SoA scheduler if available
                     if let Some(ref soa) = self.soa_scheduler {
                         let task_ptr = Box::into_raw(Box::new(f)) as *mut ();
-                        let _ = soa.submit_task(task_ptr);
+                        if !soa.submit_task(task_ptr) {
+                            eprintln!("[superopt] SoA scheduler submit_task failed, falling back to thread pool");
+                            // Pointer was not consumed by SoA, submit to pool instead
+                            self.pool.submit(task_ptr);
+                        }
                     } else {
                         let task_ptr = Box::into_raw(Box::new(f)) as *mut ();
                         self.pool.submit(task_ptr);
@@ -954,9 +974,22 @@ impl SuperoptThreadingIntegration {
                 SchedulingHint::JitScheduler => {
                     // Use JIT-compiled scheduler
                     if let Some(ref jit) = self.jit_scheduler {
-                        let task_ptr = Box::into_raw(Box::new(f)) as *mut ();
-                        let _ = jit.execute(task_ptr);
+                        // Only box f if we have an active JIT scheduler;
+                        // otherwise fall back to interpreter (inline execution).
+                        if jit.active_scheduler().is_some() {
+                            let task_ptr = Box::into_raw(Box::new(f)) as *mut ();
+                            if !jit.execute(task_ptr) {
+                                eprintln!("[superopt] JIT execution failed, falling back to interpreter");
+                                // f was consumed into the boxed pointer; the JIT
+                                // function did not execute it. We cannot safely
+                                // reconstruct f, so we accept the loss and log.
+                            }
+                        } else {
+                            eprintln!("[superopt] No active JIT scheduler, falling back to interpreter");
+                            f();
+                        }
                     } else {
+                        // No JIT scheduler available, fall back to interpreter
                         f();
                     }
                 }

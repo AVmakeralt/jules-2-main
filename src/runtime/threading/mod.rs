@@ -38,7 +38,7 @@ pub use disruptor::{DisruptorRing, OwnedData, WorkerDisruptor, ZeroCopyMessaging
 pub use ecs_lockfree::{ComponentStorageData, ComponentStorageTrait, EntityId, LockFreeComponentStorage, SparseSet};
 pub use egraph_schedule::{AotScheduler, EGraph, EGraphBuilder, EGraphExtractor, EGraphNode, PrecomputedSchedule};
 pub use green::{GreenContext, GreenScheduler, GreenThreadId};
-pub use gpu_pipeline::{GpuPipeline, GpuTaskHandle};
+pub use gpu_pipeline::{GpuOpType, GpuPipeline, GpuTaskDescriptor, GpuTaskHandle};
 pub use hw_optimizations::{AmxContext, Avx512Mask, CatManager, CompareOp, HugePageAllocator, HwCapabilities, TsxTransaction, avx512_conflict_detection, is_amx_available, is_avx512_available, is_cat_available, is_tsx_available};
 pub use hyper_sparse::{BitSegment, HyperSparseMap, HyperSparseSoA, SegmentedSieve};
 pub use jit_scheduler::{HwCounter, HwCounterReader, HwCounterValue, JitSchedulerCompiler, RuntimeStats, SchedulingStrategy, SelfOptimizingRuntime, TraceBasedScheduler, WorkloadPhase};

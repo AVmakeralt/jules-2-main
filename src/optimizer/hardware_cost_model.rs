@@ -42,16 +42,114 @@ impl Microarchitecture {
     pub fn detect() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
-            Self::Skylake
+            Self::detect_x86_64()
         }
         #[cfg(target_arch = "aarch64")]
         {
-            Self::Zen3
+            Self::detect_aarch64()
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             Self::Unknown
         }
+    }
+
+    /// Detect microarchitecture on x86_64 using CPUID
+    #[cfg(target_arch = "x86_64")]
+    fn detect_x86_64() -> Self {
+        use std::arch::x86_64::CpuidResult;
+
+        // CPUID is always available on x86_64 (guaranteed by the architecture).
+        let CpuidResult { ebx, edx, ecx, .. } = std::arch::x86_64::__cpuid(0);
+
+        // Assemble the 12-byte vendor string from EBX, EDX, ECX
+        let vendor = [
+            (ebx & 0xFF) as u8,
+            ((ebx >> 8) & 0xFF) as u8,
+            ((ebx >> 16) & 0xFF) as u8,
+            ((ebx >> 24) & 0xFF) as u8,
+            (edx & 0xFF) as u8,
+            ((edx >> 8) & 0xFF) as u8,
+            ((edx >> 16) & 0xFF) as u8,
+            ((edx >> 24) & 0xFF) as u8,
+            (ecx & 0xFF) as u8,
+            ((ecx >> 8) & 0xFF) as u8,
+            ((ecx >> 16) & 0xFF) as u8,
+            ((ecx >> 24) & 0xFF) as u8,
+        ];
+
+        let CpuidResult { eax, .. } = std::arch::x86_64::__cpuid(1);
+
+        // Extract family and model from EAX
+        let base_family = (eax >> 8) & 0xF;
+        let base_model = (eax >> 4) & 0xF;
+        let extended_family = (eax >> 20) & 0xFF;
+        let extended_model = (eax >> 16) & 0xF;
+
+        let family = if base_family == 0xF {
+            base_family + extended_family
+        } else {
+            base_family
+        };
+
+        let model = if base_family == 0x6 || base_family == 0xF {
+            (extended_model << 4) + base_model
+        } else {
+            base_model
+        };
+
+        if &vendor == b"GenuineIntel" {
+            match (family, model) {
+                (6, 0x55) => Self::SkylakeX,
+                (6, 0x5E) => Self::Skylake,
+                (6, 0x7D) | (6, 0x7E) => Self::IceLake,
+                (6, 0x97) | (6, 0x9A) => Self::GoldenCove,
+                (6, _) => Self::Skylake, // safe fallback for modern Intel
+                _ => Self::Unknown,
+            }
+        } else if &vendor == b"AuthenticAMD" {
+            match (family, model) {
+                (0x17, 0x30..=0x3F) => Self::Zen2,
+                (0x19, 0x00..=0x0F) => Self::Zen3,
+                (0x19, 0x10..=0x1F) => Self::Zen4,
+                (0x17, _) => Self::Zen2,   // fallback
+                (0x19, _) => Self::Zen3,   // fallback
+                _ => Self::Unknown,
+            }
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// Detect microarchitecture on aarch64
+    #[cfg(target_arch = "aarch64")]
+    fn detect_aarch64() -> Self {
+        // On Linux, try reading CPU implementer/part from /proc/cpuinfo
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+                let mut implementer: Option<u32> = None;
+                let mut part: Option<u32> = None;
+                for line in info.lines() {
+                    if let Some(val) = line.strip_prefix("CPU implementer") {
+                        let val = val.trim_start_matches(&[' ', '\t', ':']);
+                        implementer = u32::from_str_radix(val.trim_start_matches("0x"), 16).ok();
+                    }
+                    if let Some(val) = line.strip_prefix("CPU part") {
+                        let val = val.trim_start_matches(&[' ', '\t', ':']);
+                        part = u32::from_str_radix(val.trim_start_matches("0x"), 16).ok();
+                    }
+                }
+                // Apple implementer = 0x61 ('a')
+                if implementer == Some(0x61) {
+                    // Apple M1/M2 — no port maps for ARM yet
+                    return Self::Unknown;
+                }
+                // Other ARM implementers — not mapped yet
+                let _ = part;
+            }
+        }
+        Self::Unknown
     }
 
     /// Get the port map for this microarchitecture

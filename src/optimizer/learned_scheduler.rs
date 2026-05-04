@@ -214,16 +214,18 @@ impl MicroLatencyNet {
         output.clamp(0.1, 100.0) as f64
     }
 
-    /// Train on a single (features, actual_latency) pair using SGD.
+    /// Train with full backpropagation through both layers
     pub fn train_one(&mut self, features: &[f32; Self::INPUT_DIM], actual: f32, lr: f32) {
         // Forward pass
         let mut hidden = [0.0f32; Self::HIDDEN_DIM];
+        let mut pre_activations = [0.0f32; Self::HIDDEN_DIM];
         for j in 0..Self::HIDDEN_DIM {
             let mut sum = self.biases_h[j];
             for i in 0..Self::INPUT_DIM {
                 sum += self.weights_ih[i * Self::HIDDEN_DIM + j] * features[i];
             }
-            hidden[j] = if sum > 0.0 { sum } else { 0.0 };
+            pre_activations[j] = sum;
+            hidden[j] = if sum > 0.0 { sum } else { 0.0 }; // ReLU
         }
 
         let mut output = self.bias_o;
@@ -234,13 +236,34 @@ impl MicroLatencyNet {
         // Loss = 0.5 * (output - actual)^2
         let error = output - actual;
 
-        // Backward pass (simplified: only update output layer for speed)
-        // Full backprop would update weights_ih too, but the output layer
-        // captures most of the adaptive behavior.
+        // ── Full backpropagation ──
+
+        // Output layer gradients
+        let d_output = error; // dL/d(output) = (output - actual)
+
+        // Hidden layer gradients (chain rule through ReLU)
+        let mut d_hidden = [0.0f32; Self::HIDDEN_DIM];
         for j in 0..Self::HIDDEN_DIM {
-            self.weights_ho[j] -= lr * error * hidden[j];
+            d_hidden[j] = self.weights_ho[j] * d_output;
+            // ReLU derivative: 0 if pre-activation was <= 0
+            if pre_activations[j] <= 0.0 {
+                d_hidden[j] = 0.0;
+            }
         }
-        self.bias_o -= lr * error;
+
+        // Update output layer weights
+        for j in 0..Self::HIDDEN_DIM {
+            self.weights_ho[j] -= lr * d_output * hidden[j];
+        }
+        self.bias_o -= lr * d_output;
+
+        // Update input-to-hidden weights
+        for j in 0..Self::HIDDEN_DIM {
+            for i in 0..Self::INPUT_DIM {
+                self.weights_ih[i * Self::HIDDEN_DIM + j] -= lr * d_hidden[j] * features[i];
+            }
+            self.biases_h[j] -= lr * d_hidden[j];
+        }
     }
 
     /// Total number of parameters.

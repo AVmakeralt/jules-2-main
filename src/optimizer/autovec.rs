@@ -159,19 +159,33 @@ impl VectorPatternDetector {
 
     /// Detect available SIMD capabilities
     fn detect_simd_capabilities() -> Vec<VectorWidth> {
-        let mut widths = vec![VectorWidth::W128]; // SSE/NEON always available on x86/ARM
+        let mut widths = Vec::new();
         
         #[cfg(target_arch = "x86_64")]
         {
-            // Check for AVX
+            // SSE4.2 provides 128-bit vector support
+            if Self::has_sse42() {
+                widths.push(VectorWidth::W128);
+            }
+            // Check for AVX (256-bit)
             if Self::has_avx() {
                 widths.push(VectorWidth::W256);
             }
-            
-            // Check for AVX-512
+            // Check for AVX-512 (512-bit)
             if Self::has_avx512() {
                 widths.push(VectorWidth::W512);
             }
+        }
+        
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // ARM NEON always provides 128-bit vectors
+            widths.push(VectorWidth::W128);
+        }
+        
+        // Fallback: always include W128 if nothing was detected
+        if widths.is_empty() {
+            widths.push(VectorWidth::W128);
         }
         
         widths
@@ -179,16 +193,32 @@ impl VectorPatternDetector {
 
     #[cfg(target_arch = "x86_64")]
     fn has_avx() -> bool {
-        // In a real implementation, use CPUID to check AVX support
-        // For now, assume AVX is available on modern x86-64
-        true
+        is_x86_feature_detected!("avx")
     }
 
     #[cfg(target_arch = "x86_64")]
     fn has_avx512() -> bool {
-        // In a real implementation, use CPUID to check AVX-512 support
-        // For now, assume AVX-512 is available on modern CPUs
-        false // Conservative: AVX-512 not always available
+        is_x86_feature_detected!("avx512f")
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn has_avx() -> bool {
+        false
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn has_avx512() -> bool {
+        false
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn has_sse42() -> bool {
+        is_x86_feature_detected!("sse4.2")
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn has_sse42() -> bool {
+        false
     }
 
     /// Analyze a loop for vectorization opportunities
@@ -311,9 +341,112 @@ pub struct LoopInfo {
     pub operations: Vec<String>,
 }
 
+/// Dependency type for loop-carried dependencies
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyKind {
+    /// Read-after-write: iteration reads a value written by a previous iteration
+    RAW,
+    /// Write-after-read: iteration writes a value read by a previous iteration
+    WAR,
+    /// Write-after-write: iteration writes a value also written by a previous iteration
+    WAW,
+}
+
+/// A detected dependency between loop iterations
+#[derive(Debug, Clone)]
+pub struct Dependency {
+    /// Kind of dependency
+    pub kind: DependencyKind,
+    /// Description of the dependency
+    pub description: String,
+}
+
+/// Analyzes loop-carried dependencies to determine vectorization safety
+pub struct DependencyAnalyzer {
+    /// Detected dependencies
+    dependencies: Vec<Dependency>,
+}
+
+impl DependencyAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            dependencies: Vec::new(),
+        }
+    }
+
+    /// Analyze a vector pattern for dependencies
+    pub fn analyze(&self, pattern: &VectorPattern) -> VerificationResult {
+        match pattern {
+            VectorPattern::Map { .. } => {
+                // Map: each iteration applies the same operation to independent
+                // elements. No read-after-write, write-after-read, or
+                // write-after-write dependencies between iterations.
+                VerificationResult::Safe
+            }
+            VectorPattern::Reduce { op, .. } => {
+                // Reduce: iterations accumulate into a shared accumulator.
+                // This is safe only if the operation is associative,
+                // because vectorized reduction reorders the accumulation.
+                //
+                // Associative enough for reduction:
+                //   Add, Mul on floats (despite FP non-associativity,
+                //   compilers allow this with fast-math semantics)
+                //   Min, Max on floats
+                //
+                // NOT associative (vectorization is unsafe):
+                //   Sub, Div — because a - b - c ≠ a - (b - c)
+                if Self::is_associative_for_reduction(*op) {
+                    VerificationResult::Safe
+                } else {
+                    VerificationResult::Unsafe
+                }
+            }
+            VectorPattern::Zip { .. } => {
+                // Zip: element-wise combination of two independent arrays.
+                // No cross-iteration dependencies.
+                VerificationResult::Safe
+            }
+            VectorPattern::Indexed { is_gather, .. } => {
+                if *is_gather {
+                    // Gather (indexed load): indices could alias with the output
+                    // array, creating read-after-write or write-after-read
+                    // dependencies. Without alias analysis, we cannot prove
+                    // safety statically.
+                    VerificationResult::Unknown
+                } else {
+                    // Scatter (indexed store): indices could overlap, meaning
+                    // two iterations write to the same location (WAW) or a
+                    // later iteration overwrites a value read earlier (WAR).
+                    VerificationResult::Unsafe
+                }
+            }
+            VectorPattern::Stencil { .. } => {
+                // Stencil: sliding window with read-only access pattern.
+                // Output writes go to a separate array, so no dependencies.
+                VerificationResult::Safe
+            }
+        }
+    }
+
+    /// Check if an operation is associative enough for vectorized reduction.
+    ///
+    /// Add, Mul, Min, Max are considered associative for reduction purposes
+    /// (floating-point Add/Mul are technically not associative due to rounding,
+    /// but compilers treat them as such under fast-math / relaxed FP semantics).
+    /// Sub and Div are NOT associative: a - b - c ≠ a - (b - c).
+    fn is_associative_for_reduction(op: VectorOp) -> bool {
+        matches!(op, VectorOp::Add | VectorOp::Mul | VectorOp::Min | VectorOp::Max)
+    }
+
+    /// Get the detected dependencies
+    pub fn dependencies(&self) -> &[Dependency] {
+        &self.dependencies
+    }
+}
+
 /// E-graph vectorization verifier
 ///
-/// Uses the e-graph to verify that vectorization is safe.
+/// Uses the e-graph and dependency analysis to verify that vectorization is safe.
 pub struct EGraphVectorVerifier {
     /// Whether verification is enabled
     enabled: bool,
@@ -324,47 +457,14 @@ impl EGraphVectorVerifier {
         Self { enabled: true }
     }
 
-    /// Verify that vectorization is safe using e-graph
+    /// Verify that vectorization is safe using dependency analysis
     pub fn verify(&self, candidate: &VectorizationCandidate) -> VerificationResult {
         if !self.enabled {
-            return VerificationResult::Safe; // Assume safe if verification disabled
+            return VerificationResult::Safe;
         }
 
-        // In a real implementation, this would:
-        // 1. Build an e-graph for the scalar version
-        // 2. Build an e-graph for the vector version
-        // 3. Prove equivalence using the e-graph
-        // 4. Check for dependencies that would break vectorization
-
-        // For now, use heuristics
-        match &candidate.pattern {
-            VectorPattern::Map { .. } => {
-                // Map is always safe (no dependencies between elements)
-                VerificationResult::Safe
-            }
-            VectorPattern::Reduce { .. } => {
-                // Reduction is safe if operation is associative
-                // E-graph can prove associativity
-                VerificationResult::Safe
-            }
-            VectorPattern::Zip { .. } => {
-                // Zip is safe (element-wise)
-                VerificationResult::Safe
-            }
-            VectorPattern::Indexed { is_gather, .. } => {
-                // Gather/scatter is safe if no aliasing
-                // E-graph can check for aliasing
-                if *is_gather {
-                    VerificationResult::Safe // Conservative
-                } else {
-                    VerificationResult::Unsafe // Scatter is riskier
-                }
-            }
-            VectorPattern::Stencil { .. } => {
-                // Stencil is safe if kernel is dependency-free
-                VerificationResult::Safe
-            }
-        }
+        let analyzer = DependencyAnalyzer::new();
+        analyzer.analyze(&candidate.pattern)
     }
 
     /// Enable or disable verification
@@ -744,5 +844,99 @@ mod tests {
         
         let safe = vectorizer.safe_candidates();
         assert!(!safe.is_empty());
+    }
+
+    #[test]
+    fn test_dependency_analyzer_map() {
+        let analyzer = DependencyAnalyzer::new();
+        let pattern = VectorPattern::Map {
+            op: VectorOp::Add,
+            element_type: "f64".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
+    }
+
+    #[test]
+    fn test_dependency_analyzer_reduce_associative() {
+        let analyzer = DependencyAnalyzer::new();
+        // Add is associative → Safe
+        let pattern = VectorPattern::Reduce {
+            op: VectorOp::Add,
+            element_type: "f64".to_string(),
+            initial: "0".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
+
+        // Mul is associative → Safe
+        let pattern = VectorPattern::Reduce {
+            op: VectorOp::Mul,
+            element_type: "f64".to_string(),
+            initial: "1".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
+
+        // Min is associative → Safe
+        let pattern = VectorPattern::Reduce {
+            op: VectorOp::Min,
+            element_type: "f32".to_string(),
+            initial: "inf".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
+
+        // Max is associative → Safe
+        let pattern = VectorPattern::Reduce {
+            op: VectorOp::Max,
+            element_type: "f32".to_string(),
+            initial: "-inf".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
+    }
+
+    #[test]
+    fn test_dependency_analyzer_reduce_non_associative() {
+        let analyzer = DependencyAnalyzer::new();
+        // Sub is NOT associative → Unsafe
+        let pattern = VectorPattern::Reduce {
+            op: VectorOp::Sub,
+            element_type: "f64".to_string(),
+            initial: "0".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Unsafe);
+
+        // Div is NOT associative → Unsafe
+        let pattern = VectorPattern::Reduce {
+            op: VectorOp::Div,
+            element_type: "f64".to_string(),
+            initial: "1".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Unsafe);
+    }
+
+    #[test]
+    fn test_dependency_analyzer_indexed() {
+        let analyzer = DependencyAnalyzer::new();
+        // Gather: can't prove safety statically → Unknown
+        let pattern = VectorPattern::Indexed {
+            is_gather: true,
+            element_type: "i32".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Unknown);
+
+        // Scatter: indices could overlap → Unsafe
+        let pattern = VectorPattern::Indexed {
+            is_gather: false,
+            element_type: "i32".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Unsafe);
+    }
+
+    #[test]
+    fn test_dependency_analyzer_stencil() {
+        let analyzer = DependencyAnalyzer::new();
+        let pattern = VectorPattern::Stencil {
+            kernel: vec![1, 2, 1],
+            element_type: "f32".to_string(),
+        };
+        assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
     }
 }

@@ -261,15 +261,33 @@ pub struct PartialEvaluator {
     /// All top-level function definitions, indexed by name, for call
     /// specialization.
     functions: FxHashMap<String, FnDecl>,
+    /// Set of known pure functions (no side effects, deterministic).
+    /// Calls to pure functions with all-static arguments can be evaluated
+    /// at partial-eval time.
+    pure_functions: HashSet<String>,
 }
 
 impl PartialEvaluator {
     pub fn new(config: PartialEvalConfig) -> Self {
+        let pure_functions: HashSet<String> = [
+            "sin", "cos", "sqrt", "abs", "min", "max",
+            "pow", "exp", "log", "floor", "ceil", "round",
+            "signum", "clamp",
+        ].iter().map(|s| s.to_string()).collect();
+
         Self {
             config,
             stats: PartialEvalStats::default(),
             functions: FxHashMap::default(),
+            pure_functions,
         }
+    }
+
+    /// Register a user-defined function as pure (no side effects, deterministic).
+    /// This allows the partial evaluator to evaluate calls to this function
+    /// at compile time when all arguments are statically known.
+    pub fn register_pure_function(&mut self, name: &str) {
+        self.pure_functions.insert(name.to_string());
     }
 
     /// Run partial evaluation on an entire program.
@@ -292,7 +310,7 @@ impl PartialEvaluator {
                         // have a default that is a literal).
                         for p in &fn_decl.params {
                             let bt = if let Some(default) = &p.default {
-                                Self::expr_binding_time(default, &env)
+                                self.expr_binding_time(default, &env)
                             } else {
                                 BindingTime::Dynamic
                             };
@@ -311,7 +329,7 @@ impl PartialEvaluator {
                     let mut env = BtaEnv::new();
                     for p in &sys.params {
                         let bt = if let Some(default) = &p.default {
-                            Self::expr_binding_time(default, &env)
+                            self.expr_binding_time(default, &env)
                         } else {
                             BindingTime::Dynamic
                         };
@@ -347,7 +365,7 @@ impl PartialEvaluator {
     // ── Binding-Time Analysis ─────────────────────────────────────────────
 
     /// Determine the binding-time of an expression under the given environment.
-    fn expr_binding_time(expr: &Expr, env: &BtaEnv) -> BindingTime {
+    fn expr_binding_time(&self, expr: &Expr, env: &BtaEnv) -> BindingTime {
         match expr {
             Expr::IntLit { .. }
             | Expr::FloatLit { .. }
@@ -357,35 +375,45 @@ impl PartialEvaluator {
             Expr::Ident { name, .. } => env.binding_time(name),
 
             Expr::BinOp { lhs, rhs, .. } => {
-                let l = Self::expr_binding_time(lhs, env);
-                let r = Self::expr_binding_time(rhs, env);
+                let l = self.expr_binding_time(lhs, env);
+                let r = self.expr_binding_time(rhs, env);
                 l.max(r) // If either is dynamic, the whole thing is dynamic
             }
-            Expr::UnOp { expr, .. } => Self::expr_binding_time(expr, env),
+            Expr::UnOp { expr, .. } => self.expr_binding_time(expr, env),
 
             Expr::Call { func, args, .. } => {
-                // A call is dynamic unless all args are static AND the
-                // function is pure (conservative: assume dynamic).
-                let func_bt = Self::expr_binding_time(func, env);
+                let func_bt = self.expr_binding_time(func, env);
                 let args_bt = args
                     .iter()
-                    .map(|a| Self::expr_binding_time(a, env))
+                    .map(|a| self.expr_binding_time(a, env))
                     .max()
                     .unwrap_or(BindingTime::Static);
-                func_bt.max(args_bt)
+
+                // If the function is pure and all args are static, the call is static
+                let is_pure = if let Expr::Ident { name, .. } = func.as_ref() {
+                    self.pure_functions.contains(name)
+                } else {
+                    false
+                };
+
+                if is_pure && func_bt == BindingTime::Static && args_bt == BindingTime::Static {
+                    BindingTime::Static
+                } else {
+                    func_bt.max(args_bt)
+                }
             }
 
             Expr::IfExpr { cond, .. } => {
                 // The result depends on the condition and both branches.
-                Self::expr_binding_time(cond, env)
+                self.expr_binding_time(cond, env)
             }
 
-            Expr::Field { object, .. } => Self::expr_binding_time(object, env),
+            Expr::Field { object, .. } => self.expr_binding_time(object, env),
             Expr::Index { object, indices, .. } => {
-                let obj_bt = Self::expr_binding_time(object, env);
+                let obj_bt = self.expr_binding_time(object, env);
                 let idx_bt = indices
                     .iter()
-                    .map(|i| Self::expr_binding_time(i, env))
+                    .map(|i| self.expr_binding_time(i, env))
                     .max()
                     .unwrap_or(BindingTime::Static);
                 obj_bt.max(idx_bt)
@@ -393,24 +421,24 @@ impl PartialEvaluator {
 
             Expr::Tuple { elems, .. } | Expr::ArrayLit { elems, .. } => elems
                 .iter()
-                .map(|e| Self::expr_binding_time(e, env))
+                .map(|e| self.expr_binding_time(e, env))
                 .max()
                 .unwrap_or(BindingTime::Static),
 
             Expr::StructLit { fields, .. } => fields
                 .iter()
-                .map(|(_, v)| Self::expr_binding_time(v, env))
+                .map(|(_, v)| self.expr_binding_time(v, env))
                 .max()
                 .unwrap_or(BindingTime::Static),
 
             Expr::Closure { .. } => BindingTime::Dynamic,
             Expr::Block(_) => BindingTime::Dynamic, // conservative
             Expr::Range { lo, hi, .. } => {
-                let lo_bt = lo.as_ref().map_or(BindingTime::Static, |e| Self::expr_binding_time(e, env));
-                let hi_bt = hi.as_ref().map_or(BindingTime::Static, |e| Self::expr_binding_time(e, env));
+                let lo_bt = lo.as_ref().map_or(BindingTime::Static, |e| self.expr_binding_time(e, env));
+                let hi_bt = hi.as_ref().map_or(BindingTime::Static, |e| self.expr_binding_time(e, env));
                 lo_bt.max(hi_bt)
             }
-            Expr::Cast { expr, .. } => Self::expr_binding_time(expr, env),
+            Expr::Cast { expr, .. } => self.expr_binding_time(expr, env),
 
             // Tensor/ML operations are dynamic by default.
             Expr::MatMul { .. }
@@ -572,7 +600,7 @@ impl PartialEvaluator {
         block.stmts = new_stmts;
 
         if let Some(tail) = block.tail.take() {
-            let bt = Self::expr_binding_time(&tail, env);
+            let bt = self.expr_binding_time(&tail, env);
             if bt == BindingTime::Static {
                 if let Some(val) = Self::eval_expr(&tail, env) {
                     self.stats.expressions_folded += 1;
@@ -592,7 +620,7 @@ impl PartialEvaluator {
         match stmt {
             Stmt::Let { span, pattern, ty, init, mutable } => {
                 let init = init.map(|e| {
-                    let bt = Self::expr_binding_time(&e, env);
+                    let bt = self.expr_binding_time(&e, env);
                     if bt == BindingTime::Static {
                         if let Some(val) = Self::eval_expr(&e, env) {
                             self.stats.expressions_folded += 1;
@@ -610,7 +638,7 @@ impl PartialEvaluator {
             }
 
             Stmt::Expr { span, expr, has_semi } => {
-                let bt = Self::expr_binding_time(&expr, env);
+                let bt = self.expr_binding_time(&expr, env);
                 if bt == BindingTime::Static {
                     // The expression has no side effects we can observe at
                     // partial-eval time, so eliminate it.
@@ -626,7 +654,7 @@ impl PartialEvaluator {
             }
 
             Stmt::If { span, cond, then, else_ } => {
-                let bt = Self::expr_binding_time(&cond, env);
+                let bt = self.expr_binding_time(&cond, env);
                 if bt == BindingTime::Static {
                     self.stats.branches_eliminated += 1;
                     if let Some(val) = Self::eval_expr(&cond, env) {
@@ -702,7 +730,7 @@ impl PartialEvaluator {
             }
 
             Stmt::ForIn { span, pattern, iter, body, label } => {
-                let iter_bt = Self::expr_binding_time(&iter, env);
+                let iter_bt = self.expr_binding_time(&iter, env);
                 if iter_bt == BindingTime::Static {
                     // Try to unroll a loop with static bounds
                     if let Expr::Range { lo, hi, .. } = &iter {
@@ -769,7 +797,7 @@ impl PartialEvaluator {
 
     /// Specialize an expression: fold static parts, leave dynamic parts.
     fn specialize_expr(&mut self, expr: Expr, env: &mut BtaEnv, depth: usize) -> Expr {
-        let bt = Self::expr_binding_time(&expr, env);
+        let bt = self.expr_binding_time(&expr, env);
         if bt == BindingTime::Static {
             if let Some(val) = Self::eval_expr(&expr, env) {
                 self.stats.expressions_folded += 1;
@@ -793,7 +821,7 @@ impl PartialEvaluator {
                 // Specialize function calls: if all args are static, we might
                 // be able to inline and evaluate the whole call.
                 if self.config.inline_fully_static {
-                    let all_static = args.iter().all(|a| Self::expr_binding_time(a, env) == BindingTime::Static);
+                    let all_static = args.iter().all(|a| self.expr_binding_time(a, env) == BindingTime::Static);
                     if all_static {
                         if let Expr::Ident { name, .. } = &*func {
                             if self.functions.contains_key(name) {
@@ -892,6 +920,7 @@ mod tests {
 
     #[test]
     fn test_binding_time_analysis() {
+        let pe = PartialEvaluator::new(PartialEvalConfig::default());
         let mut env = BtaEnv::new();
         env.insert("x".into(), BindingTime::Static, PartialValue::Int(42));
         env.insert("y".into(), BindingTime::Dynamic, PartialValue::Unknown);
@@ -902,7 +931,7 @@ mod tests {
             lhs: Box::new(Expr::Ident { span: Span::dummy(), name: "x".into() }),
             rhs: Box::new(Expr::Ident { span: Span::dummy(), name: "y".into() }),
         };
-        assert_eq!(Self::expr_binding_time(&expr, &env), BindingTime::Dynamic);
+        assert_eq!(pe.expr_binding_time(&expr, &env), BindingTime::Dynamic);
 
         let expr2 = Expr::BinOp {
             span: Span::dummy(),
@@ -910,7 +939,61 @@ mod tests {
             lhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
             rhs: Box::new(Expr::Ident { span: Span::dummy(), name: "x".into() }),
         };
-        assert_eq!(Self::expr_binding_time(&expr2, &env), BindingTime::Static);
+        assert_eq!(pe.expr_binding_time(&expr2, &env), BindingTime::Static);
+    }
+
+    #[test]
+    fn test_pure_function_binding_time() {
+        let pe = PartialEvaluator::new(PartialEvalConfig::default());
+        let env = BtaEnv::new();
+
+        // Pure function with static args → Static
+        let expr = Expr::Call {
+            span: Span::dummy(),
+            func: Box::new(Expr::Ident { span: Span::dummy(), name: "sqrt".into() }),
+            args: vec![Expr::FloatLit { span: Span::dummy(), value: 4.0 }],
+            named: vec![],
+        };
+        assert_eq!(pe.expr_binding_time(&expr, &env), BindingTime::Static);
+
+        // Unknown function with static args → Dynamic (not in pure set)
+        let expr2 = Expr::Call {
+            span: Span::dummy(),
+            func: Box::new(Expr::Ident { span: Span::dummy(), name: "unknown_fn".into() }),
+            args: vec![Expr::FloatLit { span: Span::dummy(), value: 4.0 }],
+            named: vec![],
+        };
+        assert_eq!(pe.expr_binding_time(&expr2, &env), BindingTime::Dynamic);
+
+        // Pure function with dynamic args → Dynamic
+        let mut env_dyn = BtaEnv::new();
+        env_dyn.insert("y".into(), BindingTime::Dynamic, PartialValue::Unknown);
+        let expr3 = Expr::Call {
+            span: Span::dummy(),
+            func: Box::new(Expr::Ident { span: Span::dummy(), name: "sqrt".into() }),
+            args: vec![Expr::Ident { span: Span::dummy(), name: "y".into() }],
+            named: vec![],
+        };
+        assert_eq!(pe.expr_binding_time(&expr3, &env_dyn), BindingTime::Dynamic);
+    }
+
+    #[test]
+    fn test_register_pure_function() {
+        let mut pe = PartialEvaluator::new(PartialEvalConfig::default());
+        let env = BtaEnv::new();
+
+        // Before registration: unknown
+        let expr = Expr::Call {
+            span: Span::dummy(),
+            func: Box::new(Expr::Ident { span: Span::dummy(), name: "my_pure_fn".into() }),
+            args: vec![Expr::IntLit { span: Span::dummy(), value: 1 }],
+            named: vec![],
+        };
+        assert_eq!(pe.expr_binding_time(&expr, &env), BindingTime::Dynamic);
+
+        // After registration: static
+        pe.register_pure_function("my_pure_fn");
+        assert_eq!(pe.expr_binding_time(&expr, &env), BindingTime::Static);
     }
 
     #[test]

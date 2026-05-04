@@ -72,6 +72,54 @@ impl CodeArena {
     }
 }
 
+/// Runtime linker for patching inline cache call sites.
+///
+/// When a type-guard trampoline misses (the incoming type doesn't match the
+/// cached type), it jumps to a generic dispatch trampoline.  The `RuntimeLinker`
+/// manages the mapping from call-site addresses to their dispatch handlers and
+/// can patch call sites once a concrete type-specific handler is available.
+pub struct RuntimeLinker {
+    /// Map from call-site address to the generic stub address
+    call_sites: HashMap<u64, u64>,
+    /// Map from (call_site, type_id) to optimized handler address
+    type_handlers: HashMap<(u64, u64), u64>,
+    /// Address of the generic dispatch trampoline
+    trampoline_addr: u64,
+}
+
+impl RuntimeLinker {
+    pub fn new() -> Self {
+        Self {
+            call_sites: HashMap::new(),
+            type_handlers: HashMap::new(),
+            trampoline_addr: 0, // Would be set to actual trampoline in real impl
+        }
+    }
+
+    /// Register a call site that needs runtime patching
+    pub fn register_call_site(&mut self, site_addr: u64, stub_addr: u64) {
+        self.call_sites.insert(site_addr, stub_addr);
+    }
+
+    /// Patch a call site to jump directly to a type-specific handler
+    pub fn patch_call_site(&mut self, site_addr: u64, type_id: u64, handler_addr: u64) {
+        self.type_handlers.insert((site_addr, type_id), handler_addr);
+        // In a real implementation, this would overwrite the 8-byte address
+        // at site_addr with handler_addr using mprotect + memcpy
+    }
+
+    /// Resolve the handler for a given call site and type
+    pub fn resolve(&self, site_addr: u64, type_id: u64) -> Option<u64> {
+        self.type_handlers.get(&(site_addr, type_id)).copied()
+    }
+}
+
+impl Default for RuntimeLinker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Global code arena shared across all inline caches.
 static mut CODE_ARENA: Option<CodeArena> = None;
 
@@ -445,8 +493,11 @@ impl CallSite {
         // mov rax, <address>
         code.push(0x48);
         code.push(0xB8);
-        // Use a sentinel value for the generic stub; the runtime linker patches this
-        code.extend_from_slice(&0xDEAD_BEEF_0000_0000u64.to_le_bytes());
+        // Placeholder: RuntimeLinker will patch this with the actual generic dispatch address.
+        // Using a recognizable pattern for debugging: 0xCAFE_CAFE_0000_0000
+        // The generic dispatch trampoline reads the type ID from RDI, looks it up
+        // in a global dispatch table, and jumps to the type-specific handler.
+        code.extend_from_slice(&0xCAFE_CAFE_0000_0000u64.to_le_bytes());
 
         // jmp rax
         code.extend_from_slice(&[0xFF, 0xE0]);

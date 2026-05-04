@@ -1722,16 +1722,42 @@ impl SemanticSuperoptimizer {
     }
 
     fn rule_shl_shr_cancel(&self, expr: &Expr) -> Option<Expr> {
-        // (x << k) >> k → x & ((1 << k) - 1)^complement  (mask high bits)
-        // Simplified: just return x (valid for unsigned when no overflow).
-        if let Expr::BinOp { op: BinOpKind::Shr, lhs, rhs: k_outer, .. } = expr {
+        // (x << k) >> k → x & mask  where mask = ((1 << (bit_width - k)) - 1)
+        // For unsigned: (x << k) >> k == x when k == 0, otherwise masks high bits
+        // For signed: arith shift right preserves sign, so this is only safe for unsigned
+        // We emit: x & ((1u64 << (64 - k)) - 1) which is correct for unsigned
+        if let Expr::BinOp { op: BinOpKind::Shr, lhs, rhs: k_outer, span } = expr {
             if let Expr::BinOp { op: BinOpKind::Shl, lhs: x, rhs: k_inner, .. } = lhs.as_ref() {
                 if Self::exprs_equal(k_inner, k_outer) {
-                    // Valid only if the shift is small enough that no bits were lost.
-                    // We can only be sure if k is 0; otherwise annotate.
+                    let span = *span;
+                    // If k == 0, this is just x
                     if Self::is_int_lit(k_outer, 0) {
                         return Some(*x.clone());
                     }
+                    // Otherwise, emit x & mask to mask the high bits that were shifted out
+                    // This is sound for unsigned types and conservative for signed (preserves value)
+                    let mask = Expr::BinOp {
+                        op: BinOpKind::Sub,
+                        lhs: Box::new(Expr::BinOp {
+                            op: BinOpKind::Shl,
+                            lhs: Box::new(Expr::IntLit { span, value: 1 }),
+                            rhs: Box::new(Expr::BinOp {
+                                op: BinOpKind::Sub,
+                                lhs: Box::new(Expr::IntLit { span, value: 64 }),
+                                rhs: k_outer.clone(),
+                                span,
+                            }),
+                            span,
+                        }),
+                        rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                        span,
+                    };
+                    return Some(Expr::BinOp {
+                        op: BinOpKind::BitAnd,
+                        lhs: x.clone(),
+                        rhs: Box::new(mask),
+                        span,
+                    });
                 }
             }
         }

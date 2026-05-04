@@ -3,7 +3,7 @@
 // Bridges the advanced optimizer's superoptimizer with XLA HLO generation
 // =========================================================================
 
-use crate::ml::ml_engine::{ComputationGraph, Operation};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bridge between superoptimizer and XLA backend
 pub struct SuperoptXlaBridge {
@@ -11,6 +11,8 @@ pub struct SuperoptXlaBridge {
     superopt_config: SuperoptimizerConfig,
     #[cfg(not(feature = "xla"))]
     _phantom: std::marker::PhantomData<()>,
+    /// Accumulated statistics from optimization passes
+    stats: SuperoptStatsAccum,
 }
 
 #[cfg(feature = "xla")]
@@ -35,18 +37,41 @@ impl SuperoptimizerConfig {
     }
 }
 
+/// Thread-safe accumulators for optimization statistics.
+/// These are incremented during each optimization pass so that
+/// `get_stats()` returns meaningful (non-zero) values.
+struct SuperoptStatsAccum {
+    rewrites_performed: AtomicU64,
+    strength_reductions: AtomicU64,
+    cse_eliminations: AtomicU64,
+    algebraic_simplifications: AtomicU64,
+}
+
+impl SuperoptStatsAccum {
+    fn new() -> Self {
+        Self {
+            rewrites_performed: AtomicU64::new(0),
+            strength_reductions: AtomicU64::new(0),
+            cse_eliminations: AtomicU64::new(0),
+            algebraic_simplifications: AtomicU64::new(0),
+        }
+    }
+}
+
 impl SuperoptXlaBridge {
     pub fn new() -> Self {
         #[cfg(feature = "xla")]
         {
             Self {
                 superopt_config: SuperoptimizerConfig::default(),
+                stats: SuperoptStatsAccum::new(),
             }
         }
         #[cfg(not(feature = "xla"))]
         {
             Self {
                 _phantom: std::marker::PhantomData,
+                stats: SuperoptStatsAccum::new(),
             }
         }
     }
@@ -164,6 +189,8 @@ impl SuperoptXlaBridge {
                         if let Some(operand) = op.operands.first() {
                             if operand == "1" || operand == "1.0" {
                                 op.opcode = "identity".to_string();
+                                self.stats.algebraic_simplifications.fetch_add(1, Ordering::Relaxed);
+                                self.stats.rewrites_performed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -172,6 +199,8 @@ impl SuperoptXlaBridge {
                         if let Some(operand) = op.operands.first() {
                             if operand == "0" || operand == "0.0" {
                                 op.opcode = "identity".to_string();
+                                self.stats.algebraic_simplifications.fetch_add(1, Ordering::Relaxed);
+                                self.stats.rewrites_performed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -194,6 +223,8 @@ impl SuperoptXlaBridge {
                             if operand == "2" || operand == "2.0" {
                                 op.opcode = "multiply".to_string();
                                 op.operands[1] = "0.5".to_string();
+                                self.stats.strength_reductions.fetch_add(1, Ordering::Relaxed);
+                                self.stats.rewrites_performed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -206,6 +237,8 @@ impl SuperoptXlaBridge {
                                 if let Some(base) = op.operands.first() {
                                     op.operands = vec![base.clone(), base.clone()];
                                 }
+                                self.stats.strength_reductions.fetch_add(1, Ordering::Relaxed);
+                                self.stats.rewrites_performed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -231,6 +264,8 @@ impl SuperoptXlaBridge {
                     shape: op.shape.clone(),
                     operands: vec![existing_name.clone()],
                 });
+                self.stats.cse_eliminations.fetch_add(1, Ordering::Relaxed);
+                self.stats.rewrites_performed.fetch_add(1, Ordering::Relaxed);
             } else {
                 seen.insert(key, op.name.clone());
                 optimized.push(op);
@@ -270,15 +305,16 @@ impl SuperoptXlaBridge {
         Ok(hlo)
     }
 
-    /// Get statistics from the superoptimizer
+    /// Get statistics from the superoptimizer.
+    ///
+    /// Returns actual accumulated statistics from optimization passes
+    /// rather than zeroed-out values.
     pub fn get_stats(&self) -> SuperoptStats {
-        // In a real implementation, this would return actual statistics
-        // from the superoptimizer runs
         SuperoptStats {
-            rewrites_performed: 0,
-            strength_reductions: 0,
-            cse_eliminations: 0,
-            algebraic_simplifications: 0,
+            rewrites_performed: self.stats.rewrites_performed.load(Ordering::Relaxed),
+            strength_reductions: self.stats.strength_reductions.load(Ordering::Relaxed),
+            cse_eliminations: self.stats.cse_eliminations.load(Ordering::Relaxed),
+            algebraic_simplifications: self.stats.algebraic_simplifications.load(Ordering::Relaxed),
         }
     }
 }
@@ -327,6 +363,10 @@ mod tests {
         ];
         let optimized = bridge.apply_algebraic_rewrites(ops);
         assert_eq!(optimized[0].opcode, "identity");
+        // Stats should have been updated
+        let stats = bridge.get_stats();
+        assert!(stats.algebraic_simplifications > 0);
+        assert!(stats.rewrites_performed > 0);
     }
 
     #[test]
@@ -343,6 +383,9 @@ mod tests {
         let optimized = bridge.apply_strength_reduction(ops);
         assert_eq!(optimized[0].opcode, "multiply");
         assert_eq!(optimized[0].operands[1], "0.5");
+        // Stats should have been updated
+        let stats = bridge.get_stats();
+        assert!(stats.strength_reductions > 0);
     }
 
     #[test]
@@ -365,5 +408,20 @@ mod tests {
         let optimized = bridge.apply_cse(ops);
         assert_eq!(optimized.len(), 2);
         assert_eq!(optimized[1].opcode, "copy");
+        // Stats should have been updated
+        let stats = bridge.get_stats();
+        assert!(stats.cse_eliminations > 0);
+    }
+
+    #[test]
+    fn test_stats_nonzero_after_optimization() {
+        let bridge = SuperoptXlaBridge::new();
+        let hlo = "HloModule test {\n  mul.1 = multiply([2,2]) operands=input.0,1\n  add.2 = add([2,2]) operands=input.0,0\n}\n";
+        let _ = bridge.optimize_hlo_ir(hlo);
+        let stats = bridge.get_stats();
+        // After running optimizations, at least algebraic_simplifications should be > 0
+        // because both mul by 1 and add by 0 are simplified
+        assert!(stats.rewrites_performed > 0);
+        assert!(stats.algebraic_simplifications > 0);
     }
 }
