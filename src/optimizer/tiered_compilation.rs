@@ -100,11 +100,9 @@ pub struct CompiledCode {
 
 impl FunctionState {
     pub fn new(name: String, size_estimate: usize) -> Self {
-        let mut tracing_jit = TracingJIT::new();
-        // Keep tier-3 in managed tracing mode unless explicitly enabled for
-        // native codegen stability work.
-        // Compile trace after 50 executions — balances warm-up quality vs. latency.
-        tracing_jit.compile_trigger = 50;
+        // NOTE: TracingJIT is NOT created per-function — it lives in the
+        // TieredCompilationManager. The previous code allocated one here and
+        // immediately dropped it, which was pure waste.
 
         Self {
             name,
@@ -516,6 +514,15 @@ impl TieredExecutionManager {
                 Err(_) => {}
             }
         }
+        // Cascade fallback: Tier 3 → Tier 2 → Tier 1 → Tier 0
+        // Previously this jumped straight to Tier 0, skipping potentially
+        // available native code at Tier 1/2.
+        if self.live_native_codes.contains_key(&(name.to_string(), Tier::Tier2_OptimizingJIT)) {
+            return self.execute_tier2(name, fallback_args);
+        }
+        if self.live_native_codes.contains_key(&(name.to_string(), Tier::Tier1_BaselineJIT)) {
+            return self.execute_tier1(name, fallback_args);
+        }
         self.execute_tier0(name, fallback_args)
     }
 
@@ -574,6 +581,10 @@ impl TieredExecutionManager {
         let compile_time = compile_start.elapsed();
 
         if compilation_result.is_ok() {
+            // Decrement the compilation budget by the actual time spent
+            let compile_time_ms = compile_time.as_millis() as u64;
+            self.compilation_budget_remaining_ms = self.compilation_budget_remaining_ms.saturating_sub(compile_time_ms);
+
             if let Some(state) = self.function_states.get_mut(name) {
                 state.compilation_times.insert(new_tier, compile_time);
                 state.current_tier = new_tier;
@@ -629,24 +640,45 @@ impl TieredExecutionManager {
 
     /// Compile the function to native code using the full optimizing JIT pipeline.
     ///
-    /// At Tier 2 the interpreter has already disabled its own JIT (set in
-    /// `load_program`) so we are the sole code generator.  We compile the
-    /// function's bytecode through `jit::translate`, which runs:
-    ///   • Peephole optimizer (forward constant propagation, dead-store elim)
-    ///   • Linear-scan register allocator over 10 GPRs
-    ///   • 3-instruction superinstruction fusions (Mul+Add→LEA, chain fusions)
-    ///   • 2-instruction fusions (LoadI+BinOp, BinOp+Store, BinOp+Branch, …)
-    ///   • Short-form branch encoding (rel8 where possible)
+    /// Tier 2 DIFFERS from Tier 1 by running the AST-level superoptimizer before
+    /// bytecode compilation. This means:
+    ///   • Constant folding, CSE, DCE, inlining, LICM (from Superoptimizer)
+    ///   • Then the JIT's own peephole, register allocation, fusion passes
     ///
-    /// If Tier 1 native code exists for this function it is retained — we may
-    /// still need it if a deoptimization from Tier 2 targets Tier 1.
+    /// The result is significantly better code for hot functions that have been
+    /// observed at Tier 0/1 long enough to be worth the compilation cost.
     fn compile_optimizing(&mut self, name: &str) -> Result<(), String> {
         let compiled_fn: CompiledFn = {
-            let decl = self
+            // Clone the declaration so we can run the superoptimizer on a
+            // mutable copy without affecting the original AST.
+            let mut decl = self
                 .function_decls
                 .get(name)
                 .ok_or_else(|| format!("unknown function declaration `{name}`"))?
                 .clone();
+
+            // Run the AST-level superoptimizer before bytecode compilation.
+            // This is the KEY difference from Tier 1: we invest more compile
+            // time to get better code. The superoptimizer performs:
+            //   - Constant folding & propagation (SCCP)
+            //   - Common subexpression elimination
+            //   - Dead code / dead store elimination
+            //   - Algebraic simplification (50+ rules)
+            //   - Strength reduction
+            //   - Loop invariant code motion
+            //   - Function inlining
+            //   - Branch optimization
+            let config = crate::optimizer::advanced_optimizer::SuperoptimizerConfig::maximum();
+            let mut superopt = crate::optimizer::advanced_optimizer::Superoptimizer::new(config);
+            // Wrap in a temporary program to run the optimizer
+            let mut temp_program = crate::compiler::ast::Program::default();
+            temp_program.items.push(crate::compiler::ast::Item::Fn(decl.clone()));
+            superopt.optimize_program(&mut temp_program);
+            // Extract the optimized function back out
+            if let Some(crate::compiler::ast::Item::Fn(optimized_decl)) = temp_program.items.into_iter().next() {
+                decl = optimized_decl;
+            }
+
             compile_fn(&decl)
         };
 

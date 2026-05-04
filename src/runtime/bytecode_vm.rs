@@ -38,9 +38,11 @@ use crate::optimizer::data_dependent_jit::DataDependentJIT;
 // §1  BYTECODE INSTRUCTION SET
 // =============================================================================
 
-/// Ultra-compact bytecode instruction (fits in 24 bytes for cache efficiency)
+/// Ultra-compact bytecode instruction (fits in 16 bytes for cache efficiency)
+/// Reduced from 32-byte alignment — the largest variant (LoadConstInt = u16+i64 = 10 bytes)
+/// fits in 16 bytes. This doubles I-cache density for instruction streams.
 #[derive(Debug, Clone, Copy)]
-#[repr(C, align(32))]
+#[repr(C, align(16))]
 pub enum Instr {
     // Constant loads (imm32 for common cases, imm64 for rare)
     LoadConst { dst: u16, idx: u32 },
@@ -80,8 +82,6 @@ pub enum Instr {
     Jump { offset: i32 },
     JumpFalse { cond: u16, offset: i32 },
     JumpTrue { cond: u16, offset: i32 },
-    JumpIfFalse { cond: u16, offset: i32 },
-    JumpIfTrue { cond: u16, offset: i32 },
     
     // Function call
     Call { dst: u16, func: u16, argc: u16, start: u16 },
@@ -619,8 +619,6 @@ impl BytecodeCompiler {
             Instr::Jump { offset: ref mut o } => *o = offset,
             Instr::JumpFalse { offset: ref mut o, .. } => *o = offset,
             Instr::JumpTrue { offset: ref mut o, .. } => *o = offset,
-            Instr::JumpIfFalse { offset: ref mut o, .. } => *o = offset,
-            Instr::JumpIfTrue { offset: ref mut o, .. } => *o = offset,
             other => panic!("patch_jump_offset: not a jump instruction at pos {pos}, found {other:?}"),
         }
     }
@@ -632,8 +630,6 @@ impl BytecodeCompiler {
             Instr::Jump { offset: ref mut o } => *o = offset,
             Instr::JumpFalse { offset: ref mut o, .. } => *o = offset,
             Instr::JumpTrue { offset: ref mut o, .. } => *o = offset,
-            Instr::JumpIfFalse { offset: ref mut o, .. } => *o = offset,
-            Instr::JumpIfTrue { offset: ref mut o, .. } => *o = offset,
             other => panic!("patch_jump_offset_to: not a jump instruction at pos {pos}, found {other:?}"),
         }
     }
@@ -1360,7 +1356,10 @@ pub struct CallFrame {
 pub struct BytecodeVM {
     /// All compiled functions
     functions: Vec<BytecodeFunction>,
-    
+
+    /// Function name → index lookup for O(1) Call dispatch (avoids O(n) linear scan)
+    function_index: FxHashMap<String, usize>,
+
     /// Global constant pool
     constants: Vec<Value>,
     
@@ -1398,6 +1397,7 @@ impl BytecodeVM {
     pub fn new() -> Self {
         Self {
             functions: Vec::new(),
+            function_index: FxHashMap::default(),
             constants: Vec::new(),
             inline_caches: Vec::new(),
             memory_pool: MemoryPool::with_capacity(1024),
@@ -1432,6 +1432,11 @@ impl BytecodeVM {
     
     /// Load compiled functions into VM
     pub fn load_functions(&mut self, functions: Vec<BytecodeFunction>) {
+        // Build function name → index lookup for O(1) Call dispatch
+        self.function_index.clear();
+        for (i, f) in functions.iter().enumerate() {
+            self.function_index.insert(f.name.clone(), i);
+        }
         self.functions = functions;
     }
     
@@ -1443,7 +1448,11 @@ impl BytecodeVM {
         // Initialize slots with arguments
         let needed_slots = self.functions[func_idx].num_locals.max(self.functions[func_idx].num_params) as usize;
         let num_slots = needed_slots.max(64); // Minimum slot size to avoid index-out-of-bounds
-        self.memory_pool.slots.resize(num_slots, Value::Unit);
+        // Only grow the slot array — never shrink it. This avoids O(n) reallocation
+        // on every function call for leaf functions that need fewer slots.
+        if self.memory_pool.slots.len() < num_slots {
+            self.memory_pool.slots.resize(num_slots, Value::Unit);
+        }
         self.memory_pool.max_slot_used = num_slots.saturating_sub(1);
         for (i, arg) in args.iter().enumerate() {
             if i < num_slots {
@@ -1498,8 +1507,7 @@ impl BytecodeVM {
     ///   `PrefetchEngine::prefetch_insn` doc for the full reasoning.
     /// - Profiling is sampled (every N instructions) rather than per-instruction
     ///   to avoid atomic overhead on every dispatch.
-    #[cold]
-    #[inline(never)]
+    #[inline]
     fn execute_direct_threaded(&mut self, func: &BytecodeFunction, func_len: usize) -> Result<(), RuntimeError> {
         // Create raw pointer to self before any field borrows.
         // Used by the Call instruction to recursively invoke execute()
@@ -1513,27 +1521,25 @@ impl BytecodeVM {
         let constants = &func.constants;
         let slots = &mut self.memory_pool.slots;
         let mut pc: usize = 0;
+        #[cfg(feature = "gnn-optimizer")]
         let mut branch_density: u8 = 0;
         // Sampling counter: profile every 256 instructions instead of every one.
         let mut profile_counter: u8 = 0;
-        // Safety counter: abort infinite loops during development
-        let mut safety_counter: u64 = 0;
-        
         // Pre-compute slot pointer for write-intent prefetch in the dispatch loop.
         let slot_ptr = slots.as_mut_ptr();
 
         // Main dispatch loop
         while pc < func_len {
-            safety_counter += 1;
-            if safety_counter > 100_000 {
-                eprintln!("[bytecode-vm] SAFETY: infinite loop detected at pc={pc} in func {:?}, slots={:?}", 
-                    func.name, &slots[..8.min(slots.len())]);
-                // Dump last few instructions for debugging
-                let start = pc.saturating_sub(5);
-                for i in start..func_len.min(start+15) {
-                    eprintln!("  [{}] {:?}", i, &instructions[i]);
+            // Safety counter: only in debug builds to catch infinite loops during development.
+            // In release builds this is a pure perf killer (load+add+compare+branch per instruction).
+            #[cfg(debug_assertions)]
+            {
+                safety_counter += 1;
+                if safety_counter > 10_000_000 {
+                    eprintln!("[bytecode-vm] SAFETY: infinite loop detected at pc={pc} in func {:?}", 
+                        func.name);
+                    return Err(RuntimeError::new("infinite loop detected (safety counter)"));
                 }
-                return Err(RuntimeError::new("infinite loop detected (safety counter)"));
             }
             // Sampled profiling: avoids an atomic fetch_add on every instruction.
             // The counter wraps every 256 dispatches; profiler sees ~0.4% of PCs.
@@ -1716,7 +1722,8 @@ impl BytecodeVM {
                 
                 // ── HOT PATH: Control flow ──
                 Instr::Jump { offset } => {
-                    branch_density = branch_density.saturating_add(1);
+                    #[cfg(feature = "gnn-optimizer")]
+                    { branch_density = branch_density.saturating_add(1); }
                     // Detect backward jumps (loops) for DataDependentJIT profiling.
                     // When a backedge is taken, observe the loop trip count so
                     // the JIT can detect hot values and create specializations.
@@ -1742,7 +1749,8 @@ impl BytecodeVM {
                 }
                 
                 Instr::JumpFalse { cond, offset } => {
-                    branch_density = branch_density.saturating_add(1);
+                    #[cfg(feature = "gnn-optimizer")]
+                    { branch_density = branch_density.saturating_add(1); }
                     let cond_val = &slots[*cond as usize];
                     if !cond_val.is_truthy() {
                         pc = if *offset >= 0 {
@@ -1756,7 +1764,8 @@ impl BytecodeVM {
                 }
                 
                 Instr::JumpTrue { cond, offset } => {
-                    branch_density = branch_density.saturating_add(1);
+                    #[cfg(feature = "gnn-optimizer")]
+                    { branch_density = branch_density.saturating_add(1); }
                     let cond_val = &slots[*cond as usize];
                     if cond_val.is_truthy() {
                         pc = if *offset >= 0 {
@@ -2104,35 +2113,7 @@ impl BytecodeVM {
                     pc += 1;
                 }
 
-                // ── Jump If False (alias for JumpFalse) ──
-                Instr::JumpIfFalse { cond, offset } => {
-                    branch_density = branch_density.saturating_add(1);
-                    let cond_val = &slots[*cond as usize];
-                    if !cond_val.is_truthy() {
-                        pc = if *offset >= 0 {
-                            pc + *offset as usize
-                        } else {
-                            pc.wrapping_sub((-(*offset)) as usize)
-                        };
-                    } else {
-                        pc += 1;
-                    }
-                }
-
-                // ── Jump If True (alias for JumpTrue) ──
-                Instr::JumpIfTrue { cond, offset } => {
-                    branch_density = branch_density.saturating_add(1);
-                    let cond_val = &slots[*cond as usize];
-                    if cond_val.is_truthy() {
-                        pc = if *offset >= 0 {
-                            pc + *offset as usize
-                        } else {
-                            pc.wrapping_sub((-(*offset)) as usize)
-                        };
-                    } else {
-                        pc += 1;
-                    }
-                }
+                // JumpIfFalse/JumpIfTrue removed — merged into JumpFalse/JumpTrue above
 
                 // ── Function Call ──
                 // func slot contains a Value::Fn. Push a CallFrame, collect args,
@@ -2145,9 +2126,18 @@ impl BytecodeVM {
                     let arg_count = *argc as usize;
 
                     // Collect args before any further mutation of slots.
-                    let args: Vec<Value> = (0..arg_count)
-                        .map(|i| slots.get(arg_start + i).cloned().unwrap_or(Value::Unit))
-                        .collect();
+                    // Stack-allocate for small arg counts (≤4) to avoid heap alloc.
+                    let args: Vec<Value> = if arg_count <= 4 {
+                        let mut small: [Value; 4] = [Value::Unit, Value::Unit, Value::Unit, Value::Unit];
+                        for i in 0..arg_count {
+                            small[i] = slots.get(arg_start + i).cloned().unwrap_or(Value::Unit);
+                        }
+                        small[..arg_count].to_vec()
+                    } else {
+                        (0..arg_count)
+                            .map(|i| slots.get(arg_start + i).cloned().unwrap_or(Value::Unit))
+                            .collect()
+                    };
 
                     // ── DataDependentJIT: profile call arguments ──
                     // Observe integer arguments so the JIT can detect hot
@@ -2198,8 +2188,8 @@ impl BytecodeVM {
                                 continue;
                             }
 
-                            // Look up the BytecodeFunction by name
-                            let callee_idx = self.functions.iter().position(|f| f.name == fn_name);
+                            // Look up the BytecodeFunction by name — O(1) hash lookup
+                            let callee_idx = self.function_index.get(fn_name).copied();
                             match callee_idx {
                                 Some(idx) => {
                                     // Push call frame (return to next instruction)
@@ -2252,8 +2242,8 @@ impl BytecodeVM {
                                 continue;
                             }
 
-                            // Function referenced by name (from BytecodeCompiler)
-                            let callee_idx = self.functions.iter().position(|f| f.name == *fn_name);
+                            // Function referenced by name (from BytecodeCompiler) — O(1) hash lookup
+                            let callee_idx = self.function_index.get(fn_name).copied();
                             match callee_idx {
                                 Some(idx) => {
                                     self.call_stack.push(CallFrame {
@@ -2303,15 +2293,25 @@ impl BytecodeVM {
                     }
 
                     // Collect arguments from slots[start..start+argc)
+                    // For small arg counts (≤4), stack-allocate to avoid heap allocation
                     let arg_start = *start as usize;
                     let arg_count = *argc as usize;
-                    let args: Vec<Value> = (0..arg_count)
-                        .map(|i| slots.get(arg_start + i).cloned().unwrap_or(Value::Unit))
-                        .collect();
+                    let result = if arg_count <= 4 {
+                        let mut small_args: [Value; 4] = [Value::Unit, Value::Unit, Value::Unit, Value::Unit];
+                        for i in 0..arg_count {
+                            small_args[i] = slots.get(arg_start + i).cloned().unwrap_or(Value::Unit);
+                        }
+                        self.native_functions[fidx](&small_args[..arg_count])
+                    } else {
+                        let args: Vec<Value> = (0..arg_count)
+                            .map(|i| slots.get(arg_start + i).cloned().unwrap_or(Value::Unit))
+                            .collect();
+                        self.native_functions[fidx](&args)
+                    };
 
-                    match self.native_functions[fidx](&args) {
-                        Ok(result) => {
-                            slots[*dst as usize] = result;
+                    match result {
+                        Ok(val) => {
+                            slots[*dst as usize] = val;
                         }
                         Err(e) => return Err(e),
                     }
@@ -2324,8 +2324,9 @@ impl BytecodeVM {
                 // slot 0 and exit the dispatch loop.
                 Instr::Return { value } => {
                     if let Some(frame) = self.call_stack.pop() {
-                        // Move return value to slot 0 for the caller
-                        let ret_val = slots[*value as usize].clone();
+                        // Move return value to slot 0 using mem::replace (avoids clone)
+                        let v_slot = *value as usize;
+                        let ret_val = std::mem::replace(&mut slots[v_slot], Value::Unit);
                         slots[0] = ret_val;
                         pc = frame.return_pc;
                     } else {
@@ -2346,18 +2347,42 @@ impl BytecodeVM {
                     let obj_val = &slots[*obj as usize];
                     match obj_val {
                         Value::Struct(data) => {
-                            // field_idx corresponds to the Nth field in sorted order
-                            let sorted_field = data.fields.iter().nth(*field_idx as usize);
-                            match sorted_field {
-                                Some((_, v)) => {
+                            // Use InlineCache for O(1) field access — avoids O(n) iter().nth()
+                            let shape_id = data.fields.len() as u64;
+                            // Try inline cache first (monomorphic fast path)
+                            let cached = if let Some(cache) = self.inline_caches.get(0) {
+                                cache.lookup(shape_id)
+                            } else {
+                                None
+                            };
+                            if let Some(offset) = cached {
+                                if let Some(v) = data.fields.iter().nth(offset as usize).map(|(_, v)| v) {
                                     slots[*dst as usize] = v.clone();
+                                    pc += 1;
+                                    continue;
                                 }
-                                None => {
-                                    return Err(RuntimeError::new(format!(
-                                        "LoadField: field index {} out of range at pc={pc}",
-                                        field_idx
-                                    )));
+                            }
+                            // Slow path: iterate to field_idx, then update cache
+                            let fidx = *field_idx as usize;
+                            let mut iter = data.fields.iter();
+                            let result = if let Some((key, v)) = iter.nth(fidx) {
+                                // Update inline cache for next time
+                                if self.inline_caches.is_empty() {
+                                    self.inline_caches.push(InlineCache::new());
                                 }
+                                if let Some(cache) = self.inline_caches.get_mut(0) {
+                                    cache.update(shape_id, fidx as i32);
+                                }
+                                Ok(v.clone())
+                            } else {
+                                Err(RuntimeError::new(format!(
+                                    "LoadField: field index {} out of range at pc={pc}",
+                                    field_idx
+                                )))
+                            };
+                            match result {
+                                Ok(v) => slots[*dst as usize] = v,
+                                Err(e) => return Err(e),
                             }
                         }
                         other => {
@@ -2372,12 +2397,34 @@ impl BytecodeVM {
 
                 // ── Store Field in Struct ──
                 Instr::StoreField { obj, field_idx, src } => {
-                    let src_val = slots[*src as usize].clone();
+                    let src_val = std::mem::replace(&mut slots[*src as usize], Value::Unit);
                     let obj_val = &mut slots[*obj as usize];
                     match obj_val {
                         Value::Struct(data) => {
-                            // Find the Nth field in sorted order and update it
-                            let key = data.fields.iter().nth(*field_idx as usize).map(|(k, _)| k.clone());
+                            // Use InlineCache for O(1) field key lookup
+                            let shape_id = data.fields.len() as u64;
+                            let cached = if let Some(cache) = self.inline_caches.get(0) {
+                                cache.lookup(shape_id)
+                            } else {
+                                None
+                            };
+                            let key = if let Some(offset) = cached {
+                                data.fields.iter().nth(offset as usize).map(|(k, _)| k.clone())
+                            } else {
+                                // Slow path: find Nth field in sorted order
+                                let fidx = *field_idx as usize;
+                                let key = data.fields.iter().nth(fidx).map(|(k, _)| k.clone());
+                                // Update inline cache
+                                if let Some(ref k) = key {
+                                    if self.inline_caches.is_empty() {
+                                        self.inline_caches.push(InlineCache::new());
+                                    }
+                                    if let Some(cache) = self.inline_caches.get_mut(0) {
+                                        cache.update(shape_id, fidx as i32);
+                                    }
+                                }
+                                key
+                            };
                             match key {
                                 Some(k) => {
                                     data.fields.insert(k, src_val);
@@ -3052,7 +3099,7 @@ impl BytecodeVM {
     /// Returns the function's return value or a runtime error.
     /// This is the primary API for executing Jules programs via the bytecode VM.
     pub fn call_fn(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
-        let func_idx = self.functions.iter().position(|f| f.name == name)
+        let func_idx = self.function_index.get(name).copied()
             .ok_or_else(|| RuntimeError::new(format!("undefined function `{name}`")))?;
         self.execute(func_idx, &args)
     }

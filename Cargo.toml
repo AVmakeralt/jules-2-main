@@ -131,7 +131,7 @@ overflow-checks = true
 # Production release: optimized for speed
 [profile.release]
 opt-level = 3
-lto = "thin"              # Thin LTO for faster compile with near-identical runtime perf
+lto = "fat"               # Full LTO for maximum cross-crate inlining
 codegen-units = 1          # Single unit for maximum inlining & optimization
 panic = "abort"            # Removes unwinding machinery (~5% speedup)
 strip = "symbols"

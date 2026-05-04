@@ -115,7 +115,10 @@ impl Parser {
 
     #[inline(always)]
     fn check(&self, kind: &TokenKind) -> bool {
-        std::mem::discriminant(&self.peek().kind) == std::mem::discriminant(kind)
+        // Use PartialEq instead of std::mem::discriminant — discriminant
+        // involves an indirect call and can't be inlined as effectively.
+        // TokenKind derives PartialEq, so this is a direct comparison.
+        &self.peek().kind == kind
     }
 
     /// True when the current token matches `kind` exactly (including payload
@@ -454,8 +457,30 @@ impl Parser {
                 | TokenKind::AtBenchmark
                 | TokenKind::AtDeprecated
                 | TokenKind::AtAi => {
-                    let raw = format!("{:?}", self.peek().kind);
-                    let name = raw.trim_start_matches("At").to_lowercase();
+                    // Direct match instead of Debug-formatting and string manipulation.
+                    // This avoids a heap allocation (format!) and string processing
+                    // (trim_start_matches, to_lowercase) on every attribute.
+                    let name = match &self.peek().kind {
+                        TokenKind::AtGrad => "grad",
+                        TokenKind::AtSimd => "simd",
+                        TokenKind::AtParallel => "parallel",
+                        TokenKind::AtSeq => "seq",
+                        TokenKind::AtUnroll => "unroll",
+                        TokenKind::AtInline => "inline",
+                        TokenKind::AtNoInline => "noinline",
+                        TokenKind::AtKernel => "kernel",
+                        TokenKind::AtJit => "jit",
+                        TokenKind::AtVmap => "vmap",
+                        TokenKind::AtCheckpoint => "checkpoint",
+                        TokenKind::AtQuantize => "quantize",
+                        TokenKind::AtPrune => "prune",
+                        TokenKind::AtProfile => "profile",
+                        TokenKind::AtTest => "test",
+                        TokenKind::AtBenchmark => "benchmark",
+                        TokenKind::AtDeprecated => "deprecated",
+                        TokenKind::AtAi => "ai",
+                        _ => "unknown",
+                    }.to_string();
                     self.advance();
                     let args = if self.is(&TokenKind::LParen) {
                         self.parse_named_attr_args().unwrap_or_default()

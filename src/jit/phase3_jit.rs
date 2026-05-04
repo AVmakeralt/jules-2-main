@@ -179,8 +179,11 @@ impl ExecArena {
 impl Drop for ExecMem {
     fn drop(&mut self) {
         if !self.arena_backed && self.offset > 0 && self.len > 0 {
-            // For non-arena-backed allocations, we need to unmap
-            // This is handled by the arena itself for arena-backed allocations
+            // For non-arena-backed allocations, unmap the memory to prevent leaks.
+            // Arena-backed allocations are freed when the arena itself is dropped.
+            unsafe {
+                let _ = libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            }
         }
     }
 }
