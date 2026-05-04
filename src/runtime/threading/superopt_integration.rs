@@ -22,6 +22,8 @@ use crate::runtime::threading::{
     PrecisionLevel, TaskPriority, LossyComputationContext, LossyComputationManager,
     HyperSparseMap, HyperSparseSoA, SegmentedSieve,
     CrossBoundaryOptimizer, FusedOperation,
+    PropheticPrefetchEngine, PrefetchEmitter, PrefetchHint, PrefetchLevel, AccessPattern,
+    prefetch_hypersparse_next, prefetch_soa_gather, prefetch_soa_queue_next,
 };
 
 /// Scheduling hint from superoptimizer (extended)
@@ -71,6 +73,9 @@ pub enum SchedulingHint {
     HyperSparse,
     /// Use cross-boundary optimization (fused lossy + hyper-sparse)
     CrossBoundary,
+    /// Use prophetic hardware prefetching (PHP) — inject prefetch instructions
+    /// into JIT traces based on PEBS-detected cache miss patterns
+    PropheticPrefetch,
 }
 
 /// Task metadata with scheduling hints (extended)
@@ -494,6 +499,39 @@ pub fn generate_rewrite_rules() -> Vec<RewriteRule> {
         condition: RewriteCondition::Always,
         speedup: 5.0,
     });
+
+    // Phase 10: Prophetic Hardware Prefetcher (PHP) rules
+    rules.push(RewriteRule {
+        name: "prophetic_prefetch_pointer_chase".to_string(),
+        pattern: "pointer_dereference()".to_string(),
+        replacement: "prefetched_pointer_dereference()".to_string(),
+        condition: RewriteCondition::RequiresHw("rdpmc".to_string()),
+        speedup: 3.0,
+    });
+
+    rules.push(RewriteRule {
+        name: "prophetic_prefetch_soa_iter".to_string(),
+        pattern: "soa_iteration()".to_string(),
+        replacement: "prefetched_soa_iteration()".to_string(),
+        condition: RewriteCondition::RequiresHw("rdpmc".to_string()),
+        speedup: 2.5,
+    });
+
+    rules.push(RewriteRule {
+        name: "prophetic_prefetch_gather".to_string(),
+        pattern: "simd_gather()".to_string(),
+        replacement: "prefetched_simd_gather()".to_string(),
+        condition: RewriteCondition::RequiresHw("avx512".to_string()),
+        speedup: 4.0,
+    });
+
+    rules.push(RewriteRule {
+        name: "prophetic_prefetch_hypersparse".to_string(),
+        pattern: "hypersparse_traversal()".to_string(),
+        replacement: "prefetched_hypersparse_traversal()".to_string(),
+        condition: RewriteCondition::RequiresHw("rdpmc".to_string()),
+        speedup: 6.0,
+    });
     
     rules
 }
@@ -526,6 +564,8 @@ pub struct SuperoptThreadingIntegration {
     huge_pages: Option<HugePageAllocator>,
     /// Hybrid notification system
     hybrid_notify: Option<HybridNotify>,
+    /// Prophetic Hardware Prefetcher engine
+    prophetic_prefetch: PropheticPrefetchEngine,
 }
 
 impl SuperoptThreadingIntegration {
@@ -533,6 +573,8 @@ impl SuperoptThreadingIntegration {
     pub fn new() -> Self {
         let hw_caps = HwCapabilities::detect();
         let rewrite_rules = generate_rewrite_rules();
+        let huge_pages_available = hw_caps.huge_pages;
+        let tsx_available = is_tsx_available();
         
         Self {
             pool: ThreadPool::new(),
@@ -548,6 +590,11 @@ impl SuperoptThreadingIntegration {
             cat_manager: Some(CatManager::new()),
             huge_pages: Some(HugePageAllocator::new()),
             hybrid_notify: Some(HybridNotify::new(num_cpus::get())),
+            prophetic_prefetch: PropheticPrefetchEngine::new(
+                256, // max tracked instruction sites
+                huge_pages_available,
+                tsx_available,
+            ),
         }
     }
     
@@ -677,6 +724,12 @@ impl SuperoptThreadingIntegration {
                     }
                     "cross_boundary_fused" | "zero_copy_fused" | "egraph_sparse_opt" => {
                         analysis.hint = SchedulingHint::CrossBoundary;
+                    }
+                    "prophetic_prefetch_pointer_chase"
+                    | "prophetic_prefetch_soa_iter"
+                    | "prophetic_prefetch_gather"
+                    | "prophetic_prefetch_hypersparse" => {
+                        analysis.hint = SchedulingHint::PropheticPrefetch;
                     }
                     _ => {}
                 }
@@ -940,6 +993,14 @@ impl SuperoptThreadingIntegration {
                     // Execute with zero-copy ownership transfer and CAT cache partitioning
                     f();
                 }
+                SchedulingHint::PropheticPrefetch => {
+                    // Use prophetic hardware prefetching
+                    // The PropheticPrefetchEngine has already identified cache-miss
+                    // hotspots from PEBS data and injected prefetch instructions
+                    // into the JIT-compiled trace.  Execute normally — the prefetches
+                    // are embedded in the compiled code.
+                    f();
+                }
             }
         } else {
             // No metadata, execute inline
@@ -980,6 +1041,16 @@ impl SuperoptThreadingIntegration {
     /// Get hybrid notification system
     pub fn hybrid_notify(&self) -> Option<&HybridNotify> {
         self.hybrid_notify.as_ref()
+    }
+
+    /// Get the prophetic hardware prefetcher engine
+    pub fn prophetic_prefetch(&mut self) -> &mut PropheticPrefetchEngine {
+        &mut self.prophetic_prefetch
+    }
+
+    /// Get the prophetic hardware prefetcher engine (read-only)
+    pub fn prophetic_prefetch_ref(&self) -> &PropheticPrefetchEngine {
+        &self.prophetic_prefetch
     }
 
     /// Clear the task metadata registry

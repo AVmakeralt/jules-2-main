@@ -178,16 +178,27 @@ impl BtaEnv {
 
     /// Merge two environments after a branch (take the dynamic/lattice join).
     pub fn merge_branch(&mut self, other: &BtaEnv) {
-        for (name, (bt, val)) in &self.bindings {
-            if let Some((other_bt, _)) = other.bindings.get(name) {
-                // If either branch made it dynamic, it stays dynamic
-                if *other_bt == BindingTime::Dynamic || *bt == BindingTime::Dynamic {
-                    self.bindings.insert(name.clone(), (BindingTime::Dynamic, PartialValue::Unknown));
+        // Collect names that need to be made dynamic first, then apply
+        // to avoid borrowing self.bindings as both mutable and immutable.
+        let names_to_make_dynamic: Vec<String> = self.bindings.iter()
+            .filter_map(|(name, (bt, _))| {
+                if *bt == BindingTime::Dynamic {
+                    return Some(name.clone());
                 }
-            } else {
-                // Variable was written in only one branch — conservatively dynamic
-                self.bindings.insert(name.clone(), (BindingTime::Dynamic, PartialValue::Unknown));
-            }
+                if let Some((other_bt, _)) = other.bindings.get(name) {
+                    if *other_bt == BindingTime::Dynamic {
+                        return Some(name.clone());
+                    }
+                } else {
+                    // Variable was written in only one branch — conservatively dynamic
+                    return Some(name.clone());
+                }
+                None
+            })
+            .collect();
+
+        for name in names_to_make_dynamic {
+            self.bindings.insert(name, (BindingTime::Dynamic, PartialValue::Unknown));
         }
     }
 }
@@ -286,7 +297,7 @@ impl PartialEvaluator {
                                 BindingTime::Dynamic
                             };
                             let val = if bt == BindingTime::Static {
-                                Self::eval_expr(default.as_ref().unwrap(), &env)
+                                Self::eval_expr(p.default.as_ref().unwrap(), &env)
                                     .unwrap_or(PartialValue::Unknown)
                             } else {
                                 PartialValue::Unknown
@@ -305,7 +316,7 @@ impl PartialEvaluator {
                             BindingTime::Dynamic
                         };
                         let val = if bt == BindingTime::Static {
-                            Self::eval_expr(default.as_ref().unwrap(), &env)
+                            Self::eval_expr(p.default.as_ref().unwrap(), &env)
                                 .unwrap_or(PartialValue::Unknown)
                         } else {
                             PartialValue::Unknown
@@ -412,7 +423,8 @@ impl PartialEvaluator {
             | Expr::Pow { .. }
             | Expr::VecCtor { .. }
             | Expr::Path { .. }
-            | Expr::MethodCall { .. } => BindingTime::Dynamic,
+            | Expr::MethodCall { .. }
+            | Expr::Assign { .. } => BindingTime::Dynamic,
         }
     }
 
@@ -566,10 +578,10 @@ impl PartialEvaluator {
                     self.stats.expressions_folded += 1;
                     block.tail = Some(Box::new(val.to_expr(tail.span())));
                 } else {
-                    block.tail = Some(Box::new(tail));
+                    block.tail = Some(tail);
                 }
             } else {
-                block.tail = Some(Box::new(self.specialize_expr(tail, env, depth)));
+                block.tail = Some(Box::new(self.specialize_expr(*tail, env, depth)));
             }
         }
     }

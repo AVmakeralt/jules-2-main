@@ -844,6 +844,7 @@ Integration of all threading optimizations with superoptimizer.
 - Amx, Tsx, Cat, Avx512, HugePages
 - SoA, JitScheduler, Speculative, WorkCompression
 - NeuralGuided, LossyComputation, HyperSparse, CrossBoundary
+- PropheticPrefetch (hardware prefetch injection)
 
 #### Prophecy Variables (`runtime/threading/prophecy.rs`)
 
@@ -856,6 +857,57 @@ Speculative parallelism using formally-verified predictions of future values. Se
 - `ProphecyExecutor`: Integrates with TSX, rseq, and io_uring
 - `ProphecyContext<T>`: Speculative execution context with TSX rollback
 - `ProphecyResult<T>`: Result of a speculation (Correct, Wrong, Aborted)
+
+#### Prophetic Hardware Prefetcher (`runtime/threading/prophetic_prefetch.rs`)
+
+A compiler/JIT-level prefetch engine that orchestrates the CPU's L1/L2 caches directly by dynamically injecting non-blocking hardware prefetch instructions (`PREFETCHT0`, `PREFETCHNTA`, `PREFETCHT1`, `PREFETCHT2`) into JIT-compiled machine code. Instead of manually buffering data in RAM, the PHP lets the CPU's internal memory controller handle the asynchronous fetch, achieving zero-runtime-memory-overhead prefetching.
+
+**Architecture:**
+
+The PHP fuses three existing Jules components into a single feedback loop:
+
+1. **HwFeedbackCollector** (PEBS): Detects instructions that chronically cause L1/L2 cache misses by sampling `CacheMisses`, `L1Misses`, and `L2Misses` events via Intel PEBS. Each sample carries the instruction pointer and the accessed data address.
+2. **ProphecyOracle**: Already supports `ProphecyKind::MemoryAddress`. The PHP registers prophecies for predicted next-addresses based on observed stride patterns, and tracks prediction accuracy. When confidence drops below 85%, the prefetch is revoked.
+3. **Phase3/Phase6 JIT**: When recompiling a hot trace, the JIT queries the PHP for active `PrefetchHint` entries. If a hint applies to an instruction in the trace, the JIT emits the appropriate `PREFETCH` instruction N iterations ahead of the actual load.
+
+**Access Pattern Classification:**
+
+The PHP classifies memory access patterns to determine when software prefetching is beneficial versus harmful:
+
+- **Linear**: Unit or near-unit stride access (e.g., iterating an array sequentially). The CPU's L2 stream prefetcher already handles this — the PHP deliberately does NOT emit prefetches for linear patterns to avoid interfering with the hardware prefetcher.
+- **FixedStride**: Non-unit but consistent stride (e.g., accessing every Nth element). The hardware prefetcher may handle small strides, but larger strides (>4 cache lines) benefit from software prefetch with adaptive lookahead (1-8 strides ahead depending on stride magnitude).
+- **PointerChase**: Linked list / tree traversal / HyperSparseMap lookups. The hardware prefetcher cannot predict these at all — prime target for PHP. Uses `PREFETCHT0` (all cache levels) with lookahead=1.
+- **GatherScatter**: SIMD gather/scatter with irregular access. Uses `PREFETCHNTA` (non-temporal, L1 only) since data is typically read once.
+- **Unknown**: Not enough observations yet — no prefetch emitted.
+
+**Three Vulnerability Mitigations:**
+
+1. **Cache Pollution / Confidence-Based Fallback**: If the `ProphecyOracle`'s prediction accuracy for an instruction drops below the 85% threshold, the PHP revokes the prefetch hint. On the next JIT recompilation, the prefetch instruction is stripped from the trace. This prevents wrong predictions from evicting useful data from the cache.
+
+2. **Hardware Prefetcher Conflict Avoidance**: Modern Intel/AMD CPUs have L2 stream prefetchers that already handle linear access patterns. The PHP only emits `_mm_prefetch` for non-linear structures where hardware prefetchers fail: pointer-chasing, gather/scatter, and large-stride fixed patterns. Linear patterns are explicitly excluded.
+
+3. **Page Boundary Safety**: Prefetching an address that crosses a page boundary into unmapped memory causes a soft page fault — far more expensive than the cache miss being hidden. The PHP checks that `base_address + stride * lookahead` does not cross an OS page boundary (4KB standard, 2MB if HugePageAllocator is active) before emitting a prefetch.
+
+**JIT Integration:**
+
+The `PrefetchEmitter` provides both runtime intrinsics (`emit_prefetch_t0`, `emit_prefetch_nta`, etc.) for interpreted code and encoding helpers (`encode_prefetch_t0`, `encode_prefetch_nta`, etc.) for the Phase3/Phase6 JIT to emit raw x86-64 bytes directly into compiled traces. The encoding follows the standard `0F 18 /0` through `0F 18 /7` ModRM format with disp32 offsets.
+
+**SoA and HyperSparse Integration:**
+
+Convenience functions are provided for common Jules data structures:
+- `prefetch_soa_queue_next()`: Prefetches the next N entries across all SoA arrays (functions, data, priorities)
+- `prefetch_hypersparse_next()`: Prefetches the next segment in a HyperSparseMap pointer-chase traversal
+- `prefetch_soa_gather()`: Prefetches scattered values during SIMD gather operations
+
+**Key Structures:**
+- `PrefetchTracker`: Core tracker fed by PEBS cache-miss observations; infers stride patterns, classifies access patterns, generates prefetch hints
+- `PrefetchHint`: Complete prefetch suggestion (instruction ID, stride, lookahead distance, cache level, access pattern, confidence)
+- `PrefetchLevel`: Target cache level (`AllLevels`/T0, `L2`/T1, `L3`/T2, `NonTemporal`/NTA)
+- `AccessPattern`: Memory access classification (`Linear`, `FixedStride`, `PointerChase`, `GatherScatter`, `Unknown`)
+- `PrefetchEmitter`: JIT code emission for x86 prefetch instructions (both runtime intrinsics and raw byte encoding)
+- `PropheticPrefetchEngine`: Top-level engine fusing PrefetchTracker + ProphecyOracle + PrefetchEmitter
+- `PropheticPrefetchStats`: Comprehensive statistics (hints issued/revoked, prediction accuracy, estimated cycle benefit)
+- `PrefetchTrackerStats`: Tracker-level statistics (tracked instructions, page violations prevented, HW conflicts avoided)
 
 ---
 

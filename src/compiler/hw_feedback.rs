@@ -164,6 +164,8 @@ pub enum SuggestionType {
     UseVectorization,
     /// Reorder instructions
     ReorderInstructions,
+    /// Use prophetic hardware prefetching (PHP) — inject JIT prefetch instructions
+    UsePropheticPrefetch,
 }
 
 /// Hardware feedback collector
@@ -504,6 +506,14 @@ impl HwFeedbackAnalyzer {
                 expected_improvement: (1.0 - metrics.l1_hit_rate) * 0.2,
                 confidence: 0.5,
             });
+
+            // Suggest prophetic hardware prefetching for non-linear access patterns
+            suggestions.push(OptimizationSuggestion {
+                suggestion_type: SuggestionType::UsePropheticPrefetch,
+                description: format!("Low L1 hit rate ({:.2}%): Enable Prophetic Hardware Prefetcher (PHP) for pointer-chasing and non-linear access patterns", metrics.l1_hit_rate * 100.0),
+                expected_improvement: (1.0 - metrics.l1_hit_rate) * 0.4,
+                confidence: 0.85,
+            });
         }
 
         suggestions
@@ -525,6 +535,27 @@ impl HwFeedbackAnalyzer {
         }
 
         None
+    }
+
+    /// Extract PEBS cache-miss samples that are suitable for feeding into
+    /// the Prophetic Hardware Prefetcher (PHP) engine.
+    ///
+    /// Returns a vector of (instruction_id, data_address, is_pointer_chase) tuples
+    /// from samples that are cache-miss events with valid data addresses.
+    /// The `is_pointer_chase` heuristic is based on the weight of the sample:
+    /// very high-weight misses typically indicate pointer-chasing patterns
+    /// (linked list, tree traversal, HyperSparseMap lookups).
+    pub fn extract_prefetch_candidates(&self, profile: &PerfProfile) -> Vec<(usize, usize, bool)> {
+        profile.samples.iter()
+            .filter(|s| matches!(s.event, PerfEvent::CacheMisses | PerfEvent::L1Misses | PerfEvent::L2Misses))
+            .filter_map(|s| {
+                s.data_addr.map(|addr| {
+                    let instruction_id = s.ip as usize;
+                    let is_pointer_chase = s.weight > 100; // High-weight misses suggest pointer chase
+                    (instruction_id, addr as usize, is_pointer_chase)
+                })
+            })
+            .collect()
     }
 }
 

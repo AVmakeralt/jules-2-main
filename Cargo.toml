@@ -58,6 +58,10 @@ required-features = ["gnn-optimizer"]
 name = "bench-speed"
 path = "benches/bench_speed.rs"
 
+[[bin]]
+name = "bench-jhal"
+path = "benches/bench_jhal.rs"
+
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }

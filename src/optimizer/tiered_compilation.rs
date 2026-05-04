@@ -671,7 +671,7 @@ impl TieredExecutionManager {
             let config = crate::optimizer::advanced_optimizer::SuperoptimizerConfig::maximum();
             let mut superopt = crate::optimizer::advanced_optimizer::Superoptimizer::new(config);
             // Wrap in a temporary program to run the optimizer
-            let mut temp_program = crate::compiler::ast::Program::default();
+            let mut temp_program = crate::compiler::ast::Program::new();
             temp_program.items.push(crate::compiler::ast::Item::Fn(decl.clone()));
             superopt.optimize_program(&mut temp_program);
             // Extract the optimized function back out

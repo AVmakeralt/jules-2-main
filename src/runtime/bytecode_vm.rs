@@ -1527,6 +1527,9 @@ impl BytecodeVM {
         let mut profile_counter: u8 = 0;
         // Pre-compute slot pointer for write-intent prefetch in the dispatch loop.
         let slot_ptr = slots.as_mut_ptr();
+        // Safety counter: only in debug builds to catch infinite loops during development.
+        #[cfg(debug_assertions)]
+        let mut safety_counter: u64 = 0;
 
         // Main dispatch loop
         while pc < func_len {
@@ -2189,7 +2192,7 @@ impl BytecodeVM {
                             }
 
                             // Look up the BytecodeFunction by name — O(1) hash lookup
-                            let callee_idx = self.function_index.get(fn_name).copied();
+                            let callee_idx = self.function_index.get(&fn_name).copied();
                             match callee_idx {
                                 Some(idx) => {
                                     // Push call frame (return to next instruction)

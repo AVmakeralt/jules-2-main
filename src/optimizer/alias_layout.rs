@@ -217,25 +217,30 @@ impl AliasAnalyzer {
 
     /// Prove that all fields of a struct are non-aliasing (from borrow checker).
     pub fn prove_struct_fields_noalias(&mut self, struct_name: &str) {
-        if let Some(decl) = self.struct_defs.get(struct_name) {
-            let fields: Vec<&StructField> = decl.fields.iter().collect();
-            for i in 0..fields.len() {
-                for j in (i + 1)..fields.len() {
-                    self.prove_noalias(
-                        MemoryRegion::StructField {
-                            struct_name: struct_name.to_string(),
-                            field_name: fields[i].name.clone(),
-                        },
-                        MemoryRegion::StructField {
-                            struct_name: struct_name.to_string(),
-                            field_name: fields[j].name.clone(),
-                        },
-                        AliasProof::FieldOffsetDisjoint,
-                    );
-                }
+        // Collect field names first to avoid borrowing self as both
+        // mutable and immutable at the same time.
+        let field_names: Vec<String> = if let Some(decl) = self.struct_defs.get(struct_name) {
+            decl.fields.iter().map(|f| f.name.clone()).collect()
+        } else {
+            return;
+        };
+
+        for i in 0..field_names.len() {
+            for j in (i + 1)..field_names.len() {
+                self.prove_noalias(
+                    MemoryRegion::StructField {
+                        struct_name: struct_name.to_string(),
+                        field_name: field_names[i].clone(),
+                    },
+                    MemoryRegion::StructField {
+                        struct_name: struct_name.to_string(),
+                        field_name: field_names[j].clone(),
+                    },
+                    AliasProof::FieldOffsetDisjoint,
+                );
             }
-            self.analyzed_structs.insert(struct_name.to_string());
         }
+        self.analyzed_structs.insert(struct_name.to_string());
     }
 
     /// Get all noalias pairs.
