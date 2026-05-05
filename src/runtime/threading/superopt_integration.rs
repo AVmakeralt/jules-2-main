@@ -1107,6 +1107,7 @@ impl Default for SuperoptThreadingIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::ast::Span;
     /* Commented out: IntLit is not a standalone item in crate::compiler::ast,
        and BinOpKind::MatMul does not exist in ast::BinOpKind.
     #[test]

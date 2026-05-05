@@ -29,7 +29,7 @@ use jules::runtime::jhal::{
     FIRST_USER_VECTOR,
     IrqPredictor,
     IdentityMap, HugePageAllocator, HugePageSize,
-    IommuDropZone, NmiWatchdog,
+    IommuDropZone,
     CfiJumpTable,
     PTE_PRESENT, PTE_WRITABLE,
 };
@@ -148,10 +148,6 @@ fn main() {
 
     bench("iommu_dma_check", iterations, || {
         bench_iommu_check(iterations)
-    });
-
-    bench("nmi_watchdog_pet", iterations, || {
-        bench_nmi_pet(iterations)
     });
 
     bench("cfi_jump_table_lookup", iterations, || {
@@ -537,16 +533,6 @@ fn bench_iommu_check(iters: usize) -> u64 {
     for i in 0..iters {
         let addr = black_box(0x1000_0000 + (i as u64 & 0xFFFF));
         count += black_box(dz.is_dma_allowed(addr, 0x100)) as u64;
-    }
-    count
-}
-
-fn bench_nmi_pet(iters: usize) -> u64 {
-    let wd = NmiWatchdog::new(62_500);
-    let mut count = 0u64;
-    for _ in 0..iters {
-        wd.pet();
-        count += black_box(wd.epoch()) & 0xFF;
     }
     count
 }

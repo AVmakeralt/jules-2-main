@@ -1022,7 +1022,7 @@ mod tests {
 
         // Should contain hex values
         let offset_mask = 8 * 1024 * 1024 - 1; // 0x007FFFFF
-        let base = 0x10_0000_0000;
+        let base: u64 = 0x10_0000_0000;
         assert!(
             asm.contains(&format!("{offset_mask:016X}")),
             "missing offset mask in: {asm}"

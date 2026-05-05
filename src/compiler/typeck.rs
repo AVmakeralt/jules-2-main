@@ -4214,6 +4214,7 @@ mod tests {
         let program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
+            superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
@@ -4252,6 +4253,7 @@ mod tests {
         let program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
+            superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
@@ -4286,6 +4288,7 @@ mod tests {
         let program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ppo_attr]))],
+            superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
@@ -4318,6 +4321,7 @@ mod tests {
         let program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
+            superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
@@ -4364,6 +4368,7 @@ mod tests {
             let program = Program {
                 span: dummy(),
                 items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
+            superopt_mode: SuperoptMode::All,
             };
 
             let mut ck = make_checker();
@@ -4389,6 +4394,7 @@ mod tests {
         let program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ppo_attr]))],
+            superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
@@ -4470,6 +4476,7 @@ mod tests {
         let program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ppo_attr]))],
+            superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
@@ -4520,6 +4527,7 @@ mod tests {
         let program = Program {
             span,
             items: vec![Item::Fn(fn_decl)],
+            superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();

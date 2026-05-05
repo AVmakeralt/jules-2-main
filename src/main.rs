@@ -3428,6 +3428,7 @@ mod tests {
         let program = crate::compiler::ast::Program {
             span: sp,
             items: vec![crate::compiler::ast::Item::Model(model)],
+            superopt_mode: crate::compiler::ast::SuperoptMode::All,
         };
         let rows = feature_capability_matrix(&program);
         assert_eq!(rows.len(), 1);

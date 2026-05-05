@@ -157,12 +157,11 @@ pub use irq_injection::{
     rdtsc,
 };
 
-// Identity Mapping, HugePage, IOMMU, NMI, CFI
+// Identity Mapping, HugePage, IOMMU, CFI
 pub use identity_map::{
     IdentityMap,
     HugePageAllocator, HugePageSize,
     IommuDropZone,
-    NmiWatchdog, NMI_DEFAULT_INTERVAL,
     CfiJumpTable, CfiReport, verify_cfi_compliance,
     PTE_PRESENT, PTE_WRITABLE, PTE_HUGE_PAGE, PTE_NO_EXECUTE,
     SANCTUARY_SIZE,

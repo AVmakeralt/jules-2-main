@@ -350,7 +350,7 @@ impl OptimizationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::threading::lossy_computation::LossyComputationManager;
+    use crate::runtime::threading::lossy_computation::{LossyComputationManager, TaskPriority};
 
     #[test]
     fn test_fused_operation() {

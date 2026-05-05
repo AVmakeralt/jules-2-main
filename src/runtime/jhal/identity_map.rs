@@ -1,5 +1,5 @@
 // =========================================================================
-// Identity Mapping, HugePage Allocator, IOMMU, NMI Watchdog, and CFI
+// Identity Mapping, HugePage Allocator, IOMMU, and CFI
 //
 // When Jules IS the OS, it doesn't use virtual memory — it IS the
 // virtual memory manager. This module implements:
@@ -7,15 +7,18 @@
 //   1. Identity Mapping — VA = PA, no TLB misses for core logic
 //   2. HugePage Allocator — 1GB/2MB pages for minimal TLB pressure
 //   3. IOMMU Drop Zones — Protect Sanctuary from DMA attacks
-//   4. NMI Watchdog — Detect and recover from deadlocks
-//   5. CFI — Control Flow Integrity (no unchecked indirect jumps)
+//   4. CFI — Control Flow Integrity (no unchecked indirect jumps)
+//
+// NOTE: The NMI watchdog has been removed. Infinite loop / deadlock
+// detection is now handled by the EntropyWatchdog in formal_verify.rs,
+// which monitors state mutation entropy at loop backedges instead of
+// relying on a hardware NMI timer.
 //
 // REFERENCES:
 //   Intel SDM Vol 3, §4.3 (64-bit paging)
 //   Intel VT-d Specification (IOMMU)
 // =========================================================================
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 
 // ─── 1. IDENTITY MAPPING ────────────────────────────────────────────────────
@@ -323,80 +326,7 @@ impl IommuDropZone {
     pub fn drop_zone_base(&self) -> u64 { self.drop_zone_base }
 }
 
-// ─── 4. NMI WATCHDOG ────────────────────────────────────────────────────────
-
-/// Default NMI watchdog interval: 10ms in APIC timer ticks.
-/// At 100 Hz bus clock / 16 divide = ~6.25 MHz, 10ms ≈ 62,500 ticks.
-pub const NMI_DEFAULT_INTERVAL: u32 = 62_500;
-
-/// NMI Watchdog: detects deadlocks by checking an epoch counter.
-/// If the epoch hasn't advanced after 2 consecutive NMI checks,
-/// assumes the core is deadlocked and forces a restart.
-#[allow(dead_code)]
-pub struct NmiWatchdog {
-    epoch: AtomicU64,
-    last_epoch: u64,
-    interval_ticks: u32,
-    max_hits: u32,
-    hit_count: u32,
-}
-
-impl NmiWatchdog {
-    pub const fn new(interval_ticks: u32) -> Self {
-        Self {
-            epoch: AtomicU64::new(0),
-            last_epoch: 0,
-            interval_ticks,
-            max_hits: 3,
-            hit_count: 0,
-        }
-    }
-
-    /// Start the NMI watchdog (program APIC LINT1 as NMI).
-    pub unsafe fn start(&self) {
-        // Configure Local APIC LINT1 for NMI delivery
-        // This requires the Local APIC driver — in a real implementation,
-        // we'd call local_apic.set_lint1(vector, masked: false)
-    }
-
-    /// Check if the core is alive. Called from the NMI handler.
-    /// Returns true if the epoch advanced (core is alive).
-    pub fn check_and_pet(&mut self) -> bool {
-        let current = self.epoch.load(Ordering::Acquire);
-        if current != self.last_epoch {
-            self.last_epoch = current;
-            self.hit_count = 0;
-            true
-        } else {
-            self.hit_count += 1;
-            if self.hit_count >= self.max_hits {
-                // Core is deadlocked — force restart
-                // SAFETY: This is called from NMI handler context, which is
-                // inherently unsafe. The caller must ensure this is valid.
-                unsafe { self.force_restart() };
-            }
-            false
-        }
-    }
-
-    /// Increment the epoch counter (called by the scheduler each tick).
-    pub fn pet(&self) {
-        self.epoch.fetch_add(1, Ordering::Release);
-    }
-
-    /// Force-abort the current TSX transaction and restart the core.
-    pub unsafe fn force_restart(&self) {
-        // In a real implementation:
-        // 1. If in TSX transaction, it's already aborted by NMI
-        // 2. Restore CPU state from last checkpoint
-        // 3. Resume execution from known-good point
-    }
-
-    pub fn epoch(&self) -> u64 { self.epoch.load(Ordering::Acquire) }
-    pub fn hit_count(&self) -> u32 { self.hit_count }
-}
-
-// ─── 5. CFI (Control Flow Integrity) ────────────────────────────────────────
+// ─── 4. CFI (Control Flow Integrity) ────────────────────────────────────────
 
 /// Maximum number of valid jump targets in the CFI table.
 const CFI_MAX_TARGETS: usize = 1024;
@@ -550,23 +480,6 @@ mod tests {
         assert!(!dz.is_dma_allowed(0x0, 0x100)); // Inside sanctuary
         assert!(dz.is_sanctuary(0x100));
         assert!(!dz.is_sanctuary(0x1000_0000)); // In drop zone, not sanctuary
-    }
-
-    #[test]
-    fn test_nmi_watchdog() {
-        let mut wd = NmiWatchdog::new(NMI_DEFAULT_INTERVAL);
-        assert_eq!(wd.epoch(), 0);
-        wd.pet();
-        assert_eq!(wd.epoch(), 1);
-        assert!(wd.check_and_pet()); // Epoch advanced
-    }
-
-    #[test]
-    fn test_nmi_watchdog_deadlock() {
-        let mut wd = NmiWatchdog::new(NMI_DEFAULT_INTERVAL);
-        wd.last_epoch = 0;
-        assert!(!wd.check_and_pet()); // Epoch didn't advance
-        assert_eq!(wd.hit_count(), 1);
     }
 
     #[test]

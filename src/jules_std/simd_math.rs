@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_exp_basic() {
-        for &x in &[0.0, 1.0, -1.0, 0.5, 2.0, -2.0, 5.0, -5.0] {
+        for &x in &[0.0f32, 1.0f32, -1.0f32, 0.5f32, 2.0f32, -2.0f32, 5.0f32, -5.0f32] {
             let expected = x.exp();
             let got = fast_exp_f32(x);
             let rel_err = if expected != 0.0 { (got - expected).abs() / expected.abs() } else { got.abs() };
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_tanh_basic() {
-        for &x in &[0.0, 0.5, 1.0, 2.0, -1.0, -2.0, 5.0, -5.0, 10.0] {
+        for &x in &[0.0f32, 0.5f32, 1.0f32, 2.0f32, -1.0f32, -2.0f32, 5.0f32, -5.0f32, 10.0f32] {
             let expected = x.tanh();
             let got = fast_tanh_f32(x);
             let abs_err = (got - expected).abs();
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_sqrt_basic() {
-        for &x in &[0.0, 1.0, 2.0, 4.0, 9.0, 0.25, 100.0, 0.01] {
+        for &x in &[0.0f32, 1.0f32, 2.0f32, 4.0f32, 9.0f32, 0.25f32, 100.0f32, 0.01f32] {
             let expected = x.sqrt();
             let got = fast_sqrt_f32(x);
             let rel_err = if expected != 0.0 { (got - expected).abs() / expected } else { got.abs() };
@@ -511,8 +511,8 @@ mod tests {
 
     #[test]
     fn test_rsqrt_basic() {
-        for &x in &[1.0, 2.0, 4.0, 9.0, 0.25, 100.0] {
-            let expected = 1.0 / x.sqrt();
+        for &x in &[1.0f32, 2.0f32, 4.0f32, 9.0f32, 0.25f32, 100.0f32] {
+            let expected = 1.0f32 / x.sqrt();
             let got = fast_rsqrt_f32(x);
             let rel_err = (got - expected).abs() / expected;
             assert!(rel_err < TOLERANCE, "rsqrt({}): expected {}, got {}, rel_err {}", x, expected, got, rel_err);
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_log_basic() {
-        for &x in &[0.5, 1.0, 2.0, 4.0, 10.0, 0.1, 100.0, f32::E] {
+        for &x in &[0.5f32, 1.0f32, 2.0f32, 4.0f32, 10.0f32, 0.1f32, 100.0f32, std::f32::consts::E] {
             let expected = x.ln();
             let got = fast_log_f32(x);
             let rel_err = if expected != 0.0 { (got - expected).abs() / expected.abs() } else { got.abs() };
@@ -551,8 +551,8 @@ mod tests {
 
     #[test]
     fn test_sigmoid_basic() {
-        for &x in &[0.0, 1.0, -1.0, 5.0, -5.0, 0.5, 10.0, -10.0] {
-            let expected = 1.0 / (1.0 + (-x).exp());
+        for &x in &[0.0f32, 1.0f32, -1.0f32, 5.0f32, -5.0f32, 0.5f32, 10.0f32, -10.0f32] {
+            let expected = 1.0f32 / (1.0f32 + (-x).exp());
             let got = fast_sigmoid_f32(x);
             let abs_err = (got - expected).abs();
             assert!(abs_err < TOLERANCE, "sigmoid({}): expected {}, got {}, abs_err {}", x, expected, got, abs_err);
