@@ -107,10 +107,10 @@ impl Tensor {
             / (shape.get(0).copied().unwrap_or(1) + shape.get(1).copied().unwrap_or(1)) as f32)
             .sqrt();
         let data = (0..numel)
-            .map(|_| {
+            .map(|i| {
                 // Pseudo-random number between -limit and limit
-                let r = (numel as f32 * (_as_pseudo_rand(numel) as f32)).sin() * limit.abs();
-                if (numel ^ _as_pseudo_rand(numel * 2)) & 1 == 0 {
+                let r = (i as f32 * (_as_pseudo_rand(i) as f32)).sin() * limit.abs();
+                if (i ^ _as_pseudo_rand(i * 2)) & 1 == 0 {
                     r
                 } else {
                     -r
@@ -522,7 +522,7 @@ impl Tensor {
     }
 
     pub fn mean(&self) -> f32 {
-        self.sum() / self.numel() as f32
+        self.sum() / (self.numel().max(1)) as f32
     }
 
     /// Compute gradient for ReLU
@@ -542,13 +542,16 @@ impl Tensor {
         }
     }
 
-    /// Compute gradient for Sigmoid
+    /// Compute gradient for Sigmoid.
+    /// API contract: `self` MUST be the sigmoid *output* tensor (i.e. the result of
+    /// calling `sigmoid()` on the input), NOT the raw input tensor. The derivative
+    /// σ'(x) = σ(x) * (1 - σ(x)) requires the sigmoid output values.
     pub fn sigmoid_grad(&self, upstream_grad: &Tensor) -> Tensor {
         let len = upstream_grad.data.len();
         let mut data = vec![0.0; len];
         for i in 0..len {
-            let x = self.data[i];
-            data[i] = upstream_grad.data[i] * x * (1.0 - x);
+            let sig_out = self.data[i]; // must be σ(x), not x
+            data[i] = upstream_grad.data[i] * sig_out * (1.0 - sig_out);
         }
         Tensor {
             shape: upstream_grad.shape.clone(),
@@ -586,52 +589,30 @@ impl Tensor {
             .unwrap_or(1);
 
         if threads > 1 && ops >= Self::PARALLEL_MATMUL_MIN_OPS {
-            let min_rows_per_chunk = 32usize;
-            let target_chunks = (threads * 2).max(1);
-            let rows_per_chunk = m.div_ceil(target_chunks).max(min_rows_per_chunk);
-            
-            // Use custom threading engine instead of thread::scope
+            // Split rows into two halves and process in parallel using join
             use crate::runtime::threading::join;
 
-            let a_data = &self.data;
-            let bt_data = &other_t;
+            let mid = m / 2;
+            let a_data_lo = self.data.clone();
+            let bt_data_lo = other_t.clone();
+            let a_data_hi = self.data.clone();
+            let bt_data_hi = other_t.clone();
 
-            let num_chunks = m.div_ceil(rows_per_chunk);
+            let (out_lo, out_hi) = join::<Vec<f32>, Vec<f32>, _, _>(
+                move || {
+                    let mut buf = vec![0.0f32; mid * n];
+                    matmul_blocked_rows(&a_data_lo, &bt_data_lo, 0, mid, k, n, &mut buf, 0);
+                    buf
+                },
+                move || {
+                    let mut buf = vec![0.0f32; (m - mid) * n];
+                    matmul_blocked_rows(&a_data_hi, &bt_data_hi, mid, m, k, n, &mut buf, mid);
+                    buf
+                },
+            );
 
-            // Process chunks in parallel using join
-            for chunk_idx in 0..num_chunks {
-                let row_start = chunk_idx * rows_per_chunk;
-                let row_end = (row_start + rows_per_chunk).min(m);
-                let a_data = a_data.clone();
-                let bt_data = bt_data.clone();
-                let chunk_len = (row_end - row_start) * n;
-                let local_out_len = chunk_len;
-                let local_out = {
-                    let mut local_out = vec![0.0f32; chunk_len];
-                    join::<Vec<f32>, (), _, _>(
-                        move || {
-                            matmul_blocked_rows(
-                                &a_data,
-                                &bt_data,
-                                row_start,
-                                row_end,
-                                k,
-                                n,
-                                &mut local_out,
-                                row_start,
-                            );
-                            local_out
-                        },
-                        || (),
-                    ).0
-                };
-
-                // Copy result back
-                let start = chunk_idx * rows_per_chunk * n;
-                if start + local_out_len <= result.len() {
-                    result[start..start + local_out_len].copy_from_slice(&local_out);
-                }
-            }
+            result[..mid * n].copy_from_slice(&out_lo);
+            result[mid * n..].copy_from_slice(&out_hi);
         } else {
             matmul_blocked_rows(&self.data, &other_t, 0, m, k, n, &mut result, 0);
         }
@@ -1253,6 +1234,9 @@ impl ComputationGraph {
             };
 
             match op {
+                Operation::Input | Operation::Constant => {
+                    // Leaf nodes have no gradient to propagate
+                }
                 Operation::Add => {
                     // Gradient flows equally to both inputs
                     if let Some(input_id) = inputs.get(0) {
@@ -1330,7 +1314,223 @@ impl ComputationGraph {
                         }
                     }
                 }
-                _ => {} // Other operations handled similarly
+                Operation::Sub => {
+                    if let (Some(&a_id), Some(&b_id)) = (inputs.get(0), inputs.get(1)) {
+                        let grad_a = upstream_grad.clone();
+                        // db = -grad
+                        let grad_b_data: Vec<f32> = upstream_grad.data.iter().map(|g| -g).collect();
+                        let grad_b = Tensor { shape: upstream_grad.shape.clone(), data: grad_b_data };
+
+                        if let Some(a) = self.nodes.get_mut(&a_id) {
+                            a.gradient = Some(match &a.gradient {
+                                Some(g) => g.add(&grad_a),
+                                None => grad_a,
+                            });
+                        }
+                        if let Some(b) = self.nodes.get_mut(&b_id) {
+                            b.gradient = Some(match &b.gradient {
+                                Some(g) => g.add(&grad_b),
+                                None => grad_b,
+                            });
+                        }
+                    }
+                }
+                Operation::Div => {
+                    if let (Some(&a_id), Some(&b_id)) = (inputs.get(0), inputs.get(1)) {
+                        let a_val = &self.nodes.get(&a_id).unwrap().value.clone();
+                        let b_val = &self.nodes.get(&b_id).unwrap().value.clone();
+
+                        // da = grad / b
+                        let grad_a_data: Vec<f32> = upstream_grad.data.iter()
+                            .zip(&b_val.data)
+                            .map(|(g, b)| g / b)
+                            .collect();
+                        let grad_a = Tensor { shape: upstream_grad.shape.clone(), data: grad_a_data };
+
+                        // db = -grad * a / (b * b)
+                        let grad_b_data: Vec<f32> = upstream_grad.data.iter()
+                            .zip(&a_val.data)
+                            .zip(&b_val.data)
+                            .map(|((g, a), b)| -g * a / (b * b))
+                            .collect();
+                        let grad_b = Tensor { shape: upstream_grad.shape.clone(), data: grad_b_data };
+
+                        if let Some(a) = self.nodes.get_mut(&a_id) {
+                            a.gradient = Some(match &a.gradient {
+                                Some(g) => g.add(&grad_a),
+                                None => grad_a,
+                            });
+                        }
+                        if let Some(b) = self.nodes.get_mut(&b_id) {
+                            b.gradient = Some(match &b.gradient {
+                                Some(g) => g.add(&grad_b),
+                                None => grad_b,
+                            });
+                        }
+                    }
+                }
+                Operation::Sigmoid => {
+                    if let Some(&input_id) = inputs.get(0) {
+                        let input_val = &self.nodes.get(&input_id).unwrap().value.clone();
+                        let sig = input_val.sigmoid();
+                        let grad_input = sig.sigmoid_grad(&upstream_grad);
+
+                        if let Some(input) = self.nodes.get_mut(&input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&grad_input),
+                                None => grad_input,
+                            });
+                        }
+                    }
+                }
+                Operation::Tanh => {
+                    if let Some(&input_id) = inputs.get(0) {
+                        let input_val = &self.nodes.get(&input_id).unwrap().value.clone();
+                        // da = grad * (1 - tanh(a)^2)
+                        let tanh_vals: Vec<f32> = input_val.data.iter().map(|x| x.tanh()).collect();
+                        let grad_data: Vec<f32> = upstream_grad.data.iter()
+                            .zip(&tanh_vals)
+                            .map(|(g, t)| g * (1.0 - t * t))
+                            .collect();
+                        let grad_input = Tensor { shape: upstream_grad.shape.clone(), data: grad_data };
+
+                        if let Some(input) = self.nodes.get_mut(&input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&grad_input),
+                                None => grad_input,
+                            });
+                        }
+                    }
+                }
+                Operation::Softmax => {
+                    if let Some(&input_id) = inputs.get(0) {
+                        let input_val = &self.nodes.get(&input_id).unwrap().value.clone();
+                        let softmax_vals = input_val.softmax();
+                        // Jacobian-based: da_i = sum_j(grad_j * s_j * (delta_ij - s_i))
+                        let n = softmax_vals.data.len();
+                        let mut grad_data = vec![0.0f32; n];
+                        for i in 0..n {
+                            for j in 0..n {
+                                let kronecker = if i == j { 1.0 } else { 0.0 };
+                                grad_data[i] += upstream_grad.data[j] * softmax_vals.data[j] * (kronecker - softmax_vals.data[i]);
+                            }
+                        }
+                        let grad_input = Tensor { shape: upstream_grad.shape.clone(), data: grad_data };
+
+                        if let Some(input) = self.nodes.get_mut(&input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&grad_input),
+                                None => grad_input,
+                            });
+                        }
+                    }
+                }
+                Operation::Sum => {
+                    if let Some(&input_id) = inputs.get(0) {
+                        let input_val = &self.nodes.get(&input_id).unwrap().value.clone();
+                        // da = grad * ones_like(a) — grad is a scalar broadcast to a's shape
+                        let grad_scalar = upstream_grad.data.first().copied().unwrap_or(1.0);
+                        let grad_data = vec![grad_scalar; input_val.numel()];
+                        let grad_input = Tensor { shape: input_val.shape.clone(), data: grad_data };
+
+                        if let Some(input) = self.nodes.get_mut(&input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&grad_input),
+                                None => grad_input,
+                            });
+                        }
+                    }
+                }
+                Operation::Mean => {
+                    if let Some(&input_id) = inputs.get(0) {
+                        let input_val = &self.nodes.get(&input_id).unwrap().value.clone();
+                        // da = grad / numel * ones_like(a)
+                        let grad_scalar = upstream_grad.data.first().copied().unwrap_or(1.0);
+                        let numel = input_val.numel() as f32;
+                        let grad_data = vec![grad_scalar / numel; input_val.numel()];
+                        let grad_input = Tensor { shape: input_val.shape.clone(), data: grad_data };
+
+                        if let Some(input) = self.nodes.get_mut(&input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&grad_input),
+                                None => grad_input,
+                            });
+                        }
+                    }
+                }
+                Operation::Reshape { .. } => {
+                    if let Some(&input_id) = inputs.get(0) {
+                        let input_val = &self.nodes.get(&input_id).unwrap().value.clone();
+                        // da = grad.reshape(a.shape)
+                        let grad_input = Tensor {
+                            shape: input_val.shape.clone(),
+                            data: upstream_grad.data.clone(),
+                        };
+
+                        if let Some(input) = self.nodes.get_mut(&input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&grad_input),
+                                None => grad_input,
+                            });
+                        }
+                    }
+                }
+                Operation::Transpose { ref axes } => {
+                    if let Some(&input_id) = inputs.get(0) {
+                        let input_val = &self.nodes.get(&input_id).unwrap().value.clone();
+                        // da = grad.transpose(inverse of axes)
+                        let inv_axes = {
+                            let mut inv = vec![0usize; axes.len()];
+                            for (i, &a) in axes.iter().enumerate() {
+                                inv[a] = i;
+                            }
+                            inv
+                        };
+                        // Compute transposed shape and data
+                        let grad_shape: Vec<usize> = inv_axes.iter().map(|&a| upstream_grad.shape[a]).collect();
+                        let strides: Vec<usize> = {
+                            let mut s = vec![1usize; upstream_grad.shape.len()];
+                            for d in (0..upstream_grad.shape.len() - 1).rev() {
+                                s[d] = s[d + 1] * upstream_grad.shape[d + 1];
+                            }
+                            s
+                        };
+                        let numel = upstream_grad.numel();
+                        let mut grad_data = vec![0.0f32; numel];
+                        for idx in 0..numel {
+                            // Compute multi-index in grad's layout
+                            let mut remaining = idx;
+                            let mut src_multi: Vec<usize> = vec![0; upstream_grad.shape.len()];
+                            for d in 0..upstream_grad.shape.len() {
+                                src_multi[d] = remaining / strides[d];
+                                remaining %= strides[d];
+                            }
+                            // Apply inverse permutation to get input's multi-index
+                            let mut dst_multi: Vec<usize> = vec![0; input_val.shape.len()];
+                            for d in 0..inv_axes.len() {
+                                dst_multi[d] = src_multi[inv_axes[d]];
+                            }
+                            // Compute flat index in output
+                            let mut dst_strides = vec![1usize; dst_multi.len()];
+                            for d in (0..dst_multi.len() - 1).rev() {
+                                dst_strides[d] = dst_strides[d + 1] * grad_shape[d + 1];
+                            }
+                            let mut dst_idx = 0;
+                            for d in 0..dst_multi.len() {
+                                dst_idx += dst_multi[d] * dst_strides[d];
+                            }
+                            grad_data[dst_idx] = upstream_grad.data[idx];
+                        }
+                        let grad_input = Tensor { shape: grad_shape, data: grad_data };
+
+                        if let Some(input) = self.nodes.get_mut(&input_id) {
+                            input.gradient = Some(match &input.gradient {
+                                Some(g) => g.add(&grad_input),
+                                None => grad_input,
+                            });
+                        }
+                    }
+                }
             };
         }
     }

@@ -45,6 +45,7 @@
 // =========================================================================
 
 #![allow(dead_code)]
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use super::io_port::{outb, inb};
 
@@ -165,8 +166,8 @@ const RING_MASK: usize = RING_SIZE - 1;
 /// The byte will never appear on the physical UART because `dequeue()`
 /// only runs outside the transaction.
 pub struct SerialRingBuffer {
-    /// Ring buffer storage.
-    buffer: [u8; RING_SIZE],
+    /// Ring buffer storage (UnsafeCell for interior mutability from &self).
+    buffer: UnsafeCell<[u8; RING_SIZE]>,
     /// Write position (only modified by the producer).
     head: AtomicUsize,
     /// Read position (only modified by the consumer).
@@ -175,11 +176,19 @@ pub struct SerialRingBuffer {
     dropped: AtomicU32,
 }
 
+// SAFETY: SerialRingBuffer is safe to share between threads because:
+// - The buffer is accessed through UnsafeCell for interior mutability
+// - The producer only writes to buffer[head] and updates head atomically
+// - The consumer only reads from buffer[tail] and updates tail atomically
+// - The producer and consumer never access the same cell simultaneously
+//   (guaranteed by the ring buffer invariant: next_head != tail for writes)
+unsafe impl Sync for SerialRingBuffer {}
+
 impl SerialRingBuffer {
     /// Create a new empty ring buffer.
     pub const fn new() -> Self {
         Self {
-            buffer: [0u8; RING_SIZE],
+            buffer: UnsafeCell::new([0u8; RING_SIZE]),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             dropped: AtomicU32::new(0),
@@ -207,8 +216,9 @@ impl SerialRingBuffer {
         // The buffer cell at `head` is not being read by the consumer
         // because `head != tail` (we checked above) and the consumer
         // only reads cells between `tail` and `head`.
+        // UnsafeCell::get() provides a valid mutable pointer for interior mutability.
         unsafe {
-            let ptr = self.buffer.as_ptr().add(head) as *mut u8;
+            let ptr = (self.buffer.get() as *mut u8).add(head);
             core::ptr::write_volatile(ptr, byte);
         }
         self.head.store(next_head, Ordering::Release);
@@ -227,7 +237,7 @@ impl SerialRingBuffer {
         }
 
         let byte = unsafe {
-            let ptr = self.buffer.as_ptr().add(tail);
+            let ptr = (self.buffer.get() as *const u8).add(tail);
             core::ptr::read_volatile(ptr)
         };
         let next_tail = (tail + 1) & RING_MASK;
@@ -511,7 +521,7 @@ impl Console {
         let active_cores = detect_cpu_count_fallback();
         Self {
             port,
-            rings: const_array_of_rings(),
+            rings: create_rings(),
             active_cores,
         }
     }
@@ -523,7 +533,7 @@ impl Console {
         let active_cores = detect_cpu_count_fallback();
         Self {
             port: serial,
-            rings: const_array_of_rings(),
+            rings: create_rings(),
             active_cores,
         }
     }
@@ -593,12 +603,11 @@ impl Default for Console {
     }
 }
 
-/// Helper: create a const array of SerialRingBuffer values.
-/// Required because SerialRingBuffer::new() is const but [T; N] construction
-/// needs either Copy or const initialization.
-const fn const_array_of_rings() -> [SerialRingBuffer; MAX_CORES] {
-    const INIT: SerialRingBuffer = SerialRingBuffer::new();
-    [INIT; MAX_CORES]
+/// Helper: create an array of SerialRingBuffer values.
+/// Uses core::array::from_fn because UnsafeCell is not Copy,
+/// so [INIT; N] array syntax is not available.
+fn create_rings() -> [SerialRingBuffer; MAX_CORES] {
+    core::array::from_fn(|_| SerialRingBuffer::new())
 }
 
 /// Fallback CPU count detection using CPUID — NO external crates.

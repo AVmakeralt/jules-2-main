@@ -57,7 +57,7 @@ impl SpeculativeExecutor {
             let deps_satisfied = task.dependencies.iter()
                 .all(|dep| self.completed.contains(dep));
             
-            if deps_satisfied || task.depth < self.max_depth {
+            if deps_satisfied && task.depth < self.max_depth {
                 let mut spec_task = task.clone();
                 spec_task.depth += 1;
                 self.speculative.push(spec_task);

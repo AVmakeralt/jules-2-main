@@ -372,7 +372,7 @@ impl Parser {
             TokenKind::KwStruct => self.parse_struct(attrs).map(Item::Struct),
             TokenKind::KwComponent => self.parse_component(attrs).map(Item::Component),
             TokenKind::KwEnum => self.parse_enum(attrs).map(Item::Enum),
-            TokenKind::KwConst => self.parse_const().map(Item::Const),
+            TokenKind::KwConst => self.parse_const(_pub).map(Item::Const),
             TokenKind::KwUse => self.parse_use().map(Item::Use),
             TokenKind::KwMod => self.parse_mod(_pub),
             TokenKind::KwAgent => self.parse_agent(attrs).map(Item::Agent),
@@ -520,13 +520,33 @@ impl Parser {
             args.push(expr);
         } else {
             // Keep parity with call args: support `name: value` as a shorthand.
+            // Capture the key name and create an Assign expression so the
+            // key is not silently discarded.
             if matches!(&self.peek().kind, TokenKind::Ident(_))
                 && self.peek2().kind == TokenKind::Colon
             {
-                self.advance();
-                self.advance();
+                // Read the key identifier.
+                let key_span = self.peek().span;
+                let key_name = if let TokenKind::Ident(s) = &self.peek().kind {
+                    s.clone()
+                } else {
+                    unreachable!("checked above")
+                };
+                self.advance(); // consume key ident
+                self.advance(); // consume colon
+                let value = self.parse_expr(0)?;
+                args.push(Expr::Assign {
+                    span: key_span,
+                    op: AssignOpKind::Assign,
+                    target: Box::new(Expr::Ident {
+                        span: key_span,
+                        name: key_name,
+                    }),
+                    value: Box::new(value),
+                });
+            } else {
+                args.push(self.parse_expr(0)?);
             }
-            args.push(self.parse_expr(0)?);
         }
 
         while self.eat(&TokenKind::Comma) {
@@ -536,10 +556,27 @@ impl Parser {
             if matches!(&self.peek().kind, TokenKind::Ident(_))
                 && self.peek2().kind == TokenKind::Colon
             {
-                self.advance();
-                self.advance();
+                let key_span = self.peek().span;
+                let key_name = if let TokenKind::Ident(s) = &self.peek().kind {
+                    s.clone()
+                } else {
+                    unreachable!("checked above")
+                };
+                self.advance(); // consume key ident
+                self.advance(); // consume colon
+                let value = self.parse_expr(0)?;
+                args.push(Expr::Assign {
+                    span: key_span,
+                    op: AssignOpKind::Assign,
+                    target: Box::new(Expr::Ident {
+                        span: key_span,
+                        name: key_name,
+                    }),
+                    value: Box::new(value),
+                });
+            } else {
+                args.push(self.parse_expr(0)?);
             }
-            args.push(self.parse_expr(0)?);
         }
 
         self.expect(&TokenKind::RParen)?;
@@ -859,9 +896,8 @@ impl Parser {
         })
     }
 
-    fn parse_const(&mut self) -> ParseResult<ConstDecl> {
+    fn parse_const(&mut self, is_pub: bool) -> ParseResult<ConstDecl> {
         let start = self.current_span();
-        let is_pub = self.peek().kind == TokenKind::KwPub; // already consumed above
         self.expect(&TokenKind::KwConst)?;
         let (_, name) = self.expect_ident()?;
         self.expect(&TokenKind::Colon)?;
@@ -890,6 +926,7 @@ impl Parser {
             }
             if self.is(&TokenKind::Star) {
                 self.advance();
+                segments.push("*".to_string());
                 break;
             }
         }

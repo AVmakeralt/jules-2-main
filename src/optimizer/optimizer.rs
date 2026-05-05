@@ -335,7 +335,7 @@ impl LrSchedule for ReduceOnPlateau {
         }
         if self.best.is_infinite() {
             self.best = metric;
-            self.bad_epochs = 1;
+            self.bad_epochs = 0;
             if self.bad_epochs >= self.patience {
                 self.current_mul *= self.factor;
                 self.bad_epochs = 0;
@@ -698,18 +698,12 @@ impl Optimizer for Sgd {
                     let g = clip_grad(g, self.hp.grad_clip) + eff_wd * *w;
                     v[j] = self.momentum * v[j] - eff_lr * g;
                     *w += self.momentum * v[j] - eff_lr * g;
-                    if eff_wd > 0.0 {
-                        *w *= 1.0 - (eff_lr * eff_wd * 0.5);
-                    }
                 }
             } else {
                 for (j, (&g, w)) in p.grads.iter().zip(p.weights.iter_mut()).enumerate() {
                     let g = clip_grad(g, self.hp.grad_clip) + eff_wd * *w;
                     v[j] = self.momentum * v[j] - eff_lr * g;
                     *w += v[j];
-                    if eff_wd > 0.0 {
-                        *w *= 1.0 - (eff_lr * eff_wd * 0.5);
-                    }
                 }
             }
         }

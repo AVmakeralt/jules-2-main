@@ -1,4 +1,6 @@
 pub mod aot_native;
+pub mod neural_superblock;
+pub mod temporal_fusion;
 #[cfg(feature = "phase3-jit")]
 pub mod phase3_jit;
 #[cfg(feature = "phase6-simd")]

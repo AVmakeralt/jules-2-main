@@ -54,6 +54,8 @@ pub struct FastNetworkBackend {
     backend: NetworkBackend,
     /// io_uring fast socket (if available)
     fast_socket: Option<crate::runtime::io_uring::FastSocket>,
+    /// TCP stream for Standard backend
+    tcp_stream: Option<TcpStream>,
 }
 
 impl FastNetworkBackend {
@@ -68,6 +70,7 @@ impl FastNetworkBackend {
         Self {
             backend,
             fast_socket,
+            tcp_stream: None,
         }
     }
 
@@ -81,7 +84,22 @@ impl FastNetworkBackend {
         Self {
             backend,
             fast_socket,
+            tcp_stream: None,
         }
+    }
+
+    /// Create with a connected TCP stream for the Standard backend
+    pub fn with_tcp_stream(stream: TcpStream) -> Self {
+        Self {
+            backend: NetworkBackend::Standard,
+            fast_socket: None,
+            tcp_stream: Some(stream),
+        }
+    }
+
+    /// Set or replace the TCP stream used by the Standard backend
+    pub fn set_tcp_stream(&mut self, stream: TcpStream) {
+        self.tcp_stream = Some(stream);
     }
 
     /// Get the active backend type
@@ -96,17 +114,28 @@ impl FastNetworkBackend {
                 if let Some(ref mut socket) = self.fast_socket {
                     socket.fast_send(data)
                 } else {
-                    // Fallback to standard
-                    Ok(data.len())
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "io_uring backend selected but no fast socket available",
+                    ))
                 }
             }
             NetworkBackend::Dpdk => {
-                // DPDK userspace send - in production, this would use rte_eth_tx_burst
-                Ok(data.len())
+                // DPDK userspace send - not yet implemented
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "DPDK backend is not yet implemented",
+                ))
             }
             NetworkBackend::Standard => {
-                // Standard socket I/O - data is consumed by the caller
-                Ok(data.len())
+                if let Some(ref mut stream) = self.tcp_stream {
+                    stream.write(data)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "Standard backend requires a connected TCP stream; use with_tcp_stream() or set_tcp_stream()",
+                    ))
+                }
             }
         }
     }
@@ -118,14 +147,29 @@ impl FastNetworkBackend {
                 if let Some(ref mut socket) = self.fast_socket {
                     socket.fast_recv(buf)
                 } else {
-                    Ok(0)
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "io_uring backend selected but no fast socket available",
+                    ))
                 }
             }
             NetworkBackend::Dpdk => {
-                // DPDK userspace recv - in production, this would use rte_eth_rx_burst
-                Ok(0)
+                // DPDK userspace recv - not yet implemented
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "DPDK backend is not yet implemented",
+                ))
             }
-            NetworkBackend::Standard => Ok(0),
+            NetworkBackend::Standard => {
+                if let Some(ref mut stream) = self.tcp_stream {
+                    stream.read(buf)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "Standard backend requires a connected TCP stream; use with_tcp_stream() or set_tcp_stream()",
+                    ))
+                }
+            }
         }
     }
 
@@ -226,13 +270,19 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_network_backend_send_recv() {
+    fn test_fast_network_backend_send_recv_no_stream() {
         let mut backend = FastNetworkBackend::with_backend(NetworkBackend::Standard);
-        let n = backend.send(b"hello").unwrap();
-        assert_eq!(n, 5);
-
+        // Without a TCP stream, send/recv should return an error
+        assert!(backend.send(b"hello").is_err());
         let mut buf = [0u8; 64];
-        let n = backend.recv(&mut buf).unwrap();
-        assert_eq!(n, 0); // Standard backend has no buffered data
+        assert!(backend.recv(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_fast_network_backend_dpdk_unimplemented() {
+        let mut backend = FastNetworkBackend::with_backend(NetworkBackend::Dpdk);
+        assert!(backend.send(b"hello").is_err());
+        let mut buf = [0u8; 64];
+        assert!(backend.recv(&mut buf).is_err());
     }
 }

@@ -381,6 +381,9 @@ impl LatencyCalibrator {
         let mut nodes: Box<[ChaseNode; N]> = unsafe {
             let layout = std::alloc::Layout::new::<[ChaseNode; N]>();
             let raw = std::alloc::alloc_zeroed(layout) as *mut [ChaseNode; N];
+            if raw.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
             Box::from_raw(raw)
         };
 

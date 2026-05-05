@@ -802,13 +802,46 @@ impl GnnLayer {
 
     /// Forward pass: compute new node representations
     /// h_self: (N, d_in), adj: (N, N) normalized adjacency
-    /// Skip attention for inference speed when N <= 16
+    /// Uses attention mechanism when attn_key/attn_query are available
     pub fn forward(&self, h: &Tensor, adj: &Tensor) -> Tensor {
         // Self transformation
         let h_self = h.matmul(&self.w_self); // (N, d_out)
 
-        // Neighbor aggregation via adjacency (skip full attention for speed)
-        let h_neigh = adj.matmul(h).matmul(&self.w_neigh); // (N, d_out)
+        // Neighbor aggregation — use attention-weighted aggregation when available
+        let h_neigh = if let (Some(attn_key), Some(attn_query)) = (&self.attn_key, &self.attn_query) {
+            // Compute attention scores: query * key^T
+            // q = h @ attn_query  (N, num_heads)
+            // k = h @ attn_key    (N, num_heads)
+            let q = h.matmul(attn_query); // (N, num_heads)
+            let k = h.matmul(attn_key);   // (N, num_heads)
+
+            // attn_scores = q @ k^T / sqrt(num_heads), then softmax row-wise
+            let num_heads = q.cols;
+            let scale = 1.0 / (num_heads as f64).sqrt();
+            let attn_scores = q.matmul(&k.t()).scale(scale).softmax(); // (N, N)
+
+            // Mask attention with adjacency (only attend to neighbors + self)
+            let attn_masked = attn_scores.hadamard(adj); // (N, N)
+
+            // Renormalize attention weights per row
+            let mut attn_normalized = Tensor::zeros(attn_masked.rows, attn_masked.cols);
+            for i in 0..attn_masked.rows {
+                let row_start = i * attn_masked.cols;
+                let row_sum: f64 = attn_masked.data[row_start..row_start + attn_masked.cols].iter().sum();
+                if row_sum > 1e-10 {
+                    for j in 0..attn_masked.cols {
+                        attn_normalized.data[i * attn_masked.cols + j] =
+                            attn_masked.data[i * attn_masked.cols + j] / row_sum;
+                    }
+                }
+            }
+
+            // Weighted neighbor aggregation
+            attn_normalized.matmul(h).matmul(&self.w_neigh) // (N, d_out)
+        } else {
+            // Fallback: simple adjacency-based aggregation (no attention)
+            adj.matmul(h).matmul(&self.w_neigh) // (N, d_out)
+        };
 
         // Combine self + neighbor
         let h_combined = h_self.add(&h_neigh);

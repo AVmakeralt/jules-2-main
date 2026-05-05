@@ -515,7 +515,7 @@ impl AutoVectorizer {
     /// Get candidates sorted by expected speedup
     pub fn candidates_by_speedup(&self) -> Vec<&VectorizationCandidate> {
         let mut candidates: Vec<_> = self.candidates.iter().collect();
-        candidates.sort_by(|a, b| b.speedup.partial_cmp(&a.speedup).unwrap());
+        candidates.sort_by(|a, b| b.speedup.partial_cmp(&a.speedup).unwrap_or(std::cmp::Ordering::Equal));
         candidates
     }
 

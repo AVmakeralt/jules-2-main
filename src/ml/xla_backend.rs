@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use xla_ffi as xla;
 
 /// XLA computation handle
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct XlaComputation {
     pub id: u64,
     pub hlo_ir: String, // HLO (High Level Optimizer) IR representation
@@ -23,6 +23,19 @@ pub struct XlaComputation {
     pub cpu_ops: Vec<CpuOp>,
     #[cfg(feature = "xla")]
     pub native_handle: Option<*mut std::ffi::c_void>, // Native XLA computation handle
+}
+
+impl Clone for XlaComputation {
+    fn clone(&self) -> Self {
+        XlaComputation {
+            id: self.id,
+            hlo_ir: self.hlo_ir.clone(),
+            compiled: self.compiled,
+            cpu_ops: self.cpu_ops.clone(),
+            #[cfg(feature = "xla")]
+            native_handle: None, // Do NOT clone raw pointers — avoid double-free
+        }
+    }
 }
 
 // =========================================================================

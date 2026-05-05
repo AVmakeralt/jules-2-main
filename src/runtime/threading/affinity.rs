@@ -133,18 +133,16 @@ fn set_thread_affinity_windows(cpu_id: usize) -> Result<(), String> {
 #[cfg(feature = "numa")]
 #[cfg(target_os = "linux")]
 pub fn set_thread_affinity_for_thread(thread: &std::thread::Thread, cpu_id: usize) -> Result<(), String> {
-    use libc::{pthread_self, pthread_setaffinity_np};
-    
     unsafe {
         let mut cpuset: cpu_set_t = std::mem::zeroed();
         CPU_ZERO(&mut cpuset);
         CPU_SET(cpu_id as i32, &mut cpuset);
-        
-        // Get the pthread_t from the thread handle
-        // Note: This is a simplified approach - in production would use proper thread ID extraction
-        let pthread_id = pthread_self();
-        let result = pthread_setaffinity_np(pthread_id, std::mem::size_of::<cpu_set_t>(), &cpuset);
-        
+
+        // Use the target thread's OS ID instead of pthread_self() (current thread).
+        // sched_setaffinity operates on the tid (which equals the pid of the thread).
+        let tid = thread.id().as_u64().get() as libc::pid_t;
+        let result = sched_setaffinity(tid, std::mem::size_of::<cpu_set_t>(), &cpuset);
+
         if result == 0 {
             Ok(())
         } else {

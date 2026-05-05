@@ -115,24 +115,36 @@ pub fn register_rseq() -> bool {
         
         #[cfg(target_os = "linux")]
         {
-            // Register rseq via syscall
-            // On glibc 2.35+, registration happens automatically
-            // We simulate the registration here
-            let _rseq_ptr = &state.rseq as *const Rseq as *const libc::c_void;
-            let _rseq_size = std::mem::size_of::<Rseq>() as libc::size_t;
-            let _flags = 0;
-            let _sig = 0;
-            
+            let rseq_ptr = &state.rseq as *const Rseq as *const libc::c_void;
+            let rseq_len = std::mem::size_of::<Rseq>() as libc::size_t;
+            let flags: u32 = 0;
+            let sig: u32 = 0;
+
+            // Perform the actual rseq registration syscall
             // syscall(__NR_rseq, &rseq, sizeof(rseq), flags, sig)
-            // Use libc::syscall if available, otherwise mark as registered
-            // Since glibc 2.35+ auto-registers, we just mark it
-            state.registered.store(true, Ordering::Release);
-            
-            // Get current CPU ID via sched_getcpu
-            let cpu_id = unsafe { libc::sched_getcpu() };
-            state.rseq.cpu_id.store(cpu_id as u32, Ordering::Release);
-            
-            true
+            let ret = unsafe {
+                libc::syscall(
+                    334, // __NR_rseq on x86_64
+                    rseq_ptr as libc::c_ulong,
+                    rseq_len as libc::c_ulong,
+                    flags as libc::c_ulong,
+                    sig as libc::c_ulong,
+                )
+            };
+
+            if ret == 0 {
+                // Registration succeeded — now safe to mark as registered
+                state.registered.store(true, Ordering::Release);
+
+                // Get current CPU ID via sched_getcpu
+                let cpu_id = unsafe { libc::sched_getcpu() };
+                state.rseq.cpu_id.store(cpu_id as u32, Ordering::Release);
+
+                true
+            } else {
+                // Syscall failed; do NOT set registered = true
+                false
+            }
         }
         
         #[cfg(not(target_os = "linux"))]
@@ -222,13 +234,22 @@ impl<T> PerCpu<T> {
     
     /// Get the value for the current CPU (wait-free with rseq)
     pub fn get(&self) -> &T {
-        let cpu_id = get_cpu_id().filter(|&id| id < self.num_cpus).unwrap_or(0);
+        let cpu_id = get_cpu_id().filter(|&id| id < self.num_cpus).unwrap_or_else(|| {
+            // When rseq is unavailable, use sched_getcpu() or a thread-ID-based
+            // fallback instead of always returning CPU 0, which would cause data
+            // races when multiple threads share the same slot.
+            let cpu = unsafe { libc::sched_getcpu() } as usize;
+            if cpu < self.num_cpus { cpu } else { cpu % self.num_cpus }
+        });
         &self.data[cpu_id]
     }
     
     /// Get mutable reference for the current CPU (wait-free with rseq)
     pub fn get_mut(&mut self) -> &mut T {
-        let cpu_id = get_cpu_id().filter(|&id| id < self.num_cpus).unwrap_or(0);
+        let cpu_id = get_cpu_id().filter(|&id| id < self.num_cpus).unwrap_or_else(|| {
+            let cpu = unsafe { libc::sched_getcpu() } as usize;
+            if cpu < self.num_cpus { cpu } else { cpu % self.num_cpus }
+        });
         &mut self.data[cpu_id]
     }
     

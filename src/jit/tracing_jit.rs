@@ -724,7 +724,7 @@ impl NativeCodeGenerator {
     fn sub_rax_rcx(&mut self) { self.bbb(0x48, 0x29, 0xC8); }
     fn imul_rax_rcx(&mut self) { self.bbbb(0x48, 0x0F, 0xAF, 0xC1); }
     fn idiv_rax_rcx(&mut self) { self.bbb(0x48, 0x99, 0xF7); self.b(0xF1); }
-    fn irem_rax_rcx(&mut self) { self.bbb(0x48, 0x99, 0xF7); self.b(0xF1); }
+    fn irem_rax_rcx(&mut self) { self.bbb(0x48, 0x99, 0xF7); self.b(0xF1); self.bbb(0x48, 0x89, 0xD0); /* mov rax, rdx — remainder from RDX */ }
     fn and_rax_rcx(&mut self) { self.bbb(0x48, 0x21, 0xC8); }
     fn or_rax_rcx(&mut self) { self.bbb(0x48, 0x09, 0xC8); }
     fn xor_rax_rcx(&mut self) { self.bbb(0x48, 0x31, 0xC8); }
@@ -822,7 +822,7 @@ impl TracingJIT {
                 if let Some(t) = self.recorder.get_trace_mut(tid) { t.execution_count += 1; }
             }
         }
-        if self.should_start_tracing(100) { self.recorder.start_recording(entry_pc); self.traces_recorded += 1; }
+        if self.should_start_tracing(self.trace_trigger) { self.recorder.start_recording(entry_pc); self.traces_recorded += 1; }
         Err(RuntimeError::new("Interpreter fallback: JIT trace hot but not compiled, or guard failed"))
     }
 }

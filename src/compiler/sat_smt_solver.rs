@@ -272,10 +272,10 @@ impl SatSmtSolver {
     /// Propagate a constraint to update ranges
     fn propagate_constraint(&self, constraint: &Constraint) -> Option<HashMap<VarId, ValueRange>> {
         match constraint {
-            Constraint::Lt(left, right) => self.propagate_comparison(left, right, |a, b| a < b),
-            Constraint::Le(left, right) => self.propagate_comparison(left, right, |a, b| a <= b),
-            Constraint::Gt(left, right) => self.propagate_comparison(left, right, |a, b| a > b),
-            Constraint::Ge(left, right) => self.propagate_comparison(left, right, |a, b| a >= b),
+            Constraint::Lt(left, right) => self.propagate_comparison(left, right, ComparisonOp::Lt),
+            Constraint::Le(left, right) => self.propagate_comparison(left, right, ComparisonOp::Le),
+            Constraint::Gt(left, right) => self.propagate_comparison(left, right, ComparisonOp::Gt),
+            Constraint::Ge(left, right) => self.propagate_comparison(left, right, ComparisonOp::Ge),
             Constraint::Eq(left, right) => self.propagate_equality(left, right),
             Constraint::Ne(left, right) => self.propagate_inequality(left, right),
             Constraint::Bool(_) => None,
@@ -287,33 +287,57 @@ impl SatSmtSolver {
         &self,
         left: &ArithExpr,
         right: &ArithExpr,
-        compare: fn(i64, i64) -> bool,
+        op: ComparisonOp,
     ) -> Option<HashMap<VarId, ValueRange>> {
         let mut new_ranges = HashMap::new();
 
         if let (ArithExpr::Var(left_var), ArithExpr::Const(right_const)) = (left, right) {
             let left_range = self.get_range(*left_var);
             if left_range.known {
-                // If left < right_const, then left.max < right_const
-                let new_max = if compare(left_range.max, *right_const) {
-                    left_range.max
-                } else {
-                    *right_const - 1
-                };
-                new_ranges.insert(*left_var, ValueRange::new(left_range.min, new_max));
+                match op {
+                    ComparisonOp::Lt => {
+                        // left < right_const => left.max = right_const - 1
+                        new_ranges.insert(*left_var, ValueRange::new(left_range.min, right_const - 1));
+                    }
+                    ComparisonOp::Le => {
+                        // left <= right_const => left.max = right_const
+                        new_ranges.insert(*left_var, ValueRange::new(left_range.min, *right_const));
+                    }
+                    ComparisonOp::Gt => {
+                        // left > right_const => left.min = right_const + 1
+                        new_ranges.insert(*left_var, ValueRange::new(right_const + 1, left_range.max));
+                    }
+                    ComparisonOp::Ge => {
+                        // left >= right_const => left.min = right_const
+                        new_ranges.insert(*left_var, ValueRange::new(*right_const, left_range.max));
+                    }
+                    _ => {}
+                }
             }
         }
 
         if let (ArithExpr::Const(left_const), ArithExpr::Var(right_var)) = (left, right) {
             let right_range = self.get_range(*right_var);
             if right_range.known {
-                // If left_const < right, then right.min > left_const
-                let new_min = if compare(*left_const, right_range.min) {
-                    right_range.min
-                } else {
-                    *left_const + 1
-                };
-                new_ranges.insert(*right_var, ValueRange::new(new_min, right_range.max));
+                match op {
+                    ComparisonOp::Lt => {
+                        // left_const < right => right.min = left_const + 1
+                        new_ranges.insert(*right_var, ValueRange::new(left_const + 1, right_range.max));
+                    }
+                    ComparisonOp::Le => {
+                        // left_const <= right => right.min = left_const
+                        new_ranges.insert(*right_var, ValueRange::new(*left_const, right_range.max));
+                    }
+                    ComparisonOp::Gt => {
+                        // left_const > right => right.max = left_const - 1
+                        new_ranges.insert(*right_var, ValueRange::new(right_range.min, left_const - 1));
+                    }
+                    ComparisonOp::Ge => {
+                        // left_const >= right => right.max = left_const
+                        new_ranges.insert(*right_var, ValueRange::new(right_range.min, *left_const));
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -356,14 +380,36 @@ impl SatSmtSolver {
 
     /// Propagate inequality constraint
     fn propagate_inequality(&self, left: &ArithExpr, right: &ArithExpr) -> Option<HashMap<VarId, ValueRange>> {
-        let new_ranges = HashMap::new();
+        let mut new_ranges = HashMap::new();
 
         if let (ArithExpr::Var(var), ArithExpr::Const(const_val)) = (left, right) {
             let range = self.get_range(*var);
-            if range.known && range.is_constant() && range.min == *const_val {
-                // If var == const_val, this constraint is unsatisfiable
-                // Return empty map to indicate conflict
-                return Some(HashMap::new());
+            if range.known {
+                if range.is_constant() && range.min == *const_val {
+                    // If var == const_val, this constraint is unsatisfiable
+                    // Return empty map to indicate conflict
+                    return Some(HashMap::new());
+                }
+                // var != const_val: remove const_val from range if possible
+                if range.min == *const_val {
+                    new_ranges.insert(*var, ValueRange::new(const_val + 1, range.max));
+                } else if range.max == *const_val {
+                    new_ranges.insert(*var, ValueRange::new(range.min, const_val - 1));
+                }
+            }
+        }
+
+        if let (ArithExpr::Const(const_val), ArithExpr::Var(var)) = (right, left) {
+            let range = self.get_range(*var);
+            if range.known {
+                if range.is_constant() && range.min == *const_val {
+                    return Some(HashMap::new());
+                }
+                if range.min == *const_val {
+                    new_ranges.insert(*var, ValueRange::new(const_val + 1, range.max));
+                } else if range.max == *const_val {
+                    new_ranges.insert(*var, ValueRange::new(range.min, const_val - 1));
+                }
             }
         }
 

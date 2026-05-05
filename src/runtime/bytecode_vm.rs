@@ -435,6 +435,7 @@ pub struct BytecodeCompiler {
     break_labels: Vec<usize>,     // positions of Jump instructions to patch at loop end
     loop_starts: Vec<usize>,      // PC at the start of each enclosing loop (for continue)
     loop_continue_starts: Vec<usize>, // PC of the continue target for each enclosing loop
+    break_labels_at_loop_start: Vec<usize>, // break_labels.len() when each loop was entered
 }
 
 impl BytecodeCompiler {
@@ -451,6 +452,7 @@ impl BytecodeCompiler {
             break_labels: Vec::new(),
             loop_starts: Vec::new(),
             loop_continue_starts: Vec::new(),
+            break_labels_at_loop_start: Vec::new(),
         }
     }
 
@@ -901,18 +903,9 @@ impl BytecodeCompiler {
     /// innermost loop (i.e. those recorded after the last `loop_starts.push()`).
     fn patch_break_labels(&mut self, loop_end: usize) {
         // Break labels belonging to the innermost loop are the ones recorded
-        // after the current loop's loop_start was pushed.  Since we haven't
-        // popped loop_starts yet, the count of break labels to patch equals
-        // the total minus those that existed before this loop started.
-        let _depth = self.loop_starts.len();
-        // Collect the break positions that belong to this loop.
-        let split_point = {
-            // We track how many break labels were already present when we
-            // entered this loop by remembering the count at loop entry.
-            // Since we don't store that, we use a simple heuristic:
-            // all break_labels belong to the innermost loop for now.
-            0
-        };
+        // after the current loop's loop_start was pushed.  We pop the saved
+        // count from break_labels_at_loop_start to get the correct split point.
+        let split_point = self.break_labels_at_loop_start.pop().unwrap_or(0);
         let labels: Vec<usize> = self.break_labels.drain(split_point..).collect();
         for pos in labels {
             self.patch_jump_offset_to(pos, loop_end);
@@ -1042,6 +1035,7 @@ impl BytecodeCompiler {
             Stmt::While { cond, body, .. } => {
                 let loop_start = self.current_function.instructions.len();
                 self.loop_starts.push(loop_start);
+                self.break_labels_at_loop_start.push(self.break_labels.len());
 
                 // Continue target for while loops is the condition check
                 self.loop_continue_starts.push(loop_start);
@@ -1049,10 +1043,6 @@ impl BytecodeCompiler {
                 let cond_slot = self.alloc_slot();
                 self.compile_expr(cond, cond_slot)?;
                 let jump_end_pos = self.emit_jump_false(cond_slot);
-
-                // Track how many break labels exist before the body, so we
-                // can patch only the ones belonging to this loop.
-                let break_count_before = self.break_labels.len();
 
                 self.compile_block(body, 0)?;
 
@@ -1062,11 +1052,7 @@ impl BytecodeCompiler {
                 // Patch: condition-jump and all break jumps land here
                 let loop_end = self.current_function.instructions.len();
                 self.patch_jump_offset(jump_end_pos);
-                // Patch break labels that were recorded inside this loop body
-                let labels: Vec<usize> = self.break_labels.drain(break_count_before..).collect();
-                for pos in labels {
-                    self.patch_jump_offset_to(pos, loop_end);
-                }
+                self.patch_break_labels(loop_end);
 
                 self.loop_starts.pop();
                 self.loop_continue_starts.pop();
@@ -1074,21 +1060,17 @@ impl BytecodeCompiler {
             Stmt::Loop { body, .. } => {
                 let loop_start = self.current_function.instructions.len();
                 self.loop_starts.push(loop_start);
+                self.break_labels_at_loop_start.push(self.break_labels.len());
 
                 // Continue target for `loop` is the body start
                 self.loop_continue_starts.push(loop_start);
-
-                let break_count_before = self.break_labels.len();
 
                 self.compile_block(body, 0)?;
 
                 self.emit_backward_jump(loop_start);
 
                 let loop_end = self.current_function.instructions.len();
-                let labels: Vec<usize> = self.break_labels.drain(break_count_before..).collect();
-                for pos in labels {
-                    self.patch_jump_offset_to(pos, loop_end);
-                }
+                self.patch_break_labels(loop_end);
 
                 self.loop_starts.pop();
                 self.loop_continue_starts.pop();
@@ -1116,12 +1098,12 @@ impl BytecodeCompiler {
                 // loop_body:
                 let loop_body_start = self.current_function.instructions.len();
                 self.loop_starts.push(loop_body_start);
+                self.break_labels_at_loop_start.push(self.break_labels.len());
 
                 // Load element at current index
                 self.emit(Instr::LoadIndex { dst: elem_slot, arr: iter_slot, idx: index_slot });
 
                 // Compile body
-                let break_count_before = self.break_labels.len();
                 self.compile_block(body, 0)?;
 
                 // continue_target: increment index
@@ -1142,10 +1124,7 @@ impl BytecodeCompiler {
 
                 // loop_end:
                 let loop_end = self.current_function.instructions.len();
-                let labels: Vec<usize> = self.break_labels.drain(break_count_before..).collect();
-                for pos in labels {
-                    self.patch_jump_offset_to(pos, loop_end);
-                }
+                self.patch_break_labels(loop_end);
 
                 self.loop_starts.pop();
                 self.loop_continue_starts.pop();

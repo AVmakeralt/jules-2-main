@@ -663,7 +663,8 @@ impl PciEnumerator {
             _ => 0,
         };
 
-        for i in 0..max_bars {
+        let mut i = 0;
+        while i < max_bars {
             let bar_offset = 0x10 + (i as u8) * 4;
             let bar_lo = self.read_config(bus, device, function, bar_offset);
 
@@ -675,8 +676,8 @@ impl PciEnumerator {
                 let bar_hi = self.read_config(bus, device, function, bar_offset + 4);
                 bars[i] = ((bar_hi as u64) << 32) | ((bar_lo as u64) & !0xF);
                 bar_count = i + 1;
-                // Skip next BAR (it's the upper 32 bits)
-                // Note: we consume the next slot implicitly
+                // Skip next BAR slot (it's the upper 32 bits of this 64-bit BAR)
+                i += 1;
             } else if is_io {
                 bars[i] = (bar_lo as u64) & !0x3;
                 bar_count = i + 1;
@@ -685,6 +686,7 @@ impl PciEnumerator {
                 bars[i] = (bar_lo as u64) & !0xF;
                 bar_count = i + 1;
             }
+            i += 1;
         }
 
         // For PCI bridges, read secondary/subordinate bus numbers

@@ -587,7 +587,7 @@ pub extern "C" fn jules_check_code_ffi(source: *const c_char) -> JulesError {
 }
 
 #[no_mangle]
-pub extern "C" fn julius_free_string(s: *mut c_char) {
+pub extern "C" fn jules_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             let _ = CString::from_raw(s);

@@ -319,9 +319,27 @@ impl HwFeedbackCollector {
             attr.config = *config;
             attr.flags = 1; // disabled=1 so we can enable after grouping
 
+            // Architecture-dependent syscall number for perf_event_open.
+            // x86-64: 298, aarch64: 241, riscv64: 241, arm: 364
+            #[cfg(target_arch = "x86_64")]
+            let syscall_nr: i64 = 298;
+            #[cfg(target_arch = "aarch64")]
+            let syscall_nr: i64 = 241;
+            #[cfg(target_arch = "riscv64")]
+            let syscall_nr: i64 = 241;
+            #[cfg(target_arch = "arm")]
+            let syscall_nr: i64 = 364;
+            #[cfg(not(any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "arm"
+            )))]
+            let syscall_nr: i64 = -1; // unsupported — will fail gracefully
+
             let fd = unsafe {
                 libc::syscall(
-                    298, // __NR_perf_event_open on x86-64
+                    syscall_nr,
                     &attr as *const PerfEventAttr as *const libc::c_void,
                     0,   // pid: 0 = current process
                     -1i32 as libc::c_ulong, // cpu: -1 = any
@@ -636,9 +654,11 @@ impl FeedbackLoopController {
         Ok(suggestions)
     }
 
-    /// Check if converged
+    /// Check if converged.
+    /// Returns `false` when no iterations have run yet (no previous metrics),
+    /// since convergence cannot be determined without a prior measurement.
     pub fn is_converged(&self) -> bool {
-        self.iterations >= self.max_iterations || self.previous_metrics.is_none()
+        self.previous_metrics.is_some() && self.iterations >= self.max_iterations
     }
 
     /// Get current metrics

@@ -274,16 +274,32 @@ impl LoomModelChecker {
 
     /// Detect data races
     fn detect_data_race(&self, state: &MemoryState, trace: &[ThreadOp]) -> Option<String> {
-        // Find concurrent accesses to same address without synchronization
-        let mut access_map: HashMap<usize, Vec<(usize, bool)>> = HashMap::new(); // addr -> vec<(thread_id, is_write)>
-        
+        // Find concurrent accesses to same address without synchronization.
+        // Track which lock each thread holds at each point in the trace, so
+        // that accesses protected by the same lock are not flagged as races.
+
+        // For each access, record: (addr, thread_id, is_write, lock_held)
+        // where lock_held is the lock_id the thread held at the time of access,
+        // or None if no lock was held.
+        let mut access_map: HashMap<usize, Vec<(usize, bool, Option<usize>)>> = HashMap::new();
+
+        // Walk the trace to determine lock ownership at each access.
+        let mut held_locks: HashMap<usize, usize> = HashMap::new(); // thread_id -> lock_id
         for op in trace {
             match op {
                 ThreadOp::Read { addr, thread_id } => {
-                    access_map.entry(*addr).or_default().push((*thread_id, false));
+                    let lock = held_locks.get(thread_id).copied();
+                    access_map.entry(*addr).or_default().push((*thread_id, false, lock));
                 }
                 ThreadOp::Write { addr, thread_id, .. } => {
-                    access_map.entry(*addr).or_default().push((*thread_id, true));
+                    let lock = held_locks.get(thread_id).copied();
+                    access_map.entry(*addr).or_default().push((*thread_id, true, lock));
+                }
+                ThreadOp::LockAcquire { lock_id, thread_id, .. } => {
+                    held_locks.insert(*thread_id, *lock_id);
+                }
+                ThreadOp::LockRelease { thread_id, .. } => {
+                    held_locks.remove(thread_id);
                 }
                 _ => {}
             }
@@ -292,10 +308,36 @@ impl LoomModelChecker {
         for (addr, accesses) in &access_map {
             if accesses.len() > 1 {
                 // Check if there's a write-write or write-read race
-                let has_write = accesses.iter().any(|(_, is_write)| *is_write);
-                let multiple_threads: HashSet<_> = accesses.iter().map(|(tid, _)| tid).collect();
+                let has_write = accesses.iter().any(|(_, is_write, _)| *is_write);
+                let multiple_threads: HashSet<_> = accesses.iter().map(|(tid, _, _)| tid).collect();
                 
                 if has_write && multiple_threads.len() > 1 {
+                    // Check if all conflicting accesses are protected by the
+                    // same lock. If every pair of accesses from different
+                    // threads share at least one common lock, it's not a race.
+                    let all_protected = accesses.iter().all(|(_, _, lock)| lock.is_some());
+                    if all_protected {
+                        // Collect the set of locks protecting each access.
+                        let locks: HashSet<_> = accesses.iter()
+                            .filter_map(|(_, _, lock)| *lock)
+                            .collect();
+                        // If all accesses share a single common lock, they are
+                        // properly synchronized and not a data race.
+                        if locks.len() == 1 {
+                            continue; // Not a race — same lock protects all accesses.
+                        }
+                        // Multiple different locks: check if there's a pair of
+                        // accesses from different threads where at least one is
+                        // a write and they don't share a common lock.
+                        let has_unprotected_pair = accesses.iter().any(|(t1, w1, l1)| {
+                            *w1 && accesses.iter().any(|(t2, w2, l2)| {
+                                t1 != t2 && (*w1 || *w2) && l1 != l2
+                            })
+                        });
+                        if !has_unprotected_pair {
+                            continue; // All conflicting accesses share a lock.
+                        }
+                    }
                     return Some(format!("Data race detected at address 0x{:x}", addr));
                 }
             }

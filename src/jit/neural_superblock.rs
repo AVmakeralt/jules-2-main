@@ -584,7 +584,7 @@ impl NeuralTracingJIT {
         let superblock = CompiledSuperblock {
             block_id,
             decision,
-            estimated_ipc: self.gnn.predict_ipc(&graph, &self.predictor.arch),
+            estimated_ipc: self.predictor.gnn.predict_ipc(&graph, &self.predictor.arch),
         };
 
         self.compiled_traces.insert(block_id, superblock.clone());

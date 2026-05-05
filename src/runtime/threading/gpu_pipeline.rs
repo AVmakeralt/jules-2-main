@@ -137,10 +137,10 @@ pub struct GpuTaskHandle {
     id: u64,
     /// Completed flag
     completed: AtomicBool,
-    /// Result data
-    result: Vec<f32>,
-    /// Error message
-    error: Option<String>,
+    /// Result data (protected by Mutex for interior mutability behind Arc)
+    result: std::sync::Mutex<Vec<f32>>,
+    /// Error message (protected by Mutex for interior mutability behind Arc)
+    error: std::sync::Mutex<Option<String>>,
 }
 
 impl GpuTaskHandle {
@@ -149,8 +149,8 @@ impl GpuTaskHandle {
         Self {
             id,
             completed: AtomicBool::new(false),
-            result: Vec::new(),
-            error: None,
+            result: std::sync::Mutex::new(Vec::new()),
+            error: std::sync::Mutex::new(None),
         }
     }
 
@@ -160,28 +160,30 @@ impl GpuTaskHandle {
     }
 
     /// Mark as completed with result
-    pub fn complete(&mut self, result: Vec<f32>) {
-        self.result = result;
+    pub fn complete(&self, result: Vec<f32>) {
+        *self.result.lock().unwrap() = result;
         self.completed.store(true, Ordering::Release);
     }
 
     /// Mark as failed with error
-    pub fn fail(&mut self, error: String) {
-        self.error = Some(error);
+    pub fn fail(&self, error: String) {
+        *self.error.lock().unwrap() = Some(error);
         self.completed.store(true, Ordering::Release);
     }
 
     /// Get result (blocks if not completed)
-    pub fn get_result(&self) -> Result<&[f32], &str> {
+    pub fn get_result(&self) -> Result<std::sync::MutexGuard<'_, Vec<f32>>, String> {
         while !self.is_completed() {
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
         
-        if let Some(ref error) = self.error {
-            Err(error)
-        } else {
-            Ok(&self.result)
+        let err = self.error.lock().unwrap();
+        if err.is_some() {
+            return Err(err.clone().unwrap());
         }
+        drop(err);
+        
+        Ok(self.result.lock().unwrap())
     }
 
     /// Get the task ID
@@ -241,9 +243,9 @@ impl GpuBuffer {
 /// GPU pipeline for double-buffered execution
 pub struct GpuPipeline {
     /// Pending tasks
-    pending: Arc<std::sync::Mutex<Vec<GpuTaskHandle>>>,
+    pending: Arc<std::sync::Mutex<Vec<Arc<GpuTaskHandle>>>>,
     /// Completed tasks
-    completed: Arc<std::sync::Mutex<Vec<GpuTaskHandle>>>,
+    completed: Arc<std::sync::Mutex<Vec<Arc<GpuTaskHandle>>>>,
     /// Next task ID
     next_id: AtomicUsize,
     /// Double buffer state
@@ -292,10 +294,13 @@ impl GpuPipeline {
         buffer.task_id.store(id, Ordering::Release);
         buffer.set_state(BufferState::Processing);
         
-        // Add to pending
-        let mut pending = self.pending.lock().unwrap();
-        pending.push(GpuTaskHandle::new(id));
-        
+        // Add the SAME Arc to the pending queue so that the returned handle
+        // is the one that gets marked as completed during execution.
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.push(handle.clone());
+        }
+
         // Swap buffers
         let next_idx = (buffer_idx + 1) % self.buffers.len();
         self.buffer_index.store(next_idx, Ordering::Release);
@@ -316,12 +321,12 @@ impl GpuPipeline {
             // Simulate GPU work
             std::thread::sleep(std::time::Duration::from_millis(10));
             
-            // Move from pending to completed
+            // Find the handle in pending and mark it as completed via the shared Arc
             let mut pending = pending.lock().unwrap();
             let mut completed = completed.lock().unwrap();
             
-            if let Some(pos) = pending.iter().position(|t| t.id == task_id) {
-                let mut task = pending.remove(pos);
+            if let Some(pos) = pending.iter().position(|t| t.id() == task_id) {
+                let task = pending.remove(pos);
                 task.complete(data);
                 completed.push(task);
             }
@@ -331,13 +336,7 @@ impl GpuPipeline {
     /// Poll for completed tasks
     pub fn poll(&self) -> Vec<Arc<GpuTaskHandle>> {
         let mut completed = self.completed.lock().unwrap();
-        let mut results = Vec::new();
-        
-        if !completed.is_empty() {
-            results = completed.drain(..).map(Arc::new).collect();
-        }
-        
-        results
+        std::mem::take(&mut *completed)
     }
 
     /// Get current buffer index for double-buffering
@@ -416,10 +415,10 @@ impl GpuPipeline {
         buffer.task_id.store(id, Ordering::Release);
         buffer.set_state(BufferState::Processing);
 
-        // Create a handle and push it onto the pending queue.
-        let handle = GpuTaskHandle::new(id);
+        // Create a shared handle and push it onto the pending queue.
+        let handle = Arc::new(GpuTaskHandle::new(id));
         let mut pending = self.pending.lock().unwrap();
-        pending.push(handle);
+        pending.push(handle.clone());
 
         // Advance the double-buffer index for the next submission.
         let next_idx = (buffer_idx + 1) % self.buffers.len();
@@ -443,8 +442,8 @@ impl GpuPipeline {
             let mut pending = pending_arc.lock().unwrap();
             let mut completed = completed_arc.lock().unwrap();
 
-            if let Some(pos) = pending.iter().position(|t| t.id == id) {
-                let mut task = pending.remove(pos);
+            if let Some(pos) = pending.iter().position(|t| t.id() == id) {
+                let task = pending.remove(pos);
                 task.complete(result);
                 completed.push(task);
             }

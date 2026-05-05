@@ -618,7 +618,13 @@ impl BorrowChecker {
                 self.check_block(body);
                 self.pop_scope();
             }
-            Stmt::EntityFor { body, .. } | Stmt::While { body, .. } | Stmt::Loop { body, .. } => {
+            Stmt::EntityFor { var, body, .. } => {
+                self.push_scope();
+                self.bind_var(var);
+                self.check_block(body);
+                self.pop_scope();
+            }
+            Stmt::While { body, .. } | Stmt::Loop { body, .. } => {
                 self.check_block(body)
             }
             Stmt::If {

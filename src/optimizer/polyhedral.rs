@@ -1450,6 +1450,38 @@ impl Default for PolyhedralOptimizer {
     }
 }
 
+/// Error type for polyhedral optimizer operations.
+///
+/// Replaces `panic!()` calls with structured errors that callers can handle
+/// gracefully instead of crashing in production.
+#[derive(Debug, Clone)]
+pub enum PolyhedralError {
+    /// Expected a specific pattern (e.g., `Pattern::Ident`) but got something else.
+    UnexpectedPattern { expected: &'static str },
+    /// Expected a `ForIn` statement at a specific position in the loop nest.
+    ExpectedForIn { position: &'static str },
+    /// Expected a specific expression kind (e.g., `Expr::Ident`) but got something else.
+    UnexpectedExpr { expected: &'static str },
+}
+
+impl std::fmt::Display for PolyhedralError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PolyhedralError::UnexpectedPattern { expected } => {
+                write!(f, "Expected {} pattern", expected)
+            }
+            PolyhedralError::ExpectedForIn { position } => {
+                write!(f, "Expected ForIn statement at {}", position)
+            }
+            PolyhedralError::UnexpectedExpr { expected } => {
+                write!(f, "Expected {} expression", expected)
+            }
+        }
+    }
+}
+
+impl std::error::Error for PolyhedralError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1601,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn test_loop_interchange() {
+    fn test_loop_interchange() -> Result<(), PolyhedralError> {
         // Build: for i in 0..M { for j in 0..N { body } }
         let body_stmt = expr_stmt(add_assign_expr(
             index_expr("C", vec![ident("i"), ident("j")]),
@@ -1630,25 +1662,26 @@ mod tests {
             Stmt::ForIn { pattern, body, .. } => {
                 match pattern {
                     Pattern::Ident { name, .. } => assert_eq!(name, "j"),
-                    _ => panic!("Expected Ident pattern"),
+                    _ => return Err(PolyhedralError::UnexpectedPattern { expected: "Ident" }),
                 }
                 assert_eq!(body.stmts.len(), 1);
                 match &body.stmts[0] {
                     Stmt::ForIn { pattern, .. } => {
                         match pattern {
                             Pattern::Ident { name, .. } => assert_eq!(name, "i"),
-                            _ => panic!("Expected Ident pattern"),
+                            _ => return Err(PolyhedralError::UnexpectedPattern { expected: "Ident" }),
                         }
                     }
-                    _ => panic!("Expected inner ForIn"),
+                    _ => return Err(PolyhedralError::ExpectedForIn { position: "inner" }),
                 }
             }
-            _ => panic!("Expected ForIn"),
+            _ => return Err(PolyhedralError::ExpectedForIn { position: "outermost" }),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_loop_interchange_triple() {
+    fn test_loop_interchange_triple() -> Result<(), PolyhedralError> {
         // Build: for i in 0..M { for j in 0..N { for k in 0..K { body } } }
         let body_stmt = expr_stmt(add_assign_expr(
             index_expr("C", vec![ident("i"), ident("j")]),
@@ -1683,31 +1716,32 @@ mod tests {
                 // Outermost: i
                 match pattern {
                     Pattern::Ident { name, .. } => assert_eq!(name, "i"),
-                    _ => panic!("Expected Ident pattern"),
+                    _ => return Err(PolyhedralError::UnexpectedPattern { expected: "Ident" }),
                 }
                 match &body.stmts[0] {
                     Stmt::ForIn { pattern, body, .. } => {
                         // Middle: k
                         match pattern {
                             Pattern::Ident { name, .. } => assert_eq!(name, "k"),
-                            _ => panic!("Expected Ident pattern"),
+                            _ => return Err(PolyhedralError::UnexpectedPattern { expected: "Ident" }),
                         }
                         match &body.stmts[0] {
                             Stmt::ForIn { pattern, .. } => {
                                 // Innermost: j
                                 match pattern {
                                     Pattern::Ident { name, .. } => assert_eq!(name, "j"),
-                                    _ => panic!("Expected Ident pattern"),
+                                    _ => return Err(PolyhedralError::UnexpectedPattern { expected: "Ident" }),
                                 }
                             }
-                            _ => panic!("Expected inner ForIn"),
+                            _ => return Err(PolyhedralError::ExpectedForIn { position: "innermost" }),
                         }
                     }
-                    _ => panic!("Expected middle ForIn"),
+                    _ => return Err(PolyhedralError::ExpectedForIn { position: "middle" }),
                 }
             }
-            _ => panic!("Expected ForIn"),
+            _ => return Err(PolyhedralError::ExpectedForIn { position: "outermost" }),
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -1715,7 +1749,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_loop_tiling_double() {
+    fn test_loop_tiling_double() -> Result<(), PolyhedralError> {
         // Build: for i in 0..M { for j in 0..N { body } }
         let body_stmt = expr_stmt(add_assign_expr(
             index_expr("C", vec![ident("i"), ident("j")]),
@@ -1756,11 +1790,12 @@ mod tests {
             Stmt::ForIn { pattern, .. } => {
                 match pattern {
                     Pattern::Ident { name, .. } => assert_eq!(name, "tile_i"),
-                    _ => panic!("Expected Ident pattern for tile_i"),
+                    _ => return Err(PolyhedralError::UnexpectedPattern { expected: "Ident for tile_i" }),
                 }
             }
-            _ => panic!("Expected ForIn"),
+            _ => return Err(PolyhedralError::ExpectedForIn { position: "outermost" }),
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -1878,7 +1913,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fuse_loops_merges_bodies() {
+    fn test_fuse_loops_merges_bodies() -> Result<(), PolyhedralError> {
         let loop1 = for_in("i", range(int_lit(0), ident("N")), vec![
             expr_stmt(Expr::Assign {
                 span: d(),
@@ -1909,17 +1944,18 @@ mod tests {
             Stmt::ForIn { pattern, body, .. } => {
                 match pattern {
                     Pattern::Ident { name, .. } => assert_eq!(name, "i"),
-                    _ => panic!("Expected Ident pattern"),
+                    _ => return Err(PolyhedralError::UnexpectedPattern { expected: "Ident" }),
                 }
                 // Body should contain both statements
                 assert_eq!(body.stmts.len(), 2);
             }
-            _ => panic!("Expected ForIn"),
+            _ => return Err(PolyhedralError::ExpectedForIn { position: "outermost" }),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_apply_fusion_on_block() {
+    fn test_apply_fusion_on_block() -> Result<(), PolyhedralError> {
         let loop1 = for_in("i", range(int_lit(0), ident("N")), vec![
             expr_stmt(Expr::Assign {
                 span: d(),
@@ -1958,8 +1994,9 @@ mod tests {
             Stmt::ForIn { body, .. } => {
                 assert_eq!(body.stmts.len(), 2);
             }
-            _ => panic!("Expected ForIn"),
+            _ => return Err(PolyhedralError::ExpectedForIn { position: "outermost" }),
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -1967,17 +2004,18 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_extract_range_upper_bound_range() {
+    fn test_extract_range_upper_bound_range() -> Result<(), PolyhedralError> {
         let iter = range(int_lit(0), ident("M"));
         let ub = PolyhedralOptimizer::extract_range_upper_bound(&iter);
         match ub {
             Expr::Ident { name, .. } => assert_eq!(name, "M"),
-            _ => panic!("Expected Ident for upper bound"),
+            _ => return Err(PolyhedralError::UnexpectedExpr { expected: "Ident" }),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_extract_range_upper_bound_lt() {
+    fn test_extract_range_upper_bound_lt() -> Result<(), PolyhedralError> {
         let iter = Expr::BinOp {
             span: d(),
             op: BinOpKind::Lt,
@@ -1987,8 +2025,9 @@ mod tests {
         let ub = PolyhedralOptimizer::extract_range_upper_bound(&iter);
         match ub {
             Expr::Ident { name, .. } => assert_eq!(name, "M"),
-            _ => panic!("Expected Ident for upper bound"),
+            _ => return Err(PolyhedralError::UnexpectedExpr { expected: "Ident" }),
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -1996,7 +2035,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_build_nested_loop_roundtrip() {
+    fn test_build_nested_loop_roundtrip() -> Result<(), PolyhedralError> {
         let body_stmt = expr_stmt(add_assign_expr(
             index_expr("C", vec![ident("i"), ident("j")]),
             int_lit(1),
@@ -2028,21 +2067,22 @@ mod tests {
             Stmt::ForIn { pattern, body, .. } => {
                 match pattern {
                     Pattern::Ident { name, .. } => assert_eq!(name, "i"),
-                    _ => panic!("Expected Ident"),
+                    _ => return Err(PolyhedralError::UnexpectedPattern { expected: "Ident" }),
                 }
                 assert_eq!(body.stmts.len(), 1);
                 match &body.stmts[0] {
                     Stmt::ForIn { pattern, body, .. } => {
                         match pattern {
                             Pattern::Ident { name, .. } => assert_eq!(name, "j"),
-                            _ => panic!("Expected Ident"),
+                            _ => return Err(PolyhedralError::UnexpectedPattern { expected: "Ident" }),
                         }
                         assert_eq!(body.stmts.len(), 1);
                     }
-                    _ => panic!("Expected inner ForIn"),
+                    _ => return Err(PolyhedralError::ExpectedForIn { position: "inner" }),
                 }
             }
-            _ => panic!("Expected ForIn"),
+            _ => return Err(PolyhedralError::ExpectedForIn { position: "outermost" }),
         }
+        Ok(())
     }
 }

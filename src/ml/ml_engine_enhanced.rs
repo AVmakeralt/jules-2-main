@@ -263,7 +263,14 @@ impl Tensor {
         assert_eq!(self.shape, other.shape, "Shape mismatch in division");
         let data = self.data.iter()
             .zip(&other.data)
-            .map(|(a, b)| a / (b + 1e-10))
+            .map(|(a, b)| {
+                let safe_b = if b.abs() < 1e-10 {
+                    1e-10 * if *b >= 0.0 { 1.0 } else { -1.0 }
+                } else {
+                    *b
+                };
+                a / safe_b
+            })
             .collect();
         Tensor {
             shape: self.shape.clone(),
@@ -480,7 +487,7 @@ impl Tensor {
     pub fn gelu(&self) -> Tensor {
         let data = self.data.iter()
             .map(|x| {
-                let cdf = 0.5 * (1.0 + (std::f32::consts::PI * x * x / 8.0).sqrt().tanh());
+                let cdf = 0.5 * (1.0 + (2.0f32 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x * x * x)).tanh();
                 x * cdf
             })
             .collect();
@@ -524,7 +531,7 @@ impl Tensor {
 
     pub fn mish(&self) -> Tensor {
         let data = self.data.iter()
-            .map(|x| x * (1.0 + (-x.powi(2)).exp()).sqrt().tanh())
+            .map(|x| x * (1.0 + x.exp().max(1e-7)).ln().tanh())
             .collect();
         Tensor {
             shape: self.shape.clone(),
@@ -627,16 +634,62 @@ impl Tensor {
     // Normalization Operations
     // =========================================================================
 
+    /// Batch normalization: computes mean and variance **per channel** (across
+    /// batch and spatial dims). Expects tensor shape `[N, C, …]` where dim 1 is
+    /// the channel dimension. `gamma`/`beta` should have shape `[C]`.
     pub fn batch_norm(&self, gamma: &Tensor, beta: &Tensor, _momentum: f32, epsilon: f32) -> (Tensor, f32, f32) {
-        let mean = self.mean();
-        let variance = self.variance();
+        assert!(self.shape.len() >= 2, "batch_norm requires at least 2D tensor");
+        let n = self.shape[0];       // batch size
+        let c = self.shape[1];       // channels
+        let spatial: usize = if self.shape.len() > 2 {
+            self.shape[2..].iter().product()
+        } else {
+            1
+        };
+        let count_per_channel = (n * spatial).max(1);
 
-        let data: Vec<f32> = self.data.iter()
-            .map(|x| {
-                let normalized = (x - mean) / (variance + epsilon).sqrt();
-                gamma.data[0] * normalized + beta.data[0]
+        // Per-channel mean and variance
+        let mut channel_means = vec![0.0f32; c];
+        let mut channel_vars = vec![0.0f32; c];
+
+        for ch in 0..c {
+            let mut sum = 0.0f32;
+            for batch in 0..n {
+                for sp in 0..spatial {
+                    let idx = batch * c * spatial + ch * spatial + sp;
+                    sum += self.data[idx];
+                }
+            }
+            channel_means[ch] = sum / count_per_channel as f32;
+        }
+
+        for ch in 0..c {
+            let mut var_sum = 0.0f32;
+            let mean = channel_means[ch];
+            for batch in 0..n {
+                for sp in 0..spatial {
+                    let idx = batch * c * spatial + ch * spatial + sp;
+                    let d = self.data[idx] - mean;
+                    var_sum += d * d;
+                }
+            }
+            channel_vars[ch] = var_sum / count_per_channel as f32;
+        }
+
+        // Normalize per channel
+        let data: Vec<f32> = (0..self.numel())
+            .map(|i| {
+                let ch = (i / spatial) % c;
+                let normalized = (self.data[i] - channel_means[ch]) / (channel_vars[ch] + epsilon).sqrt();
+                let g = if ch < gamma.data.len() { gamma.data[ch] } else { gamma.data[0] };
+                let b_val = if ch < beta.data.len() { beta.data[ch] } else { beta.data[0] };
+                g * normalized + b_val
             })
             .collect();
+
+        // Return average mean/variance for API compatibility
+        let avg_mean = channel_means.iter().sum::<f32>() / c.max(1) as f32;
+        let avg_var = channel_vars.iter().sum::<f32>() / c.max(1) as f32;
 
         (
             Tensor {
@@ -644,21 +697,47 @@ impl Tensor {
                 data,
                 requires_grad: self.requires_grad,
             },
-            mean,
-            variance,
+            avg_mean,
+            avg_var,
         )
     }
 
+    /// Layer normalization: computes mean and variance **per sample** (across
+    /// feature dims). Expects tensor shape `[N, D]` or `[N, …]` where each
+    /// sample (row) is normalized independently. `gamma`/`beta` should have
+    /// shape `[D]` (or `[last_dim]`).
     pub fn layer_norm(&self, gamma: &Tensor, beta: &Tensor, epsilon: f32) -> Tensor {
-        let mean = self.mean();
-        let variance = self.variance();
+        assert!(self.shape.len() >= 2, "layer_norm requires at least 2D tensor");
+        let n = self.shape[0];       // number of samples
+        let feat: usize = self.shape[1..].iter().product(); // features per sample
 
-        let data: Vec<f32> = self.data.iter()
-            .map(|x| {
-                let normalized = (x - mean) / (variance + epsilon).sqrt();
-                gamma.data[0] * normalized + beta.data[0]
-            })
-            .collect();
+        let mut data = vec![0.0f32; self.numel()];
+
+        for sample in 0..n {
+            let base = sample * feat;
+            // Per-sample mean
+            let mut sum = 0.0f32;
+            for d in 0..feat {
+                sum += self.data[base + d];
+            }
+            let mean = sum / feat.max(1) as f32;
+
+            // Per-sample variance
+            let mut var_sum = 0.0f32;
+            for d in 0..feat {
+                let diff = self.data[base + d] - mean;
+                var_sum += diff * diff;
+            }
+            let variance = var_sum / feat.max(1) as f32;
+
+            // Normalize per sample
+            for d in 0..feat {
+                let normalized = (self.data[base + d] - mean) / (variance + epsilon).sqrt();
+                let g = if d < gamma.data.len() { gamma.data[d] } else { gamma.data[0] };
+                let b_val = if d < beta.data.len() { beta.data[d] } else { beta.data[0] };
+                data[base + d] = g * normalized + b_val;
+            }
+        }
 
         Tensor {
             shape: self.shape.clone(),
@@ -748,9 +827,20 @@ impl Tensor {
         let mut new_shape = self.shape.clone();
         new_shape[axis] += other.shape[axis];
 
+        let outer_size: usize = if axis > 0 { self.shape[..axis].iter().product() } else { 1 };
+        let self_axis = self.shape[axis];
+        let other_axis = other.shape[axis];
+        let inner_size: usize = if axis + 1 < self.shape.len() { self.shape[axis + 1..].iter().product() } else { 1 };
+
         let mut data = Vec::with_capacity(self.numel() + other.numel());
-        data.extend_from_slice(&self.data);
-        data.extend_from_slice(&other.data);
+        for g in 0..outer_size {
+            // Copy self's slice for this group
+            let src_offset = g * self_axis * inner_size;
+            data.extend_from_slice(&self.data[src_offset..src_offset + self_axis * inner_size]);
+            // Copy other's slice for this group
+            let src_offset = g * other_axis * inner_size;
+            data.extend_from_slice(&other.data[src_offset..src_offset + other_axis * inner_size]);
+        }
 
         Tensor {
             shape: new_shape,
@@ -763,15 +853,19 @@ impl Tensor {
         let mut result = Vec::new();
         let mut start = 0;
 
+        let outer_size: usize = if axis > 0 { self.shape[..axis].iter().product() } else { 1 };
+        let inner_size: usize = if axis + 1 < self.shape.len() { self.shape[axis + 1..].iter().product() } else { 1 };
+
         for &idx in &indices {
+            let chunk_axis = idx - start;
             let mut new_shape = self.shape.clone();
-            new_shape[axis] = idx - start;
+            new_shape[axis] = chunk_axis;
 
-            let elements_per_chunk = self.numel() / self.shape[axis];
-            let _chunk_size = (idx - start) * elements_per_chunk;
-
-            let data = self.data[start * elements_per_chunk..(start + idx - start) * elements_per_chunk]
-                .to_vec();
+            let mut data = Vec::with_capacity(outer_size * chunk_axis * inner_size);
+            for g in 0..outer_size {
+                let src_offset = (g * self.shape[axis] + start) * inner_size;
+                data.extend_from_slice(&self.data[src_offset..src_offset + chunk_axis * inner_size]);
+            }
 
             result.push(Tensor {
                 shape: new_shape,
@@ -796,9 +890,15 @@ impl Tensor {
         let mut new_shape = first_shape.clone();
         new_shape.insert(axis, tensors.len());
 
-        let mut data = Vec::new();
-        for tensor in tensors {
-            data.extend_from_slice(&tensor.data);
+        let outer_size: usize = if axis > 0 { first_shape[..axis].iter().product() } else { 1 };
+        let inner_size: usize = if axis + 1 < first_shape.len() { first_shape[axis..].iter().product() } else { 1 };
+
+        let mut data = Vec::with_capacity(tensors.len() * tensors[0].numel());
+        for g in 0..outer_size {
+            for tensor in tensors {
+                let src_offset = g * inner_size;
+                data.extend_from_slice(&tensor.data[src_offset..src_offset + inner_size]);
+            }
         }
 
         Tensor {
@@ -1030,7 +1130,7 @@ impl LossFunctions {
             .sum::<f32>()
             .sqrt();
 
-        (1.0 * pos_dist.powi(2) + 0.0 * (margin - pos_dist).max(0.0).powi(2)) / 2.0
+        (1.0 * pos_dist.powi(2) + (margin - pos_dist).max(0.0).powi(2)) / 2.0
     }
 
     /// Ranking Loss (pairwise ranking)

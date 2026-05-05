@@ -31,13 +31,13 @@ pub struct GreenContext {
     id: GreenThreadId,
     /// Completed flag
     completed: AtomicBool,
-    /// Function to execute
-    func: Option<fn()>,
+    /// Function to execute (boxed closure)
+    func: Option<Box<dyn FnOnce()>>,
 }
 
 impl GreenContext {
     /// Create a new green thread context
-    pub fn new(id: GreenThreadId, stack_size: usize, func: fn()) -> Self {
+    pub fn new(id: GreenThreadId, stack_size: usize, func: Box<dyn FnOnce()>) -> Self {
         let stack = vec![0u8; stack_size];
         let stack_base = Box::into_raw(stack.into_boxed_slice()) as *mut u8 as usize;
         
@@ -75,8 +75,12 @@ impl Drop for GreenContext {
     fn drop(&mut self) {
         if self.stack_base != 0 {
             unsafe {
-                let stack = std::slice::from_raw_parts_mut(self.stack_base as *mut u8, self.stack_size);
-                let _ = Box::from_raw(stack);
+                // Reconstruct Box<[u8]> with proper slice metadata.
+                // The original allocation was Box<[u8]> (boxed slice), so we must
+                // use slice_from_raw_parts to provide the length metadata that
+                // Box::from_raw expects.
+                let ptr = std::ptr::slice_from_raw_parts_mut(self.stack_base as *mut u8, self.stack_size);
+                let _ = Box::from_raw(ptr);
             }
         }
     }
@@ -136,42 +140,42 @@ extern "C" fn context_switch(
     unsafe {
         // Save current context
         asm!(
-            "mov x19, [x4]",
-            "mov x20, [x4, 8]",
-            "mov x21, [x4, 16]",
-            "mov x22, [x4, 24]",
-            "mov x23, [x4, 32]",
-            "mov x24, [x4, 40]",
-            "mov x25, [x4, 48]",
-            "mov x26, [x4, 56]",
-            "mov x27, [x4, 64]",
-            "mov x28, [x4, 72]",
-            "mov x29, [x4, 80]",
-            "mov [x0], sp",
-            "mov [x0, 8], x19",
-            "mov [x0, 16], x20",
-            "mov [x0, 24], x21",
-            "mov [x0, 32], x22",
-            "mov [x0, 40], x23",
-            "mov [x0, 48], x24",
-            "mov [x0, 56], x25",
-            "mov [x0, 64], x26",
-            "mov [x0, 72], x27",
-            "mov [x0, 80], x28",
-            "mov [x0, 88], x29",
+            "ldr x19, [x4]",
+            "ldr x20, [x4, 8]",
+            "ldr x21, [x4, 16]",
+            "ldr x22, [x4, 24]",
+            "ldr x23, [x4, 32]",
+            "ldr x24, [x4, 40]",
+            "ldr x25, [x4, 48]",
+            "ldr x26, [x4, 56]",
+            "ldr x27, [x4, 64]",
+            "ldr x28, [x4, 72]",
+            "ldr x29, [x4, 80]",
+            "str sp, [x0]",
+            "str x19, [x0, 8]",
+            "str x20, [x0, 16]",
+            "str x21, [x0, 24]",
+            "str x22, [x0, 32]",
+            "str x23, [x0, 40]",
+            "str x24, [x0, 48]",
+            "str x25, [x0, 56]",
+            "str x26, [x0, 64]",
+            "str x27, [x0, 72]",
+            "str x28, [x0, 80]",
+            "str x29, [x0, 88]",
             // Restore new context
             "mov sp, x1",
-            "mov x19, [x5]",
-            "mov x20, [x5, 8]",
-            "mov x21, [x5, 16]",
-            "mov x22, [x5, 24]",
-            "mov x23, [x5, 32]",
-            "mov x24, [x5, 40]",
-            "mov x25, [x5, 48]",
-            "mov x26, [x5, 56]",
-            "mov x27, [x5, 64]",
-            "mov x28, [x5, 72]",
-            "mov x29, [x5, 80]",
+            "ldr x19, [x5]",
+            "ldr x20, [x5, 8]",
+            "ldr x21, [x5, 16]",
+            "ldr x22, [x5, 24]",
+            "ldr x23, [x5, 32]",
+            "ldr x24, [x5, 40]",
+            "ldr x25, [x5, 48]",
+            "ldr x26, [x5, 56]",
+            "ldr x27, [x5, 64]",
+            "ldr x28, [x5, 72]",
+            "ldr x29, [x5, 80]",
             in("x0") old_sp,
             in("x1") new_sp,
             in("x4") old_regs,
@@ -250,18 +254,14 @@ impl GreenScheduler {
     }
 
     /// Spawn a new green thread
-    pub fn spawn<F>(&self, _f: F) -> GreenThreadId
+    pub fn spawn<F>(&self, f: F) -> GreenThreadId
     where
         F: FnOnce() + Send + 'static,
     {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) as GreenThreadId;
         
-        // Create green thread context with 8KB stack
-        // Note: We need to store the closure, which is complex with the current design
-        // Use a simplified approach for closure execution
-        let context = Box::new(GreenContext::new(id, STACK_SIZE, || {
-            // Execute the closure - in production, would use proper closure storage
-        }));
+        // Create green thread context, storing the closure for execution
+        let context = Box::new(GreenContext::new(id, STACK_SIZE, Box::new(f)));
         
         let mut contexts = self.contexts.lock().unwrap();
         contexts.insert(id, context);
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_green_context() {
-        let context = GreenContext::new(1, 8192, || {});
+        let context = GreenContext::new(1, 8192, Box::new(|| {}));
         assert!(!context.is_completed());
         context.complete();
         assert!(context.is_completed());
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_green_context_id() {
-        let context = GreenContext::new(42, 8192, || {});
+        let context = GreenContext::new(42, 8192, Box::new(|| {}));
         assert_eq!(context.id(), 42);
     }
 }

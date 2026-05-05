@@ -62,7 +62,7 @@
 // =============================================================================
 
 use crate::compiler::borrowck::{Lifetime, AccessPattern};
-use crate::runtime::memory_management::MemoryTier;
+// MemoryTier was removed; MemoryTierId is defined locally below
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -539,6 +539,8 @@ unsafe fn libc_move_pages(
         in("r8")  status as u64,       // int __user *status
         in("r9")  flags as u64,        // int flags
         out("rax") ret,
+        out("rcx") _,
+        out("r11") _,
         options(nostack)
     );
     // Linux syscalls return -errno on error (as a small negative number)
@@ -713,10 +715,12 @@ impl PageMigrationScheduler {
         } else {
             self.migration_stats.total_migrations_aborted += 1;
         }
+        let total_count = self.migration_stats.total_migrations_completed
+            + self.migration_stats.total_migrations_aborted;
         self.migration_stats.average_migration_time_ns = 
-            (self.migration_stats.average_migration_time_ns * (self.migration_stats.total_migrations_completed + self.migration_stats.total_migrations_aborted - 1) as f64
+            (self.migration_stats.average_migration_time_ns * total_count.saturating_sub(1) as f64
                 + total_duration_ns as f64)
-            / (self.migration_stats.total_migrations_completed + self.migration_stats.total_migrations_aborted) as f64;
+            / total_count.max(1) as f64;
         
         MigrationResult {
             allocation_id: request.allocation_id,
@@ -814,7 +818,7 @@ impl TierMigrationValidator {
         
         // Cache and return
         let validation_result = ValidationResult {
-            is_safe: result.is_sat(), // UNSAT means definitely safe
+            is_safe: !result.is_sat(), // UNSAT means definitely safe
             proof: result.proof(),
             constraints: self.extract_constraints(&result),
         };

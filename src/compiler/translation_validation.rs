@@ -113,7 +113,7 @@ pub enum AbstractValue {
 }
 
 /// Symbolic execution state
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolicState {
     /// Variable values
     pub values: HashMap<VarId, AbstractValue>,
@@ -347,8 +347,12 @@ impl TranslationValidator {
 
                     // Merge states
                     let merged = self.merge_states(&state, &succ_state);
-                    states.insert(*succ, merged);
-                    worklist.push(*succ);
+
+                    // Fixed-point: only push successor if state changed
+                    if states.get(succ) != Some(&merged) {
+                        states.insert(*succ, merged);
+                        worklist.push(*succ);
+                    }
                 }
             }
         }

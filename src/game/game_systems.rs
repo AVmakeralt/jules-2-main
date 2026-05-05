@@ -205,8 +205,7 @@ impl PhysicsWorld {
             return;
         } // Already separating
 
-        let inv_mass_sum = 1.0 / (mass1 + mass2);
-        let impulse = -dvn / inv_mass_sum;
+        let impulse = -dvn * (mass1 * mass2) / (mass1 + mass2);
 
         if let Some(body1) = self.bodies.get_mut(&id1) {
             if body1.mass > 0.0 {

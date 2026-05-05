@@ -155,6 +155,8 @@ struct Board {
     black_pawn_count: i32,
     white_advance_sum: f32,
     black_advance_sum: f32,
+    white_king_captured: bool,
+    black_king_captured: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -198,6 +200,8 @@ impl Board {
             black_pawn_count: 8,
             white_advance_sum: 8.0,
             black_advance_sum: 8.0,
+            white_king_captured: false,
+            black_king_captured: false,
         }
     }
 
@@ -267,7 +271,7 @@ impl Board {
                     }
                 }
             }
-            n += king_moves(self.white_king, self.black_king, occ, true, &mut out[n..]);
+            n += king_moves(self.white_king, self.black_king, self.white_pawns, &mut out[n..]);
         } else {
             let mut bb = self.black_pawns;
             while bb != 0 {
@@ -304,7 +308,7 @@ impl Board {
                     }
                 }
             }
-            n += king_moves(self.black_king, self.white_king, occ, false, &mut out[n..]);
+            n += king_moves(self.black_king, self.white_king, self.black_pawns, &mut out[n..]);
         }
         n
     }
@@ -332,6 +336,7 @@ impl Board {
             }
             if self.black_king == mv.to {
                 self.done = true;
+                self.black_king_captured = true;
                 reward += 1.0;
             }
             if mv.to >= 56 {
@@ -353,6 +358,7 @@ impl Board {
             }
             if self.white_king == mv.to {
                 self.done = true;
+                self.white_king_captured = true;
                 reward -= 1.0;
             }
             if mv.to < 8 {
@@ -365,8 +371,10 @@ impl Board {
 }
 
 #[inline]
-fn king_moves(own_king: u8, enemy_king: u8, occ: u64, white: bool, out: &mut [Move]) -> usize {
-    let _ = white;
+/// Generate king moves. `friendly_occ` is a bitmask of squares occupied by
+/// friendly pieces (pawns). The king cannot move onto those squares but can
+/// still capture enemy pieces on other occupied squares.
+fn king_moves(own_king: u8, _enemy_king: u8, friendly_occ: u64, out: &mut [Move]) -> usize {
     let r = (own_king / 8) as i32;
     let c = (own_king % 8) as i32;
     let mut n = 0;
@@ -382,7 +390,7 @@ fn king_moves(own_king: u8, enemy_king: u8, occ: u64, white: bool, out: &mut [Mo
             }
             let to = (nr * 8 + nc) as u8;
             let b = 1u64 << to;
-            if to != enemy_king && (occ & b) != 0 {
+            if (friendly_occ & b) != 0 {
                 continue;
             }
             out[n] = Move { from: own_king, to };
@@ -462,7 +470,7 @@ pub fn train_chess_policy_batched_from(
                 grads.apply(&mut weights, 0.002f32);
             }
         }
-        if b.black_king != 60 {
+        if b.black_king_captured {
             wins += 1;
         } else if b.black_pawn_count == 0 {
             wins += 1;
@@ -528,7 +536,7 @@ pub fn eval_policy_vs_random(
             };
             b.apply_move(chosen);
         }
-        if b.black_king != 60 || b.black_pawn_count == 0 {
+        if b.black_king_captured || b.black_pawn_count == 0 {
             wins += 1;
         }
     }

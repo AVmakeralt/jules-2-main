@@ -67,17 +67,31 @@ struct ExecMem {
     arena_backed: bool,
 }
 
-struct ExecArena {
+/// A single stable chunk of executable memory within the arena.
+/// Chunks are never reallocated — once allocated, their base pointer
+/// remains valid until the entire arena is dropped.  This prevents
+/// dangling function pointers when the arena needs more space.
+struct ArenaChunk {
     base: NonNull<u8>,
-    len: usize,
+    capacity: usize,
+    /// The global offset at which this chunk begins.
+    start_offset: usize,
+}
+
+struct ExecArena {
+    /// Chain of stable chunks.  New allocations go to the latest chunk;
+    /// if it's full, a new chunk is appended (never reallocated).
+    chunks: Vec<ArenaChunk>,
+    /// Total bytes used across all chunks (global offset for next allocation).
     cursor: usize,
-    // Fixed: track all allocated code regions for fixup after growth
     allocations: Vec<(usize, usize)>, // (offset, size) of each allocation
 }
 
 impl Drop for ExecArena {
     fn drop(&mut self) {
-        unsafe { munmap(self.base.as_ptr().cast(), self.len) };
+        for chunk in &self.chunks {
+            unsafe { munmap(chunk.base.as_ptr().cast(), chunk.capacity) };
+        }
     }
 }
 
@@ -126,59 +140,83 @@ impl ExecArena {
             libc::madvise(ptr, Self::DEFAULT_LEN, libc::MADV_HUGEPAGE);
         }
 
-        Some(Self {
+        let chunk = ArenaChunk {
             base: NonNull::new(ptr.cast::<u8>())?,
-            len: Self::DEFAULT_LEN,
+            capacity: Self::DEFAULT_LEN,
+            start_offset: 0,
+        };
+
+        Some(Self {
+            chunks: vec![chunk],
             cursor: 0,
             allocations: Vec::new(),
         })
     }
 
-    /// Get current pointer from offset (handles arena growth safely)
+    /// Resolve a global offset to a pointer by finding the owning chunk.
+    /// Each chunk is stable (never moved), so the returned pointer remains
+    /// valid for the lifetime of the arena.
     fn get_ptr(&self, offset: usize) -> *const u8 {
-        unsafe { self.base.as_ptr().add(offset) }
+        for chunk in &self.chunks {
+            if offset >= chunk.start_offset && offset < chunk.start_offset + chunk.capacity {
+                let local = offset - chunk.start_offset;
+                return unsafe { chunk.base.as_ptr().add(local) };
+            }
+        }
+        panic!("Invalid arena offset: {}", offset)
     }
 
     fn alloc(&mut self, bytes: usize) -> Option<usize> {
         let aligned = (bytes + 15) & !15;
-        let next = self.cursor.checked_add(aligned)?;
-        if next > self.len {
-            // Grow exponentially: double the arena size, capped at 128 MiB.
-            let new_len = (self.len * 2).min(128 * 1024 * 1024);
-            let new_ptr = unsafe {
-                mmap(
-                    std::ptr::null_mut(),
-                    new_len,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANON,
-                    -1,
-                    0,
-                )
-            };
-            if new_ptr.is_null() || new_ptr == libc::MAP_FAILED {
-                return None;
+
+        // Try to allocate from the latest chunk.
+        if let Some(chunk) = self.chunks.last() {
+            let used_in_chunk = self.cursor - chunk.start_offset;
+            if used_in_chunk + aligned <= chunk.capacity {
+                let offset = self.cursor;
+                self.allocations.push((offset, bytes));
+                self.cursor += aligned;
+                return Some(offset);
             }
-            // Copy existing code to the new arena.
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.base.as_ptr(), new_ptr.cast::<u8>(), self.cursor);
-            }
-            // Unmap the old arena.
-            unsafe { munmap(self.base.as_ptr().cast(), self.len) };
-            self.base = NonNull::new(new_ptr.cast::<u8>())?;
-            self.len = new_len;
-            // All NativeCode objects use get_ptr() which computes the current address from the offset
-            // No dangling pointers since offsets are always valid
         }
+
+        // Current chunk is full — allocate a new stable chunk instead of
+        // reallocating (which would invalidate existing function pointers).
+        let new_capacity = aligned.max(
+            self.chunks.last().map_or(Self::DEFAULT_LEN, |c| (c.capacity * 2).min(128 * 1024 * 1024))
+        );
+        let new_ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                new_capacity,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if new_ptr.is_null() || new_ptr == libc::MAP_FAILED {
+            return None;
+        }
+
+        let start_offset = self.cursor;
+        let chunk = ArenaChunk {
+            base: NonNull::new(new_ptr.cast::<u8>())?,
+            capacity: new_capacity,
+            start_offset,
+        };
+        self.chunks.push(chunk);
+
         let offset = self.cursor;
         self.allocations.push((offset, bytes));
-        self.cursor = next;
+        self.cursor += aligned;
         Some(offset)
     }
 }
 
 impl Drop for ExecMem {
     fn drop(&mut self) {
-        if !self.arena_backed && self.offset > 0 && self.len > 0 {
+        if !self.arena_backed && !self.ptr.is_null() && self.len > 0 {
             // For non-arena-backed allocations, unmap the memory to prevent leaks.
             // Arena-backed allocations are freed when the arena itself is dropped.
             unsafe {

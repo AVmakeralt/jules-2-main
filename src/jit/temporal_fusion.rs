@@ -63,7 +63,8 @@
 // =============================================================================
 
 use crate::compiler::ast::*;
-use crate::optimizer::ml_superopt::{MlSuperoptimizer, TilingParams};
+#[cfg(feature = "gnn-optimizer")]
+use crate::optimizer::ml_superopt::{MlSuperoptimizer, TilingParams, TilingSearchResult};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -124,6 +125,21 @@ pub struct CodeLocation {
     pub function: String,
     pub offset_bytes: u64,
 }
+
+impl std::hash::Hash for CodeLocation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.function.hash(state);
+        self.offset_bytes.hash(state);
+    }
+}
+
+impl PartialEq for CodeLocation {
+    fn eq(&self, other: &Self) -> bool {
+        self.function == other.function && self.offset_bytes == other.offset_bytes
+    }
+}
+
+impl Eq for CodeLocation {}
 
 /// Statistics on temporal fusion effectiveness.
 #[derive(Debug, Clone, Default)]
@@ -196,18 +212,32 @@ pub struct MicroSequenceDetector {
     min_occurrences: u64,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MicroSequence {
     /// Instructions in the sequence.
     ops: Vec<MicroOp>,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MicroOp {
     opcode: String,
     read_regs: HashSet<String>,
     write_regs: HashSet<String>,
     has_memory: bool,
+}
+
+impl std::hash::Hash for MicroOp {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.opcode.hash(state);
+        self.has_memory.hash(state);
+        // Hash sorted register names for determinism
+        let mut read: Vec<&String> = self.read_regs.iter().collect();
+        read.sort();
+        for r in read { r.hash(state); }
+        let mut write: Vec<&String> = self.write_regs.iter().collect();
+        write.sort();
+        for r in write { r.hash(state); }
+    }
 }
 
 impl MicroSequenceDetector {
@@ -257,30 +287,30 @@ impl MicroSequenceDetector {
             IrInstruction::Load { dst, src, .. } => MicroOp {
                 opcode: "load".to_string(),
                 read_regs: HashSet::new(),
-                write_regs: [*dst].iter().map(|s| s.to_string()).collect(),
+                write_regs: [dst.clone()].iter().map(|s| s.to_string()).collect(),
                 has_memory: true,
             },
             IrInstruction::Store { dst, src, .. } => MicroOp {
                 opcode: "store".to_string(),
-                read_regs: [*src, *dst].iter().map(|s| s.to_string()).collect(),
+                read_regs: [src.clone(), dst.clone()].iter().map(|s| s.to_string()).collect(),
                 write_regs: HashSet::new(),
                 has_memory: true,
             },
             IrInstruction::Add { dst, lhs, rhs } => MicroOp {
                 opcode: "add".to_string(),
-                read_regs: [*lhs, *rhs].iter().map(|s| s.to_string()).collect(),
-                write_regs: [*dst].iter().map(|s| s.to_string()).collect(),
+                read_regs: [lhs.clone(), rhs.clone()].iter().map(|s| s.to_string()).collect(),
+                write_regs: [dst.clone()].iter().map(|s| s.to_string()).collect(),
                 has_memory: false,
             },
             IrInstruction::Cmp { lhs, rhs } => MicroOp {
                 opcode: "cmp".to_string(),
-                read_regs: [*lhs, *rhs].iter().map(|s| s.to_string()).collect(),
+                read_regs: [lhs.clone(), rhs.clone()].iter().map(|s| s.to_string()).collect(),
                 write_regs: HashSet::new(),
                 has_memory: false,
             },
             IrInstruction::Br { cond, .. } => MicroOp {
                 opcode: "br".to_string(),
-                read_regs: [*cond].iter().map(|s| s.to_string()).collect(),
+                read_regs: [cond.clone()].iter().map(|s| s.to_string()).collect(),
                 write_regs: HashSet::new(),
                 has_memory: false,
             },
@@ -327,7 +357,7 @@ impl CrossLocationCorrelator {
         self.sequence_locations
             .entry(seq_id)
             .or_insert_with(Vec::new)
-            .push(location);
+            .push(location.clone());
         
         self.location_functions.insert(
             format!("{}:{}", location.function, location.offset_bytes),
@@ -454,7 +484,7 @@ impl MicroarchitectureModel {
         let mut total_instructions = 0u32;
         
         for seq in sequences {
-            total_instructions += seq.instructions.len();
+            total_instructions += seq.instructions.len() as u32;
             total_microops += seq.microop_cost;
         }
         
@@ -656,10 +686,10 @@ impl MacroOpEmitter {
             match op.opcode.as_str() {
                 "load" => {
                     // mov r64, [disp32]   — REX.W + 8B /r + ModRM + SIB + disp32
-                    let rex = 0x48; // REX.W (64-bit operand size)
+                    let rex = 0x48 | if dst_reg >= 8 { 0x04 } else { 0x00 }; // REX.W | REX.R
                     let opcode = 0x8B; // MOV r64, r/m64
-                    // ModRM: mod=00, reg=dst, rm=100 (SIB follows)
-                    let modrm = 0x04 | (dst_reg << 3);
+                    // ModRM: mod=00, reg=dst(low 3 bits), rm=100 (SIB follows)
+                    let modrm = 0x04 | ((dst_reg & 7) << 3);
                     // SIB: scale=00, index=100 (none), base=101 (disp32 only)
                     let sib = 0x25;
                     // disp32: placeholder offset — in a real JIT this would be
@@ -670,9 +700,9 @@ impl MacroOpEmitter {
                 }
                 "store" => {
                     // mov [disp32], r64   — REX.W + 89 /r + ModRM + SIB + disp32
-                    let rex = 0x48;
+                    let rex = 0x48 | if src_reg >= 8 { 0x04 } else { 0x00 }; // REX.W | REX.R
                     let opcode = 0x89; // MOV r/m64, r64
-                    let modrm = 0x04 | (src_reg << 3);
+                    let modrm = 0x04 | ((src_reg & 7) << 3);
                     let sib = 0x25;
                     let disp = 0x1000_0000u32 + (op_idx as u32 * 8);
                     bytes.extend_from_slice(&[rex, opcode, modrm, sib]);
@@ -680,31 +710,39 @@ impl MacroOpEmitter {
                 }
                 "add" => {
                     // add r64, r64   — REX.W + 01 /r + ModRM
-                    let rex = 0x48;
+                    let rex = 0x48
+                        | if src_reg >= 8 { 0x04 } else { 0x00 } // REX.R
+                        | if dst_reg >= 8 { 0x01 } else { 0x00 }; // REX.B
                     let opcode = 0x01; // ADD r/m64, r64
-                    // ModRM: mod=11 (register), reg=src, rm=dst
-                    let modrm = 0xC0 | (src_reg << 3) | dst_reg;
+                    // ModRM: mod=11 (register), reg=src(low 3 bits), rm=dst(low 3 bits)
+                    let modrm = 0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7);
                     bytes.extend_from_slice(&[rex, opcode, modrm]);
                 }
                 "sub" => {
                     // sub r64, r64   — REX.W + 29 /r + ModRM
-                    let rex = 0x48;
+                    let rex = 0x48
+                        | if src_reg >= 8 { 0x04 } else { 0x00 } // REX.R
+                        | if dst_reg >= 8 { 0x01 } else { 0x00 }; // REX.B
                     let opcode = 0x29; // SUB r/m64, r64
-                    let modrm = 0xC0 | (src_reg << 3) | dst_reg;
+                    let modrm = 0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7);
                     bytes.extend_from_slice(&[rex, opcode, modrm]);
                 }
                 "mul" => {
                     // imul r64, r64  — REX.W + 0F AF /r + ModRM
-                    let rex = 0x48;
+                    let rex = 0x48
+                        | if src_reg >= 8 { 0x04 } else { 0x00 } // REX.R
+                        | if dst_reg >= 8 { 0x01 } else { 0x00 }; // REX.B
                     bytes.extend_from_slice(&[rex, 0x0F, 0xAF]);
-                    let modrm = 0xC0 | (src_reg << 3) | dst_reg;
+                    let modrm = 0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7);
                     bytes.push(modrm);
                 }
                 "cmp" => {
                     // cmp r64, r64   — REX.W + 39 /r + ModRM
-                    let rex = 0x48;
+                    let rex = 0x48
+                        | if src_reg >= 8 { 0x04 } else { 0x00 } // REX.R
+                        | if dst_reg >= 8 { 0x01 } else { 0x00 }; // REX.B
                     let opcode = 0x39; // CMP r/m64, r64
-                    let modrm = 0xC0 | (src_reg << 3) | dst_reg;
+                    let modrm = 0xC0 | ((src_reg & 7) << 3) | (dst_reg & 7);
                     bytes.extend_from_slice(&[rex, opcode, modrm]);
                 }
                 "jmp" => {
@@ -879,6 +917,7 @@ impl TemporalFusionPipeline {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Integration point with the ML superoptimizer (ml_superopt.rs).
+#[cfg(feature = "gnn-optimizer")]
 pub struct MlSuperoptIntegration {
     /// ML superoptimizer instance.
     ml_superopt: MlSuperoptimizer,
@@ -886,6 +925,7 @@ pub struct MlSuperoptIntegration {
     tiling_params: TilingParams,
 }
 
+#[cfg(feature = "gnn-optimizer")]
 impl MlSuperoptIntegration {
     /// Create integration with ML superoptimizer.
     pub fn new() -> Self {

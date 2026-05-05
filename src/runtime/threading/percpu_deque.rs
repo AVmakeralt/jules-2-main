@@ -42,7 +42,7 @@ struct PerCpuDequeBuffer {
 impl PerCpuDequeBuffer {
     fn new(capacity: usize) -> Self {
         let layout = Layout::array::<PerCpuDequeEntry>(capacity).unwrap();
-        let entries = unsafe { alloc(layout) };
+        let entries = unsafe { alloc(layout) as *mut PerCpuDequeEntry };
         
         if entries.is_null() {
             panic!("Failed to allocate per-CPU deque buffer");
@@ -51,14 +51,14 @@ impl PerCpuDequeBuffer {
         // Initialize entries
         for i in 0..capacity {
             unsafe {
-                let entry = (entries as *mut PerCpuDequeEntry).add(i);
+                let entry = entries.add(i);
                 (*entry).task.store(ptr::null_mut(), Ordering::Relaxed);
                 (*entry).seq.store(i, Ordering::Relaxed);
             }
         }
         
         Self {
-            entries: unsafe { alloc(layout) as *mut PerCpuDequeEntry },
+            entries,
             capacity,
             mask: capacity - 1,
         }

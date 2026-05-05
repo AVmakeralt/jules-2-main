@@ -377,7 +377,7 @@ impl MatmulKernel for Fp32Avx2Kernel {
                     for p in 0..k {
                         let a_vec = _mm256_loadu_ps(a.as_ptr().add(i * k + p));
                         for jj in 0..4 {
-                            if i + jj < m && j + jj < n {
+                            if j + jj < n {
                                 let b_val = _mm256_set1_ps(b[p * n + j + jj]);
                                 let mul = _mm256_mul_ps(a_vec, b_val);
                                 acc[jj] += _mm256_cvtss_f32(_mm256_hadd_ps(mul, mul));
@@ -767,8 +767,8 @@ impl Int8Avx2Kernel {
                     result = _mm512_add_ps(result, bias_vec);
                 }
 
-                let res_arr = [0.0f32; 16];
-                _mm512_storeu_ps(res_arr.as_ptr() as *mut f32, result);
+                let mut res_arr = [0.0f32; 16];
+                _mm512_storeu_ps(res_arr.as_mut_ptr(), result);
                 for jj in 0..16.min(n - o) {
                     c[i * n + o + jj] = *res_arr.as_ptr().add(jj);
                 }
@@ -828,8 +828,8 @@ impl Int8Avx2Kernel {
                     result = _mm256_add_ps(result, bias_vec);
                 }
 
-                let res_arr = [0.0f32; 8];
-                _mm256_storeu_ps(res_arr.as_ptr() as *mut f32, result);
+                let mut res_arr = [0.0f32; 8];
+                _mm256_storeu_ps(res_arr.as_mut_ptr(), result);
                 for jj in 0..8.min(n - o) {
                     c[i * n + o + jj] = *res_arr.as_ptr().add(jj);
                 }
@@ -902,8 +902,8 @@ impl Int8Avx2Kernel {
                     result = _mm256_add_ps(result, bias_vec);
                 }
 
-                let res_arr = [0.0f32; 8];
-                _mm256_storeu_ps(res_arr.as_ptr() as *mut f32, result);
+                let mut res_arr = [0.0f32; 8];
+                _mm256_storeu_ps(res_arr.as_mut_ptr(), result);
                 for jj in 0..8.min(n - o) {
                     c[i * n + o + jj] = *res_arr.as_ptr().add(jj);
                 }

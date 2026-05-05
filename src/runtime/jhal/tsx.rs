@@ -100,12 +100,14 @@ pub unsafe fn xend() {
 /// Abort a TSX transaction with the given code (bits 31:24 of EAX).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub unsafe fn xabort(_code: u8) {
-    // XABORT is not supported by all assemblers. Use a placeholder.
-    // On real hardware, this would be: xabort imm8
-    // For now, we use a trap instruction to indicate this should never
-    // actually be called in our benchmark environment.
-    core::arch::asm!("ud2", options(noreturn));
+pub unsafe fn xabort(code: u8) {
+    // XABORT encoding: 0xC6 F8 /0 ib where ib is the abort code.
+    // Using .byte directive to emit the correct instruction.
+    core::arch::asm!(
+        ".byte 0xC6, 0xF8, {}",
+        in(reg_byte) code,
+        options(noreturn)
+    );
 }
 
 /// Test whether currently executing inside a TSX transaction.
@@ -283,9 +285,23 @@ impl AmxTileConfig {
 /// Uses XSETBV to enable AMX state in XCR0, then LDTILECFG.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn amx_init(config: &AmxTileConfig) {
-    // Enable AMX in XCR0: set bits 17 (AMX_TILECFG) and 18 (AMX_TILEDATA)
+    // Enable AMX in XCR0: read-modify-write to preserve existing state (SSE/AVX/etc.)
     // XCR0 = XCR0 | (1 << 17) | (1 << 18)
-    let xcr0_new: u64 = (1 << 17) | (1 << 18);
+
+    // Step 1: Read current XCR0 via XGETBV
+    let xcr0_eax: u32;
+    let xcr0_edx: u32;
+    core::arch::asm!(
+        "xgetbv",
+        in("ecx") 0u32,        // XCR0
+        out("eax") xcr0_eax,
+        out("edx") xcr0_edx,
+        options(nomem, nostack)
+    );
+    let xcr0_old = ((xcr0_edx as u64) << 32) | (xcr0_eax as u64);
+
+    // Step 2: OR in AMX bits and write back via XSETBV
+    let xcr0_new = xcr0_old | ((1u64 << 17) | (1u64 << 18));
     core::arch::asm!(
         "xsetbv",
         in("ecx") 0u32,        // XCR0

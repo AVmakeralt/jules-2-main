@@ -121,7 +121,7 @@ impl StackTask {
 /// Slab-allocated task descriptor
 #[allow(dead_code)]
 struct SlabTask {
-    /// Vtable pointer
+    /// Vtable pointer (heap-allocated via Box::into_raw to avoid dangling)
     vtable: *const TaskVtable,
     /// Inline data (up to 64 bytes)
     data: [u8; 64],
@@ -147,6 +147,17 @@ impl SlabTask {
             (vtable.run)(self as *mut _ as *mut ());
         }
         self.completed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for SlabTask {
+    fn drop(&mut self) {
+        // Reconstitute the Box<TaskVtable> to properly free the heap-allocated vtable
+        if !self.vtable.is_null() {
+            unsafe {
+                let _ = Box::from_raw(self.vtable as *mut TaskVtable);
+            }
+        }
     }
 }
 
@@ -264,7 +275,7 @@ where
         }
     }
 
-    // Create vtable on the stack instead of static
+    // Create vtable on the heap so it outlives spawn()'s stack frame
     let vtable = TaskVtable {
         run: run_task::<T, F>,
         drop: drop_task::<T, F>,
@@ -284,7 +295,7 @@ where
 
     unsafe {
         let task = &mut *(descriptor as *mut SlabTask);
-        task.vtable = &vtable;
+        task.vtable = Box::into_raw(Box::new(vtable));
         
         // Store closure in inline data
         let closure_ptr = task.data.as_mut_ptr() as *mut F;
@@ -292,7 +303,16 @@ where
     }
 
     let pool = get_pool();
-    let task_ptr = descriptor as *mut ();
+    // Wrap the SlabTask execution in a Box<dyn FnOnce()> and double-box
+    // so the worker can safely call it through *mut ()
+    let slab_task_ptr = descriptor as *mut SlabTask;
+    let erased: Box<dyn FnOnce()> = Box::new(move || {
+        unsafe {
+            let task = &mut *slab_task_ptr;
+            task.execute();
+        }
+    });
+    let task_ptr = Box::into_raw(Box::new(erased)) as *mut ();
     pool.submit(task_ptr);
 
     JoinHandle {
@@ -327,14 +347,14 @@ where
         let chunk_end = (chunk_start + chunk_size).min(range.end);
         let f_clone = f.clone();
         
-        let task = Box::new(move || {
+        let task: Box<dyn FnOnce()> = Box::new(move || {
             let mut guard = f_clone.lock().unwrap();
             for i in chunk_start..chunk_end {
                 guard(i);
             }
         });
         
-        let task_ptr = Box::into_raw(task) as *mut ();
+        let task_ptr = Box::into_raw(Box::new(task)) as *mut ();
         pool.submit(task_ptr);
     }
 }

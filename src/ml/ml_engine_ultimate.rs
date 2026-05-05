@@ -333,7 +333,7 @@ impl Tensor {
     }
 
     pub fn gelu(&self) -> Tensor {
-        let cdf_coeff = std::f32::consts::PI.sqrt() / 2.0 / std::f32::consts::PI;
+        let cdf_coeff = (2.0f32 / std::f32::consts::PI).sqrt();
         Tensor {
             shape: self.shape.clone(),
             data: self.data.iter()
@@ -734,65 +734,72 @@ impl OptimizerState {
         }
     }
 
-    pub fn step(&self, opt_type: &OptimType, param_id: &str, weights: &mut [f32], grads: &[f32]) {
+    pub fn step(&mut self, opt_type: &OptimType, param_id: &str, weights: &mut [f32], grads: &[f32]) {
         match opt_type {
             OptimType::SGD { lr, momentum } => {
-                let m = self.m.get(param_id)
-                    .cloned()
+                let m = self.m.remove(param_id)
                     .unwrap_or_else(|| vec![0.0; weights.len()]);
 
+                let mut m_new = vec![0.0; weights.len()];
                 for i in 0..weights.len() {
                     let grad = if i < grads.len() { grads[i] } else { 0.0 };
-                    let m_new = momentum * m[i] - lr * grad;
-                    weights[i] += m_new;
+                    m_new[i] = momentum * m[i] - lr * grad;
+                    weights[i] += m_new[i];
                 }
+                self.m.insert(param_id.to_string(), m_new);
             }
             OptimType::Adam { lr, beta1, beta2, eps } => {
-                let m = self.m.get(param_id)
-                    .cloned()
+                let m = self.m.remove(param_id)
                     .unwrap_or_else(|| vec![0.0; weights.len()]);
-                let v = self.v.get(param_id)
-                    .cloned()
+                let v = self.v.remove(param_id)
                     .unwrap_or_else(|| vec![0.0; weights.len()]);
 
                 let t = (self.step as f32) + 1.0;
                 let bc1 = 1.0 - beta1.powf(t);
                 let bc2 = 1.0 - beta2.powf(t);
 
+                let mut m_new = vec![0.0; weights.len()];
+                let mut v_new = vec![0.0; weights.len()];
                 for i in 0..weights.len() {
                     let grad = if i < grads.len() { grads[i] } else { 0.0 };
-                    let m_new = beta1 * m[i] + (1.0 - beta1) * grad;
-                    let v_new = beta2 * v[i] + (1.0 - beta2) * grad * grad;
+                    m_new[i] = beta1 * m[i] + (1.0 - beta1) * grad;
+                    v_new[i] = beta2 * v[i] + (1.0 - beta2) * grad * grad;
 
-                    let m_hat = m_new / bc1;
-                    let v_hat = v_new / bc2;
+                    let m_hat = m_new[i] / bc1;
+                    let v_hat = v_new[i] / bc2;
 
                     weights[i] -= lr * m_hat / (v_hat.sqrt() + eps);
                 }
+                self.m.insert(param_id.to_string(), m_new);
+                self.v.insert(param_id.to_string(), v_new);
+                self.step += 1;
             }
             OptimType::AdamW { lr, beta1, beta2, eps, wd } => {
-                let m = self.m.get(param_id)
-                    .cloned()
+                let m = self.m.remove(param_id)
                     .unwrap_or_else(|| vec![0.0; weights.len()]);
-                let v = self.v.get(param_id)
-                    .cloned()
+                let v = self.v.remove(param_id)
                     .unwrap_or_else(|| vec![0.0; weights.len()]);
 
                 let t = (self.step as f32) + 1.0;
                 let bc1 = 1.0 - beta1.powf(t);
                 let bc2 = 1.0 - beta2.powf(t);
 
+                let mut m_new = vec![0.0; weights.len()];
+                let mut v_new = vec![0.0; weights.len()];
                 for i in 0..weights.len() {
                     let grad = if i < grads.len() { grads[i] } else { 0.0 };
-                    let m_new = beta1 * m[i] + (1.0 - beta1) * grad;
-                    let v_new = beta2 * v[i] + (1.0 - beta2) * grad * grad;
+                    m_new[i] = beta1 * m[i] + (1.0 - beta1) * grad;
+                    v_new[i] = beta2 * v[i] + (1.0 - beta2) * grad * grad;
 
-                    let m_hat = m_new / bc1;
-                    let v_hat = v_new / bc2;
+                    let m_hat = m_new[i] / bc1;
+                    let v_hat = v_new[i] / bc2;
 
                     weights[i] -= lr * m_hat / (v_hat.sqrt() + eps);
                     weights[i] *= 1.0 - wd * lr;
                 }
+                self.m.insert(param_id.to_string(), m_new);
+                self.v.insert(param_id.to_string(), v_new);
+                self.step += 1;
             }
         }
     }

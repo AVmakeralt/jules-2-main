@@ -1,8 +1,10 @@
 // =============================================================================
 // GNN E-Graph Superoptimizer — Training & Benchmark
 //
-// Run: cargo run --release --bin train-gnn
+// Run: cargo run --release --bin train-gnn --features gnn-optimizer
 // =============================================================================
+
+#![cfg(feature = "gnn-optimizer")]
 
 use std::hint::black_box;
 use std::time::Instant;

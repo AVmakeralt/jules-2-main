@@ -6,3 +6,4 @@ pub mod hot_reload;
 pub mod profiling_tools;
 pub mod shader_tooling;
 pub mod string_intern;
+pub mod train_gnn;

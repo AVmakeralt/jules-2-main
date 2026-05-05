@@ -3,10 +3,15 @@
 // Safe memory reclamation for lock-free data structures
 // =========================================================================
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Global epoch counter
 static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Number of active readers (pinned guards). Epoch advancement is blocked
+/// while this is non-zero, preventing garbage reclamation while any guard
+/// still holds a reference to an epoch.
+static ACTIVE_READERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Number of epochs in the cycle
 const NUM_EPOCHS: usize = 3;
@@ -32,6 +37,10 @@ impl Participant {
 
     /// Pin the current epoch
     pub fn pin(&self) -> Guard<'_> {
+        // Increment active readers to prevent epoch advancement while
+        // any guard exists.
+        ACTIVE_READERS.fetch_add(1, Ordering::Acquire);
+
         let current = self.local_epoch.load(Ordering::Acquire);
         let global = GLOBAL_EPOCH.load(Ordering::Acquire);
         
@@ -86,7 +95,8 @@ impl<'a> Guard<'a> {
 
 impl<'a> Drop for Guard<'a> {
     fn drop(&mut self) {
-        // Unpin is automatic - just drop the guard
+        // Unpin: decrement active readers so epoch advancement can proceed
+        ACTIVE_READERS.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -118,7 +128,16 @@ impl GarbageBag {
 }
 
 /// Advance the global epoch
+///
+/// Only advances when no readers are currently pinned. This prevents
+/// garbage from being reclaimed while a reader is still accessing it.
 pub fn advance_epoch() {
+    // Do not advance while any guard (reader) is active — otherwise garbage
+    // could be reclaimed while a reader is still accessing it.
+    if ACTIVE_READERS.load(Ordering::Acquire) > 0 {
+        return;
+    }
+
     let current = GLOBAL_EPOCH.fetch_add(1, Ordering::AcqRel);
     let next = current + 1;
     

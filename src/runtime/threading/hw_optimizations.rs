@@ -222,7 +222,9 @@ impl TsxTransaction {
         #[cfg(target_arch = "x86_64")]
         {
             // Use XBEGIN instruction via inline assembly
-            // If XBEGIN fails (returns non-zero), use fallback path
+            // On success, rax = _XBEGIN_STARTED (0xFFFFFFFF, all bits set).
+            // On abort, rax contains the abort reason (never 0xFFFFFFFF).
+            const _XBEGIN_STARTED: u64 = 0xFFFFFFFF;
             let status: u64;
             unsafe {
                 std::arch::asm!(
@@ -231,7 +233,7 @@ impl TsxTransaction {
                     lateout("rax") status,
                 );
             }
-            status == 0
+            status == _XBEGIN_STARTED
         }
         
         #[cfg(not(target_arch = "x86_64"))]
@@ -524,8 +526,16 @@ impl HugePageAllocator {
     pub fn deallocate(&mut self, ptr: *mut u8) {
         if let Some(idx) = self.regions.iter().position(|r| r.addr == ptr) {
             let region = self.regions.remove(idx);
-            let layout = std::alloc::Layout::from_size_align(region.size, 4096).unwrap();
-            unsafe { std::alloc::dealloc(ptr, layout) };
+            unsafe {
+                if region.page_size > 4096 {
+                    // Region was allocated with mmap (huge page) — must use munmap
+                    libc::munmap(region.addr as *mut libc::c_void, region.size);
+                } else {
+                    // Region was allocated with std::alloc — use dealloc
+                    let layout = std::alloc::Layout::from_size_align(region.size, 4096).unwrap();
+                    std::alloc::dealloc(ptr, layout);
+                }
+            }
         }
     }
 }
@@ -533,8 +543,16 @@ impl HugePageAllocator {
 impl Drop for HugePageAllocator {
     fn drop(&mut self) {
         for region in &self.regions {
-            let layout = std::alloc::Layout::from_size_align(region.size, 4096).unwrap();
-            unsafe { std::alloc::dealloc(region.addr, layout) };
+            unsafe {
+                if region.page_size > 4096 {
+                    // Region was allocated with mmap (huge page) — must use munmap
+                    libc::munmap(region.addr as *mut libc::c_void, region.size);
+                } else {
+                    // Region was allocated with std::alloc — use dealloc
+                    let layout = std::alloc::Layout::from_size_align(region.size, 4096).unwrap();
+                    std::alloc::dealloc(region.addr, layout);
+                }
+            }
         }
     }
 }

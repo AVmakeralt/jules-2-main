@@ -9,3 +9,4 @@ pub mod loom_model_check;
 pub mod sat_smt_solver;
 pub mod translation_validation;
 pub mod hw_feedback;
+pub mod diff_opt;

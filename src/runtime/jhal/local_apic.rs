@@ -571,9 +571,9 @@ pub fn read_apic_base_msr() -> u64 {
 }
 
 /// Extract the APIC base physical address from the MSR value.
-/// Bits 12–35 contain the base address (aligned to 4KB).
+/// Bits 12–51 contain the base address (aligned to 4KB).
 pub fn apic_base_from_msr(msr: u64) -> usize {
-    (msr & 0xFFFF_F000) as usize
+    (msr & 0x000F_FFFF_F000) as usize
 }
 
 /// Check if this core is the Bootstrap Processor (BSP).

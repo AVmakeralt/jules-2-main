@@ -191,10 +191,14 @@ impl WorkStealingDeque {
             let mut tasks = Vec::with_capacity(half);
             for i in 0..half {
                 let idx = (top.wrapping_add(i)) & (buffer.capacity - 1);
-                let task = buffer.data()[idx];
+                // Read through shared reference only — the thief must not use
+                // data_mut() which returns &mut from &self through UnsafeCell,
+                // as that would create a data race with the owner thread.
+                let task = buffer.data_at(idx);
                 if !task.is_null() {
                     tasks.push(task);
-                    buffer.data_mut()[idx] = ptr::null_mut();
+                    // Slot clearing is deferred to the owner thread via epoch
+                    // reclamation; the thief must not write to the buffer.
                 }
             }
             tasks
@@ -263,10 +267,24 @@ impl Buffer {
         // SAFETY: Access is synchronized through atomic operations on bottom/top
         unsafe { &*self.data.get() }
     }
+
+    /// Get the task pointer at a specific index (read-only, safe for thief threads).
+    /// Uses a volatile read to avoid compiler optimizations and ensure the read
+    /// is properly ordered with respect to the atomic CAS in steal/steal_half.
+    fn data_at(&self, idx: usize) -> TaskPtr {
+        // SAFETY: Access is synchronized through atomic operations on bottom/top.
+        // The thief only reads after a successful CAS on top, which provides
+        // the necessary happens-before relationship with the owner's write.
+        unsafe {
+            let vec = &*self.data.get();
+            std::ptr::read_volatile(&vec[idx])
+        }
+    }
     
     /// Get a mutable reference to the data vector
     fn data_mut(&self) -> &mut Vec<TaskPtr> {
-        // SAFETY: Access is synchronized through atomic operations on bottom/top
+        // SAFETY: Only the owner thread may call data_mut(). Thief threads
+        // must use data_at() for read-only access to avoid data races.
         unsafe { &mut *self.data.get() }
     }
 }

@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ptr;
+use std::cell::UnsafeCell;
 
 /// Cache line size
 const CACHE_LINE_SIZE: usize = 64;
@@ -18,15 +19,15 @@ type TaskFn = fn(*mut ());
 /// Stores task fields in separate contiguous arrays for better cache efficiency
 pub struct SoaTaskQueue {
     /// Function pointers (separate array)
-    functions: Vec<TaskFn>,
+    functions: UnsafeCell<Vec<TaskFn>>,
     /// Data pointers (separate array)
-    data: Vec<*mut ()>,
+    data: UnsafeCell<Vec<*mut ()>>,
     /// Priorities (separate array, for SIMD scanning)
-    priorities: Vec<u8>,
+    priorities: UnsafeCell<Vec<u8>>,
     /// Flags (separate array)
-    flags: Vec<u8>,
+    flags: UnsafeCell<Vec<u8>>,
     /// Task types (separate array)
-    task_types: Vec<u8>,
+    task_types: UnsafeCell<Vec<u8>>,
     /// Head index
     head: AtomicUsize,
     /// Tail index
@@ -37,17 +38,22 @@ pub struct SoaTaskQueue {
     mask: usize,
 }
 
+// SAFETY: SoaTaskQueue uses atomic head/tail indices for synchronization and
+// UnsafeCell for interior mutability of the data arrays. Access to the arrays
+// is coordinated through the atomic indices, making it safe to share across threads.
+unsafe impl Sync for SoaTaskQueue {}
+
 impl SoaTaskQueue {
     /// Create a new SoA task queue
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.next_power_of_two();
         
         Self {
-            functions: vec![|_| {}; capacity],
-            data: vec![ptr::null_mut(); capacity],
-            priorities: vec![255; capacity],
-            flags: vec![0; capacity],
-            task_types: vec![0; capacity],
+            functions: UnsafeCell::new(vec![|_| {}; capacity]),
+            data: UnsafeCell::new(vec![ptr::null_mut(); capacity]),
+            priorities: UnsafeCell::new(vec![255; capacity]),
+            flags: UnsafeCell::new(vec![0; capacity]),
+            task_types: UnsafeCell::new(vec![0; capacity]),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             capacity,
@@ -66,14 +72,14 @@ impl SoaTaskQueue {
         
         let idx = tail & self.mask;
         
-        // Write to separate arrays - need interior mutability for &self
+        // Write to separate arrays using UnsafeCell for interior mutability
         // SAFETY: We're the only producer (single-producer), and we've verified there's space
         unsafe {
-            let functions = self.functions.as_ptr() as *mut TaskFn;
-            let data_arr = self.data.as_ptr() as *mut *mut ();
-            let priorities = self.priorities.as_ptr() as *mut u8;
-            let flags = self.flags.as_ptr() as *mut u8;
-            let task_types = self.task_types.as_ptr() as *mut u8;
+            let functions = (*self.functions.get()).as_mut_ptr();
+            let data_arr = (*self.data.get()).as_mut_ptr();
+            let priorities = (*self.priorities.get()).as_mut_ptr();
+            let flags = (*self.flags.get()).as_mut_ptr();
+            let task_types = (*self.task_types.get()).as_mut_ptr();
             
             *functions.add(idx) = func;
             *data_arr.add(idx) = data;
@@ -102,30 +108,35 @@ impl SoaTaskQueue {
         let mut best_idx = None;
         let mut best_priority = 255u8;
         
+        let priorities = unsafe { &*self.priorities.get() };
+        let functions = unsafe { &*self.functions.get() };
+        let data = unsafe { &*self.data.get() };
+        let task_types = unsafe { &*self.task_types.get() };
+        
         for i in 0..(tail.wrapping_sub(head)) {
             let idx = (head.wrapping_add(i)) & self.mask;
-            let priority = self.priorities[idx];
+            let p = priorities[idx];
             
-            if priority < best_priority {
-                best_priority = priority;
+            if p < best_priority {
+                best_priority = p;
                 best_idx = Some(idx);
                 
-                if priority == 0 {
+                if p == 0 {
                     break; // Can't get better than 0
                 }
             }
         }
         
         if let Some(idx) = best_idx {
-            let func = self.functions[idx];
-            let data = self.data[idx];
-            let task_type = self.task_types[idx];
+            let func = functions[idx];
+            let d = data[idx];
+            let tt = task_types[idx];
             
             // Mark as consumed
             // SAFETY: Single consumer pattern with atomic synchronization
             unsafe {
-                let priorities = self.priorities.as_ptr() as *mut u8;
-                let data_arr = self.data.as_ptr() as *mut *mut ();
+                let priorities = (*self.priorities.get()).as_mut_ptr();
+                let data_arr = (*self.data.get()).as_mut_ptr();
                 *priorities.add(idx) = 255;
                 *data_arr.add(idx) = ptr::null_mut();
             }
@@ -135,7 +146,7 @@ impl SoaTaskQueue {
                 self.head.store(head.wrapping_add(1), Ordering::Release);
             }
             
-            Some((func, data, best_priority, task_type))
+            Some((func, d, best_priority, tt))
         } else {
             None
         }
@@ -151,10 +162,14 @@ impl SoaTaskQueue {
         }
         
         let idx = head & self.mask;
-        let func = self.functions[idx];
-        let data = self.data[idx];
-        let priority = self.priorities[idx];
-        let task_type = self.task_types[idx];
+        let functions = unsafe { &*self.functions.get() };
+        let data_arr = unsafe { &*self.data.get() };
+        let priorities = unsafe { &*self.priorities.get() };
+        let task_types = unsafe { &*self.task_types.get() };
+        let func = functions[idx];
+        let data = data_arr[idx];
+        let priority = priorities[idx];
+        let task_type = task_types[idx];
         
         self.head.store(head.wrapping_add(1), Ordering::Release);
         

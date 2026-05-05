@@ -417,15 +417,41 @@ impl MemoryReorgOrchestrator {
                 converter.convert(data)
             }
             (MemoryLayout::StructureOfArrays, MemoryLayout::ArrayOfStructures) => {
-                let soa_arrays: Vec<Vec<u8>> = vec![Vec::new(); components.len()];
-                // Reconstruct from current SoA state
-                soa_arrays
+                // Reconstruct AoS from current SoA data.
+                // Split the flat data buffer into per-component SoA slices,
+                // then interleave them back into AoS order.
+                let entity_count = data.len()
+                    / (converter.component_size * converter.component_count);
+                let component_array_bytes = entity_count * converter.component_size;
+                let soa_arrays: Vec<Vec<u8>> = (0..converter.component_count)
+                    .map(|c| {
+                        let start = c * component_array_bytes;
+                        data[start..start + component_array_bytes].to_vec()
+                    })
+                    .collect();
+                converter.convert_soa_to_aos(&soa_arrays)
             }
             _ => {
                 tx.abort();
                 return Ok(self.current_layout);
             }
         };
+
+        // Write reorganized data back to the actual data store.
+        match target {
+            MemoryLayout::StructureOfArrays => {
+                // Flatten Vec<Vec<u8>> SoA arrays back into the flat buffer.
+                let flat: Vec<u8> = new_data.iter().flatten().cloned().collect();
+                let copy_len = flat.len().min(data.len());
+                data[..copy_len].copy_from_slice(&flat[..copy_len]);
+            }
+            MemoryLayout::ArrayOfStructures => {
+                // new_data is Vec<u8> from convert_soa_to_aos.
+                let copy_len = new_data.len().min(data.len());
+                data[..copy_len].copy_from_slice(&new_data[..copy_len]);
+            }
+            _ => {}
+        }
 
         // Try to commit
         match tx.commit() {

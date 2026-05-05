@@ -183,8 +183,8 @@ pub struct Worker {
     _pad3: [u8; 64],
     /// Reference to global injector
     injector: Arc<Injector>,
-    /// Reference to all workers (for stealing)
-    workers: Arc<Vec<Arc<Worker>>>,
+    /// Reference to all workers (for stealing) — late-initialized via OnceLock
+    workers: Arc<std::sync::OnceLock<Arc<Vec<Arc<Worker>>>>>,
     /// Epoch participant
     participant: Arc<Participant>,
     /// Shutdown flag
@@ -201,7 +201,7 @@ impl Worker {
     fn new(
         id: usize,
         injector: Arc<Injector>,
-        workers: Arc<Vec<Arc<Worker>>>,
+        workers: Arc<std::sync::OnceLock<Arc<Vec<Arc<Worker>>>>>,
         participant: Arc<Participant>,
         shutdown: Arc<AtomicBool>,
         numa_node: Option<usize>,
@@ -279,14 +279,18 @@ impl Worker {
 
     /// Steal work from other workers with NUMA-aware priority
     fn steal(&self, guard: &Guard) -> Option<*mut ()> {
-        let num_workers = self.workers.len();
+        let workers = match self.workers.get() {
+            Some(w) => w,
+            None => return None,
+        };
+        let num_workers = workers.len();
         
         // NUMA-aware stealing: prefer same-node workers first
         if let Some(my_node) = self.numa_node {
             // Try same-node workers first
             for offset in 1..num_workers {
                 let target_id = (self.id + offset) % num_workers;
-                let target = &self.workers[target_id];
+                let target = &workers[target_id];
                 
                 if target.numa_node == Some(my_node) {
                     // Try per-CPU deque first
@@ -309,7 +313,7 @@ impl Worker {
             // Then try cross-node workers
             for offset in 1..num_workers {
                 let target_id = (self.id + offset) % num_workers;
-                let target = &self.workers[target_id];
+                let target = &workers[target_id];
                 
                 if target.numa_node != Some(my_node) {
                     for task in target.percpu_deque.steal_half(target_id, guard) {
@@ -330,7 +334,7 @@ impl Worker {
             // No NUMA info, steal from any worker
             for offset in 1..num_workers {
                 let target_id = (self.id + offset) % num_workers;
-                let target = &self.workers[target_id];
+                let target = &workers[target_id];
                 
                 for task in target.percpu_deque.steal_half(target_id, guard) {
                     if !task.is_null() {
@@ -354,9 +358,11 @@ impl Worker {
     fn execute_task(&self, task: *mut ()) {
         self.tasks_executed.fetch_add(1, Ordering::Relaxed);
         unsafe {
-            // Task is a function pointer
-            let func: fn() = std::mem::transmute(task);
-            func();
+            // Task is a Box<Box<dyn FnOnce()>> passed through *mut ().
+            // Double-boxing is needed because Box<dyn FnOnce()> is a fat pointer
+            // and cannot be stored in a single *mut ().
+            let func: Box<Box<dyn FnOnce()>> = Box::from_raw(task as *mut Box<dyn FnOnce()>);
+            (*func)();
         }
     }
 
@@ -419,8 +425,8 @@ impl ThreadPool {
             let worker = Arc::new(Worker::new(
                 id,
                 injector.clone(),
-                // Workers will be filled after creation
-                Arc::new(Vec::new()),
+                // Placeholder — will be set after all workers are created
+                Arc::new(std::sync::OnceLock::new()),
                 participant.clone(),
                 shutdown.clone(),
                 numa_node,
@@ -429,9 +435,11 @@ impl ThreadPool {
             workers.push(worker);
         }
         
-        // Update workers with full worker list - use Arc::new_cyclic to avoid the clone issue
-        // Since workers reference each other, we just use the initially created workers
+        // Build the shared worker list and initialize each worker's OnceLock
         let workers_arc = Arc::new(workers);
+        for worker in workers_arc.iter() {
+            let _ = worker.workers.set(workers_arc.clone());
+        }
         
         // Spawn worker threads with CPU affinity
         for worker in workers_arc.iter() {

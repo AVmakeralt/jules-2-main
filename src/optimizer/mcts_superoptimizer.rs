@@ -873,21 +873,79 @@ impl MctsSuperoptimizer {
                 }
             }
             RewriteAction::IdentityLeft => {
-                if let Instr::BinOp { op, lhs: _, rhs } = instr {
-                    Some((**rhs).clone())
+                if let Instr::BinOp { op, lhs, rhs } = instr {
+                    // Validate: the left operand must be the identity element for this op
+                    let valid = match op {
+                        BinOpKind::Add => matches!(**lhs, Instr::ConstInt(0)),
+                        BinOpKind::Mul => matches!(**lhs, Instr::ConstInt(1)),
+                        BinOpKind::BitOr => matches!(**lhs, Instr::ConstInt(0)),
+                        BinOpKind::BitAnd => matches!(**lhs, Instr::ConstInt(v) if v == u128::MAX),
+                        _ => false,
+                    };
+                    if valid {
+                        Some((**rhs).clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             }
             RewriteAction::IdentityRight => {
-                if let Instr::BinOp { op, lhs, rhs: _ } = instr {
-                    Some((**lhs).clone())
+                if let Instr::BinOp { op, lhs, rhs } = instr {
+                    // Validate: the right operand must be the identity element for this op
+                    let valid = match op {
+                        BinOpKind::Add => matches!(**rhs, Instr::ConstInt(0)),
+                        BinOpKind::Sub => matches!(**rhs, Instr::ConstInt(0)),
+                        BinOpKind::Mul => matches!(**rhs, Instr::ConstInt(1)),
+                        BinOpKind::Div => matches!(**rhs, Instr::ConstInt(1)),
+                        BinOpKind::BitOr => matches!(**rhs, Instr::ConstInt(0)),
+                        BinOpKind::BitAnd => matches!(**rhs, Instr::ConstInt(v) if v == u128::MAX),
+                        BinOpKind::Shl | BinOpKind::Shr => matches!(**rhs, Instr::ConstInt(0)),
+                        _ => false,
+                    };
+                    if valid {
+                        Some((**lhs).clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             }
-            RewriteAction::AnnihilateLeft | RewriteAction::AnnihilateRight => {
-                Some(Instr::ConstInt(0))
+            RewriteAction::AnnihilateLeft => {
+                if let Instr::BinOp { op, lhs, .. } = instr {
+                    // Validate: the left operand must be the annihilator for this op
+                    let valid = match op {
+                        BinOpKind::Mul => matches!(**lhs, Instr::ConstInt(0)),
+                        BinOpKind::BitAnd => matches!(**lhs, Instr::ConstInt(0)),
+                        _ => false,
+                    };
+                    if valid {
+                        Some(Instr::ConstInt(0))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            RewriteAction::AnnihilateRight => {
+                if let Instr::BinOp { op, rhs, .. } = instr {
+                    // Validate: the right operand must be the annihilator for this op
+                    let valid = match op {
+                        BinOpKind::Mul => matches!(**rhs, Instr::ConstInt(0)),
+                        BinOpKind::BitAnd => matches!(**rhs, Instr::ConstInt(0)),
+                        _ => false,
+                    };
+                    if valid {
+                        Some(Instr::ConstInt(0))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
             RewriteAction::ConstantFold => self.constant_fold(instr),
             RewriteAction::StrengthReduce => {

@@ -374,15 +374,28 @@ impl GpuBackendImpl for CpuBackend {
                 }
             }
             "softmax" => {
-                let max_v = out_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let mut sum = 0.0f32;
-                for v in &mut out_data {
-                    *v = (*v - max_v).exp();
-                    sum += *v;
-                }
-                if sum != 0.0 {
-                    for v in &mut out_data {
-                        *v /= sum;
+                // Per-row softmax for 2D tensors [rows, cols].
+                // For 1D, treat as a single row.
+                let row_len = if inp.shape.len() >= 2 {
+                    inp.shape[inp.shape.len() - 1]
+                } else {
+                    out_data.len()
+                };
+                let num_rows = out_data.len() / row_len.max(1);
+                for r in 0..num_rows {
+                    let row_start = r * row_len;
+                    let row_end = row_start + row_len;
+                    let row = &mut out_data[row_start..row_end];
+                    let max_v = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mut sum = 0.0f32;
+                    for v in row.iter_mut() {
+                        *v = (*v - max_v).exp();
+                        sum += *v;
+                    }
+                    if sum != 0.0 {
+                        for v in row.iter_mut() {
+                            *v /= sum;
+                        }
                     }
                 }
             }
@@ -745,15 +758,15 @@ fn cpu_flash_attention(
 /// - A valid GPU adapter enumerated at runtime via `wgpu::Instance::enumerate_adapters()`
 /// - Compute pipeline creation for WGSL shaders (see GpuKernels)
 ///
-/// When GPU hardware is not available, this backend falls back to CPU execution
-/// using the same kernels as CpuBackend. This ensures correctness while allowing
-/// a seamless upgrade path when a real GPU is present.
+/// When GPU hardware is not available, compute operations return errors rather
+/// than silently falling back to CPU. Use CpuBackend explicitly if CPU
+/// execution is desired.
 pub struct WgpuBackend {
     // Jules native GPU backend runtime state (backend-agnostic compute path).
     buffers: Arc<Mutex<HashMap<u64, GpuBuffer>>>,
     next_id: Arc<Mutex<u64>>,
     /// Whether a real wgpu GPU adapter was found at initialization.
-    gpu_available: bool,
+    pub gpu_available: bool,
 }
 
 impl WgpuBackend {
@@ -856,6 +869,9 @@ impl GpuBackendImpl for WgpuBackend {
         b: &GpuBufferHandle,
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
+        if !self.gpu_available {
+            return Err("WgpuBackend: GPU not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         let mut buffers = self.buffers.lock().unwrap();
         let a_buf = buffers.get(&a.id).ok_or("Buffer A not found")?;
         let b_buf = buffers.get(&b.id).ok_or("Buffer B not found")?;
@@ -878,6 +894,9 @@ impl GpuBackendImpl for WgpuBackend {
         op: GpuOp,
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
+        if !self.gpu_available {
+            return Err("WgpuBackend: GPU not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         if matches!(op, GpuOp::MatMul) {
             return Err("MatMul is not an elementwise operation. Use the matmul() method instead.".into());
         }
@@ -925,6 +944,9 @@ impl GpuBackendImpl for WgpuBackend {
         stride: u32,
         padding: u32,
     ) -> Result<(), String> {
+        if !self.gpu_available {
+            return Err("WgpuBackend: GPU not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
             .get(&input.id)
@@ -972,6 +994,9 @@ impl GpuBackendImpl for WgpuBackend {
         pool_size: u32,
         is_max: bool,
     ) -> Result<(), String> {
+        if !self.gpu_available {
+            return Err("WgpuBackend: GPU not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
             .get(&input.id)
@@ -1016,6 +1041,9 @@ impl GpuBackendImpl for WgpuBackend {
         out: &GpuBufferHandle,
         activation: &str,
     ) -> Result<(), String> {
+        if !self.gpu_available {
+            return Err("WgpuBackend: GPU not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
             .get(&input.id)
@@ -1038,15 +1066,26 @@ impl GpuBackendImpl for WgpuBackend {
                 }
             }
             "softmax" => {
-                let max_v = out_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let mut sum = 0.0f32;
-                for v in &mut out_data {
-                    *v = (*v - max_v).exp();
-                    sum += *v;
-                }
-                if sum != 0.0 {
-                    for v in &mut out_data {
-                        *v /= sum;
+                let row_len = if inp.shape.len() >= 2 {
+                    inp.shape[inp.shape.len() - 1]
+                } else {
+                    out_data.len()
+                };
+                let num_rows = out_data.len() / row_len.max(1);
+                for r in 0..num_rows {
+                    let row_start = r * row_len;
+                    let row_end = row_start + row_len;
+                    let row = &mut out_data[row_start..row_end];
+                    let max_v = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mut sum = 0.0f32;
+                    for v in row.iter_mut() {
+                        *v = (*v - max_v).exp();
+                        sum += *v;
+                    }
+                    if sum != 0.0 {
+                        for v in row.iter_mut() {
+                            *v /= sum;
+                        }
                     }
                 }
             }
@@ -1069,6 +1108,9 @@ impl GpuBackendImpl for WgpuBackend {
         scale: f32,
         causal: bool,
     ) -> Result<(), String> {
+        if !self.gpu_available {
+            return Err("WgpuBackend: GPU not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         let mut buffers = self.buffers.lock().unwrap();
         let q_buf = buffers.get(&query.id).ok_or("Query buffer not found")?;
         let k_buf = buffers.get(&key.id).ok_or("Key buffer not found")?;
@@ -1094,7 +1136,7 @@ impl GpuBackendImpl for WgpuBackend {
     }
 
     fn is_available(&self) -> bool {
-        true // Always available — falls back to CPU if no GPU detected
+        self.gpu_available // Only truly available when GPU hardware is present
     }
 }
 
@@ -1113,8 +1155,8 @@ impl GpuBackendImpl for WgpuBackend {
 /// - A CUDA-capable GPU must be installed
 /// - The CUDA Toolkit (optional, for cuBLAS/cuDNN integration)
 ///
-/// When CUDA is not available, the CudaBackend falls back to CPU execution
-/// using the same compute kernels as CpuBackend.
+/// When CUDA is not available, CudaBackend compute operations return errors
+/// instead of silently falling back to CPU.
 mod cuda_ffi {
     #![allow(non_camel_case_types)]
 
@@ -1188,12 +1230,13 @@ fn probe_library(name: &[u8]) -> bool {
 /// NVIDIA CUDA backend.
 ///
 /// Attempts to use the CUDA Driver API for GPU computation.
-/// If libcuda.so is not available at runtime, falls back to CPU execution
-/// that actually computes the result (not identity/no-op).
+/// If libcuda.so is not available at runtime, compute operations return errors
+/// rather than silently falling back to CPU. Use CpuBackend explicitly if CPU
+/// execution is desired.
 pub struct CudaBackend {
     buffers: Arc<Mutex<HashMap<u64, GpuBuffer>>>,
     next_id: Arc<Mutex<u64>>,
-    has_cuda: bool,
+    pub has_cuda: bool,
 }
 
 impl CudaBackend {
@@ -1285,6 +1328,9 @@ impl GpuBackendImpl for CudaBackend {
         b: &GpuBufferHandle,
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
+        if !self.has_cuda {
+            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         // TODO: When has_cuda is true, use cuBLAS sgemm or cuLaunchKernel
         // with a custom matmul kernel.
         // CPU fallback: actually compute the matrix multiplication.
@@ -1310,6 +1356,9 @@ impl GpuBackendImpl for CudaBackend {
         op: GpuOp,
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
+        if !self.has_cuda {
+            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         if matches!(op, GpuOp::MatMul) {
             return Err("MatMul is not an elementwise operation. Use the matmul() method instead.".into());
         }
@@ -1354,6 +1403,9 @@ impl GpuBackendImpl for CudaBackend {
         stride: u32,
         padding: u32,
     ) -> Result<(), String> {
+        if !self.has_cuda {
+            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         // CPU fallback: actually compute the convolution.
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
@@ -1402,6 +1454,9 @@ impl GpuBackendImpl for CudaBackend {
         pool_size: u32,
         is_max: bool,
     ) -> Result<(), String> {
+        if !self.has_cuda {
+            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         // CPU fallback: actually compute pooling.
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
@@ -1447,6 +1502,9 @@ impl GpuBackendImpl for CudaBackend {
         out: &GpuBufferHandle,
         activation: &str,
     ) -> Result<(), String> {
+        if !self.has_cuda {
+            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         // CPU fallback: actually compute activation functions.
         let mut buffers = self.buffers.lock().unwrap();
         let inp = buffers
@@ -1470,15 +1528,27 @@ impl GpuBackendImpl for CudaBackend {
                 }
             }
             "softmax" => {
-                let max_v = out_data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let mut sum = 0.0f32;
-                for v in &mut out_data {
-                    *v = (*v - max_v).exp();
-                    sum += *v;
-                }
-                if sum != 0.0 {
-                    for v in &mut out_data {
-                        *v /= sum;
+                // Per-row softmax for 2D tensors [rows, cols].
+                let row_len = if inp.shape.len() >= 2 {
+                    inp.shape[inp.shape.len() - 1]
+                } else {
+                    out_data.len()
+                };
+                let num_rows = out_data.len() / row_len.max(1);
+                for r in 0..num_rows {
+                    let row_start = r * row_len;
+                    let row_end = row_start + row_len;
+                    let row = &mut out_data[row_start..row_end];
+                    let max_v = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mut sum = 0.0f32;
+                    for v in row.iter_mut() {
+                        *v = (*v - max_v).exp();
+                        sum += *v;
+                    }
+                    if sum != 0.0 {
+                        for v in row.iter_mut() {
+                            *v /= sum;
+                        }
                     }
                 }
             }
@@ -1501,6 +1571,9 @@ impl GpuBackendImpl for CudaBackend {
         scale: f32,
         causal: bool,
     ) -> Result<(), String> {
+        if !self.has_cuda {
+            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        }
         // CPU fallback: scaled dot-product attention (actually computes).
         let mut buffers = self.buffers.lock().unwrap();
         let q_buf = buffers.get(&query.id).ok_or("Query buffer not found")?;
@@ -1527,7 +1600,7 @@ impl GpuBackendImpl for CudaBackend {
     }
 
     fn is_available(&self) -> bool {
-        true // Always available — falls back to CPU if no CUDA detected
+        self.has_cuda // Only truly available when CUDA hardware is present
     }
 }
 
@@ -1557,11 +1630,8 @@ impl GpuBackend {
                 return GpuBackend::Wgpu(Arc::new(backend));
             }
         }
-        // Fallback to wGPU CPU mode, then CPU backend
-        match WgpuBackend::new() {
-            Ok(backend) => GpuBackend::Wgpu(Arc::new(backend)),
-            Err(_) => GpuBackend::Cpu(Arc::new(CpuBackend::new())),
-        }
+        // Fallback to CPU backend (no silent GPU fallback)
+        GpuBackend::Cpu(Arc::new(CpuBackend::new()))
     }
 
     /// Force CPU backend
@@ -1569,11 +1639,13 @@ impl GpuBackend {
         GpuBackend::Cpu(Arc::new(CpuBackend::new()))
     }
 
-    /// Force CUDA backend (falls back to CPU if CUDA not available)
+    /// Force CUDA backend (returns CudaBackend only if CUDA hardware is present;
+    /// otherwise returns CpuBackend since CudaBackend without CUDA cannot run
+    /// any compute operations)
     pub fn cuda() -> Self {
         match CudaBackend::new() {
-            Ok(backend) => GpuBackend::Cuda(Arc::new(backend)),
-            Err(_) => GpuBackend::Cpu(Arc::new(CpuBackend::new())),
+            Ok(backend) if backend.has_cuda => GpuBackend::Cuda(Arc::new(backend)),
+            _ => GpuBackend::Cpu(Arc::new(CpuBackend::new())),
         }
     }
 
@@ -2027,6 +2099,16 @@ mod tests {
     #[test]
     fn test_jules_gpu_elementwise_and_activation() {
         let backend = WgpuBackend::new().unwrap();
+        if !backend.gpu_available {
+            // Without a real GPU, compute operations must return an error
+            // instead of silently falling back to CPU.
+            let a = backend.upload(&[1.0, -2.0, 3.0, -4.0], vec![2, 2]);
+            let b = backend.upload(&[0.5, 0.5, 0.5, 0.5], vec![2, 2]);
+            let out = backend.upload(&[0.0, 0.0, 0.0, 0.0], vec![2, 2]);
+            assert!(backend.elementwise(&a, &b, GpuOp::Add, &out).is_err());
+            assert!(backend.activation(&out, &out, "relu").is_err());
+            return;
+        }
         let a = backend.upload(&[1.0, -2.0, 3.0, -4.0], vec![2, 2]);
         let b = backend.upload(&[0.5, 0.5, 0.5, 0.5], vec![2, 2]);
         let out = backend.upload(&[0.0, 0.0, 0.0, 0.0], vec![2, 2]);
@@ -2042,6 +2124,14 @@ mod tests {
     #[test]
     fn test_jules_gpu_batched_matmul() {
         let backend = WgpuBackend::new().unwrap();
+        if !backend.gpu_available {
+            assert!(backend.matmul(
+                &GpuBufferHandle { id: 0 },
+                &GpuBufferHandle { id: 0 },
+                &GpuBufferHandle { id: 0 },
+            ).is_err());
+            return;
+        }
         let a = backend.upload(
             &[
                 1.0, 2.0, 3.0, 4.0, // batch 0

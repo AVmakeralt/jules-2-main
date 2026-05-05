@@ -113,6 +113,11 @@ pub enum Ty {
     Struct(String),
     /// A resolved enum variant's parent type.
     Enum(String),
+    /// Result<T, E> — a sum type representing success (Ok) or error (Err).
+    Result {
+        ok: Box<Ty>,
+        err: Box<Ty>,
+    },
     /// An ECS component type (subset of `Struct`).
     Component(String),
     /// The ECS world handle: `world`.
@@ -207,6 +212,7 @@ impl Ty {
                 }
             }
             Ty::Option(inner) => format!("Option<{}>", inner.display()),
+            Ty::Result { ok, err } => format!("Result<{}, {}>", ok.display(), err.display()),
             Ty::FnPtr { params, ret } => {
                 let ps: Vec<_> = params.iter().map(|p| p.display()).collect();
                 format!("fn({}) -> {}", ps.join(", "), ret.display())
@@ -341,19 +347,56 @@ impl InferCtx {
         }
     }
 
+    /// Check whether inference variable `id` occurs anywhere inside `ty`
+    /// (following the substitution chain).  If so, unifying `id` with `ty`
+    /// would create an infinite type (e.g. `_#0 = Option<_#0>`).
+    fn occurs_in(&self, id: u32, ty: &Ty) -> bool {
+        match ty {
+            Ty::Infer(oid) => {
+                if *oid == id {
+                    return true;
+                }
+                // Follow the substitution chain.
+                match self.subst.get(oid) {
+                    Some(subst) => self.occurs_in(id, subst),
+                    None => false,
+                }
+            }
+            Ty::Option(inner) => self.occurs_in(id, inner),
+            Ty::Result { ok, err } => self.occurs_in(id, ok) || self.occurs_in(id, err),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.occurs_in(id, t)),
+            Ty::Array { elem, .. } => self.occurs_in(id, elem),
+            Ty::Slice(inner) => self.occurs_in(id, inner),
+            Ty::Ref { inner, .. } => self.occurs_in(id, inner),
+            Ty::FnPtr { params, ret } => {
+                params.iter().any(|t| self.occurs_in(id, t)) || self.occurs_in(id, ret)
+            }
+            Ty::Tensor { shape, .. } => shape.iter().any(|d| {
+                // Named dimensions could conceivably be type-level, but
+                // they never contain inference variables.
+                let _ = d;
+                false
+            }),
+            // Scalar, Bool, Str, Unit, Never, Vec, Mat, Quat, Struct, Enum,
+            // Component, World — leaf types that cannot contain inference vars.
+            _ => false,
+        }
+    }
+
     /// Attempt to unify `a` and `b`, recording the binding.
     /// Returns `true` on success, `false` on mismatch.
     /// Fixed: only clone when inserting into substitution map
+    /// Fixed: added occurs check to prevent infinite types
     pub fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
         let a_resolved = self.resolve(a).clone();
         let b_resolved = self.resolve(b).clone();
         match (a_resolved, b_resolved) {
             (Ty::Infer(id), other) | (other, Ty::Infer(id)) => {
-                // Occurs check: don't bind a var to itself.
-                if matches!(other, Ty::Infer(oid) if oid == id) {
-                    return true;
+                // Occurs check: if `id` appears within `other`, unifying
+                // would create an infinite type (e.g. `_#0 = Option<_#0>`).
+                if self.occurs_in(id, &other) {
+                    return false;
                 }
-                // Only clone ONCE when actually inserting
                 self.subst.insert(id, other.clone());
                 true
             }
@@ -381,6 +424,11 @@ impl InferCtx {
             (Ty::Tuple(ts_a), Ty::Tuple(ts_b)) => {
                 ts_a.len() == ts_b.len() && ts_a.iter().zip(ts_b.iter()).all(|(a, b)| self.unify(a, b))
             }
+            // Result types unify if both type arguments unify.
+            (
+                Ty::Result { ok: oa, err: ea },
+                Ty::Result { ok: ob, err: eb },
+            ) => self.unify(oa.as_ref(), ob.as_ref()) && self.unify(ea.as_ref(), eb.as_ref()),
             // Everything else must be structurally equal.
             _ => a == b,
         }
@@ -878,7 +926,10 @@ impl TypeCk {
                     ret: Box::new(r),
                 }
             }
-            Type::Result { ok: _, err: _ } => self.infer.fresh(),
+            Type::Result { ok, err } => Ty::Result {
+                ok: Box::new(self.lower_ast_type(ok, span)),
+                err: Box::new(self.lower_ast_type(err, span)),
+            },
         }
     }
 

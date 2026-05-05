@@ -841,7 +841,7 @@ impl LowerCtx {
                     BinOpKind::Le     => IRInstr::ICmp { dst: d, cond: ICmpCond::SLe, lhs: l, rhs: r },
                     BinOpKind::Gt     => IRInstr::ICmp { dst: d, cond: ICmpCond::SGt, lhs: l, rhs: r },
                     BinOpKind::Ge     => IRInstr::ICmp { dst: d, cond: ICmpCond::SGe, lhs: l, rhs: r },
-                    _ => { self.emit(IRInstr::Const { dst: d, value: 0 }); return d; }
+                    other => { panic!("unsupported binary operator: {:?}", other); }
                 };
                 self.emit(i);
                 d
@@ -852,7 +852,7 @@ impl LowerCtx {
                 let i = match op {
                     UnOpKind::Neg => IRInstr::Neg { dst: d, src: s },
                     UnOpKind::Not => IRInstr::Not { dst: d, src: s },
-                    _ => { self.emit(IRInstr::Const { dst: d, value: 0 }); return d; }
+                    other => { panic!("unsupported unary operator: {:?}", other); }
                 };
                 self.emit(i);
                 d
@@ -1389,13 +1389,13 @@ pub fn run_reassociate(func: &mut IRFunction) {
         for instr in &block.instrs {
             // Try to fold (a + c1) + c2 → a + (c1 + c2)
             let simplified = match instr {
-                IRInstr::Add { dst, lhs, rhs: _ } => {
+                IRInstr::Add { dst, lhs, rhs } => {
                     if let Some(&IRInstr::Add { lhs: inner_lhs, rhs: inner_rhs, .. }) = value_map.get(lhs) {
                         // lhs is (inner_lhs + inner_rhs), try to push constant up
                         if let Some(&IRInstr::Const { value: c1, .. }) = value_map.get(&inner_rhs) {
-                            if let IRInstr::Const { value: c2, .. } = instr {
+                            if let Some(&IRInstr::Const { value: c2, .. }) = value_map.get(rhs) {
                                 // Fold: (a + c1) + c2 = a + (c1 + c2)
-                                let new_const = c1.wrapping_add(*c2);
+                                let new_const = c1.wrapping_add(c2);
                                 let new_lhs = inner_lhs;
                                 let new_rhs_var = func.next_var;
                                 func.next_var += 1;
@@ -1406,8 +1406,8 @@ pub fn run_reassociate(func: &mut IRFunction) {
                         }
                         // Same for (c1 + a) + c2 = c1 + (a + c2)
                         if let Some(&IRInstr::Const { value: c1, .. }) = value_map.get(&inner_lhs) {
-                            if let IRInstr::Const { value: c2, .. } = instr {
-                                let new_const = c1.wrapping_add(*c2);
+                            if let Some(&IRInstr::Const { value: c2, .. }) = value_map.get(rhs) {
+                                let new_const = c1.wrapping_add(c2);
                                 let new_lhs = inner_rhs;
                                 let new_rhs_var = func.next_var;
                                 func.next_var += 1;
@@ -1419,12 +1419,12 @@ pub fn run_reassociate(func: &mut IRFunction) {
                     }
                     instr.clone()
                 }
-                IRInstr::Mul { dst, lhs, rhs: _ } => {
+                IRInstr::Mul { dst, lhs, rhs } => {
                     // Similar for multiplication: (a * c1) * c2 = a * (c1 * c2)
                     if let Some(&IRInstr::Mul { lhs: inner_lhs, rhs: inner_rhs, .. }) = value_map.get(lhs) {
                         if let Some(&IRInstr::Const { value: c1, .. }) = value_map.get(&inner_rhs) {
-                            if let IRInstr::Const { value: c2, .. } = instr {
-                                let new_const = c1.wrapping_mul(*c2);
+                            if let Some(&IRInstr::Const { value: c2, .. }) = value_map.get(rhs) {
+                                let new_const = c1.wrapping_mul(c2);
                                 let new_lhs = inner_lhs;
                                 let new_rhs_var = func.next_var;
                                 func.next_var += 1;

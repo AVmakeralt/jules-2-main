@@ -238,17 +238,31 @@ pub struct IoUringCqe {
 pub struct IoUring {
     /// io_uring file descriptor
     fd: i32,
-    /// Submission queue
+    /// Submission queue ring mapping
     sq: *mut u8,
-    /// Completion queue
+    /// Completion queue ring mapping
     cq: *mut u8,
-    /// Ring buffer size
+    /// SQ ring size in bytes
+    sq_ring_size: usize,
+    /// CQ ring size in bytes
+    cq_ring_size: usize,
+    /// Number of SQ entries
+    sq_entries: u32,
+    /// Number of CQ entries
+    cq_entries: u32,
+    /// SQE array mapping (separate from the ring)
+    sqes: *mut IoUringSqe,
+    /// Ring buffer size (deprecated, kept for API compat)
     #[allow(dead_code)]
     ring_size: usize,
     /// SQPOLL mode enabled
     sqpoll: bool,
     /// Fixed files registered
     fixed_files: bool,
+    /// SQ ring offsets (from params.sq_off)
+    sq_off: [u64; 6],
+    /// CQ ring offsets (from params.cq_off)
+    cq_off: [u64; 5],
 }
 
 impl IoUring {
@@ -286,22 +300,128 @@ impl IoUring {
                 libc::syscall(
                     libc::SYS_io_uring_setup,
                     entries as libc::c_ulong,
-                    &params as *const _,
+                    &mut params as *mut _,
                 )
             };
             
             if fd < 0 {
                 return Err(format!("io_uring_setup failed: errno {}", unsafe { *libc::__errno_location() }));
             }
-            
-            // Map the ring buffers (simplified - would need proper mmap in production)
+            let fd = fd as i32;
+
+            // --- mmap the SQ/CQ rings and SQE array ---
+            // sq_off[0] = ring header offset (used as mmap offset for the SQ ring)
+            // sq_off[5] = number of SQEs mapped (used for the SQE array size)
+            // The SQ ring and CQ ring are mmap'd from the io_uring fd using the
+            // offsets returned in params.
+
+            let sq_entries = params.sq_entries;
+            let cq_entries = params.cq_entries;
+
+            // Calculate the SQ ring mapping size.
+            // The kernel returns the ring size in sq_off[5] (sq_off array size field)
+            // on newer kernels; on older kernels we compute it from the offsets.
+            // For a simplified implementation we use the last sq_off entry as the
+            // size hint, or fall back to a generous estimate.
+            let sq_ring_size = if params.sq_off[5] != 0 {
+                params.sq_off[5] as usize
+            } else {
+                // Fallback: estimate based on entries
+                sq_entries as usize * std::mem::size_of::<u32>() * 4 + 4096
+            };
+
+            // The CQ ring is typically mapped with a separate offset.
+            // IORING_OFF_CQ_RING = 0x08000000 on kernels that support it;
+            // for single-mmap mode (IORING_SETUP_NO_MMAP is not set by default)
+            // the SQ and CQ share one mapping on older kernels.
+            // We use the cq_off[4] (extra field) as size hint, or estimate.
+            let cq_ring_size = if params.cq_off[4] != 0 {
+                params.cq_off[4] as usize
+            } else {
+                cq_entries as usize * std::mem::size_of::<IoUringCqe>() + 4096
+            };
+
+            // mmap the SQ ring
+            let sq = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    sq_ring_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_POPULATE,
+                    fd,
+                    params.sq_off[0] as libc::off_t, // IORING_OFF_SQ_RING
+                )
+            };
+            if sq == libc::MAP_FAILED {
+                unsafe { libc::close(fd); }
+                return Err(format!(
+                    "io_uring SQ mmap failed: errno {}",
+                    unsafe { *libc::__errno_location() }
+                ));
+            }
+
+            // mmap the CQ ring (offset IORING_OFF_CQ_RING = 0x08000000)
+            let cq_off_mmap: libc::off_t = 0x0800_0000;
+            let cq = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    cq_ring_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_POPULATE,
+                    fd,
+                    cq_off_mmap,
+                )
+            };
+            if cq == libc::MAP_FAILED {
+                unsafe {
+                    libc::munmap(sq, sq_ring_size);
+                    libc::close(fd);
+                }
+                return Err(format!(
+                    "io_uring CQ mmap failed: errno {}",
+                    unsafe { *libc::__errno_location() }
+                ));
+            }
+
+            // mmap the SQE array (offset IORING_OFF_SQES = 0x10000000)
+            let sqes_size = sq_entries as usize * std::mem::size_of::<IoUringSqe>();
+            let sqes_off: libc::off_t = 0x1000_0000;
+            let sqes = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    sqes_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_POPULATE,
+                    fd,
+                    sqes_off,
+                )
+            };
+            if sqes == libc::MAP_FAILED {
+                unsafe {
+                    libc::munmap(cq, cq_ring_size);
+                    libc::munmap(sq, sq_ring_size);
+                    libc::close(fd);
+                }
+                return Err(format!(
+                    "io_uring SQE mmap failed: errno {}",
+                    unsafe { *libc::__errno_location() }
+                ));
+            }
+
             Ok(Self {
-                fd: fd as i32,
-                sq: ptr::null_mut(),
-                cq: ptr::null_mut(),
+                fd,
+                sq: sq as *mut u8,
+                cq: cq as *mut u8,
+                sq_ring_size,
+                cq_ring_size,
+                sq_entries,
+                cq_entries,
+                sqes: sqes as *mut IoUringSqe,
                 ring_size: entries as usize,
                 sqpoll,
                 fixed_files: false,
+                sq_off: params.sq_off,
+                cq_off: params.cq_off,
             })
         }
         
@@ -368,19 +488,26 @@ impl IoUring {
     /// Write to submission queue (SQPOLL mode, zero-syscall)
     fn sq_write(&self, sqe: IoUringSqe) -> Result<(), String> {
         // Write to shared memory ring buffer
-        // In production, would use memory-mapped SQ ring
-        // For now, simulate the write
-        if self.sq.is_null() {
+        if self.sq.is_null() || self.sqes.is_null() {
             return Err("SQ ring not mapped".to_string());
         }
-        
-        // Write SQE to SQ ring (simplified)
+
         unsafe {
-            let sq_ptr = self.sq as *mut IoUringSqe;
-            // In production, would use proper ring buffer indexing
-            *sq_ptr = sqe;
+            // Read the current SQ tail index from the ring.
+            // sq_off[1] is the offset of the tail field within the SQ ring.
+            let tail_off = self.sq_off[1] as usize;
+            let tail_ptr = (self.sq as *mut u8).add(tail_off) as *mut u32;
+            let tail = *tail_ptr;
+
+            // Write the SQE to the SQE array at the current tail position
+            let sqe_idx = (tail & (self.sq_entries - 1)) as usize;
+            let sqe_ptr = self.sqes.add(sqe_idx);
+            *sqe_ptr = sqe;
+
+            // Advance the tail (wrapping)
+            *tail_ptr = tail.wrapping_add(1);
         }
-        
+
         Ok(())
     }
     
@@ -409,8 +536,21 @@ impl Drop for IoUring {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         {
+            // Unmap SQE array
+            if !self.sqes.is_null() {
+                let sqes_size = self.sq_entries as usize * std::mem::size_of::<IoUringSqe>();
+                unsafe { libc::munmap(self.sqes as *mut libc::c_void, sqes_size); }
+            }
+            // Unmap CQ ring
+            if !self.cq.is_null() && self.cq_ring_size > 0 {
+                unsafe { libc::munmap(self.cq as *mut libc::c_void, self.cq_ring_size); }
+            }
+            // Unmap SQ ring
+            if !self.sq.is_null() && self.sq_ring_size > 0 {
+                unsafe { libc::munmap(self.sq as *mut libc::c_void, self.sq_ring_size); }
+            }
+            // Close io_uring fd
             if self.fd >= 0 {
-                // Close io_uring fd
                 unsafe {
                     libc::close(self.fd);
                 }
@@ -508,20 +648,23 @@ impl UintrSender {
             // outlives the sender.
             unsafe {
                 let upid = entry.upid_addr as *const UintrUpid;
-                // Set PIR bit for the target vector.
-                let pir_ptr = std::ptr::addr_of!((*upid).pir) as *mut u64;
-                // Atomically OR the vector bit into PIR.
-                let pir_val = core::sync::atomic::AtomicU64::from_ptr(pir_ptr);
-                pir_val.fetch_or(1u64 << entry.vector, Ordering::SeqCst);
+
+                // Set PIR bit for the target vector using a stable atomic
+                // primitive.  AtomicU64::from_ptr is nightly-only, so we
+                // use AtomicUsize on 64-bit platforms (usize == u64) which
+                // has been stable since Rust 1.0.
+                let pir_ptr = std::ptr::addr_of!((*upid).pir) as *mut usize;
+                let pir_atomic = &*(pir_ptr as *const std::sync::atomic::AtomicUsize);
+                pir_atomic.fetch_or(1usize << entry.vector, Ordering::SeqCst);
 
                 // Send the interrupt notification by writing to the
                 // notification-control word.  On real UINTR hardware
                 // this is done by SENDUIPI which triggers an IPI-like
                 // mechanism; we emulate by setting the ON (outstanding
                 // notification) bit.
-                let ncr_ptr = std::ptr::addr_of!((*upid).ncr) as *mut u64;
-                let ncr_val = core::sync::atomic::AtomicU64::from_ptr(ncr_ptr);
-                ncr_val.fetch_or(1, Ordering::SeqCst);
+                let ncr_ptr = std::ptr::addr_of!((*upid).ncr) as *mut usize;
+                let ncr_atomic = &*(ncr_ptr as *const std::sync::atomic::AtomicUsize);
+                ncr_atomic.fetch_or(1, Ordering::SeqCst);
             }
 
             Ok(())
