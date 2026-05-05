@@ -338,7 +338,7 @@ impl Tensor {
             shape: self.shape.clone(),
             data: self.data.iter()
                 .map(|x| {
-                    let cdf = 0.5 * (1.0 + (cdf_coeff * x).tanh());
+                    let cdf = 0.5 * (1.0 + (cdf_coeff * (x + 0.044715 * x * x * x)).tanh());
                     x * cdf
                 })
                 .collect(),
@@ -435,12 +435,23 @@ impl Tensor {
         let variance = self.variance();
         let std = (variance + epsilon).sqrt();
 
+        let spatial: usize = if self.shape.len() > 2 {
+            self.shape[2..].iter().product()
+        } else {
+            1
+        };
+        let c = if self.shape.len() >= 2 { self.shape[1] } else { 1 };
+
         Tensor {
             shape: self.shape.clone(),
             data: self.data.iter()
-                .map(|x| {
+                .enumerate()
+                .map(|(i, x)| {
+                    let ch = if c > 0 && spatial > 0 { (i / spatial) % c } else { 0 };
                     let normalized = (x - mean) / std;
-                    gamma.data[0] * normalized + beta.data[0]
+                    let g = if ch < gamma.data.len() { gamma.data[ch] } else { gamma.data[0] };
+                    let b = if ch < beta.data.len() { beta.data[ch] } else { beta.data[0] };
+                    g * normalized + b
                 })
                 .collect(),
             requires_grad: self.requires_grad,
@@ -735,6 +746,7 @@ impl OptimizerState {
     }
 
     pub fn step(&mut self, opt_type: &OptimType, param_id: &str, weights: &mut [f32], grads: &[f32]) {
+        self.step += 1;
         match opt_type {
             OptimType::SGD { lr, momentum } => {
                 let m = self.m.remove(param_id)
@@ -754,7 +766,7 @@ impl OptimizerState {
                 let v = self.v.remove(param_id)
                     .unwrap_or_else(|| vec![0.0; weights.len()]);
 
-                let t = (self.step as f32) + 1.0;
+                let t = self.step as f32;
                 let bc1 = 1.0 - beta1.powf(t);
                 let bc2 = 1.0 - beta2.powf(t);
 
@@ -772,7 +784,6 @@ impl OptimizerState {
                 }
                 self.m.insert(param_id.to_string(), m_new);
                 self.v.insert(param_id.to_string(), v_new);
-                self.step += 1;
             }
             OptimType::AdamW { lr, beta1, beta2, eps, wd } => {
                 let m = self.m.remove(param_id)
@@ -780,7 +791,7 @@ impl OptimizerState {
                 let v = self.v.remove(param_id)
                     .unwrap_or_else(|| vec![0.0; weights.len()]);
 
-                let t = (self.step as f32) + 1.0;
+                let t = self.step as f32;
                 let bc1 = 1.0 - beta1.powf(t);
                 let bc2 = 1.0 - beta2.powf(t);
 
@@ -799,7 +810,6 @@ impl OptimizerState {
                 }
                 self.m.insert(param_id.to_string(), m_new);
                 self.v.insert(param_id.to_string(), v_new);
-                self.step += 1;
             }
         }
     }
@@ -832,7 +842,9 @@ impl Scheduler {
 
     pub fn linear_warmup(&self, warmup: u64, total: u64) -> f32 {
         if self.step < warmup {
-            self.initial_lr * (self.step as f32 / warmup as f32)
+            self.initial_lr * (self.step as f32 / warmup.max(1) as f32)
+        } else if total == warmup {
+            self.initial_lr
         } else {
             self.initial_lr * ((total - self.step) as f32 / (total - warmup) as f32)
         }

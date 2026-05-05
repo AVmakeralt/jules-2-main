@@ -202,9 +202,15 @@ impl TsxTransaction {
 impl Drop for TsxTransaction {
     fn drop(&mut self) {
         if self.active && !self.committed {
-            // Transaction was not committed — abort it.
-            // The CPU will discard all speculative writes.
-            unsafe { xabort(0xFF) };
+            // Only call xabort if we are actually inside a hardware transaction.
+            // Calling xabort outside a transaction is undefined behaviour.
+            let in_tx = unsafe { xtest() };
+            if in_tx {
+                unsafe { xabort(0xFF) };
+            }
+            // If not in a transaction, just mark the transaction as no longer
+            // active.  The speculative writes were already discarded by the
+            // hardware when the transaction aborted (or never started).
             self.active = false;
         }
     }
@@ -391,11 +397,18 @@ pub unsafe fn amx_tdpbssd(dest: u8, src1: u8, src2: u8) {
         // to the default no-op handler.
         (0, 1, 2) => core::arch::asm!("tdpbssd tmm0, tmm1, tmm2", options(nomem, nostack)),
         (3, 1, 2) => core::arch::asm!("tdpbssd tmm3, tmm1, tmm2", options(nomem, nostack)),
-        // Default: common pattern for learned scheduler
+        // FIXME: Only 2 of 512 possible (dest, src1, src2) register combinations
+        // are implemented above.  The remaining 510 combinations are unimplemented.
+        // A full implementation would either enumerate all valid combos here or
+        // use a JIT to emit the correct instruction dynamically.
         (d, s1, s2) => {
-            // Fallback: use raw bytes for tdpbssd
-            // This is a simplified version; a full implementation would
-            // enumerate all 512 combinations or use a JIT to emit the instruction
+            // Unimplemented register combination — log a warning rather than
+            // silently doing nothing so that bugs are detectable at runtime.
+            eprintln!(
+                "WARNING: amx_tdpbssd called with unimplemented register \
+                 combination (dest={}, src1={}, src2={}); operation skipped",
+                d, s1, s2
+            );
             let _ = (d, s1, s2, tmm);
         }
     }

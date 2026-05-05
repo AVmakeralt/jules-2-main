@@ -488,44 +488,59 @@ impl NativeCodeGenerator {
                 }
             }
             Instr::BinOp(dst, op, lhs, rhs) => {
-                // Load from unboxed buffers
-                if let Some(&Some(lhs_offset)) = unboxed_slots.get(*lhs as usize) {
-                    self.emit_unboxed_load(lhs_offset, vtype, unboxed_buffer, Reg::RAX)?;
-                }
-                if let Some(&Some(rhs_offset)) = unboxed_slots.get(*rhs as usize) {
-                    self.emit_unboxed_load(rhs_offset, vtype, unboxed_buffer, Reg::RCX)?;
-                }
-                match op {
-                    BinOpKind::Add => self.add_rax_rcx(),
-                    BinOpKind::Sub => self.sub_rax_rcx(),
-                    BinOpKind::Mul => self.imul_rax_rcx(),
-                    BinOpKind::Div => self.idiv_rax_rcx(),
-                    BinOpKind::Rem => self.irem_rax_rcx(),
-                    BinOpKind::BitAnd => self.and_rax_rcx(),
-                    BinOpKind::BitOr => self.or_rax_rcx(),
-                    BinOpKind::BitXor => self.xor_rax_rcx(),
-                    BinOpKind::Shl => self.shl_rax_cl(),
-                    BinOpKind::Shr => self.shr_rax_cl(),
-                    _ => return Err(format!("Unsupported BinOp in unboxed mode: {:?}", op)),
-                }
-                // Store result to unboxed buffer
-                if let Some(&Some(dst_offset)) = unboxed_slots.get(*dst as usize) {
-                    self.emit_unboxed_store_reg(dst_offset, Reg::RAX, vtype, unboxed_buffer);
+                // Only use the unboxed path if ALL operands have unboxed offsets;
+                // otherwise fall through to the boxed implementation to avoid
+                // operating on stale register values.
+                let lhs_has = unboxed_slots.get(*lhs as usize).and_then(|o| *o).is_some();
+                let rhs_has = unboxed_slots.get(*rhs as usize).and_then(|o| *o).is_some();
+                let dst_has = unboxed_slots.get(*dst as usize).and_then(|o| *o).is_some();
+                if lhs_has && rhs_has && dst_has {
+                    // Load from unboxed buffers
+                    if let Some(&Some(lhs_offset)) = unboxed_slots.get(*lhs as usize) {
+                        self.emit_unboxed_load(lhs_offset, vtype, unboxed_buffer, Reg::RAX)?;
+                    }
+                    if let Some(&Some(rhs_offset)) = unboxed_slots.get(*rhs as usize) {
+                        self.emit_unboxed_load(rhs_offset, vtype, unboxed_buffer, Reg::RCX)?;
+                    }
+                    match op {
+                        BinOpKind::Add => self.add_rax_rcx(),
+                        BinOpKind::Sub => self.sub_rax_rcx(),
+                        BinOpKind::Mul => self.imul_rax_rcx(),
+                        BinOpKind::Div => self.idiv_rax_rcx(),
+                        BinOpKind::Rem => self.irem_rax_rcx(),
+                        BinOpKind::BitAnd => self.and_rax_rcx(),
+                        BinOpKind::BitOr => self.or_rax_rcx(),
+                        BinOpKind::BitXor => self.xor_rax_rcx(),
+                        BinOpKind::Shl => self.shl_rax_cl(),
+                        BinOpKind::Shr => self.shr_rax_cl(),
+                        _ => return Err(format!("Unsupported BinOp in unboxed mode: {:?}", op)),
+                    }
+                    // Store result to unboxed buffer
+                    if let Some(&Some(dst_offset)) = unboxed_slots.get(*dst as usize) {
+                        self.emit_unboxed_store_reg(dst_offset, Reg::RAX, vtype, unboxed_buffer);
+                    }
+                } else {
+                    // Fallback to boxed path: at least one operand lacks an unboxed offset
+                    return self.emit_instruction(ti);
                 }
             }
             Instr::Return(slot) => {
                 if let Some(&Some(offset)) = unboxed_slots.get(*slot as usize) {
                     self.emit_unboxed_load(offset, vtype, unboxed_buffer, Reg::RAX)?;
                 }
+                // Write back all dirty registers before returning so modified
+                // slot values are not lost on the unboxed path.
+                self.writeback_all_dirty()?;
             }
             _ => return Err(format!("Unsupported instruction in unboxed mode: {:?}", ti.instruction)),
         }
         Ok(())
     }
 
-    fn emit_unboxed_load(&mut self, offset: u32, _vtype: ValueType, _buffer: *mut u8, reg: Reg) -> Result<(), String> {
+    fn emit_unboxed_load(&mut self, offset: u32, _vtype: ValueType, buffer: *mut u8, reg: Reg) -> Result<(), String> {
         // Load from unboxed buffer at [buffer + offset]
-        // For now, use r8 as the buffer base register (passed in via calling convention)
+        // Load the buffer base address into r8 before using it as a base register
+        self.mov_r8_imm64(buffer as i64);
         let reg_code = reg as u8;
         let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
         self.b(rex);
@@ -541,8 +556,10 @@ impl NativeCodeGenerator {
         self.emit_unboxed_store_reg(offset, Reg::RAX, vtype, buffer);
     }
 
-    fn emit_unboxed_store_reg(&mut self, offset: u32, reg: Reg, _vtype: ValueType, _buffer: *mut u8) {
+    fn emit_unboxed_store_reg(&mut self, offset: u32, reg: Reg, _vtype: ValueType, buffer: *mut u8) {
         // Store register to unboxed buffer at [r8 + offset]
+        // Load the buffer base address into r8 before using it as a base register
+        self.mov_r8_imm64(buffer as i64);
         let reg_code = reg as u8;
         let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
         self.b(rex);
@@ -720,6 +737,7 @@ impl NativeCodeGenerator {
     }
     fn mov_eax_imm32(&mut self, v: i32) { self.b(0xB8); self.i32(v); }
     fn mov_rax_imm64(&mut self, v: i64) { self.bb(0x48, 0xB8); self.i64(v); }
+    fn mov_r8_imm64(&mut self, v: i64) { self.bb(0x49, 0xB8); self.i64(v); } // REX.W+B for r8
     fn add_rax_rcx(&mut self) { self.bbb(0x48, 0x01, 0xC8); }
     fn sub_rax_rcx(&mut self) { self.bbb(0x48, 0x29, 0xC8); }
     fn imul_rax_rcx(&mut self) { self.bbbb(0x48, 0x0F, 0xAF, 0xC1); }
@@ -791,6 +809,8 @@ pub struct TracingJIT {
     pub traces_recorded: u64,
     pub traces_compiled: u64,
     pub deoptimizations: u64,
+    /// Per-PC hot counters tracking how many times each entry_pc has been called.
+    hot_counters: FxHashMap<u64, u64>,
 }
 
 impl TracingJIT {
@@ -798,7 +818,7 @@ impl TracingJIT {
         Self {
             recorder: TraceRecorder::new(), codegen: NativeCodeGenerator::new(),
             trace_trigger: 100, compile_trigger: 10, traces_recorded: 0,
-            traces_compiled: 0, deoptimizations: 0,
+            traces_compiled: 0, deoptimizations: 0, hot_counters: FxHashMap::default(),
         }
     }
 
@@ -822,7 +842,8 @@ impl TracingJIT {
                 if let Some(t) = self.recorder.get_trace_mut(tid) { t.execution_count += 1; }
             }
         }
-        if self.should_start_tracing(self.trace_trigger) { self.recorder.start_recording(entry_pc); self.traces_recorded += 1; }
+        let hot_count = *self.hot_counters.entry(entry_pc as u64).and_modify(|c| *c += 1).or_insert(1);
+        if self.should_start_tracing(hot_count) { self.recorder.start_recording(entry_pc); self.traces_recorded += 1; }
         Err(RuntimeError::new("Interpreter fallback: JIT trace hot but not compiled, or guard failed"))
     }
 }

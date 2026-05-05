@@ -433,7 +433,7 @@ impl MemoryReorgOrchestrator {
             }
             _ => {
                 tx.abort();
-                return Ok(self.current_layout);
+                return Err(HtmError::Other);
             }
         };
 

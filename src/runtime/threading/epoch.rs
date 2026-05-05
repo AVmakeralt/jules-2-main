@@ -55,9 +55,9 @@ impl Participant {
     /// Try to collect garbage from old epochs
     fn try_collect(&self, current_epoch: u64) {
         let _epoch_idx = (current_epoch as usize) % NUM_EPOCHS;
-        let old_epoch_idx = ((current_epoch as usize).wrapping_sub(1)) % NUM_EPOCHS;
+        let old_epoch_idx = ((current_epoch as usize).saturating_sub(2)) % NUM_EPOCHS;
         
-        // Collect from two epochs ago
+        // Collect from two epochs ago (ensures at least 2 epochs of grace period)
         self.garbage_bags[old_epoch_idx].lock().unwrap().collect();
     }
 
@@ -115,6 +115,12 @@ impl GarbageBag {
 
     fn add(&mut self, item: Box<dyn Send + std::fmt::Debug>) {
         self.items.push(item);
+        
+        // Advance epoch periodically so deferred objects don't leak forever.
+        // Every 256 additions, try to advance the global epoch.
+        if self.items.len() % 256 == 0 {
+            advance_epoch();
+        }
         
         // Try to collect when bag is full
         if self.items.len() >= 32 {

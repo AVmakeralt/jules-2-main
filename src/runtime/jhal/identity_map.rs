@@ -16,6 +16,7 @@
 // =========================================================================
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
 
 // ─── 1. IDENTITY MAPPING ────────────────────────────────────────────────────
 
@@ -47,12 +48,11 @@ pub struct IdentityMap {
     pml4: [u64; PML4_ENTRIES],
     /// PDPT tables (each 512 × 8 = 4KB)
     pdpt: [[u64; PDPT_ENTRIES]; PML4_ENTRIES],
-    /// PD tables for 4KB page support (indexed by [pdpt_idx][pd_idx])
-    pd: [[[u64; PD_ENTRIES]; PDPT_ENTRIES]; PML4_ENTRIES],
+    /// PD tables for 4KB page support, allocated on demand.
+    /// Key: (pml4_idx, pdpt_idx), Value: 512-entry page table.
+    pd: HashMap<(usize, usize), Box<[u64; PD_ENTRIES]>>,
     /// Whether each PDPT entry has been initialized
     pdpt_used: [bool; PML4_ENTRIES],
-    /// Whether each PD entry has been initialized (for 4KB page tracking)
-    pd_used: [[bool; PDPT_ENTRIES]; PML4_ENTRIES],
     /// Use 1GB gigantic pages (maps entire 1GB per PDPT entry)
     use_1gb_pages: bool,
     /// Total mapped bytes
@@ -60,13 +60,12 @@ pub struct IdentityMap {
 }
 
 impl IdentityMap {
-    pub const fn new(use_1gb_pages: bool) -> Self {
+    pub fn new(use_1gb_pages: bool) -> Self {
         Self {
             pml4: [0; PML4_ENTRIES],
             pdpt: [[0; PDPT_ENTRIES]; PML4_ENTRIES],
-            pd: [[[0; PD_ENTRIES]; PDPT_ENTRIES]; PML4_ENTRIES],
+            pd: HashMap::new(),
             pdpt_used: [false; PML4_ENTRIES],
-            pd_used: [[false; PDPT_ENTRIES]; PML4_ENTRIES],
             use_1gb_pages,
             mapped_bytes: 0,
         }
@@ -88,9 +87,9 @@ impl IdentityMap {
 
         // Ensure PDPT entry points to a PD (not a 1GB huge page)
         if self.pdpt[pml4_idx][pdpt_idx] == 0 || (self.pdpt[pml4_idx][pdpt_idx] & PTE_HUGE_PAGE) != 0 {
-            let pd_addr = &self.pd[pml4_idx][pdpt_idx] as *const [u64; 512] as u64;
+            let pd_table = self.pd.entry((pml4_idx, pdpt_idx)).or_insert_with(|| Box::new([0u64; PD_ENTRIES]));
+            let pd_addr = pd_table.as_ptr() as u64;
             self.pdpt[pml4_idx][pdpt_idx] = (pd_addr & PAGE_MASK) | PTE_PRESENT | PTE_WRITABLE;
-            self.pd_used[pml4_idx][pdpt_idx] = true;
         }
 
         // PD entry points to PT — for 4KB pages, we use the PD entry itself
@@ -99,11 +98,10 @@ impl IdentityMap {
         // Here we use the pd array as a combined PD+PT where each entry maps a 4KB page.
         // PD entries for 4KB mapping: point to the page itself (no huge page bit).
         // Since we don't have a separate PT level in this simplified model,
-        // we use pd[pml4_idx][pdpt_idx] as the PD and treat entries as PT entries.
-        // Actually, we need a proper 3-level walk. The PD entry should NOT have the
-        // huge page bit set — it points to a PT. But since we inline the PT in pd,
-        // each pd[pml4_idx][pdpt_idx][pd_idx] acts as a PT entry for 4KB pages.
-        self.pd[pml4_idx][pdpt_idx][pd_idx] = (phys_addr & PAGE_MASK) | flags | PTE_PRESENT;
+        // we use pd[(pml4_idx, pdpt_idx)] as the PD and treat entries as PT entries.
+        // Each pd[(pml4_idx, pdpt_idx)][pd_idx] acts as a PT entry for 4KB pages.
+        let pd_table = self.pd.get_mut(&(pml4_idx, pdpt_idx)).expect("pd table must exist after initialization");
+        pd_table[pd_idx] = (phys_addr & PAGE_MASK) | flags | PTE_PRESENT;
         self.mapped_bytes += 4 * 1024; // 4 KB
 
         let _ = pt_idx; // Reserved for full PT implementation
@@ -113,6 +111,7 @@ impl IdentityMap {
     pub fn map_2mb(&mut self, phys_addr: u64, flags: u64) {
         let pml4_idx = ((phys_addr >> PML4_SHIFT) & 0x1FF) as usize;
         let pdpt_idx = ((phys_addr >> PDPT_SHIFT) & 0x1FF) as usize;
+        let pd_idx = ((phys_addr >> PD_SHIFT) & 0x1FF) as usize;
 
         if self.pml4[pml4_idx] == 0 {
             let pdpt_addr = &self.pdpt[pml4_idx] as *const [u64; 512] as u64;
@@ -120,8 +119,23 @@ impl IdentityMap {
             self.pdpt_used[pml4_idx] = true;
         }
 
-        // PD entry with huge page bit
-        self.pdpt[pml4_idx][pdpt_idx] = (phys_addr & PAGE_MASK) | flags | PTE_HUGE_PAGE | PTE_PRESENT;
+        // PDPT entry must point to a PD (no huge page bit at this level)
+        if self.pdpt[pml4_idx][pdpt_idx] == 0 || (self.pdpt[pml4_idx][pdpt_idx] & PTE_HUGE_PAGE) != 0 {
+            // Allocate a PD table on demand
+            let pd_table = self.pd.entry((pml4_idx, pdpt_idx)).or_insert_with(|| {
+                let mut table = Box::new([0u64; PD_ENTRIES]);
+                // Initialize all entries to not-present
+                table.fill(0);
+                table
+            });
+            let pd_addr = pd_table.as_ptr() as u64;
+            self.pdpt[pml4_idx][pdpt_idx] = (pd_addr & PAGE_MASK) | PTE_PRESENT | PTE_WRITABLE;
+        }
+
+        // PD entry with huge page bit (2MB page)
+        if let Some(pd_table) = self.pd.get_mut(&(pml4_idx, pdpt_idx)) {
+            pd_table[pd_idx] = (phys_addr & !0x1F_FFFF) | flags | PTE_HUGE_PAGE | PTE_PRESENT;
+        }
         self.mapped_bytes += 2 * 1024 * 1024; // 2 MB
     }
 

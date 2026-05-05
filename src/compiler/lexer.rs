@@ -772,12 +772,29 @@ impl<'src> Lexer<'src> {
             }
 
             match (self.peek(), self.peek2()) {
-                // Line comment: // …
+                // Line comment or floor div: `//`
+                // We must distinguish `// comment` from `//` (floor division).
+                // Heuristic: `//` is a comment only if followed by `/`, whitespace,
+                // or end-of-line/EOF.  Otherwise it's the `//` (FloorDiv) operator.
                 (Some('/'), Some('/')) => {
-                    self.advance();
-                    self.advance();
-                    while matches!(self.peek(), Some(c) if c != '\n') {
-                        self.advance();
+                    // Peek at the character after the two slashes.
+                    let third = {
+                        let mut iter = self.chars.clone();
+                        iter.next(); // skip first /
+                        iter.next(); // skip second /
+                        iter.next().map(|(_, c)| c)
+                    };
+                    match third {
+                        // `///` (doc comment) or `// ` / `//\t` / `//\n` / EOF → comment
+                        Some('/') | Some(' ') | Some('\t') | Some('\n') | None => {
+                            self.advance();
+                            self.advance();
+                            while matches!(self.peek(), Some(c) if c != '\n') {
+                                self.advance();
+                            }
+                        }
+                        // `//` followed by something else (digit, ident, etc.) → FloorDiv
+                        _ => break,
                     }
                 }
                 // Block comment: /* … */  (supports nesting)

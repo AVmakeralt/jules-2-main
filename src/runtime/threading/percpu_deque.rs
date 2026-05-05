@@ -311,12 +311,10 @@ impl PerCpuDeque {
         };
         
         if deque.top.compare_exchange(top, top.wrapping_add(1), Ordering::SeqCst, Ordering::Acquire).is_ok() {
-            if !task.is_null() {
-                unsafe {
-                    let entry = buffer.entries.add(idx);
-                    (*entry).task.store(ptr::null_mut(), Ordering::Release);
-                }
-            }
+            // Do NOT write null into the slot from the thief side — that would
+            // race with the owner's pop().  The CAS on `top` already atomically
+            // claims the task; the slot will be reused safely on the next push
+            // which writes before incrementing bottom.
             Some(task)
         } else {
             None
@@ -351,9 +349,10 @@ impl PerCpuDeque {
                 let idx = (top.wrapping_add(i)) & buffer.mask;
                 let task = unsafe {
                     let entry = buffer.entries.add(idx);
-                    let task_ptr = (*entry).task.load(Ordering::Acquire);
-                    (*entry).task.store(ptr::null_mut(), Ordering::Release);
-                    task_ptr
+                    (*entry).task.load(Ordering::Acquire)
+                    // Do NOT null the slot from the thief side — that would race
+                    // with the owner's pop().  The CAS on `top` already claims
+                    // these slots; pushes will safely overwrite them later.
                 };
                 if !task.is_null() {
                     tasks.push(task);

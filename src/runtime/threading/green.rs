@@ -99,19 +99,13 @@ extern "C" fn context_switch(
         use std::arch::asm;
         // Save current context
         asm!(
-            "mov rbx, [r8]",
-            "mov rbp, [r8 + 8]",
-            "mov r12, [r8 + 16]",
-            "mov r13, [r8 + 24]",
-            "mov r14, [r8 + 32]",
-            "mov r15, [r8 + 40]",
             "mov [rdi], rsp",
-            "mov [rdi + 8], rbx",
-            "mov [rdi + 16], rbp",
-            "mov [rdi + 24], r12",
-            "mov [rdi + 32], r13",
-            "mov [rdi + 40], r14",
-            "mov [rdi + 48], r15",
+            "mov [r8], rbx",
+            "mov [r8 + 8], rbp",
+            "mov [r8 + 16], r12",
+            "mov [r8 + 24], r13",
+            "mov [r8 + 32], r14",
+            "mov [r8 + 40], r15",
             // Restore new context
             "mov rsp, rsi",
             "mov rbx, [r9]",
@@ -290,22 +284,54 @@ impl GreenScheduler {
     /// Schedule the next green thread
     fn schedule_next(&self) {
         let mut ready_queue = self.ready_queue.lock().unwrap();
-        
+
         if let Some(next_id) = ready_queue.pop() {
-            let contexts = self.contexts.lock().unwrap();
-            if let Some(_context) = contexts.get(&next_id) {
-                // Switch to next thread
-                // In a real implementation, this would use context_switch
-                let current_id = self.current.load(Ordering::Acquire);
-                self.current.store(next_id as usize, Ordering::Release);
-                
-                // Store current context
-                if current_id != usize::MAX {
-                    // Save current context before switching
+            // Snapshot the next thread's context fields before taking any
+            // mutable borrows of the HashMap, so we don't hold two &mut at once.
+            let (new_sp, new_regs) = {
+                let contexts = self.contexts.lock().unwrap();
+                match contexts.get(&next_id) {
+                    Some(ctx) => (ctx.sp, ctx.regs),
+                    None => return,
                 }
-                
-                // Switch to new context
-                // context_switch(...)
+            };
+
+            let current_id = self.current.load(Ordering::Acquire);
+            self.current.store(next_id as usize, Ordering::Release);
+
+            if current_id != usize::MAX {
+                // Save current thread's context and switch to the next thread
+                let mut contexts = self.contexts.lock().unwrap();
+                if let Some(current_context) = contexts.get_mut(&(current_id as GreenThreadId)) {
+                    let old_sp_ptr = &mut current_context.sp as *mut usize;
+                    let old_regs_ptr = current_context.regs.as_mut_ptr() as *mut usize;
+                    let new_regs_ptr = new_regs.as_ptr() as *const usize;
+
+                    unsafe {
+                        context_switch(old_sp_ptr, new_sp, old_regs_ptr, new_regs_ptr);
+                    }
+
+                    // After context_switch returns (when this thread is resumed),
+                    // update the stored SP from the context
+                    current_context.sp = unsafe { *old_sp_ptr };
+                }
+            } else {
+                // No current thread — save main context and switch to the new thread
+                let main_sp_val = self.main_sp.load(Ordering::Acquire);
+
+                // We store main's SP/regs in stack-allocated slots so context_switch
+                // can write back into them.
+                let mut old_sp = main_sp_val;
+                let mut old_regs: [usize; 6] = [0; 6];
+
+                let new_regs_ptr = new_regs.as_ptr() as *const usize;
+
+                unsafe {
+                    context_switch(&mut old_sp as *mut usize, new_sp, old_regs.as_mut_ptr() as *mut usize, new_regs_ptr);
+                }
+
+                // Save the main context back
+                self.main_sp.store(old_sp, Ordering::Release);
             }
         } else {
             // No threads to run, return to main

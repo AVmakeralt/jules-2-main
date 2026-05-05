@@ -564,18 +564,17 @@ fn batched_matmul(
         for chunk_idx in 0..num_chunks {
             let batch_start = chunk_idx * batches_per_chunk;
             let batch_end = (batch_start + batches_per_chunk).min(batch);
+            let mid = batch_start + (batch_end - batch_start) / 2;
+
             let a_data = a_data;
             let b_data = b_data;
-            let chunk_len = (batch_end - batch_start) * batch_mat_size;
 
-            let local_out = join(
+            let (first_half, second_half) = join(
                 move || {
-                    let mut local_out = vec![0.0f32; chunk_len];
-                    for bi in batch_start..batch_end {
-                        let local_bi = bi - batch_start;
+                    let mut local_out = Vec::new();
+                    for bi in batch_start..mid {
                         let a_off = bi * a_mat;
                         let b_off = bi * b_mat;
-                        let out_off = local_bi * batch_mat_size;
                         let out = accelerated_matmul(
                             &a_data[a_off..a_off + a_mat],
                             &b_data[b_off..b_off + b_mat],
@@ -583,17 +582,34 @@ fn batched_matmul(
                             k,
                             n,
                         );
-                        local_out[out_off..out_off + batch_mat_size].copy_from_slice(&out);
+                        local_out.extend_from_slice(&out);
                     }
-                    local_out
+                    (batch_start, local_out)
                 },
-                || {},
-            ).0;
+                move || {
+                    let mut local_out = Vec::new();
+                    for bi in mid..batch_end {
+                        let a_off = bi * a_mat;
+                        let b_off = bi * b_mat;
+                        let out = accelerated_matmul(
+                            &a_data[a_off..a_off + a_mat],
+                            &b_data[b_off..b_off + b_mat],
+                            m,
+                            k,
+                            n,
+                        );
+                        local_out.extend_from_slice(&out);
+                    }
+                    (mid, local_out)
+                },
+            );
 
-            // Copy result back
-            let start = chunk_idx * batches_per_chunk * batch_mat_size;
-            if start + local_out.len() <= out_data.len() {
-                out_data[start..start + local_out.len()].copy_from_slice(&local_out);
+            // Copy results back for each half
+            for (start_bi, half_out) in [&first_half, &second_half] {
+                let start = start_bi * batch_mat_size;
+                if start + half_out.len() <= out_data.len() {
+                    out_data[start..start + half_out.len()].copy_from_slice(half_out);
+                }
             }
         }
     } else {

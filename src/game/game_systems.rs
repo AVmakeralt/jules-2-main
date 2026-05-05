@@ -122,10 +122,11 @@ impl PhysicsWorld {
                 // Apply gravity
                 body.velocity[1] += self.gravity[1] * dt;
 
-                // Apply damping
-                body.velocity[0] *= self.damping;
-                body.velocity[1] *= self.damping;
-                body.velocity[2] *= self.damping;
+                // Apply damping (frame-rate independent)
+                let damp = self.damping.powf(dt);
+                body.velocity[0] *= damp;
+                body.velocity[1] *= damp;
+                body.velocity[2] *= damp;
 
                 // Update position
                 body.position[0] += body.velocity[0] * dt;
@@ -205,7 +206,13 @@ impl PhysicsWorld {
             return;
         } // Already separating
 
-        let impulse = -dvn * (mass1 * mass2) / (mass1 + mass2);
+        // Combine restitution coefficients (use the minimum for conservative bounce)
+        let restitution = {
+            let r1 = self.colliders.get(&id1).map(|c| c.restitution).unwrap_or(0.0);
+            let r2 = self.colliders.get(&id2).map(|c| c.restitution).unwrap_or(0.0);
+            r1.min(r2)
+        };
+        let impulse = -(1.0 + restitution) * dvn * (mass1 * mass2) / (mass1 + mass2);
 
         if let Some(body1) = self.bodies.get_mut(&id1) {
             if body1.mass > 0.0 {

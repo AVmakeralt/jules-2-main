@@ -198,15 +198,50 @@ impl Tensor {
             return self.clone();
         }
 
+        let ndim = target_shape.len();
+
+        // Pad source shape with leading 1s to match target ndim
+        let mut src_shape = vec![1usize; ndim - self.shape.len()];
+        src_shape.extend_from_slice(&self.shape);
+
+        // Validate broadcastability: each src dim must be 1 or equal to target dim
+        for i in 0..ndim {
+            assert!(
+                src_shape[i] == 1 || src_shape[i] == target_shape[i],
+                "Cannot broadcast dimension {} from {} to {}",
+                i, src_shape[i], target_shape[i]
+            );
+        }
+
+        // Compute source strides (row-major)
+        let mut src_strides = vec![0usize; ndim];
+        let mut stride = 1usize;
+        for i in (0..ndim).rev() {
+            src_strides[i] = if src_shape[i] == 1 { 0 } else { stride };
+            stride *= src_shape[i];
+        }
+
+        // Compute target strides (row-major)
+        let mut tgt_strides = vec![0usize; ndim];
+        stride = 1;
+        for i in (0..ndim).rev() {
+            tgt_strides[i] = stride;
+            stride *= target_shape[i];
+        }
+
         let target_numel: usize = target_shape.iter().product();
-        let self_numel = self.numel();
 
-        assert_eq!(target_numel % self_numel, 0, "Cannot broadcast shape");
-
-        let mut data = Vec::with_capacity(target_numel);
-        let repeat_factor = target_numel / self_numel;
-        for _ in 0..repeat_factor {
-            data.extend_from_slice(&self.data);
+        // Iterate over all target elements, mapping each to the correct source element
+        let mut data = vec![0.0f32; target_numel];
+        for flat_idx in 0..target_numel {
+            let mut src_flat = 0usize;
+            let mut remaining = flat_idx;
+            for dim in 0..ndim {
+                let dim_idx = remaining / tgt_strides[dim];
+                remaining %= tgt_strides[dim];
+                src_flat += dim_idx * src_strides[dim];
+            }
+            data[flat_idx] = self.data[src_flat];
         }
 
         Tensor {
@@ -1123,14 +1158,20 @@ impl LossFunctions {
     }
 
     /// Contrastive Loss (for similarity learning)
-    pub fn contrastive(anchor: &Tensor, positive: &Tensor, margin: f32) -> f32 {
+    pub fn contrastive(anchor: &Tensor, positive: &Tensor, negative: &Tensor, margin: f32) -> f32 {
         let pos_dist: f32 = anchor.data.iter()
             .zip(&positive.data)
             .map(|(a, p)| (a - p).powi(2))
             .sum::<f32>()
             .sqrt();
 
-        (1.0 * pos_dist.powi(2) + (margin - pos_dist).max(0.0).powi(2)) / 2.0
+        let neg_dist: f32 = anchor.data.iter()
+            .zip(&negative.data)
+            .map(|(a, n)| (a - n).powi(2))
+            .sum::<f32>()
+            .sqrt();
+
+        (pos_dist.powi(2) + (margin - neg_dist).max(0.0).powi(2)) / 2.0
     }
 
     /// Ranking Loss (pairwise ranking)

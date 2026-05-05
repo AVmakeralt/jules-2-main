@@ -89,7 +89,9 @@ pub struct RseqMutex<T> {
     /// Per-CPU lock flags (0 = unlocked, 1 = locked)
     lock_flags: PerCpu<AtomicUsize>,
     /// The protected data
-    data: Mutex<T>,
+    data: UnsafeCell<T>,
+    /// Fallback mutex for contended/rseq-unavailable path
+    fallback: Mutex<()>,
     /// Fallback to standard mutex if rseq unavailable
     use_fallback: AtomicBool,
 }
@@ -98,7 +100,8 @@ impl<T> RseqMutex<T> {
     pub fn new(data: T) -> Self {
         Self {
             lock_flags: PerCpu::new(|| AtomicUsize::new(0)),
-            data: Mutex::new(data),
+            data: UnsafeCell::new(data),
+            fallback: Mutex::new(()),
             use_fallback: AtomicBool::new(false),
         }
     }
@@ -106,20 +109,31 @@ impl<T> RseqMutex<T> {
     /// Lock the mutex
     pub fn lock(&self) -> RseqMutexGuard<'_, T> {
         if self.use_fallback.load(Ordering::Acquire) {
-            // Fallback path
-            let guard = self.data.lock().unwrap();
-            return RseqMutexGuard { guard, rseq: false };
+            // Fallback path: use std::Mutex for exclusion
+            let guard = self.fallback.lock().unwrap();
+            let data = unsafe { &mut *self.data.get() };
+            return RseqMutexGuard {
+                data,
+                _fallback_guard: Some(guard),
+                lock_flags: &self.lock_flags,
+                cpu_id: None,
+            };
         }
 
         if let Some(cpu_id) = super::rseq::rseq_begin() {
-            // rseq path: check if current CPU's flag is set
+            // rseq fast path: check if current CPU's flag is set
             if let Some(flag) = self.lock_flags.get_for_cpu(cpu_id) {
                 if flag.load(Ordering::Acquire) == 0 {
-                    // Uncontended: acquire lock
+                    // Uncontended: acquire lock via per-CPU flag only (no std::Mutex)
                     flag.store(1, Ordering::Release);
                     super::rseq::rseq_end();
-                    let guard = self.data.lock().unwrap();
-                    return RseqMutexGuard { guard, rseq: true };
+                    let data = unsafe { &mut *self.data.get() };
+                    return RseqMutexGuard {
+                        data,
+                        _fallback_guard: None,
+                        lock_flags: &self.lock_flags,
+                        cpu_id: Some(cpu_id),
+                    };
                 }
             }
             super::rseq::rseq_end();
@@ -127,40 +141,51 @@ impl<T> RseqMutex<T> {
 
         // Contended or rseq unavailable: use fallback
         self.use_fallback.store(true, Ordering::Release);
-        let guard = self.data.lock().unwrap();
-        RseqMutexGuard { guard, rseq: false }
+        let guard = self.fallback.lock().unwrap();
+        let data = unsafe { &mut *self.data.get() };
+        RseqMutexGuard {
+            data,
+            _fallback_guard: Some(guard),
+            lock_flags: &self.lock_flags,
+            cpu_id: None,
+        }
     }
 }
 
 /// Guard for RseqMutex
 pub struct RseqMutexGuard<'a, T> {
-    guard: std::sync::MutexGuard<'a, T>,
-    rseq: bool,
+    data: &'a mut T,
+    /// In fallback mode, this guard prevents concurrent access
+    _fallback_guard: Option<std::sync::MutexGuard<'a, ()>>,
+    /// Per-CPU lock flags (to release on drop)
+    lock_flags: &'a PerCpu<AtomicUsize>,
+    /// CPU ID that acquired the lock (for releasing per-CPU flag)
+    cpu_id: Option<usize>,
 }
 
 impl<'a, T> std::ops::Deref for RseqMutexGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.guard
+        self.data
     }
 }
 
 impl<'a, T> std::ops::DerefMut for RseqMutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
+        self.data
     }
 }
 
 impl<'a, T> Drop for RseqMutexGuard<'a, T> {
     fn drop(&mut self) {
-        if self.rseq {
-            // Release the per-CPU lock flag
-            if let Some(_cpu_id) = super::rseq::get_cpu_id() {
-                // Note: This is simplified - in real implementation, we'd need
-                // to track which CPU acquired the lock
+        if let Some(cpu_id) = self.cpu_id {
+            // Release the per-CPU lock flag so the fast path can be used again
+            if let Some(flag) = self.lock_flags.get_for_cpu(cpu_id) {
+                flag.store(0, Ordering::Release);
             }
         }
-        // Mutex guard is released automatically
+        // _fallback_guard is released automatically when dropped,
+        // which releases the std::Mutex for the fallback path
     }
 }
 

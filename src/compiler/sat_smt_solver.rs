@@ -242,6 +242,11 @@ impl SatSmtSolver {
         self.constraints.push(constraint);
     }
 
+    /// Get the current constraints
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+
     /// Perform range analysis
     pub fn range_analysis(&mut self) -> HashMap<VarId, ValueRange> {
         let mut changed = true;
@@ -585,7 +590,9 @@ impl SatSmtSolver {
                 let a_range = self.eval_range(a);
                 let b_range = self.eval_range(b);
                 if a_range.known && b_range.known {
-                    ValueRange::new(a_range.min + b_range.min, a_range.max + b_range.max)
+                    let min = a_range.min.saturating_add(b_range.min);
+                    let max = a_range.max.saturating_add(b_range.max);
+                    ValueRange::new(min, max)
                 } else {
                     ValueRange::unknown()
                 }
@@ -594,7 +601,9 @@ impl SatSmtSolver {
                 let a_range = self.eval_range(a);
                 let b_range = self.eval_range(b);
                 if a_range.known && b_range.known {
-                    ValueRange::new(a_range.min - b_range.max, a_range.max - b_range.min)
+                    let min = a_range.min.saturating_sub(b_range.max);
+                    let max = a_range.max.saturating_sub(b_range.min);
+                    ValueRange::new(min, max)
                 } else {
                     ValueRange::unknown()
                 }
@@ -604,10 +613,10 @@ impl SatSmtSolver {
                 let b_range = self.eval_range(b);
                 if a_range.known && b_range.known {
                     let candidates = [
-                        a_range.min * b_range.min,
-                        a_range.min * b_range.max,
-                        a_range.max * b_range.min,
-                        a_range.max * b_range.max,
+                        a_range.min.saturating_mul(b_range.min),
+                        a_range.min.saturating_mul(b_range.max),
+                        a_range.max.saturating_mul(b_range.min),
+                        a_range.max.saturating_mul(b_range.max),
                     ];
                     ValueRange::new(*candidates.iter().min().unwrap(), *candidates.iter().max().unwrap())
                 } else {

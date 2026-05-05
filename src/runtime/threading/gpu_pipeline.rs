@@ -210,18 +210,24 @@ struct GpuBuffer {
     id: usize,
     /// Buffer state
     state: AtomicUsize, // BufferState as usize
-    /// Data
-    data: Vec<f32>,
+    /// Data (UnsafeCell for interior mutability — the pipeline writes into
+    /// buffers through &self references during double-buffered submission)
+    data: std::cell::UnsafeCell<Vec<f32>>,
     /// Associated task ID
     task_id: AtomicU64,
 }
+
+// SAFETY: Access to `data` is coordinated by the double-buffering protocol:
+// only one submission writes to a buffer at a time, and the buffer state
+// machine (Filling → Processing → Ready) prevents concurrent writers.
+unsafe impl Sync for GpuBuffer {}
 
 impl GpuBuffer {
     fn new(id: usize, capacity: usize) -> Self {
         Self {
             id,
             state: AtomicUsize::new(BufferState::Filling as usize),
-            data: vec![0.0; capacity],
+            data: std::cell::UnsafeCell::new(vec![0.0; capacity]),
             task_id: AtomicU64::new(0),
         }
     }
@@ -285,7 +291,7 @@ impl GpuPipeline {
         
         // Copy data to buffer
         if data.len() <= self.buffer_capacity {
-            let data_ptr = buffer.data.as_ptr() as *mut f32;
+            let data_ptr = unsafe { (*buffer.data.get()).as_mut_ptr() };
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
             }
@@ -401,7 +407,7 @@ impl GpuPipeline {
 
         // Copy input data into the double-buffer if it fits.
         if descriptor.input_data.len() <= self.buffer_capacity {
-            let data_ptr = buffer.data.as_ptr() as *mut f32;
+            let data_ptr = unsafe { (*buffer.data.get()).as_mut_ptr() };
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     descriptor.input_data.as_ptr(),

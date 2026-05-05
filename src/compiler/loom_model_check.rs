@@ -227,10 +227,30 @@ impl LoomModelChecker {
                 new_state.memory.insert(*addr, *value);
             }
             ThreadOp::LockAcquire { lock_id, thread_id, .. } => {
-                new_state.locks.insert(*lock_id, Some(*thread_id));
+                // If the lock is already held by another thread, this thread
+                // blocks until the lock becomes available.
+                let lock_available = state.locks.get(lock_id).map_or(true, |owner| owner.is_none());
+                if lock_available {
+                    new_state.locks.insert(*lock_id, Some(*thread_id));
+                } else {
+                    // Lock is held — thread transitions to Blocked
+                    new_state.thread_states.insert(*thread_id, ThreadState::Blocked);
+                }
             }
-            ThreadOp::LockRelease { lock_id, .. } => {
+            ThreadOp::LockRelease { lock_id, thread_id, .. } => {
                 new_state.locks.insert(*lock_id, None);
+                // If any thread was blocked waiting for this lock, transition
+                // it back to Ready (represented as Running in this model so
+                // the scheduler can pick it up).
+                let blocked_tids: Vec<usize> = new_state.thread_states
+                    .iter()
+                    .filter(|(_, s)| **s == ThreadState::Blocked)
+                    .map(|(&tid, _)| tid)
+                    .collect();
+                for tid in blocked_tids {
+                    // Unblock: the released lock may be what they were waiting for.
+                    new_state.thread_states.insert(tid, ThreadState::Running);
+                }
             }
             ThreadOp::Fence { .. } => {
                 // Fence operation (memory barrier)
@@ -238,8 +258,13 @@ impl LoomModelChecker {
             ThreadOp::Spawn { parent_id, child_id, .. } => {
                 new_state.thread_states.insert(*child_id, ThreadState::Running);
             }
-            ThreadOp::Join { child_id, .. } => {
-                // Join operation (child already completed)
+            ThreadOp::Join { child_id, parent_id, .. } => {
+                let child_done = state.thread_states.get(child_id).map_or(false, |s| *s == ThreadState::Completed);
+                if !child_done {
+                    // Child not yet completed — parent blocks
+                    new_state.thread_states.insert(*parent_id, ThreadState::Blocked);
+                }
+                // When child is completed, parent continues (stays Running)
             }
         }
         
@@ -348,7 +373,7 @@ impl LoomModelChecker {
 
     /// Detect deadlocks
     fn detect_deadlock(&self, state: &MemoryState) -> Option<String> {
-        // Check if all running threads are blocked on locks
+        // Check if all non-completed threads are blocked on locks
         let mut blocked_threads = HashSet::new();
         let mut running_threads = HashSet::new();
         
@@ -364,9 +389,12 @@ impl LoomModelChecker {
             }
         }
         
-        // If all running threads are blocked, we have a deadlock
-        if !running_threads.is_empty() && running_threads == blocked_threads {
-            return Some("Deadlock detected: all threads blocked".to_string());
+        // Deadlock: some threads are blocked but none are running to release them
+        if !blocked_threads.is_empty() && running_threads.is_empty() {
+            return Some(format!(
+                "Deadlock detected: {} thread(s) blocked, none running",
+                blocked_threads.len()
+            ));
         }
         
         None

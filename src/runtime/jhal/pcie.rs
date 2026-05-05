@@ -43,7 +43,7 @@
 // =========================================================================
 
 #![allow(dead_code)]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use core::cell::UnsafeCell;
 use super::io_port::{outl, inl};
 use super::mmio::MmioReg;
@@ -415,6 +415,20 @@ impl DeviceRegistry {
         }
         (results, count)
     }
+
+    /// Update the latency prophecy for a registered device.
+    /// Uses interior mutability (same ownership model as `register()`).
+    pub fn set_latency_ns(&self, idx: usize, latency_ns: u32) {
+        if idx < self.len() {
+            // SAFETY: idx < len() <= MAX_DEVICES, and we only write to the
+            // latency_ns field which is a plain u32 — no aliasing concern
+            // with concurrent reads of other fields.
+            unsafe {
+                let devices = &mut *self.devices.get();
+                devices[idx].latency_ns = latency_ns;
+            }
+        }
+    }
 }
 
 // ─── Configuration Space Access ───────────────────────────────────────────
@@ -508,7 +522,8 @@ pub struct PciEnumerator {
     /// Whether to use ECAM (true for PCIe systems).
     use_ecam: bool,
     /// Buses that have been scanned (bitfield, one bit per bus).
-    scanned_buses: [u64; 4], // 256 bits = 4 × 64
+    /// Uses AtomicU64 for thread-safe concurrent access.
+    scanned_buses: [AtomicU64; 4], // 256 bits = 4 × 64
     /// Lock for configuration space access (simple spin-lock).
     config_lock: AtomicUsize,
 }
@@ -519,7 +534,7 @@ impl PciEnumerator {
         Self {
             registry: DeviceRegistry::new(),
             use_ecam,
-            scanned_buses: [0; 4],
+            scanned_buses: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             config_lock: AtomicUsize::new(0),
         }
     }
@@ -562,14 +577,14 @@ impl PciEnumerator {
     fn is_bus_scanned(&self, bus: u8) -> bool {
         let idx = bus as usize / 64;
         let bit = bus as usize % 64;
-        (self.scanned_buses[idx] & (1 << bit)) != 0
+        (self.scanned_buses[idx].load(Ordering::Acquire) & (1 << bit)) != 0
     }
 
     /// Mark a bus as scanned.
-    fn mark_bus_scanned(&mut self, bus: u8) {
+    fn mark_bus_scanned(&self, bus: u8) {
         let idx = bus as usize / 64;
         let bit = bus as usize % 64;
-        self.scanned_buses[idx] |= 1 << bit;
+        self.scanned_buses[idx].fetch_or(1 << bit, Ordering::AcqRel);
     }
 
     /// Enumerate all PCI devices starting from bus 0.
@@ -765,10 +780,8 @@ pub fn assign_device_latency_prophecies(registry: &DeviceRegistry) {
                 _ => 200_000,          // Unknown
             };
 
-            // Store the latency estimate
-            // In a full integration, this would create a ProphecyVariable
-            // via the ProphecyOracle.
-            let _ = latency; // Used by integration layer
+            // Store the latency estimate in the device's prophecy field
+            registry.set_latency_ns(i, latency);
         }
     }
 }
@@ -924,5 +937,13 @@ mod tests {
         // Mark bus 255 as scanned (last u64, last bit)
         scanned[3] |= 1 << 63;
         assert!((scanned[3] & (1 << 63)) != 0);
+
+        // Also test the AtomicU64-based PciEnumerator methods
+        let enumerator = PciEnumerator::new(false);
+        assert!(!enumerator.is_bus_scanned(0));
+        enumerator.mark_bus_scanned(0);
+        assert!(enumerator.is_bus_scanned(0));
+        enumerator.mark_bus_scanned(255);
+        assert!(enumerator.is_bus_scanned(255));
     }
 }

@@ -1942,6 +1942,11 @@ impl BytecodeVM {
                         unsafe {
                             let v = std::ptr::read(slots.as_ptr().add(s));
                             std::ptr::write(slots.as_mut_ptr().add(d), v);
+                            // Zero the source slot to prevent double-free:
+                            // ptr::read moves ownership out of src without running
+                            // its destructor, so we must overwrite src with a
+                            // non-owning value before the Vec drops it.
+                            std::ptr::write(slots.as_mut_ptr().add(s), Value::None);
                         }
                     }
                     pc += 1;

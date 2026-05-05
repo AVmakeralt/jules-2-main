@@ -608,7 +608,23 @@ DiffCompiler::expr_mem_ops(e, c);
                                     if let Some(e) = else_ {
                                         match e.as_ref() {
                                             IfOrBlock::Block(blk) => depth_in_block(blk, depth + 1, max),
-                                            IfOrBlock::If(_) => depth_in_block(b, depth + 1, max),
+                                            IfOrBlock::If(inner) => {
+                                                // Process the inner if-statement's blocks
+                                                // instead of the outer block `b` to avoid infinite recursion
+                                                if let Stmt::If { then: inner_then, else_: inner_else, .. } = inner {
+                                                    depth_in_block(inner_then, depth + 1, max);
+                                                    if let Some(ie) = inner_else {
+                                                        match ie.as_ref() {
+                                                            IfOrBlock::Block(blk) => depth_in_block(blk, depth + 1, max),
+                                                            IfOrBlock::If(nested) => {
+                                                                if let Stmt::If { then: n_then, .. } = nested {
+                                                                    depth_in_block(n_then, depth + 1, max);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -660,7 +676,23 @@ DiffCompiler::expr_mem_ops(e, c);
                                     if let Some(e) = else_ {
                                         match e.as_ref() {
                                             IfOrBlock::Block(blk) => recursion_in_block(blk, name, flag),
-                                            IfOrBlock::If(_) => recursion_in_block(b, name, flag),
+                                            IfOrBlock::If(inner) => {
+                                                // Process the inner if-statement's blocks
+                                                // instead of the outer block `b` to avoid infinite recursion
+                                                if let Stmt::If { then: inner_then, else_: inner_else, .. } = inner {
+                                                    recursion_in_block(inner_then, name, flag);
+                                                    if let Some(ie) = inner_else {
+                                                        match ie.as_ref() {
+                                                            IfOrBlock::Block(blk) => recursion_in_block(blk, name, flag),
+                                                            IfOrBlock::If(nested) => {
+                                                                if let Stmt::If { then: n_then, .. } = nested {
+                                                                    recursion_in_block(n_then, name, flag);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

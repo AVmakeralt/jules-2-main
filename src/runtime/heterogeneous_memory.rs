@@ -613,13 +613,34 @@ impl PageMigrationScheduler {
     }
     
     fn estimate_cost(&self, request: &MigrationRequest) -> MigrationCostEstimate {
+        // Estimate transfer time based on inter-tier bandwidth
+        let bandwidth_gb_s = match (request.from_tier, request.to_tier) {
+            (MemoryTierId(0), MemoryTierId(1)) | (MemoryTierId(1), MemoryTierId(0)) => 500.0,
+            (MemoryTierId(2), MemoryTierId(0)) | (MemoryTierId(0), MemoryTierId(2)) => 200.0,
+            (MemoryTierId(3), MemoryTierId(0)) | (MemoryTierId(0), MemoryTierId(3)) => 50.0,
+            (MemoryTierId(1), MemoryTierId(2)) | (MemoryTierId(2), MemoryTierId(1)) => 150.0,
+            (MemoryTierId(1), MemoryTierId(3)) | (MemoryTierId(3), MemoryTierId(1)) => 100.0,
+            (MemoryTierId(2), MemoryTierId(3)) | (MemoryTierId(3), MemoryTierId(2)) => 40.0,
+            _ => 10.0,
+        };
+
+        let transfer_time_ns = if bandwidth_gb_s > 0.0 {
+            (request.size_bytes as f64 / (bandwidth_gb_s * 1e9)) * 1e9
+        } else {
+            f64::MAX
+        };
+
+        // Decision + coherency overhead
+        let overhead_ns = 1500.0;
+        let total_cost_ns = transfer_time_ns + overhead_ns;
+
         MigrationCostEstimate {
             src_tier: request.from_tier,
             dst_tier: request.to_tier,
             size_bytes: request.size_bytes,
-            transfer_time_ns: 0.0, // Would use migration model
-            overhead_ns: 0.0,
-            total_cost_ns: 0.0,
+            transfer_time_ns,
+            overhead_ns,
+            total_cost_ns,
         }
     }
     
@@ -677,16 +698,16 @@ impl PageMigrationScheduler {
             //   Tier 1 (HBM)  → NUMA node 1 (or higher, system-dependent)
             //   Tier 2 (CXL)  → NUMA node 2+
             //   Tier 3 (GPU)  → not directly migratable via move_pages
-            let target_numa_node = match request.to_tier {
-                MemoryTierId(0) => 0,
-                MemoryTierId(1) => 1,
-                MemoryTierId(2) => 2,
+            let target_numa_node: Option<usize> = match request.to_tier {
+                MemoryTierId(0) => Some(0),
+                MemoryTierId(1) => Some(1),
+                MemoryTierId(2) => Some(2),
                 MemoryTierId(3) => {
                     // GPU VRAM cannot be migrated via move_pages;
                     // would need CUDA/ROCm API. Mark as metadata-only.
-                    false
+                    None
                 }
-                _ => false,
+                _ => None,
             };
 
             if let Some(node) = target_numa_node {
@@ -1099,19 +1120,44 @@ impl TierSmtSolver for BuiltinTierSmtSolver {
         // - No stale reads: ∀ thread t, ∀ access a: a_before_migration ⇒ observed(a)
         // - No lost writes: ∀ write w: w_before_migration ⇒ persisted(w)
         // - Coherency: ∀ cache_line cl: coherent(cl, post_migration)
+        //
+        // Each clause represents a safety condition that must hold for
+        // the migration to be safe. A clause of all `false` means the
+        // safety condition cannot be violated (UNSAT = safe). A clause
+        // containing `true` means a potential violation exists (SAT = unsafe).
         let mut clauses = Vec::new();
-        
-        // Encode ordering constraints as CNF clauses
+
+        // Encode ordering constraints as CNF clauses.
+        // For each ordering constraint (pre_access ⇒ post_access):
+        //   If pre_migration_access >= post_migration_access, the ordering
+        //   is trivially satisfied (no violation possible).
+        //   Otherwise, a violation is possible (access could be stale).
         for oc in &query.ordering_constraints {
-            // (not pre_migration_access) OR (post_migration_access)
-            clauses.push(vec![false, true]);
+            if oc.pre_migration_access < oc.post_migration_access {
+                // Ordering is satisfiable — the pre-access could be stale
+                // after migration if not properly synchronized.
+                // Clause: [true] = satisfiable (potential violation)
+                clauses.push(vec![true]);
+            } else {
+                // Ordering is trivially satisfied (pre >= post, so no
+                // stale-read concern). Clause: [false] = UNSAT (safe).
+                clauses.push(vec![false]);
+            }
         }
-        
-        // Encode coherency constraints
+
+        // Encode coherency constraints.
+        // If writeback is required, a violation is possible unless we can
+        // prove the writeback completes before migration.
         for cc in &query.coherency_constraints {
             if cc.requires_writeback {
-                // writeback_required => not_migrating_during_write
-                clauses.push(vec![false, true]);
+                // Writeback required — potential violation if migration
+                // overlaps with dirty cache lines.
+                // Clause: [true] = satisfiable (potential violation)
+                clauses.push(vec![true]);
+            } else {
+                // No writeback needed — coherency is trivially maintained.
+                // Clause: [false] = UNSAT (safe)
+                clauses.push(vec![false]);
             }
         }
         

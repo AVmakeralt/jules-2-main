@@ -152,9 +152,13 @@ impl SlabTask {
 
 impl Drop for SlabTask {
     fn drop(&mut self) {
-        // Reconstitute the Box<TaskVtable> to properly free the heap-allocated vtable
+        // Call the vtable's drop function to properly drop the stored closure
         if !self.vtable.is_null() {
             unsafe {
+                if let Some(vtable) = self.vtable.as_ref() {
+                    (vtable.drop)(self as *mut _ as *mut ());
+                }
+                // Reconstitute the Box<TaskVtable> to properly free the heap-allocated vtable
                 let _ = Box::from_raw(self.vtable as *mut TaskVtable);
             }
         }
@@ -291,6 +295,15 @@ where
             task: std::ptr::null_mut(),
             _marker: std::marker::PhantomData,
         };
+    }
+
+    // Bounds check: closure must fit in inline data buffer
+    if std::mem::size_of::<F>() > std::mem::size_of::<[u8; 64]>() {
+        panic!(
+            "spawn: closure size ({} bytes) exceeds inline data buffer (64 bytes); \
+             reduce capture size or use Box<dyn FnOnce>",
+            std::mem::size_of::<F>()
+        );
     }
 
     unsafe {

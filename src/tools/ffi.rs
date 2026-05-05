@@ -340,12 +340,15 @@ pub extern "C" fn jules_tensor_data(tensor: *const JulesTensor) -> *const f32 {
 
     unsafe {
         let t = &*tensor;
-        let storage = TENSOR_STORAGE.lock().unwrap();
-        if let Some(data) = storage.get(&t.ptr) {
-            data.as_ptr()
-        } else {
-            std::ptr::null()
-        }
+        // NOTE: The caller MUST ensure no concurrent modification of the tensor
+        // occurs while using the returned pointer. The Mutex is released
+        // immediately after obtaining the pointer, so the caller must hold
+        // jules_tensor_lock() / jules_tensor_unlock() around usage.
+        let ptr = {
+            let storage = TENSOR_STORAGE.lock().unwrap();
+            storage.get(&t.ptr).map(|data| data.as_ptr()).unwrap_or(std::ptr::null())
+        };
+        ptr
     }
 }
 

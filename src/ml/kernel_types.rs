@@ -385,8 +385,8 @@ impl MatmulKernel for Fp32Avx2Kernel {
                         }
                     }
                     for jj in 0..4 {
-                        if i + jj < m && j + jj < n {
-                            c[(i + jj) * ldc + (j + jj)] = acc[jj];
+                        if j + jj < n {
+                            c[i * ldc + (j + jj)] = acc[jj];
                         }
                     }
                 }

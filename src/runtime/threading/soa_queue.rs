@@ -131,21 +131,50 @@ impl SoaTaskQueue {
             let func = functions[idx];
             let d = data[idx];
             let tt = task_types[idx];
-            
-            // Mark as consumed
-            // SAFETY: Single consumer pattern with atomic synchronization
-            unsafe {
-                let priorities = (*self.priorities.get()).as_mut_ptr();
-                let data_arr = (*self.data.get()).as_mut_ptr();
-                *priorities.add(idx) = 255;
-                *data_arr.add(idx) = ptr::null_mut();
+
+            // Compact the queue after popping: shift remaining elements
+            // after the popped position down by one and decrement tail.
+            // This prevents consumed slots from leaking capacity.
+            let count = tail.wrapping_sub(head);
+            let head_pos = head & self.mask;
+
+            if idx == head_pos {
+                // Popped the head element — simply advance head
+                self.head.store(head.wrapping_add(1), Ordering::Release);
+            } else {
+                // Popped from the middle or tail — shift elements after
+                // idx down by one to fill the gap.
+                let idx_logical = (idx.wrapping_sub(head_pos)) & self.mask;
+                let remaining = count.saturating_sub(idx_logical).saturating_sub(1);
+
+                // SAFETY: Single consumer pattern with atomic synchronization
+                unsafe {
+                    let functions_ptr = (*self.functions.get()).as_mut_ptr();
+                    let data_arr = (*self.data.get()).as_mut_ptr();
+                    let priorities_ptr = (*self.priorities.get()).as_mut_ptr();
+                    let flags_ptr = (*self.flags.get()).as_mut_ptr();
+                    let task_types_ptr = (*self.task_types.get()).as_mut_ptr();
+
+                    for i in 0..remaining {
+                        let src = (idx.wrapping_add(i).wrapping_add(1)) & self.mask;
+                        let dst = (idx.wrapping_add(i)) & self.mask;
+                        *functions_ptr.add(dst) = *functions_ptr.add(src);
+                        *data_arr.add(dst) = *data_arr.add(src);
+                        *priorities_ptr.add(dst) = *priorities_ptr.add(src);
+                        *flags_ptr.add(dst) = *flags_ptr.add(src);
+                        *task_types_ptr.add(dst) = *task_types_ptr.add(src);
+                    }
+
+                    // Clear the last slot (now vacant after shift)
+                    let last = (idx.wrapping_add(remaining)) & self.mask;
+                    *priorities_ptr.add(last) = 255;
+                    *data_arr.add(last) = ptr::null_mut();
+                }
+
+                // Decrement tail to reflect the removed element
+                self.tail.store(tail.wrapping_sub(1), Ordering::Release);
             }
 
-            // Update head if this was the first element
-            if idx == (head & self.mask) {
-                self.head.store(head.wrapping_add(1), Ordering::Release);
-            }
-            
             Some((func, d, best_priority, tt))
         } else {
             None

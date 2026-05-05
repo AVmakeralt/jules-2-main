@@ -430,7 +430,10 @@ impl InferCtx {
                 Ty::Result { ok: ob, err: eb },
             ) => self.unify(oa.as_ref(), ob.as_ref()) && self.unify(ea.as_ref(), eb.as_ref()),
             // Everything else must be structurally equal.
-            _ => a == b,
+            // Compare resolved types, not unresolved originals, so that
+            // e.g. Ty::Infer(0) already resolved to Ty::Struct("Foo")
+            // compares equal to another Ty::Struct("Foo").
+            _ => self.resolve(a) == self.resolve(b),
         }
     }
 }
