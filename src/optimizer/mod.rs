@@ -8,9 +8,15 @@ pub mod gnn_egraph_optimizer;
 #[cfg(feature = "gnn-optimizer")]
 pub mod gnn_trained_weights;
 pub mod hardware_cost_model;
+#[cfg(feature = "core-superopt")]
+pub mod uarch_cost;
 pub mod inline_cache;
-#[cfg(feature = "gnn-optimizer")]
+#[cfg(any(feature = "gnn-optimizer", feature = "core-superopt"))]
 pub mod mcts_superoptimizer;
+#[cfg(feature = "core-superopt")]
+pub mod mcts_core;
+#[cfg(feature = "core-superopt")]
+pub mod smt_verify;
 pub mod memory_optimizer;
 pub mod multi_tier_jit;
 pub mod optimizer;
@@ -30,3 +36,5 @@ pub mod partial_eval;
 pub mod learned_scheduler;
 pub mod alias_layout;
 pub mod dead_field_elim;
+#[cfg(feature = "core-superopt")]
+pub mod known_bits;
