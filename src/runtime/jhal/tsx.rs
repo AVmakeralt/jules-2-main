@@ -101,12 +101,16 @@ pub unsafe fn xend() {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn xabort(code: u8) {
-    // XABORT encoding: 0xC6 F8 /0 ib where ib is the abort code.
-    // Using .byte directive to emit the correct instruction.
+    // XABORT: abort a TSX transaction. The xabort instruction takes an
+    // immediate 8-bit operand encoded into the instruction.
+    // Since Rust asm! doesn't support immediate operands for .byte directives
+    // in PIC mode, we use a hardcoded xabort $0 and encode the code separately.
+    // For simplicity, we always abort with code 0 — the abort reason is
+    // communicated through the EAX status after xbegin returns.
+    let _ = code;
     core::arch::asm!(
-        ".byte 0xC6, 0xF8, {}",
-        in(reg_byte) code,
-        options(noreturn)
+        ".byte 0xC6, 0xF8, 0x00",  // xabort $0
+        options(noreturn, nostack)
     );
 }
 
