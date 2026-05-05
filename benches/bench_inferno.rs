@@ -480,9 +480,69 @@ fn bench() -> i32 {
 "#, None));
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  CATEGORY 11: COMPREHENSIVE STRESS (EVERYTHING COMBINED)
+    //  CATEGORY 11: CONSTANT FOLDING CORRECTNESS (BUG FIX VERIFICATION)
     // ══════════════════════════════════════════════════════════════════════════
-    println!("═══ CATEGORY 11: COMPREHENSIVE STRESS ══════════════════════════");
+    println!("═══ CATEGORY 11: CONSTANT FOLDING CORRECTNESS ══════════════════");
+
+    // 11a. Mutated variable must NOT be replaced with initial constant
+    results.push(run_bench("mut-var-not-folded", iterations, r#"
+fn bench() -> i32 {
+    let mut x: i32 = 2;
+    x = 10;
+    x
+}
+"#, Some(10)));
+
+    // 11b. Variable read after mutation through another variable
+    results.push(run_bench("var-after-mutation", iterations, r#"
+fn bench() -> i32 {
+    let mut x: i32 = 5;
+    let mut y: i32 = x;
+    x = 20;
+    y
+}
+"#, Some(5)));
+
+    // 11c. Multiple mutations
+    results.push(run_bench("multi-mutation", iterations, r#"
+fn bench() -> i32 {
+    let mut x: i32 = 1;
+    x = 2;
+    x = 3;
+    x = 4;
+    x
+}
+"#, Some(4)));
+
+    // 11d. Conditional mutation (both branches must produce correct result)
+    results.push(run_bench("cond-mutation", iterations, r#"
+fn bench() -> i32 {
+    let mut x: i32 = 10;
+    let flag: i32 = 1;
+    if flag != 0 {
+        x = 99;
+    }
+    x
+}
+"#, Some(99)));
+
+    // 11e. Self-mutation (x = x + 1)
+    results.push(run_bench("self-mutation", iterations, r#"
+fn bench() -> i32 {
+    let mut x: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 10 {
+        x = x + 1;
+        i = i + 1;
+    }
+    x
+}
+"#, Some(10)));
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  CATEGORY 12: COMPREHENSIVE STRESS (EVERYTHING COMBINED)
+    // ══════════════════════════════════════════════════════════════════════════
+    println!("═══ CATEGORY 12: COMPREHENSIVE STRESS ══════════════════════════");
 
     // The grand finale: nested loops + arithmetic overflow + function calls + GCD
     results.push(run_bench("grand-finale", iterations, r#"

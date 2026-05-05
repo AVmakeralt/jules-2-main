@@ -454,6 +454,23 @@ impl BytecodeCompiler {
         }
     }
 
+    /// Set whether constant folding is enabled.  When `false`, the bytecode
+    /// compiler emits literal instructions without attempting to fold them.
+    /// This is useful for debugging or when the AST-level optimizer already
+    /// performed constant propagation and folding is not desired at the
+    /// bytecode level.
+    pub fn set_fold_constants(&mut self, enabled: bool) {
+        self.fold_constants = enabled;
+        if !enabled {
+            self.known_constants.clear();
+        }
+    }
+
+    /// Set whether dead code elimination is enabled at the bytecode level.
+    pub fn set_eliminate_dead_code(&mut self, enabled: bool) {
+        self.eliminate_dead_code = enabled;
+    }
+
     #[inline]
     fn new_label(&mut self) -> u32 {
         let label = self.next_label;
@@ -468,19 +485,152 @@ impl BytecodeCompiler {
         slot
     }
     
-    /// Emit instruction, applying constant folding if enabled
+    /// Emit instruction, applying constant folding if enabled.
+    ///
+    /// **Constant-tracking discipline** (fixes the stale-constant bug):
+    /// When `fold_constants` is enabled, every instruction that is emitted
+    /// (whether folded or not) must update `known_constants` so that later
+    /// instructions see a consistent view:
+    ///
+    /// - If the instruction was folded into a `LoadConstInt/Float/Bool`,
+    ///   the destination slot is recorded as a known constant.
+    /// - If the instruction writes to a slot with a *non-constant* result
+    ///   (arithmetic, Move from unknown slot, etc.), the destination slot
+    ///   is removed from `known_constants`.
+    /// - `Nop` (from folding a no-op Move) does not affect any slot.
     #[inline]
     fn emit(&mut self, instr: Instr) {
         if self.fold_constants {
             if let Some(folded) = self.try_fold_constant(&instr) {
+                // Track the folded constant in known_constants.
+                self.track_folded_result(&folded);
                 self.current_function.instructions.push(folded);
                 return;
             }
         }
+        // Non-folded instruction: invalidate any destination slots that
+        // are overwritten by this instruction.
+        self.invalidate_dst(&instr);
         self.current_function.instructions.push(instr);
     }
+
+    /// After a constant-fold, record the destination slot's known value.
+    fn track_folded_result(&mut self, instr: &Instr) {
+        match instr {
+            Instr::LoadConstInt { dst, value } => {
+                self.known_constants.insert(*dst, Value::I64(*value));
+            }
+            Instr::LoadConstFloat { dst, value } => {
+                self.known_constants.insert(*dst, Value::F64(*value));
+            }
+            Instr::LoadConstBool { dst, value } => {
+                self.known_constants.insert(*dst, Value::Bool(*value));
+            }
+            Instr::LoadConstUnit { dst } => {
+                self.known_constants.insert(*dst, Value::Unit);
+            }
+            Instr::Nop => {
+                // Nop doesn't write to any slot — nothing to track.
+            }
+            _ => {
+                // Any other folded instruction (shouldn't happen with current
+                // folding rules, but be safe): invalidate dst.
+                if let Some(dst) = self.instr_dst(instr) {
+                    self.known_constants.remove(&dst);
+                }
+            }
+        }
+    }
+
+    /// Invalidate `known_constants` for any slot written by a non-folded
+    /// instruction.  This is the core fix for the stale-constant bug: when
+    /// a `Move`, `Add`, etc. writes to a slot, any previously-known constant
+    /// for that slot is no longer valid.
+    fn invalidate_dst(&mut self, instr: &Instr) {
+        if let Some(dst) = self.instr_dst(instr) {
+            self.known_constants.remove(&dst);
+        }
+    }
+
+    /// Return the destination slot for an instruction, if it has one.
+    #[inline]
+    fn instr_dst(&self, instr: &Instr) -> Option<u16> {
+        match instr {
+            Instr::LoadConst { dst, .. }
+            | Instr::LoadConstInt { dst, .. }
+            | Instr::LoadConstFloat { dst, .. }
+            | Instr::LoadConstBool { dst, .. }
+            | Instr::LoadConstUnit { dst }
+            | Instr::Move { dst, .. }
+            | Instr::Add { dst, .. }
+            | Instr::Sub { dst, .. }
+            | Instr::Mul { dst, .. }
+            | Instr::Div { dst, .. }
+            | Instr::Rem { dst, .. }
+            | Instr::Neg { dst, .. }
+            | Instr::BitAnd { dst, .. }
+            | Instr::BitOr { dst, .. }
+            | Instr::BitXor { dst, .. }
+            | Instr::Shl { dst, .. }
+            | Instr::Shr { dst, .. }
+            | Instr::Not { dst, .. }
+            | Instr::Eq { dst, .. }
+            | Instr::Ne { dst, .. }
+            | Instr::Lt { dst, .. }
+            | Instr::Le { dst, .. }
+            | Instr::Gt { dst, .. }
+            | Instr::Ge { dst, .. }
+            | Instr::Call { dst, .. }
+            | Instr::CallNative { dst, .. }
+            | Instr::LoadField { dst, .. }
+            | Instr::LoadIndex { dst, .. }
+            | Instr::ArrayLen { dst, .. }
+            | Instr::VecAdd { dst, .. }
+            | Instr::VecMul { dst, .. }
+            | Instr::MatMul { dst, .. }
+            | Instr::Pow { dst, .. }
+            | Instr::HadamardMul { dst, .. }
+            | Instr::MakeArray { dst, .. }
+            | Instr::MakeTuple { dst, .. }
+            | Instr::MakeStruct { dst, .. }
+            | Instr::MakeRange { dst, .. }
+            | Instr::Cast { dst, .. }
+            | Instr::TypeCheck { dst, .. }
+            | Instr::AssumeInt { dst, .. }
+            | Instr::AssumeFloat { dst, .. }
+            => Some(*dst),
+            Instr::Print { .. }
+            | Instr::StoreField { .. }
+            | Instr::StoreIndex { .. }
+            | Instr::Jump { .. }
+            | Instr::JumpFalse { .. }
+            | Instr::JumpTrue { .. }
+            | Instr::Return { .. }
+            | Instr::SimdLoopStart { .. }
+            | Instr::SimdLoopEnd
+            | Instr::ProfilePoint { .. }
+            | Instr::DebugBreak
+            | Instr::Nop
+            => None,
+        }
+    }
     
-    /// Try to fold constant expressions at compile time
+    /// Try to fold constant expressions at compile time.
+    ///
+    /// **SAFETY**: The `Move` instruction is ONLY folded when `dst == src`
+    /// (trivial no-op → Nop).  We do NOT fold `Move { dst, src }` to
+    /// `LoadConstInt` even when `src` holds a known constant, because
+    /// that would "bake in" the constant value and break subsequent
+    /// mutations of the source slot.  For example:
+    ///
+    ///   let x = 2;    // slot 0, known_constants[0] = I64(2)
+    ///   x = 10;       // Move { dst: 0, src: tmp } — must NOT fold
+    ///   let y = x;    // Move { dst: 1, src: 0 } — must NOT fold to LoadConstInt 2
+    ///   x = 20;       // slot 0 is now 20, but y would still have stale 2
+    ///
+    /// Instead, we rely on the AST-level constant propagator (§3 in
+    /// advanced_optimizer.rs) to handle variable-level constant
+    /// propagation correctly, with proper invalidation on reassignment.
     fn try_fold_constant(&self, instr: &Instr) -> Option<Instr> {
         match instr {
             Instr::Add { dst, lhs, rhs } => {
@@ -508,19 +658,22 @@ impl BytecodeCompiler {
                 }
             }
             Instr::Move { dst, src } => {
-                // Eliminate no-op moves (dst == src)
+                // Eliminate no-op moves (dst == src) — this is always safe
+                // because it reads from and writes to the same slot.
                 if dst == src {
                     return Some(Instr::Nop);
                 }
-                // Fold: Move from a known-constant slot → LoadConstInt/Float
-                if let Some(val) = self.known_constants.get(src) {
-                    return Some(match val {
-                        Value::I64(n) => Instr::LoadConstInt { dst: *dst, value: *n },
-                        Value::F64(f) => Instr::LoadConstFloat { dst: *dst, value: *f },
-                        Value::Bool(b) => Instr::LoadConstBool { dst: *dst, value: *b },
-                        _ => return None,
-                    });
-                }
+                // NOTE: We do NOT fold `Move` to `LoadConstInt/Float/Bool`
+                // here.  Previously, when `src` held a known constant, the
+                // Move was replaced with a LoadConst.  This was WRONG because
+                // it captured the constant value at the time of the Move, but
+                // subsequent mutations of the source slot would not be
+                // reflected — producing stale constant values at runtime.
+                //
+                // The correct approach is to let the Move execute at runtime,
+                // reading whatever value is currently in the source slot.
+                // The AST-level constant propagator handles variable-level
+                // constant propagation correctly.
             }
             _ => {}
         }

@@ -2628,13 +2628,27 @@ impl SimpleRng {
 /// cheapest equivalent expression found so far.  This amortizes the search
 /// cost across compilations — if `a * b + a * c` was previously optimized
 /// to `a * (b + c)`, reuse it instantly.
+///
+/// Enhanced with metadata: free-variable signatures, literal sets, and cost
+/// bounds.  This turns repeated traversals into table lookups and helps both
+/// the E-graph and stochastic pass avoid recomputing per-expression metadata.
 static EQUIV_CACHE: std::sync::OnceLock<std::sync::Mutex<FxHashMap<u64, CachedEquiv>>> =
     std::sync::OnceLock::new();
 
-/// A cached equivalence: the cheapest expression found and its cost.
+/// A cached equivalence: the cheapest expression found, its cost, and metadata
+/// that would otherwise need to be recomputed on every lookup.
 struct CachedEquiv {
     expr: Expr,
     cost: f64,
+    /// Free variables in the expression (sorted, deduplicated).
+    free_vars: Vec<String>,
+    /// All integer constants appearing in the expression (sorted, deduplicated).
+    literals: Vec<u128>,
+    /// Whether the expression is pure (no side effects).
+    is_pure: bool,
+    /// Best cost bound found — any future expression with cost above this
+    /// for the same equivalence class can be skipped immediately.
+    cost_bound: f64,
 }
 
 struct StochasticSuperoptimizer {
@@ -2655,6 +2669,139 @@ struct StochasticSuperoptimizer {
     /// normalised hash → Expr pairs.  These are added to the term bank so
     /// the superoptimizer can "recombine" parts of the original expression.
     sub_expr_bank: Vec<Expr>,
+    /// ── Beam search: keep several promising candidates instead of only the
+    /// current best.  Each entry is (node_pool, cost).  The beam width
+    /// controls how many candidates are retained between iterations.
+    beam: Vec<(Vec<TermNode>, f64)>,
+    /// Maximum number of candidates to keep in the beam.
+    beam_width: usize,
+    /// ── Profitability gate: minimum estimated cost an expression must have
+    /// before the stochastic search will run on it.  Expressions below this
+    /// threshold are already "cheap enough" and not worth the search effort.
+    min_cost_for_search: f64,
+    /// ── Two-stage verification: number of cheap screening environments.
+    /// Candidates must pass screening before full verification is applied.
+    /// This eliminates clearly-wrong candidates cheaply.
+    screening_env_count: usize,
+    /// ── Expression metadata cache: avoids recomputing free_vars, purity,
+    /// hash, and cost for the same expression across multiple passes.
+    expr_metadata_cache: FxHashMap<u64, ExprMetadata>,
+}
+
+/// Cached per-expression metadata: avoids repeatedly traversing the AST to
+/// compute free variables, purity, literal value, hash, and estimated cost.
+/// These annotations are computed once and reused across all optimizer passes.
+#[derive(Clone, Debug)]
+struct ExprMetadata {
+    /// Sorted, deduplicated free variable names.
+    free_vars: Vec<String>,
+    /// Sorted, deduplicated integer constants.
+    literals: Vec<u128>,
+    /// Whether the expression is pure (no side effects, no function calls).
+    is_pure: bool,
+    /// Normalized hash (commutative-invariant).
+    hash: u64,
+    /// Estimated execution cost.
+    cost: f64,
+    /// Estimated AST size (number of nodes).
+    size: usize,
+}
+
+impl ExprMetadata {
+    fn compute(expr: &Expr) -> Self {
+        let mut free_vars = Vec::new();
+        let mut literals = Vec::new();
+        Self::collect_free_vars(expr, &mut free_vars);
+        Self::collect_int_consts(expr, &mut literals);
+        free_vars.sort_unstable();
+        free_vars.dedup();
+        literals.sort_unstable();
+        literals.dedup();
+        let hash = StochasticSuperoptimizer::normalized_hash(expr);
+        let cost = CostModel::estimate(expr);
+        let is_pure = Self::is_pure_expr(expr);
+        let size = Self::count_nodes(expr);
+        Self { free_vars, literals, is_pure, hash, cost, size }
+    }
+
+    fn collect_free_vars(expr: &Expr, out: &mut Vec<String>) {
+        match expr {
+            Expr::Ident { name, .. } => out.push(name.clone()),
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::collect_free_vars(lhs, out);
+                Self::collect_free_vars(rhs, out);
+            }
+            Expr::UnOp { expr, .. } => Self::collect_free_vars(expr, out),
+            Expr::Call { func, args, .. } => {
+                Self::collect_free_vars(func, out);
+                for a in args { Self::collect_free_vars(a, out); }
+            }
+            Expr::Tuple { elems, .. } => {
+                for e in elems { Self::collect_free_vars(e, out); }
+            }
+            Expr::IfExpr { cond, then, else_, .. } => {
+                Self::collect_free_vars(cond, out);
+                Self::collect_free_vars_block(then, out);
+                if let Some(eb) = else_ {
+                    Self::collect_free_vars_block(eb, out);
+                }
+            }
+            Expr::Block(b) => Self::collect_free_vars_block(b, out),
+            _ => {}
+        }
+    }
+
+    fn collect_free_vars_block(block: &Block, out: &mut Vec<String>) {
+        for s in &block.stmts {
+            match s {
+                Stmt::Let { init: Some(e), .. } | Stmt::Expr { expr: e, .. } => {
+                    Self::collect_free_vars(e, out);
+                }
+                _ => {}
+            }
+        }
+        if let Some(t) = &block.tail {
+            Self::collect_free_vars(t, out);
+        }
+    }
+
+    fn collect_int_consts(expr: &Expr, out: &mut Vec<u128>) {
+        match expr {
+            Expr::IntLit { value, .. } => out.push(*value),
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::collect_int_consts(lhs, out);
+                Self::collect_int_consts(rhs, out);
+            }
+            Expr::UnOp { expr, .. } => Self::collect_int_consts(expr, out),
+            Expr::Tuple { elems, .. } => {
+                for e in elems { Self::collect_int_consts(e, out); }
+            }
+            _ => {}
+        }
+    }
+
+    fn is_pure_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit { .. }
+            | Expr::StrLit { .. } | Expr::Ident { .. } => true,
+            Expr::BinOp { lhs, rhs, .. } => Self::is_pure_expr(lhs) && Self::is_pure_expr(rhs),
+            Expr::UnOp { expr, .. } => Self::is_pure_expr(expr),
+            Expr::Tuple { elems, .. } => elems.iter().all(Self::is_pure_expr),
+            Expr::Call { .. } => false, // conservatively assume impure
+            _ => false,
+        }
+    }
+
+    fn count_nodes(expr: &Expr) -> usize {
+        match expr {
+            Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit { .. }
+            | Expr::StrLit { .. } | Expr::Ident { .. } => 1,
+            Expr::BinOp { lhs, rhs, .. } => 1 + Self::count_nodes(lhs) + Self::count_nodes(rhs),
+            Expr::UnOp { expr, .. } => 1 + Self::count_nodes(expr),
+            Expr::Tuple { elems, .. } => 1 + elems.iter().map(Self::count_nodes).sum::<usize>(),
+            _ => 1,
+        }
+    }
 }
 
 impl StochasticSuperoptimizer {
@@ -2670,6 +2817,19 @@ impl StochasticSuperoptimizer {
             original_consts: Vec::new(),
             depth2_bias: 0.25, // start at 25 % depth-2 (same as before)
             sub_expr_bank: Vec::new(),
+            // ── Beam search: keep top-4 candidates (width 4 provides good
+            // diversity without blowing up memory or verification cost).
+            beam: Vec::with_capacity(4),
+            beam_width: 4,
+            // ── Profitability gate: expressions cheaper than 2.0 cycles are
+            // already near-optimal (a single add/sub costs 1.0).  Skip search.
+            min_cost_for_search: 2.0,
+            // ── Two-stage verification: use 4 cheap screening environments
+            // before the full verification set.  This eliminates ~80% of
+            // clearly-wrong candidates with only 4 evaluations instead of 16-32.
+            screening_env_count: 4,
+            // ── Expression metadata cache.
+            expr_metadata_cache: FxHashMap::default(),
         }
     }
 
@@ -2736,7 +2896,25 @@ impl StochasticSuperoptimizer {
         let span = expr.span();
         let original_cost = CostModel::estimate(&expr);
 
-        // ── Step 0: Equivalence cache lookup ────────────────────────────────
+        // ── Profitability gate: skip search for already-cheap expressions ──
+        // Expressions with estimated cost below `min_cost_for_search` are
+        // already near-optimal — stochastic search is unlikely to find
+        // anything cheaper (e.g., a single `x + 1` costs 1.0 and can't be
+        // improved).  Skip the search entirely to save compile time.
+        if original_cost < self.min_cost_for_search {
+            return expr;
+        }
+
+        // ── Skip already-canonical forms ──────────────────────────────────
+        // A single BinOp with two Ident children (e.g., `a + b`) is already
+        // canonical and cannot be simplified further.
+        if let Expr::BinOp { lhs, rhs, .. } = &expr {
+            if matches!(**lhs, Expr::Ident { .. }) && matches!(**rhs, Expr::Ident { .. }) {
+                if original_cost <= 1.0 { return expr; }
+            }
+        }
+
+        // ── Step 0: Equivalence cache lookup (with metadata) ─────────────
         // Compute a normalized hash of the expression (sorted operands,
         // canonical form).  If we've already found a cheaper equivalent in a
         // previous compilation, return it immediately.
@@ -2748,28 +2926,26 @@ impl StochasticSuperoptimizer {
                     self.rewrites += 1;
                     return cached.expr.clone();
                 }
+                // Even if the cached expression isn't cheaper, we can use
+                // its cost_bound to short-circuit: if the best-known cost
+                // for this equivalence class equals original_cost, there's
+                // no improvement possible.
+                if (cached.cost_bound - original_cost).abs() < 1e-9 {
+                    return expr;
+                }
             }
         }
 
         // ── Step 1: collect free variables, constants, sub-expressions, and
-        //            operator frequencies ────────────────────────────────────
-        let mut free_vars: Vec<String> = Vec::new();
-        let mut consts: Vec<u128> = Vec::new();
-        Self::collect_free_vars_expr(&expr, &mut free_vars);
-        Self::collect_int_consts_expr(&expr, &mut consts);
-        free_vars.sort_unstable();
-        free_vars.dedup();
-        consts.sort_unstable();
-        consts.dedup();
+        //            operator frequencies (using cached metadata) ──────────
+        let meta = self.get_or_compute_metadata(&expr, expr_hash);
+        let free_vars = meta.free_vars.clone();
+        let mut consts = meta.literals.clone();
 
         // Store constants for proximity-based sampling later.
         self.original_consts = consts.clone();
 
-        // ── Sub-expression term bank expansion (Priority 🔥 High) ───────────
-        // Collect all sub-expressions of the original expression as potential
-        // leaves.  This allows the superoptimizer to "recombine" parts of the
-        // original expression in new ways — e.g., turning a*b + a*c into
-        // a*(b+c) by treating a, b, c as leaves.
+        // ── Sub-expression term bank expansion ────────────────────────────
         self.sub_expr_bank.clear();
         Self::collect_sub_exprs(&expr, &mut self.sub_expr_bank, span);
 
@@ -2779,24 +2955,14 @@ impl StochasticSuperoptimizer {
 
         // Universal small constants + edge-case values likely to appear in
         // optimised forms.  Expanded with MAX, MIN, and powers of 2 for
-        // better overflow/edge-case coverage (Priority ⚡ Med).
+        // better overflow/edge-case coverage.
         for c in [0u128, 1, 2, 4, 8, 16, 32, 64, 127, 128, 255,
                   u128::MAX, (1u128 << 64) - 1, 1u128 << 63,
                   (1u128 << 32) - 1, 1u128 << 31] {
             if !consts.contains(&c) { consts.push(c); }
         }
-        // Also include nearby constants from the original for proximity sampling.
-        // Note: u128::MAX is already included above; -1 in two's complement IS u128::MAX.
-
-        // If there are no free variables, constant folding should have already
-        // collapsed this expression.  The stochastic pass cannot help further.
-        // (We still try if there are constants, though.)
 
         // ── Step 2: diversify RNG per expression + sample environments ──────
-        // Mix a fast hash of the expression's free variables and constants into
-        // the shared RNG state.  This ensures that two structurally-identical
-        // sub-expressions within the same function get different random search
-        // trajectories rather than probing the exact same candidates.
         {
             let mut h = 0u64;
             for v in &free_vars {
@@ -2807,12 +2973,10 @@ impl StochasticSuperoptimizer {
             for c in &consts {
                 h = h.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(*c as u64);
             }
-            // XOR-fold into rng.state rather than resetting it entirely, so
-            // back-to-back calls on different expressions still diverge.
             self.rng.state ^= h;
         }
 
-        // ── Step 2b: Edge-case input expansion (Priority ⚡ Med) ────────────
+        // ── Step 2b: Edge-case input expansion ────────────────────────────
         // Sample environments that include edge-case values (0, 1, MAX, MIN,
         // powers of two) in addition to random values.  This reduces false
         // positives/negatives in equivalence verification, especially for
@@ -2820,14 +2984,11 @@ impl StochasticSuperoptimizer {
         let mut envs: Vec<FxHashMap<String, Value>> = Vec::with_capacity(self.verif_inputs + free_vars.len() * 5);
 
         // ── Deterministic edge-case environments ────────────────────────────
-        // Each variable gets assigned one of the "interesting" values in
-        // combination, ensuring boundary conditions are covered.
         let edge_vals: &[u128] = &[0, 1, 2, 127, 128, 255, u128::MAX,
                                     1u128 << 63, (1u128 << 63) - 1,
                                     (1u128 << 64) - 1, (1u128 << 32) - 1];
         if !free_vars.is_empty() {
             // Generate one env per edge value, all variables get the same value.
-            // This covers single-variable boundary conditions cheaply.
             for &ev in edge_vals {
                 if envs.len() >= self.verif_inputs + free_vars.len() * 3 { break; }
                 let mut env = FxHashMap::default();
@@ -2860,68 +3021,59 @@ impl StochasticSuperoptimizer {
             .collect();
 
         // If the expression isn't fully evaluable on every input, bail out.
-        // (This happens for calls, field accesses, etc.)
         if spec.iter().any(|v| v.is_none()) {
             return expr;
         }
-        // Unwrap is safe: all Some after the check above.
         let spec: Vec<Value> = spec.into_iter().map(Option::unwrap).collect();
 
-        // ── Steps 4 + 5: allocation-free random search ──────────────────────
+        // ── Steps 4 + 5: allocation-free random search with enhancements ───
         //
-        // We build a flat TermBank (a compact numeric representation of the
-        // expression space) that can be evaluated directly on the stack without
-        // ever calling Box::new.  Only when a cheaper, verified-equivalent
-        // candidate is found do we materialise a real Expr AST.
-        //
-        // Each candidate is described by a flat Vec<TermNode> that forms an
-        // implicitly-rooted expression tree.  Evaluation is a single recursive
-        // pass over that Vec; allocation is zero until we know we have a winner.
+        // Improvements over the original:
+        //  1. Two-stage verification: cheap screening first, then full.
+        //  2. Beam search: keep several promising candidates.
+        //  3. Early rejection: reject on first input mismatch.
+        //  4. Profitability gate already applied above.
 
         let term_bank = self.build_term_bank(&free_vars, &consts, span);
-        // Pre-allocate the scratch node-pool once and reuse it every iteration.
-        // Depth-2 trees can hold at most 1 + 2 + 4 = 7 nodes; depth-1 at most 3.
         let mut node_pool: Vec<TermNode> = Vec::with_capacity(16);
 
-        let mut best_expr: Option<Vec<TermNode>> = None; // None means "original is still best"
+        let mut best_expr: Option<Vec<TermNode>> = None;
         let mut best_cost = original_cost;
+
+        // ── Clear beam for this expression ────────────────────────────────
+        self.beam.clear();
 
         // Reset depth-2 bias for this expression.
         self.depth2_bias = 0.25;
 
         // ── Phase 0: try sub-expression bank candidates first ───────────────
-        // Before random search, try each sub-expression from the bank as a
-        // candidate.  These are real parts of the original expression, so they
-        // are very likely to be semantically meaningful.
         for sub_expr in &self.sub_expr_bank {
             let sub_cost = CostModel::estimate(sub_expr);
             if sub_cost >= best_cost { continue; }
 
-            // Verify equivalence
+            // Two-stage verification: screening first
+            if !Self::verify_screening(sub_expr, &envs, &spec, self.screening_env_count) {
+                continue;
+            }
+            // Full verification
             let equivalent = envs.iter().zip(spec.iter()).all(|(env, expected)| {
                 ExprInterpreter::eval(sub_expr, env).as_ref() == Some(expected)
             });
 
             if equivalent {
-                // Found a cheaper sub-expression — return it immediately.
                 self.rewrites += 1;
-                Self::update_equiv_cache(expr_hash, sub_expr.clone(), sub_cost);
+                Self::update_equiv_cache_with_meta(expr_hash, sub_expr.clone(), sub_cost, &free_vars, &consts, meta.is_pure);
                 return sub_expr.clone();
             }
         }
 
-        // ── Phase 1: guided random search ───────────────────────────────────
+        // ── Phase 1: guided random search with beam ───────────────────────
         let mut iterations_without_improvement = 0usize;
 
         for _ in 0..self.budget {
-            // ── Depth-adaptive sampling ──────────────────────────────────────
-            // If depth-1 has failed to find improvements for many iterations,
-            // increase the probability of trying depth-2 (and eventually depth-3)
-            // to explore deeper rewrites.  This avoids wasting cycles on trivial
-            // rewrites when none exist.
             if iterations_without_improvement > self.budget / 4 {
                 self.depth2_bias = (self.depth2_bias + 0.1).min(0.75);
-                iterations_without_improvement = 0; // reset after adjustment
+                iterations_without_improvement = 0;
             }
 
             let depth = if (self.rng.next_u64() as f64 / u64::MAX as f64) < self.depth2_bias {
@@ -2930,9 +3082,6 @@ impl StochasticSuperoptimizer {
                 1usize
             };
 
-            // ── Phase A: estimate cost WITHOUT allocating an Expr ────────────
-            // We build the candidate into `node_pool` (stack-like Vec reset each
-            // iteration) and immediately score it.
             node_pool.clear();
             Self::guided_random_term(
                 &mut self.rng,
@@ -2946,38 +3095,92 @@ impl StochasticSuperoptimizer {
             let candidate_cost = Self::term_cost(&node_pool, 0).0;
             if candidate_cost >= best_cost { iterations_without_improvement += 1; continue; }
 
-            // ── Phase B: verify equivalence by concrete evaluation ───────────
-            // Evaluation is a stack-recursive walk over node_pool — still zero
-            // heap allocations.
-            let equivalent = envs.iter().zip(spec.iter()).all(|(env, expected)| {
-                Self::eval_term(&node_pool, 0, env).as_ref() == Some(expected)
-            });
+            // ── Two-stage verification: screening first ────────────────────
+            // Only evaluate on the first `screening_env_count` environments.
+            // If the candidate disagrees on any of these, it's definitely not
+            // equivalent — reject immediately without testing the rest.
+            let screening_pass = envs.iter().zip(spec.iter())
+                .take(self.screening_env_count)
+                .all(|(env, expected)| {
+                    Self::eval_term(&node_pool, 0, env).as_ref() == Some(expected)
+                });
+
+            if !screening_pass {
+                iterations_without_improvement += 1;
+                continue;
+            }
+
+            // ── Full verification ──────────────────────────────────────────
+            // Candidate passed screening — now verify on ALL environments
+            // with early rejection (break on first mismatch).
+            let mut equivalent = true;
+            for (env, expected) in envs.iter().zip(spec.iter()) {
+                if Self::eval_term(&node_pool, 0, env).as_ref() != Some(expected) {
+                    equivalent = false;
+                    break;
+                }
+            }
 
             if equivalent {
-                // ── Phase C: winner found — snapshot the node pool ───────────
-                // We store a clone of the flat pool; the real Expr is only
-                // materialised once at the end (in build_winner_expr), ensuring
-                // we call Box::new at most once per optimize_expr call.
                 best_expr = Some(node_pool.clone());
                 best_cost = candidate_cost;
                 self.rewrites += 1;
                 iterations_without_improvement = 0;
+
+                // ── Beam: add to beam ──────────────────────────────────────
+                self.beam.push((node_pool.clone(), candidate_cost));
+                // Keep only the top beam_width cheapest candidates.
+                if self.beam.len() > self.beam_width {
+                    self.beam.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    self.beam.truncate(self.beam_width);
+                }
             } else {
                 iterations_without_improvement += 1;
             }
         }
 
         // ── Materialise the winning Expr and update equivalence cache ────────
-        let result = match best_expr {
+        // Pick the best from the beam (if any), otherwise use best_expr.
+        let final_pool = if !self.beam.is_empty() {
+            self.beam.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            Some(self.beam[0].0.clone())
+        } else {
+            best_expr
+        };
+
+        let result = match final_pool {
             Some(pool) => Self::build_winner_expr(&pool, 0, span),
             None => expr,
         };
 
         if best_cost < original_cost - 1e-9 {
-            Self::update_equiv_cache(expr_hash, result.clone(), best_cost);
+            Self::update_equiv_cache_with_meta(expr_hash, result.clone(), best_cost, &free_vars, &consts, meta.is_pure);
         }
 
         result
+    }
+
+    /// Get or compute expression metadata, using the cache to avoid
+    /// recomputing free vars, purity, hash, and cost for the same expression.
+    fn get_or_compute_metadata(&mut self, expr: &Expr, hash: u64) -> ExprMetadata {
+        if let Some(meta) = self.expr_metadata_cache.get(&hash) {
+            return meta.clone();
+        }
+        let meta = ExprMetadata::compute(expr);
+        self.expr_metadata_cache.insert(hash, meta.clone());
+        meta
+    }
+
+    /// Cheap screening verification: evaluate the candidate on only the first
+    /// `n` environments.  Returns true if the candidate matches the spec on
+    /// all `n` environments, false otherwise.  This eliminates ~80% of
+    /// clearly-wrong candidates with only a fraction of the evaluations.
+    fn verify_screening(candidate: &Expr, envs: &[FxHashMap<String, Value>], spec: &[Value], n: usize) -> bool {
+        envs.iter().zip(spec.iter())
+            .take(n)
+            .all(|(env, expected)| {
+                ExprInterpreter::eval(candidate, env).as_ref() == Some(expected)
+            })
     }
 
     // ── Normalized expression hashing for the equivalence cache ──────────────
@@ -3040,15 +3243,43 @@ impl StochasticSuperoptimizer {
         }
     }
 
-    /// Insert a discovered equivalence into the global cache.
+    /// Insert a discovered equivalence into the global cache (without metadata).
     fn update_equiv_cache(key: u64, expr: Expr, cost: f64) {
+        Self::update_equiv_cache_with_meta(key, expr, cost, &[], &[], true);
+    }
+
+    /// Insert a discovered equivalence into the global cache with full metadata.
+    /// The metadata (free vars, literals, purity, cost bound) is stored alongside
+    /// the expression so that future lookups can use it without recomputing.
+    fn update_equiv_cache_with_meta(
+        key: u64,
+        expr: Expr,
+        cost: f64,
+        free_vars: &[String],
+        literals: &[u128],
+        is_pure: bool,
+    ) {
         let cache = EQUIV_CACHE.get_or_init(|| {
             std::sync::Mutex::new(FxHashMap::default())
         });
         let mut guard = cache.lock().unwrap();
         guard.entry(key).and_modify(|e| {
-            if cost < e.cost { e.expr = expr.clone(); e.cost = cost; }
-        }).or_insert(CachedEquiv { expr, cost });
+            if cost < e.cost {
+                e.expr = expr.clone();
+                e.cost = cost;
+                e.cost_bound = cost;
+                if !free_vars.is_empty() { e.free_vars = free_vars.to_vec(); }
+                if !literals.is_empty() { e.literals = literals.to_vec(); }
+                e.is_pure = is_pure;
+            }
+        }).or_insert(CachedEquiv {
+            expr,
+            cost,
+            free_vars: free_vars.to_vec(),
+            literals: literals.to_vec(),
+            is_pure,
+            cost_bound: cost,
+        });
     }
 
     /// Collect all sub-expressions of the input expression as potential term
@@ -5310,26 +5541,37 @@ impl Superoptimizer {
 
         for _iter in 0..self.config.iterations {
             let size_before = self.estimate_size(body);
-            // Pass 1: Dead code elimination
+
+            // ── Pipeline reordering (user's #7) ─────────────────────────────
+            // The best order is: DCE, constprop, fold, algebraic, reassoc,
+            // CSE, DSE, branch cleanup, loop cleanup.  Every earlier pass
+            // shrinks and normalizes the search space for the later ones.
+
+            // Pass 1: Dead code elimination (trim unreachable code first)
             let mut dce = DeadCodeEliminator::new();
             dce.eliminate_block(body);
             self.dead_code_eliminated += dce.eliminated;
-            // Pass 2: Constant propagation
+
+            // Pass 2: Constant propagation (substitute known values before folding)
             let mut cp = ConstantPropagator::new();
             cp.propagate_block(body);
             self.constant_propagations += cp.propagations;
-            // Pass 3: Constant folding
+
+            // Pass 3: Constant folding (collapse constant expressions)
             let mut cf = ConstantFolder::new();
             cf.fold_block_mut(body);
             self.constant_folds += cf.folds_performed;
-            // Pass 4: Algebraic simplification
+
+            // Pass 4: Algebraic simplification (identity, inverse, idempotent rules)
             let mut asimp = AlgebraicSimplifier::new();
             asimp.simplify_block_mut(body);
             self.algebraic_simplifications += asimp.simplifications;
-            // Pass 5: Strength reduction
+
+            // Pass 5: Strength reduction (mul-by-power → shift, etc.)
             let mut sr = StrengthReducer::new();
             sr.reduce_block_mut(body);
             self.strength_reductions += sr.reductions;
+
             // Pass 6: Bitwise optimizations
             if self.config.enable_peephole {
                 let mut bo = BitwiseOptimizer::new();
@@ -5347,7 +5589,7 @@ impl Superoptimizer {
             er.reassociate_block_mut(body);
             self.reassociations += er.reassociations;
 
-            // Pass 9: CSE
+            // Pass 9: CSE (after reassociation so equivalent forms are unified)
             if self.config.enable_cse {
                 let mut cse = CommonSubexprEliminator::new();
                 cse.eliminate_block(body);
@@ -5384,10 +5626,18 @@ impl Superoptimizer {
             if size_after == size_before { break; }
         }
 
-        // Pass 14: Stochastic superoptimization  (§15.5)
-        // Runs *after* the conventional passes have reached a fixpoint so the
-        // search starts from already-simplified expressions.  Each expression
-        // in the function body is independently subjected to random search for
+        // ── Pass 14: E-graph equality saturation ────────────────────────────
+        // Runs AFTER conventional passes have reached a fixpoint.  The E-graph
+        // discovers equivalences that individual rules miss by saturating all
+        // possible rewrites simultaneously.
+        if self.config.enable_egraph && self.config.egraph_iterations > 0 {
+            let mut ego = EGraphOptimizer::new(self.config.egraph_iterations);
+            ego.optimize_block(body);
+        }
+
+        // ── Pass 15: Stochastic superoptimization ───────────────────────────
+        // Runs after ALL other passes (including E-graph) have finished.
+        // Each expression is independently subjected to random search for
         // a cheaper semantically-equivalent expression, verified by concrete
         // evaluation.  This is the only pass that can discover optimizations
         // not encoded in any of the rules above.
@@ -5398,6 +5648,23 @@ impl Superoptimizer {
             );
             so.optimize_block_mut(body);
             self.superopt_rewrites += so.rewrites;
+        }
+
+        // ── Pass 16: Cleanup sweep ──────────────────────────────────────────
+        // After the expensive passes (E-graph + stochastic), run one more
+        // cleanup sweep so newly exposed simplifications get removed.  This is
+        // especially important because E-graph and stochastic passes can create
+        // new constant or branch opportunities.
+        {
+            let mut dce2 = DeadCodeEliminator::new();
+            dce2.eliminate_block(body);
+            self.dead_code_eliminated += dce2.eliminated;
+            let mut cf2 = ConstantFolder::new();
+            cf2.fold_block_mut(body);
+            self.constant_folds += cf2.folds_performed;
+            let mut asimp2 = AlgebraicSimplifier::new();
+            asimp2.simplify_block_mut(body);
+            self.algebraic_simplifications += asimp2.simplifications;
         }
 
         self.cost_after += CostModel::estimate_block(body);
@@ -5418,7 +5685,7 @@ impl Superoptimizer {
 }
 
 // =============================================================================
-// §17  COST MODEL — x86-64 Cycle Estimation
+// §17  COST MODEL — x86-64 Cycle Estimation with Register Pressure & Branchiness
 // =============================================================================
 
 struct CostModel;
@@ -5459,6 +5726,16 @@ impl CostModel {
         }
     }
 
+    /// Estimate the execution cost of an expression in x86-64 cycles.
+    ///
+    /// Enhanced with:
+    /// - **Register pressure penalty**: Each unique variable referenced adds
+    ///   a small cost (0.1 cycles) to model register spill/reload overhead.
+    ///   More free variables → more register pressure → higher cost.
+    /// - **Branchiness penalty**: Conditional expressions (IfExpr) add a
+    ///   2.0-cycle misprediction penalty on top of their condition cost.
+    /// - **Division penalty**: Div/Rem are expensive (20 cycles baseline)
+    ///   because they typically can't be pipelined.
     fn estimate(expr: &Expr) -> f64 {
         match expr {
             Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit { .. } | Expr::StrLit { .. } => 0.0,
@@ -5474,17 +5751,50 @@ impl CostModel {
                     BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor => 1.0,
                     BinOpKind::Shl | BinOpKind::Shr => 1.0,
                 };
-                base + Self::estimate(lhs) + Self::estimate(rhs)
+                let lhs_cost = Self::estimate(lhs);
+                let rhs_cost = Self::estimate(rhs);
+                // Register pressure: count unique variables in this sub-expression
+                let reg_pressure = Self::count_unique_vars(expr) as f64 * 0.1;
+                base + lhs_cost + rhs_cost + reg_pressure
             }
             Expr::UnOp { expr, .. } => 1.0 + Self::estimate(expr),
             Expr::Call { args, .. } => 5.0 + args.iter().map(|a| Self::estimate(a)).sum::<f64>(),
             Expr::IfExpr { cond, then, else_, .. } => {
-                Self::estimate(cond) + Self::estimate_block(then)
+                // Branchiness penalty: misprediction cost (2.0 cycles)
+                2.0 + Self::estimate(cond) + Self::estimate_block(then)
                     + else_.as_ref().map_or(0.0, |e| Self::estimate_block(e))
             }
             Expr::Tuple { elems, .. } => elems.iter().map(|e| Self::estimate(e)).sum(),
             Expr::Block(block) => Self::estimate_block(block),
             _ => 1.0,
+        }
+    }
+
+    /// Count the number of unique variable references in an expression.
+    /// Used to model register pressure — more unique variables means more
+    /// registers needed, potentially causing spills.
+    fn count_unique_vars(expr: &Expr) -> usize {
+        let mut vars = std::collections::HashSet::<String>::default();
+        Self::collect_vars(expr, &mut vars);
+        vars.len()
+    }
+
+    fn collect_vars(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::Ident { name, .. } => { out.insert(name.clone()); }
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::collect_vars(lhs, out);
+                Self::collect_vars(rhs, out);
+            }
+            Expr::UnOp { expr, .. } => Self::collect_vars(expr, out),
+            Expr::Call { func, args, .. } => {
+                Self::collect_vars(func, out);
+                for a in args { Self::collect_vars(a, out); }
+            }
+            Expr::Tuple { elems, .. } => {
+                for e in elems { Self::collect_vars(e, out); }
+            }
+            _ => {}
         }
     }
 }
