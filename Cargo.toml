@@ -84,6 +84,10 @@ bumpalo = "3.14"
 smallvec = { version = "1", features = ["union", "const_generics"] }
 ahash = "0.8"
 memmap2 = "0.9"
+# Cranelift backend — optional, NOT required for the hand-written x86-64 JIT.
+# The Phase 3 JIT (phase3_jit.rs / tracing_jit.rs) is self-contained and
+# emits raw x86-64 machine code via mmap/mprotect.  Enable this feature
+# only if you want a Cranelift-based backend as an alternative.
 cranelift-codegen = { version = "0.110", optional = true }
 cranelift-module = { version = "0.110", optional = true }
 cranelift-jit = { version = "0.110", optional = true }
@@ -102,7 +106,10 @@ ffi-c = []
 nightly = []
 phase1 = []
 phase2 = []
-phase3-jit = ["cranelift-codegen", "cranelift-module", "cranelift-jit"]
+# Phase 3 JIT — hand-written x86-64 emitter, zero external deps beyond libc.
+# Cranelift is an OPTIONAL backend, not a requirement.
+phase3-jit = []
+cranelift-backend = ["cranelift-codegen", "cranelift-module", "cranelift-jit"]
 numa = ["nix"]
 phase4-llvm = []
 phase5-cow = []
@@ -110,7 +117,7 @@ phase6-simd = []
 xla = []
 gnn-optimizer = []
 ultra-fast = ["phase3-jit", "phase6-simd"]
-full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "phase4-llvm", "phase5-cow", "phase6-simd", "gnn-optimizer"]
+full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "cranelift-backend", "phase4-llvm", "phase5-cow", "phase6-simd", "gnn-optimizer"]
 
 [lints.rust]
 dead_code = "warn"

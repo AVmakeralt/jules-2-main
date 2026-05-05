@@ -340,10 +340,17 @@ impl ConstantPropagator {
                         let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
                         *expr = self.substitute(old, &env);
                     }
-                    // An assignment expression may clobber a tracked constant.
-                    if let Expr::Assign { target, .. } = expr {
+                    // An assignment expression may clobber a tracked constant
+                    // or establish a new one (e.g. `x = 10` where 10 is constant).
+                    if let Expr::Assign { target, value, op, .. } = expr {
                         if let Expr::Ident { name, .. } = target.as_ref() {
-                            env.remove(name.as_str());
+                            // Plain assignment (not compound like +=) to a known
+                            // constant: record the new value.  Otherwise evict.
+                            if matches!(op, AssignOpKind::Assign) && Self::is_constant_expr(value) {
+                                env.insert(name.clone(), (**value).clone());
+                            } else {
+                                env.remove(name.as_str());
+                            }
                         }
                     }
                 }
