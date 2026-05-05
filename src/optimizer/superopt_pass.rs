@@ -712,3 +712,209 @@ fn unop_to_opcode(op: crate::compiler::ast::UnOpKind) -> Opcode {
         UnOpKind::Deref | UnOpKind::Ref | UnOpKind::RefMut => Opcode::Mov,
     }
 }
+
+// =========================================================================
+// Hardware-Calibrated Cost Model
+//
+// Bridges the gap between the STATIC uarch cost model (uops.info tables)
+// and the REAL hardware behavior measured via Linux perf_event_open.
+//
+// The problem: the static cost model assumes ideal conditions (no cache
+// misses, no branch mispredictions, no memory stalls). Real code has all
+// of these. The HW-calibrated model:
+//   1. Runs a calibration micro-benchmark on the current CPU
+//   2. Measures actual IPC, cache miss rates, branch misprediction rates
+//   3. Computes scaling factors for the static cost model
+//   4. Adjusts the superoptimizer's cost estimates to reflect reality
+//
+// This prevents the superoptimizer from choosing transformations that
+// look good on paper (fewer uops, shorter dependency chain) but are
+// actually slower on real hardware (because they thrash the cache or
+// cause branch mispredictions).
+// =========================================================================
+
+/// Calibration data from hardware performance counters.
+///
+/// This struct captures the ratio between observed (real) and predicted
+/// (static) costs, which can be used to scale the superoptimizer's
+/// cost estimates.
+#[derive(Debug, Clone)]
+#[cfg(feature = "core-superopt")]
+pub struct HwCalibrationData {
+    /// Observed instructions per cycle (measured via perf).
+    pub observed_ipc: f64,
+    /// Theoretical maximum IPC (from uarch model: 4 for Skylake, 6 for Golden Cove, etc.).
+    pub theoretical_max_ipc: f64,
+    /// Cache miss rate as fraction of all cache references.
+    pub cache_miss_rate: f64,
+    /// Branch misprediction rate as fraction of all branch instructions.
+    pub branch_mispred_rate: f64,
+    /// Scaling factor for latency estimates.
+    /// >1.0 means real code is slower than predicted (cache misses, stalls).
+    /// Computed as: theoretical_max_ipc / observed_ipc.max(0.01)
+    pub latency_scale: f64,
+    /// Memory stall penalty (extra cycles per cache miss beyond L1 latency).
+    pub memory_stall_cycles: f64,
+    /// Whether this calibration was derived from real hardware counters
+    /// (as opposed to defaults/simulated values).
+    pub from_real_hw: bool,
+}
+
+#[cfg(feature = "core-superopt")]
+impl Default for HwCalibrationData {
+    fn default() -> Self {
+        Self {
+            observed_ipc: 2.0,     // Conservative default: modern CPUs rarely sustain >2 IPC on real workloads
+            theoretical_max_ipc: 4.0,
+            cache_miss_rate: 0.05,  // 5% is typical for compute-heavy code
+            branch_mispred_rate: 0.02, // 2% is typical for well-predicted code
+            latency_scale: 2.0,    // Real code ~2x slower than ideal due to stalls
+            memory_stall_cycles: 40.0, // ~40 cycles for L2 miss → L3 → DRAM
+            from_real_hw: false,
+        }
+    }
+}
+
+#[cfg(feature = "core-superopt")]
+impl HwCalibrationData {
+    /// Calibrate from real hardware performance counters.
+    ///
+    /// Uses the `HwFeedbackCollector` to measure actual IPC, cache miss
+    /// rates, and branch misprediction rates, then computes scaling
+    /// factors for the superoptimizer's cost model.
+    pub fn calibrate_from_hw() -> Self {
+        use crate::compiler::hw_feedback::{
+            HwFeedbackCollector, HwFeedbackAnalyzer, PebsConfig,
+        };
+
+        let mut collector = HwFeedbackCollector::new(PebsConfig::default());
+        let analyzer = HwFeedbackAnalyzer::new(0.1);
+
+        // Start profiling, run a quick calibration workload, then stop.
+        let start_ok = collector.start_profiling().is_ok();
+        if !start_ok {
+            return Self::default();
+        }
+
+        // Calibration workload: simple compute-heavy loop that exercises
+        // the same kinds of operations the superoptimizer will encounter.
+        let mut sink: u64 = 0;
+        for i in 0u64..1_000_000 {
+            sink = sink.wrapping_add(i.wrapping_mul(7919) ^ (i >> 3));
+        }
+        std::hint::black_box(sink);
+
+        let profile = match collector.stop_profiling() {
+            Ok(p) => p,
+            Err(_) => return Self::default(),
+        };
+
+        let metrics = analyzer.analyze(&profile);
+
+        // Compute the theoretical max IPC from the detected microarchitecture.
+        let theoretical_max_ipc = {
+            use crate::optimizer::uarch_cost::TargetConfig;
+            let target = TargetConfig::detect();
+            target.decode_width as f64
+        };
+
+        // The latency scale represents how much slower real code is
+        // compared to the ideal model.  If observed IPC is 1.5 but
+        // theoretical max is 4.0, then real code takes 4.0/1.5 = 2.67x
+        // longer than predicted.
+        let latency_scale = theoretical_max_ipc / metrics.ipc.max(0.01);
+
+        // Memory stall cycles: each L2 miss costs ~40 cycles (L3 hit)
+        // or ~200 cycles (DRAM).  We estimate from the cache miss rate
+        // and a conservative L2 miss penalty of 40 cycles.
+        let memory_stall_cycles = if metrics.cache_miss_rate > 0.0 {
+            // At 5% miss rate with 40-cycle penalty, that's ~2 extra
+            // cycles per instruction on average. Scale linearly.
+            40.0 * (metrics.cache_miss_rate / 0.05)
+        } else {
+            0.0
+        };
+
+        Self {
+            observed_ipc: metrics.ipc,
+            theoretical_max_ipc,
+            cache_miss_rate: metrics.cache_miss_rate,
+            branch_mispred_rate: metrics.branch_mispred_rate,
+            latency_scale,
+            memory_stall_cycles,
+            from_real_hw: true,
+        }
+    }
+
+    /// Apply this calibration to a static cycle estimate.
+    ///
+    /// The static model gives ideal-cycle counts (no stalls, no cache
+    /// misses). This function scales them to reflect real hardware:
+    ///
+    ///   calibrated_cycles = static_cycles * latency_scale
+    ///
+    /// The scale factor is derived from observed IPC vs theoretical max,
+    /// which captures cache misses, branch mispredictions, and memory
+    /// stalls in a single number.
+    #[inline]
+    pub fn calibrate_cycles(&self, static_cycles: f64) -> f64 {
+        static_cycles * self.latency_scale
+    }
+}
+
+/// A superoptimizer cost model that uses hardware calibration to adjust
+/// static cycle estimates.  This replaces the naive static-only model
+/// that ignores cache misses, branch mispredictions, and memory stalls.
+#[derive(Debug, Clone)]
+#[cfg(feature = "core-superopt")]
+pub struct HwCalibratedCostModel {
+    /// The hardware calibration data (from real counters or defaults).
+    pub calibration: HwCalibrationData,
+    /// Whether to use hardware calibration (true) or pure static model (false).
+    pub use_hw_calibration: bool,
+}
+
+#[cfg(feature = "core-superopt")]
+impl Default for HwCalibratedCostModel {
+    fn default() -> Self {
+        Self {
+            calibration: HwCalibrationData::default(),
+            use_hw_calibration: true,
+        }
+    }
+}
+
+#[cfg(feature = "core-superopt")]
+impl HwCalibratedCostModel {
+    /// Create a new cost model with hardware calibration.
+    pub fn new() -> Self {
+        let calibration = HwCalibrationData::calibrate_from_hw();
+        Self {
+            calibration,
+            use_hw_calibration: true,
+        }
+    }
+
+    /// Create a pure static cost model (no hardware calibration).
+    pub fn static_only() -> Self {
+        Self {
+            calibration: HwCalibrationData::default(),
+            use_hw_calibration: false,
+        }
+    }
+
+    /// Estimate the cost of an instruction sequence, optionally calibrated
+    /// by real hardware performance data.
+    pub fn estimate(
+        &self,
+        instrs: &[crate::optimizer::uarch_cost::MachineInstr],
+        target: crate::optimizer::uarch_cost::TargetConfig,
+    ) -> f64 {
+        let static_cycles = crate::optimizer::uarch_cost::estimate_block_cycles(instrs, target);
+        if self.use_hw_calibration {
+            self.calibration.calibrate_cycles(static_cycles)
+        } else {
+            static_cycles
+        }
+    }
+}

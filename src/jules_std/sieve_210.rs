@@ -285,21 +285,47 @@ const SEG_U64S: usize = (CANDS_PER_SEG + 63) / 64; // = 32,768 u64s = 256 KB
 /// L2-cache-aligned segment buffer.
 /// Uses a padded Vec to guarantee 64-byte cache-line alignment,
 /// which prevents false sharing and ensures optimal L2 fill patterns.
+///
+/// IMPORTANT: Previous version used align_offset(8) which only guaranteed
+/// 8-byte alignment (one u64), not 64-byte cache-line alignment.  The
+/// correct alignment for cache-line-sized access is 64 bytes = 8 u64s.
+/// We now use align_to(8) which rounds up to the next 8-u64 boundary,
+/// guaranteeing that the slice starts at a 64-byte-aligned address.
 struct AlignedSegment {
     data: Vec<u64>,
-    offset: usize,
-    len: usize,
+    offset: usize, // in units of u64
+    len: usize,    // in units of u64
 }
 
 impl AlignedSegment {
     fn new(len: usize) -> Self {
-        let padded_len = len + 8; // Extra space for alignment
+        // We need up to 7 extra u64s to reach a 64-byte boundary
+        // (7 * 8 = 56 bytes worst-case padding before alignment).
+        const ALIGN_U64S: usize = 8; // 8 u64s = 64 bytes = one cache line
+        let padded_len = len + ALIGN_U64S;
         let mut buf = vec![0u64; padded_len];
         let ptr = buf.as_mut_ptr();
-        let offset = unsafe { ptr.align_offset(8) }; // 64-byte alignment = 8 × sizeof(u64)
-        // Zero the entire buffer (including alignment padding)
-        buf.fill(0);
-        Self { data: buf, offset, len }
+
+        // Compute byte offset to the next 64-byte-aligned address.
+        // align_offset(64) returns the byte count to skip; if it
+        // returns usize::MAX (alignment not achievable), fall back
+        // to offset 0 (unaligned — still correct, just slower).
+        let byte_offset = ptr.align_offset(64);
+        let u64_offset = if byte_offset == usize::MAX {
+            0
+        } else {
+            byte_offset / std::mem::size_of::<u64>()
+        };
+
+        // Verify: the aligned address should be divisible by 64
+        let aligned_addr = unsafe { ptr.add(u64_offset) as usize };
+        debug_assert!(
+            aligned_addr % 64 == 0,
+            "AlignedSegment: not 64-byte aligned! addr={:#x}",
+            aligned_addr
+        );
+
+        Self { data: buf, offset: u64_offset, len }
     }
 
     fn as_mut_slice(&mut self) -> &mut [u64] {

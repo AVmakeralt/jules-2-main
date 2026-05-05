@@ -581,6 +581,16 @@ fn bench<F: FnMut() -> R, R>(name: &str, iterations: usize, mut f: F) {
     let ns_per_iter = min.as_nanos() as f64 / iterations as f64;
     let throughput = if ns_per_iter > 0.0 { 1_000_000_000.0 / ns_per_iter } else { f64::INFINITY };
 
+    // Throughput sanity check: flag physically impossible numbers.
+    // Any sub-0.1 ns result for a non-trivial operation is DCE.
+    let sanity_flag = if ns_per_iter < 0.1 {
+        " ⚠ DCE-DETECTED"
+    } else if ns_per_iter < 0.25 && iterations > 1000 {
+        " ⚠ SUSPECT"
+    } else {
+        ""
+    };
+
     // Honest assessment
     let assessment = if ns_per_iter < 0.5 {
         "⚡ TRIVIAL (1-2 instructions)"
@@ -597,10 +607,11 @@ fn bench<F: FnMut() -> R, R>(name: &str, iterations: usize, mut f: F) {
     };
 
     println!(
-        "{:45} ns/iter={:>8.1}  {:>12.0}/s  {}",
+        "{:45} ns/iter={:>8.1}  {:>12.0}/s  {}{}",
         name,
         ns_per_iter,
         throughput,
         assessment,
+        sanity_flag,
     );
 }

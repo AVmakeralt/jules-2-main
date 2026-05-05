@@ -47,7 +47,7 @@ path = "src/tools/bench_genesis_weave.rs"
 [[bin]]
 name = "bench-mcts-superopt"
 path = "src/tools/bench_mcts_superopt.rs"
-required-features = ["gnn-optimizer"]
+required-features = ["core-superopt"]
 
 [[bin]]
 name = "train-gnn"
@@ -65,6 +65,10 @@ path = "benches/bench_jhal.rs"
 [[bin]]
 name = "bench-inferno"
 path = "benches/bench_inferno.rs"
+
+[[bin]]
+name = "bench-adversarial"
+path = "src/tools/bench_adversarial.rs"
 
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
