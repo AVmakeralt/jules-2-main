@@ -688,6 +688,41 @@ impl Pipeline {
             }
         }
 
+        // ── Pass 9b: Unified Superoptimizer Pipeline ─────────────────────────
+        // Runs the full 5-stage pipeline: semantic rewrites → known-bits
+        // pruning → MCTS tree search → CEGIS/SMT verification → uarch cost
+        // validation.  This is the "real superoptimizer" that connects all
+        // the previously-disconnected modules.
+        //
+        // Feature gates: core-superopt (stages 2-5) or gnn-optimizer (stage 1+).
+        // Only runs when SuperoptMode is not None and opt_level >= 2.
+        #[cfg(any(feature = "core-superopt", feature = "gnn-optimizer"))]
+        if self.opt_level >= 2 {
+            use crate::compiler::ast::SuperoptMode;
+            match program.superopt_mode {
+                SuperoptMode::None => {
+                    // Skip — already reported above.
+                }
+                SuperoptMode::MctsSuperopt | SuperoptMode::EGraph
+                | SuperoptMode::MlSuperopt | SuperoptMode::All => {
+                    use crate::optimizer::superopt_pass::{SuperoptPass, SuperoptConfig};
+                    let config = SuperoptConfig::default();
+                    let mut pass = SuperoptPass::new(config);
+                    let stats = pass.optimize_program(&mut program);
+                    if self.print_opt_stats && stats.expressions_optimized > 0 {
+                        eprintln!("[opt/SUPEROPT] visited={} optimized={} mcts_verified={} smt={} kb_reject={} uarch_reject={} time={}µs",
+                            stats.expressions_visited,
+                            stats.expressions_optimized,
+                            stats.mcts_candidates_verified,
+                            stats.smt_verifications,
+                            stats.known_bits_rejections,
+                            stats.uarch_rejections,
+                            stats.total_time_us);
+                    }
+                }
+            }
+        }
+
         // ── Pass 10: Partial Evaluation / Futamura Projections ─────────────────
         // Specializes functions by evaluating static (compile-time known) arguments
         // and building residual programs for dynamic parts.  This is distinct from

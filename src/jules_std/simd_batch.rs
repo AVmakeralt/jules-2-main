@@ -755,9 +755,9 @@ impl SimdBranchless {
     ///
     /// Returns `[min(a[0], b[0]), min(a[1], b[1]), ..., min(a[7], b[7])]`.
     ///
-    /// Uses the arithmetic trick: `min(a, b) = (a + b - |a - b|) / 2`
-    /// This avoids branches entirely — just addition, subtraction, abs, and division.
-    /// The compiler fuses the division-by-2 into a multiply-by-0.5.
+    /// Uses hardware MINSD/VMINPD instructions via f64::min, which compiles
+    /// to a single instruction per element — faster than the old arithmetic
+    /// trick `(a + b - |a - b|) / 2` which required 4 operations.
     #[inline(always)]
     pub fn simd_min_8(a: [f64; 8], b: [f64; 8]) -> [f64; 8] {
         [
@@ -776,7 +776,9 @@ impl SimdBranchless {
     ///
     /// Returns `[max(a[0], b[0]), max(a[1], b[1]), ..., max(a[7], b[7])]`.
     ///
-    /// Uses the arithmetic trick: `max(a, b) = (a + b + |a - b|) / 2`
+    /// Uses hardware MAXSD/VMAXPD instructions via f64::max, which compiles
+    /// to a single instruction per element — faster than the old arithmetic
+    /// trick `(a + b + |a - b|) / 2` which required 4 operations.
     #[inline(always)]
     pub fn simd_max_8(a: [f64; 8], b: [f64; 8]) -> [f64; 8] {
         [
@@ -895,34 +897,30 @@ impl SimdBranchless {
 
 // ─── Branchless Primitive Operations ────────────────────────────────────────
 
-/// Branchless minimum using arithmetic: `min(a, b) = (a + b - |a - b|) * 0.5`
+/// Branchless minimum using hardware MINSD/VMINSD instruction.
 ///
-/// Note: For NaN inputs, falls back to f64::min for correct semantics.
-/// The compiler will optimize this to a conditional-move (CMOVSD on x86)
-/// or SIMD MIN instruction when vectorized.
+/// Replaces the old arithmetic trick `(a + b - |a - b|) / 2` which was
+/// SLOWER than a single MINSD instruction. The arithmetic trick requires
+/// addition, subtraction, absolute value, and multiplication — 4 operations
+/// vs. 1 hardware instruction.
+///
+/// `f64::min` compiles to a single MINSD (scalar) or VMINPD (SIMD)
+/// instruction, which is both faster and handles NaN correctly per IEEE 754.
 #[inline(always)]
 fn min_branchless(a: f64, b: f64) -> f64 {
-    // Arithmetic trick works for non-NaN values
-    let diff = a - b;
-    let result = (a + b - diff.abs()) * 0.5;
-    // Handle NaN: if either is NaN, use f64::min semantics
-    if a.is_nan() || b.is_nan() {
-        a.min(b)
-    } else {
-        result
-    }
+    a.min(b)  // Compiles to single MINSD instruction
 }
 
-/// Branchless maximum using arithmetic: `max(a, b) = (a + b + |a - b|) * 0.5`
+/// Branchless maximum using hardware MAXSD/VMAXPD instruction.
+///
+/// Replaces the old arithmetic trick `(a + b + |a - b|) / 2` which was
+/// SLOWER than a single MAXSD instruction for the same reason as min_branchless.
+///
+/// `f64::max` compiles to a single MAXSD (scalar) or VMAXPD (SIMD)
+/// instruction.
 #[inline(always)]
 fn max_branchless(a: f64, b: f64) -> f64 {
-    let diff = a - b;
-    let result = (a + b + diff.abs()) * 0.5;
-    if a.is_nan() || b.is_nan() {
-        a.max(b)
-    } else {
-        result
-    }
+    a.max(b)  // Compiles to single MAXSD instruction
 }
 
 /// Branchless select using IEEE 754 bit manipulation.

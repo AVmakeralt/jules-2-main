@@ -517,9 +517,11 @@ pub fn check_exclusion(seed: u64, x: i64, y: i64, radius: i64) -> bool {
     let parent_x = (x / cell_size) * cell_size;
     let parent_y = (y / cell_size) * cell_size;
 
-    // Check all potential parent cells in the exclusion radius
-    for dx in (-1i64..=1).step_by(cell_size as usize).take(3) {
-        for dy in (-1i64..=1).step_by(cell_size as usize).take(3) {
+    // Check all potential parent cells in the 3×3 exclusion neighborhood.
+    // Each offset is multiplied by cell_size to get the actual parent cell center,
+    // ensuring we check the correct grid cells in the jittered grid layout.
+    for dx in [-1i64, 0, 1] {
+        for dy in [-1i64, 0, 1] {
             let px = parent_x + dx * cell_size;
             let py = parent_y + dy * cell_size;
 

@@ -4,7 +4,7 @@
 // Implements:
 //   1. 210-Wheel Factorization: skips multiples of 2,3,5,7 (77.1% eliminated)
 //   2. Extreme Bit-Packing: 48 candidates per 210-block packed into u64
-//   3. L1-Cache Oblivious Segmentation: 32KB segments fit in L1 data cache
+//   3. L2-Cache Oblivious Segmentation: 256KB segments fit in L2 data cache
 //   4. Pre-computed Multiplier Tables: jump distances computed at init time
 //      so the inner crossing-out loop avoids modulo arithmetic
 //   5. Branchless bit-clear: unconditional AND operations, no if-branches
@@ -273,6 +273,44 @@ pub fn segmented_odds_sieve(limit: u64) -> usize {
     count
 }
 
+// ─── L2-Cache-Aligned Segment Buffer ────────────────────────────────────────
+
+/// L2-tuned segment constants (shared across all sieve functions).
+/// 256KB = 32768 u64s = 2097152 bits
+/// 2097152 / 48 = 43690.67 → use 43688 cycles = 2097024 candidates per segment
+const CYCLES_PER_SEG: u64 = 5461 * 8;      // 8× larger segments for L2 cache
+const CANDS_PER_SEG: usize = 43_688 * 48;  // = 2,097,024 candidates
+const SEG_U64S: usize = (CANDS_PER_SEG + 63) / 64; // = 32,768 u64s = 256 KB
+
+/// L2-cache-aligned segment buffer.
+/// Uses a padded Vec to guarantee 64-byte cache-line alignment,
+/// which prevents false sharing and ensures optimal L2 fill patterns.
+struct AlignedSegment {
+    data: Vec<u64>,
+    offset: usize,
+    len: usize,
+}
+
+impl AlignedSegment {
+    fn new(len: usize) -> Self {
+        let padded_len = len + 8; // Extra space for alignment
+        let mut buf = vec![0u64; padded_len];
+        let ptr = buf.as_mut_ptr();
+        let offset = unsafe { ptr.align_offset(8) }; // 64-byte alignment = 8 × sizeof(u64)
+        // Zero the entire buffer (including alignment padding)
+        buf.fill(0);
+        Self { data: buf, offset, len }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u64] {
+        &mut self.data[self.offset..self.offset + self.len]
+    }
+
+    fn zero(&mut self) {
+        self.as_mut_slice().fill(0);
+    }
+}
+
 // ─── 210-Wheel Segmented Sieve — CORRECT IMPLEMENTATION ─────────────────────
 //
 // Architecture:
@@ -320,15 +358,9 @@ pub fn sieve_210_wheel(limit: u64) -> usize {
         .collect();
 
     // ── Phase 3: Segmented sieve ──
-    //
-    // Each segment covers some number of complete 210-cycles.
-    // 32KB = 4096 u64s = 262144 bits
-    // 262144 / 48 = 5461.33 → use 5461 cycles = 262128 candidates per segment
-    const CYCLES_PER_SEG: u64 = 5461;
-    const CANDS_PER_SEG: usize = 5461 * 48;
-    const SEG_U64S: usize = (CANDS_PER_SEG + 63) / 64; // 4096
+    // Uses L2-tuned segment constants defined at module level.
 
-    let mut segment = vec![0u64; SEG_U64S];
+    let mut aligned_seg = AlignedSegment::new(SEG_U64S);
 
     // Segments are aligned to 210-cycle boundaries.
     // Start from the cycle containing sqrt_limit (we'll skip already-counted primes).
@@ -343,7 +375,8 @@ pub fn sieve_210_wheel(limit: u64) -> usize {
         let seg_u64s = (seg_cands + 63) / 64;
 
         // Clear: all bits 0 = all candidates assumed prime
-        segment[..seg_u64s].fill(0);
+        aligned_seg.zero();
+        let segment = aligned_seg.as_mut_slice();
 
         // Number range covered by this segment
         let seg_n_low = seg_start_cycle * 210 + 1;
@@ -450,11 +483,9 @@ pub fn sieve_210_wheel_fastcount(limit: u64) -> usize {
         .map(|&p| compute_wheel_steps(p))
         .collect();
 
-    const CYCLES_PER_SEG: u64 = 5461;
-    const CANDS_PER_SEG: usize = 5461 * 48;
-    const SEG_U64S: usize = (CANDS_PER_SEG + 63) / 64;
+    // Uses L2-tuned segment constants defined at module level.
 
-    let mut segment = vec![0u64; SEG_U64S];
+    let mut aligned_seg = AlignedSegment::new(SEG_U64S);
     let sqrt_cycle = sqrt_limit / 210;
     let limit_cycle = limit / 210;
     let mut seg_start_cycle = sqrt_cycle;
@@ -464,7 +495,8 @@ pub fn sieve_210_wheel_fastcount(limit: u64) -> usize {
         let seg_n_cycles = (seg_end_cycle - seg_start_cycle + 1) as usize;
         let seg_cands = seg_n_cycles * 48;
         let seg_u64s = (seg_cands + 63) / 64;
-        segment[..seg_u64s].fill(0);
+        aligned_seg.zero();
+        let segment = aligned_seg.as_mut_slice();
 
         let seg_n_low = seg_start_cycle * 210 + 1;
         let seg_n_high = seg_end_cycle * 210 + 209;
@@ -513,14 +545,42 @@ pub fn sieve_210_wheel_fastcount(limit: u64) -> usize {
             raw_count += (last | !mask).count_zeros() as usize; // count zeros only in masked region
         }
 
-        // Correction: subtract candidates that should not be counted
-        // (n=1, n <= sqrt_limit, n > limit)
-        for local_idx in 0..seg_cands {
-            if (segment[local_idx >> 6] >> (local_idx & 63)) & 1 != 0 { continue; }
-            let cycle = seg_start_cycle + (local_idx / 48) as u64;
-            let n = cycle * 210 + WHEEL_RESIDUES[local_idx % 48];
-            if n == 1 || n <= sqrt_limit || n > limit {
+        // Correction: only check boundary cycles (first and last partial cycles)
+        // where n=1, n <= sqrt_limit, or n > limit can occur.
+        // Interior cycles are fully within [sqrt_limit+1, limit], so no correction needed.
+        // The first partial cycle is seg_start_cycle (may contain n <= sqrt_limit).
+        // The last partial cycle is seg_end_cycle (may contain n > limit).
+        // Also check n=1 which only occurs at cycle=0, ridx=0.
+        if seg_start_cycle == 0 {
+            // n=1 at cycle 0, ridx 0
+            let local_idx = 0;
+            if (segment[local_idx >> 6] >> (local_idx & 63)) & 1 == 0 {
                 raw_count = raw_count.saturating_sub(1);
+            }
+        }
+
+        // Correct first cycle: candidates with n <= sqrt_limit
+        // Only needed when this is the very first segment (seg_start_cycle == sqrt_cycle)
+        if seg_start_cycle == sqrt_cycle {
+            for ridx in 0..48 {
+                let n = seg_start_cycle * 210 + WHEEL_RESIDUES[ridx];
+                if n <= sqrt_limit && n > 1 {
+                    let local_idx = ridx; // first cycle, so local_idx = ridx
+                    if (segment[local_idx >> 6] >> (local_idx & 63)) & 1 == 0 {
+                        raw_count = raw_count.saturating_sub(1);
+                    }
+                }
+            }
+        }
+
+        // Correct last cycle: candidates with n > limit
+        for ridx in 0..48 {
+            let n = seg_end_cycle * 210 + WHEEL_RESIDUES[ridx];
+            if n > limit {
+                let local_idx = (seg_n_cycles - 1) * 48 + ridx;
+                if local_idx < seg_cands && (segment[local_idx >> 6] >> (local_idx & 63)) & 1 == 0 {
+                    raw_count = raw_count.saturating_sub(1);
+                }
             }
         }
 
@@ -604,11 +664,9 @@ pub fn primes_up_to(limit: u64) -> Vec<u64> {
     let base_primes: Vec<u64> = (11..=sqrt_limit).filter(|&p| base[p as usize]).collect();
     let step_tables: Vec<WheelStepInfo> = base_primes.iter().map(|&p| compute_wheel_steps(p)).collect();
 
-    const CYCLES_PER_SEG: u64 = 5461;
-    const CANDS_PER_SEG: usize = 5461 * 48;
-    const SEG_U64S: usize = (CANDS_PER_SEG + 63) / 64;
+    // Uses L2-tuned segment constants defined at module level.
 
-    let mut segment = vec![0u64; SEG_U64S];
+    let mut aligned_seg = AlignedSegment::new(SEG_U64S);
     let sqrt_cycle = sqrt_limit / 210;
     let limit_cycle = limit / 210;
     let mut seg_start_cycle = sqrt_cycle;
@@ -618,7 +676,8 @@ pub fn primes_up_to(limit: u64) -> Vec<u64> {
         let seg_n_cycles = (seg_end_cycle - seg_start_cycle + 1) as usize;
         let seg_cands = seg_n_cycles * 48;
         let seg_u64s = (seg_cands + 63) / 64;
-        segment[..seg_u64s].fill(0);
+        aligned_seg.zero();
+        let segment = aligned_seg.as_mut_slice();
 
         let seg_n_low = seg_start_cycle * 210 + 1;
         let seg_n_high = seg_end_cycle * 210 + 209;

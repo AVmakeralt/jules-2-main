@@ -141,6 +141,9 @@ impl SquaresRng {
 /// The core Squares hash function.
 /// Uses 4 rounds of mixing with shifts, XORs, and rotations.
 /// No multiplication, no modulo — just the cheapest operations.
+///
+/// Marked `#[inline(always)]` so the compiler can see the full computation
+/// across all 8 lanes and exploit instruction-level parallelism (ILP).
 #[inline(always)]
 #[allow(unused_assignments)]
 fn squares_hash(key: u64, counter: u64) -> u64 {
@@ -273,6 +276,9 @@ fn splitmix64_next(state: &mut u64) -> u64 {
 /// The core Shishiua hash function.
 /// Uses multiplication (the "cheap hash") + XOR + rotation for
 /// rapid diffusion and high statistical quality.
+///
+/// Marked `#[inline(always)]` so the compiler can see the full computation
+/// across all 8 lanes and exploit instruction-level parallelism (ILP).
 #[inline(always)]
 fn shishiua_hash(key: [u64; 2], counter: u64) -> u64 {
     // Mix counter with key using wide multiplication
@@ -300,6 +306,24 @@ fn shishiua_hash(key: [u64; 2], counter: u64) -> u64 {
     s0 = rotl64(s0, 21);
 
     s0
+}
+
+// ─── AVX2 Runtime Detection ─────────────────────────────────────────────────
+
+/// Check if AVX2 is available at runtime using CPUID.
+///
+/// This uses `std::is_x86_feature_detected!("avx2")` which compiles to
+/// a CPUID check on x86_64. On non-x86_64 targets, always returns false.
+#[inline(always)]
+fn is_avx2_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 // ─── 8-Lane SIMD Counter-Based PRNG ─────────────────────────────────────────
@@ -343,25 +367,81 @@ impl SimdPrng8 {
     /// This is the hot path. Each lane computes:
     ///   result[i] = hash(key, counter_base + i)
     ///
-    /// The compiler will auto-vectorize the 8 identical hash computations
-    /// into SIMD instructions (AVX2 on x86, NEON on ARM).
+    /// With AVX2, uses the vectorized path for maximum throughput.
+    /// Falls back to scalar ILP-friendly computation otherwise.
+    ///
+    /// Key insight: counter-based PRNGs are embarrassingly parallel —
+    /// all 8 hashes are independent, so the CPU's instruction scheduler
+    /// can overlap their execution for maximum ILP.
     #[inline(always)]
     pub fn next_8x_u64(&mut self) -> [u64; 8] {
+        if is_avx2_available() {
+            // SAFETY: We just checked that AVX2 is available.
+            unsafe { self.next_8x_u64_avx2() }
+        } else {
+            self.next_8x_u64_scalar()
+        }
+    }
+
+    /// Scalar 8-lane generation — all 8 hashes are independent,
+    /// enabling the CPU's instruction scheduler to exploit ILP.
+    #[inline(always)]
+    fn next_8x_u64_scalar(&mut self) -> [u64; 8] {
         let cb = self.counter_base;
         self.counter_base = self.counter_base.wrapping_add(8);
 
         // Process all 8 lanes — identical operations on different data
-        // = perfect for SIMD auto-vectorization
-        [
-            shishiua_hash(self.key, cb),
-            shishiua_hash(self.key, cb.wrapping_add(1)),
-            shishiua_hash(self.key, cb.wrapping_add(2)),
-            shishiua_hash(self.key, cb.wrapping_add(3)),
-            shishiua_hash(self.key, cb.wrapping_add(4)),
-            shishiua_hash(self.key, cb.wrapping_add(5)),
-            shishiua_hash(self.key, cb.wrapping_add(6)),
-            shishiua_hash(self.key, cb.wrapping_add(7)),
-        ]
+        // = perfect for SIMD auto-vectorization and ILP.
+        // Each hash is independent, so the CPU can pipeline them.
+        let r0 = shishiua_hash(self.key, cb);
+        let r1 = shishiua_hash(self.key, cb.wrapping_add(1));
+        let r2 = shishiua_hash(self.key, cb.wrapping_add(2));
+        let r3 = shishiua_hash(self.key, cb.wrapping_add(3));
+        let r4 = shishiua_hash(self.key, cb.wrapping_add(4));
+        let r5 = shishiua_hash(self.key, cb.wrapping_add(5));
+        let r6 = shishiua_hash(self.key, cb.wrapping_add(6));
+        let r7 = shishiua_hash(self.key, cb.wrapping_add(7));
+        [r0, r1, r2, r3, r4, r5, r6, r7]
+    }
+
+    /// AVX2-optimized 8-lane generation.
+    ///
+    /// Counter-based PRNGs are embarrassingly parallel: each lane computes
+    /// hash(key, counter_base + i) independently. With `#[target_feature(enable = "avx2")]`,
+    /// the compiler can use 256-bit AVX2 registers and instructions to
+    /// process multiple lanes in true SIMD parallelism.
+    ///
+    /// The key difference from the scalar path: the compiler sees that
+    /// AVX2 is available and can vectorize the wrapping_mul, XOR, and
+    /// rotate operations across 4 u64 lanes at once (2x AVX2 registers
+    /// for 8 total lanes).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn next_8x_u64_avx2(&mut self) -> [u64; 8] {
+        let cb = self.counter_base;
+        self.counter_base = self.counter_base.wrapping_add(8);
+
+        // Process 8 independent hashes — with AVX2 enabled, the compiler
+        // can vectorize these into VPMULUDQ/VPXOR/VPROTQ instructions,
+        // processing 4 lanes per 256-bit register.
+        let r0 = shishiua_hash(self.key, cb);
+        let r1 = shishiua_hash(self.key, cb.wrapping_add(1));
+        let r2 = shishiua_hash(self.key, cb.wrapping_add(2));
+        let r3 = shishiua_hash(self.key, cb.wrapping_add(3));
+        let r4 = shishiua_hash(self.key, cb.wrapping_add(4));
+        let r5 = shishiua_hash(self.key, cb.wrapping_add(5));
+        let r6 = shishiua_hash(self.key, cb.wrapping_add(6));
+        let r7 = shishiua_hash(self.key, cb.wrapping_add(7));
+        [r0, r1, r2, r3, r4, r5, r6, r7]
+    }
+
+    /// Non-x86_64 fallback — same as scalar but kept as a separate method
+    /// so that `next_8x_u64` always has a uniform calling convention.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline(always)]
+    unsafe fn next_8x_u64_avx2(&mut self) -> [u64; 8] {
+        self.next_8x_u64_scalar()
     }
 
     /// Generate a single u64 (counter-based, just lane 0)
@@ -466,17 +546,53 @@ impl SimdPrng4 {
     }
 
     /// Generate 4 u64 values simultaneously
+    ///
+    /// With AVX2, uses the vectorized path for maximum throughput.
+    /// Falls back to scalar ILP-friendly computation otherwise.
     #[inline(always)]
     pub fn next_4x_u64(&mut self) -> [u64; 4] {
+        if is_avx2_available() {
+            unsafe { self.next_4x_u64_avx2() }
+        } else {
+            self.next_4x_u64_scalar()
+        }
+    }
+
+    /// Scalar 4-lane generation — independent hashes for ILP.
+    #[inline(always)]
+    fn next_4x_u64_scalar(&mut self) -> [u64; 4] {
         let cb = self.counter_base;
         self.counter_base = self.counter_base.wrapping_add(4);
 
-        [
-            squares_hash(self.key, cb),
-            squares_hash(self.key, cb.wrapping_add(1)),
-            squares_hash(self.key, cb.wrapping_add(2)),
-            squares_hash(self.key, cb.wrapping_add(3)),
-        ]
+        let r0 = squares_hash(self.key, cb);
+        let r1 = squares_hash(self.key, cb.wrapping_add(1));
+        let r2 = squares_hash(self.key, cb.wrapping_add(2));
+        let r3 = squares_hash(self.key, cb.wrapping_add(3));
+        [r0, r1, r2, r3]
+    }
+
+    /// AVX2-optimized 4-lane generation.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn next_4x_u64_avx2(&mut self) -> [u64; 4] {
+        let cb = self.counter_base;
+        self.counter_base = self.counter_base.wrapping_add(4);
+
+        // With AVX2 enabled, the compiler can vectorize these 4 independent
+        // hash computations into a single 256-bit AVX2 register.
+        let r0 = squares_hash(self.key, cb);
+        let r1 = squares_hash(self.key, cb.wrapping_add(1));
+        let r2 = squares_hash(self.key, cb.wrapping_add(2));
+        let r3 = squares_hash(self.key, cb.wrapping_add(3));
+        [r0, r1, r2, r3]
+    }
+
+    /// Non-x86_64 fallback.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline(always)]
+    unsafe fn next_4x_u64_avx2(&mut self) -> [u64; 4] {
+        self.next_4x_u64_scalar()
     }
 
     /// Generate single u64
