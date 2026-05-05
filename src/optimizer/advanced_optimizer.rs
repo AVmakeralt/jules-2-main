@@ -318,8 +318,15 @@ impl ConstantPropagator {
                     }
                     // 2. After substitution, record this binding if it is now a constant.
                     //    Any previous binding for the same name is evicted first.
-                    if let Pattern::Ident { name, .. } = pattern {
-                        if Self::is_constant_expr(expr) {
+                    //    CRITICAL: Mutable variables must NOT be added to the constant
+                    //    environment because they can be reassigned later, which would
+                    //    not be tracked by the env.  This prevents stale constant
+                    //    propagation after assignment.
+                    if let Pattern::Ident { name, mutable, .. } = pattern {
+                        if *mutable {
+                            // Mutable variables should never be tracked as constants.
+                            env.remove(name.as_str());
+                        } else if Self::is_constant_expr(expr) {
                             env.insert(name.clone(), expr.clone());
                         } else {
                             // The name is now bound to a non-constant; evict any
@@ -521,6 +528,16 @@ impl ConstantPropagator {
             },
             Expr::Tuple { span, elems } => Expr::Tuple {
                 span, elems: elems.into_iter().map(|e| self.substitute(e, env)).collect(),
+            },
+            // Assign: substitute into the VALUE side only.  The TARGET is an
+            // lvalue (e.g. `x`), not an rvalue, so we must NOT replace it with
+            // a constant.  Previously, Assign fell through to `_ => expr` which
+            // left the value unsubstituted — a missed optimisation but not a
+            // correctness bug.  Now we properly recurse into the value.
+            Expr::Assign { span, op, target, value } => Expr::Assign {
+                span, op,
+                target, // lvalue: do NOT substitute
+                value: Box::new(self.substitute(*value, env)),
             },
             _ => expr,
         }
@@ -5293,32 +5310,26 @@ impl Superoptimizer {
 
         for _iter in 0..self.config.iterations {
             let size_before = self.estimate_size(body);
-
             // Pass 1: Dead code elimination
             let mut dce = DeadCodeEliminator::new();
             dce.eliminate_block(body);
             self.dead_code_eliminated += dce.eliminated;
-
             // Pass 2: Constant propagation
             let mut cp = ConstantPropagator::new();
             cp.propagate_block(body);
             self.constant_propagations += cp.propagations;
-
             // Pass 3: Constant folding
             let mut cf = ConstantFolder::new();
             cf.fold_block_mut(body);
             self.constant_folds += cf.folds_performed;
-
             // Pass 4: Algebraic simplification
             let mut asimp = AlgebraicSimplifier::new();
             asimp.simplify_block_mut(body);
             self.algebraic_simplifications += asimp.simplifications;
-
             // Pass 5: Strength reduction
             let mut sr = StrengthReducer::new();
             sr.reduce_block_mut(body);
             self.strength_reductions += sr.reductions;
-
             // Pass 6: Bitwise optimizations
             if self.config.enable_peephole {
                 let mut bo = BitwiseOptimizer::new();

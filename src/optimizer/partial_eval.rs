@@ -624,9 +624,18 @@ impl PartialEvaluator {
                     if bt == BindingTime::Static {
                         if let Some(val) = Self::eval_expr(&e, env) {
                             self.stats.expressions_folded += 1;
-                            // Record the known value in the environment
-                            if let Pattern::Ident { name, .. } = &pattern {
-                                env.insert(name.clone(), BindingTime::Static, val.clone());
+                            // Record the known value in the environment.
+                            // CRITICAL: Mutable variables must NOT be marked as
+                            // Static because they can be reassigned later.  If we
+                            // mark `let mut x = 2` as Static, a later `x = 10`
+                            // won't invalidate the env, and uses of `x` will be
+                            // wrongly replaced with the initial constant value.
+                            if let Pattern::Ident { name, mutable: is_mutable, .. } = &pattern {
+                                if *is_mutable {
+                                    env.insert(name.clone(), BindingTime::Dynamic, PartialValue::Unknown);
+                                } else {
+                                    env.insert(name.clone(), BindingTime::Static, val.clone());
+                                }
                             }
                             return val.to_expr(e.span());
                         }
@@ -634,10 +643,45 @@ impl PartialEvaluator {
                     self.specialize_expr(e, env, depth)
                 });
 
+                // If the init was not static but the variable is immutable,
+                // we still need to record the binding time for the variable.
+                // If mutable, mark as Dynamic (conservative: any reassignment
+                // could change the value at runtime).
+                if let Some(ref _init_expr) = init {
+                    if let Pattern::Ident { name, mutable: is_mutable, .. } = &pattern {
+                        if *is_mutable {
+                            // Mutable variable — always dynamic after initialisation
+                            // because we cannot track all reassignment sites.
+                            env.insert(name.clone(), BindingTime::Dynamic, PartialValue::Unknown);
+                        } else if env.binding_time(name) == BindingTime::Dynamic {
+                            // Immutable variable with dynamic init — mark dynamic.
+                            // (If it was already inserted as Static above, keep it.)
+                            env.insert(name.clone(), BindingTime::Dynamic, PartialValue::Unknown);
+                        }
+                    }
+                }
+
                 Some(Stmt::Let { span, pattern, ty, init, mutable })
             }
 
             Stmt::Expr { span, expr, has_semi } => {
+                // CRITICAL: Assignment expressions mutate variables.  Before we
+                // decide whether the expression is static, we must invalidate
+                // any env entries for the assigned variable.  Otherwise, a
+                // variable previously known as Static will keep its stale value
+                // and later references will be wrongly constant-folded.
+                //
+                // Example of the bug this fixes:
+                //   let mut x = 2    // env: x = Static(2)
+                //   x = 10            // must invalidate x in env!
+                //   x                 // without invalidation, this becomes IntLit(2)
+                if let Expr::Assign { target, .. } = &expr {
+                    if let Expr::Ident { name, .. } = target.as_ref() {
+                        // The assigned variable is no longer statically known.
+                        env.insert(name.clone(), BindingTime::Dynamic, PartialValue::Unknown);
+                    }
+                }
+
                 let bt = self.expr_binding_time(&expr, env);
                 if bt == BindingTime::Static {
                     // The expression has no side effects we can observe at

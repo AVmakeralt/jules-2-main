@@ -484,29 +484,106 @@ impl BytecodeCompiler {
     fn try_fold_constant(&self, instr: &Instr) -> Option<Instr> {
         match instr {
             Instr::Add { dst, lhs, rhs } => {
-                if let (Some(Value::I64(l)), Some(Value::I64(r))) = 
+                if let (Some(Value::I64(l)), Some(Value::I64(r))) =
                     (self.known_constants.get(lhs), self.known_constants.get(rhs)) {
                     // Fold: constant + constant = constant (wrapping semantics)
                     return Some(Instr::LoadConstInt { dst: *dst, value: l.wrapping_add(*r) });
                 }
-                if let (Some(Value::F64(l)), Some(Value::F64(r))) = 
+                if let (Some(Value::F64(l)), Some(Value::F64(r))) =
                     (self.known_constants.get(lhs), self.known_constants.get(rhs)) {
                     return Some(Instr::LoadConstFloat { dst: *dst, value: l + r });
                 }
             }
+            Instr::Sub { dst, lhs, rhs } => {
+                if let (Some(Value::I64(l)), Some(Value::I64(r))) =
+                    (self.known_constants.get(lhs), self.known_constants.get(rhs)) {
+                    return Some(Instr::LoadConstInt { dst: *dst, value: l.wrapping_sub(*r) });
+                }
+            }
             Instr::Mul { dst, lhs, rhs } => {
-                if let (Some(Value::I64(l)), Some(Value::I64(r))) = 
+                if let (Some(Value::I64(l)), Some(Value::I64(r))) =
                     (self.known_constants.get(lhs), self.known_constants.get(rhs)) {
                     // Fold: constant * constant = constant (wrapping semantics)
                     return Some(Instr::LoadConstInt { dst: *dst, value: l.wrapping_mul(*r) });
                 }
             }
-            // Add more folding cases...
+            Instr::Move { dst, src } => {
+                // Eliminate no-op moves (dst == src)
+                if dst == src {
+                    return Some(Instr::Nop);
+                }
+                // Fold: Move from a known-constant slot → LoadConstInt/Float
+                if let Some(val) = self.known_constants.get(src) {
+                    return Some(match val {
+                        Value::I64(n) => Instr::LoadConstInt { dst: *dst, value: *n },
+                        Value::F64(f) => Instr::LoadConstFloat { dst: *dst, value: *f },
+                        Value::Bool(b) => Instr::LoadConstBool { dst: *dst, value: *b },
+                        _ => return None,
+                    });
+                }
+            }
             _ => {}
         }
         None
     }
-    
+
+    /// Try to evaluate a simple constant expression at compile time.
+    /// Used to populate `known_constants` for bytecode-level constant folding.
+    fn eval_const_expr(&self, expr: &crate::compiler::ast::Expr) -> Option<Value> {
+        use crate::compiler::ast::Expr;
+        match expr {
+            Expr::IntLit { value, .. } => Some(Value::I64(*value as i64)),
+            Expr::FloatLit { value, .. } => Some(Value::F64(*value)),
+            Expr::BoolLit { value, .. } => Some(Value::Bool(*value)),
+            Expr::BinOp { op, lhs, rhs, .. } => {
+                let lv = self.eval_const_expr(lhs)?;
+                let rv = self.eval_const_expr(rhs)?;
+                match (lv, rv) {
+                    (Value::I64(l), Value::I64(r)) => {
+                        use crate::compiler::ast::BinOpKind;
+                        let result = match op {
+                            BinOpKind::Add => Some(Value::I64(l.wrapping_add(r))),
+                            BinOpKind::Sub => Some(Value::I64(l.wrapping_sub(r))),
+                            BinOpKind::Mul => Some(Value::I64(l.wrapping_mul(r))),
+                            BinOpKind::Div if r != 0 => Some(Value::I64(l / r)),
+                            BinOpKind::Rem if r != 0 => Some(Value::I64(l % r)),
+                            BinOpKind::BitAnd => Some(Value::I64(l & r)),
+                            BinOpKind::BitOr => Some(Value::I64(l | r)),
+                            BinOpKind::BitXor => Some(Value::I64(l ^ r)),
+                            BinOpKind::Shl => Some(Value::I64(l.wrapping_shl(r as u32))),
+                            BinOpKind::Shr => Some(Value::I64(l.wrapping_shr(r as u32))),
+                            _ => None,
+                        };
+                        result
+                    }
+                    (Value::F64(l), Value::F64(r)) => {
+                        use crate::compiler::ast::BinOpKind;
+                        let result = match op {
+                            BinOpKind::Add => Some(Value::F64(l + r)),
+                            BinOpKind::Sub => Some(Value::F64(l - r)),
+                            BinOpKind::Mul => Some(Value::F64(l * r)),
+                            BinOpKind::Div if r != 0.0 => Some(Value::F64(l / r)),
+                            _ => None,
+                        };
+                        result
+                    }
+                    _ => None,
+                }
+            }
+            Expr::UnOp { op, expr, .. } => {
+                let v = self.eval_const_expr(expr)?;
+                match (op, v) {
+                    (crate::compiler::ast::UnOpKind::Neg, Value::I64(n)) => Some(Value::I64(n.wrapping_neg())),
+                    (crate::compiler::ast::UnOpKind::Neg, Value::F64(f)) => Some(Value::F64(-f)),
+                    (crate::compiler::ast::UnOpKind::Not, Value::I64(n)) => Some(Value::I64(!n)),
+                    (crate::compiler::ast::UnOpKind::Not, Value::Bool(b)) => Some(Value::Bool(!b)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Compile program to bytecode
     pub fn compile_program(&mut self, program: &Program) -> Result<Vec<BytecodeFunction>, String> {
         // First pass: register all function names so they can be referenced
@@ -746,12 +823,43 @@ impl BytecodeCompiler {
                 let dst = self.alloc_pattern_slot(pattern)?;
                 if let Some(expr) = init {
                     self.compile_expr(expr, dst)?;
+                    // Track known constant values for bytecode-level folding.
+                    // Mutable variables must NOT be tracked because they can be
+                    // reassigned later without invalidation.
+                    if self.fold_constants {
+                        if let crate::compiler::ast::Pattern::Ident { name: _, mutable, .. } = pattern {
+                            if !mutable {
+                                if let Some(val) = self.eval_const_expr(expr) {
+                                    self.known_constants.insert(dst, val);
+                                }
+                            }
+                        }
+                    }
                 } else {
                     self.emit(Instr::LoadConstUnit { dst });
                 }
             }
             Stmt::Expr { expr, .. } => {
-                self.compile_expr(expr, 0)?;
+                // CRITICAL: Use a scratch slot for expression statements so that
+                // the "also copy to dst" code in assignment expressions doesn't
+                // clobber a local variable.  Previously, `dst=0` was used, which
+                // overlaps with the first local variable's slot.  For example:
+                //   let mut a: i32 = 100       // a lives in slot 0
+                //   a = 10                     // Assign emits Move { dst: 0, src: tmp }
+                //                              // then "copy to dst=0" clobbers a!
+                //   a                           // reads clobbered value
+                let scratch = self.alloc_slot();
+                self.compile_expr(expr, scratch)?;
+                // Invalidate known constants when a variable is reassigned.
+                if self.fold_constants {
+                    if let crate::compiler::ast::Expr::Assign { target, .. } = expr {
+                        if let crate::compiler::ast::Expr::Ident { name, .. } = target.as_ref() {
+                            if let Some(&slot) = self.locals.get(name) {
+                                self.known_constants.remove(&slot);
+                            }
+                        }
+                    }
+                }
             }
             Stmt::Return { value, .. } => {
                 if let Some(expr) = value {
