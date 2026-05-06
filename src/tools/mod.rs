@@ -7,4 +7,5 @@ pub mod profiling_tools;
 pub mod shader_tooling;
 pub mod string_intern;
 pub mod throughput_sanity;
-pub mod train_gnn;
+// train_gnn is a binary-only target — it has fn main() and uses jules:: imports.
+// Do NOT include it as a lib module; compile it via `cargo run --bin train-gnn`.

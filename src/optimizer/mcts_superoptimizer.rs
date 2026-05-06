@@ -971,6 +971,9 @@ pub struct MctsSuperoptimizer {
     /// Fix 4: Transposition table for reusing search results across
     /// nodes with identical program hashes.
     transposition_table: FxHashMap<u64, TransEntry>,
+    /// Fix 6: Optional GNN value network for rollout (when gnn-optimizer enabled)
+    #[cfg(feature = "gnn-optimizer")]
+    gnn: Option<crate::optimizer::gnn_egraph_optimizer::GnnEgraphOptimizer>,
     /// Statistics
     pub simulations_run: u64,
     pub rewrites_found: u64,
@@ -988,6 +991,8 @@ impl MctsSuperoptimizer {
             cost_estimator,
             node_count: 0,
             transposition_table: FxHashMap::default(),
+            #[cfg(feature = "gnn-optimizer")]
+            gnn: None,
             simulations_run: 0,
             rewrites_found: 0,
             best_improvement: 0,
@@ -1640,7 +1645,9 @@ impl MctsSuperoptimizer {
         #[cfg(feature = "gnn-optimizer")]
         {
             if let Some(ref gnn) = self.gnn {
-                let value = gnn.predict_value(instr);
+                let cost = self.cost_estimator.estimate(instr);
+                let graph = crate::optimizer::gnn_egraph_optimizer::ProgramGraph::from_instr(instr, cost);
+                let (_policy, value) = gnn.model().forward(&graph);
                 return value;
             }
         }

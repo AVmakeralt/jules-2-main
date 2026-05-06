@@ -1804,6 +1804,23 @@ fn apply_rewrite(instr: &Instr, action: &RewriteAction) -> Option<Instr> {
             }
             None
         }
+        // Tier 1 semantic rewrite rules — some return None (not yet implemented
+        // for direct application) so the MCTS search can still discover them
+        // through the apply_rewrite path in mcts_superoptimizer.rs.
+        RewriteAction::LeaCombine
+        | RewriteAction::IncDec
+        | RewriteAction::CmovSelect
+        | RewriteAction::LeaMulSmallConst
+        | RewriteAction::Negate
+        | RewriteAction::AddNegToSub
+        | RewriteAction::SubNegToAdd
+        | RewriteAction::IdempotentAnd
+        | RewriteAction::IdempotentOr
+        | RewriteAction::ZeroDiv
+        | RewriteAction::RemOne
+        | RewriteAction::CmpNegate
+        | RewriteAction::AndOverOr
+        | RewriteAction::OrOverAnd => None,
     }
 }
 

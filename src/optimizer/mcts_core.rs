@@ -573,11 +573,13 @@ pub fn flatten_instr(instr: &Instr, table: &OpcodeTable) -> FlatProgram {
                 dst
             }
             Instr::Var(name) => {
-                let reg = if let Some(idx_str) = name.strip_prefix('x') {
+                // name is a u32 interned index — resolve back to &str for matching
+                let name_str = crate::optimizer::mcts_superoptimizer::StringInterner::get(*name);
+                let reg = if let Some(idx_str) = name_str.strip_prefix('x') {
                     idx_str.parse::<u8>().unwrap_or(0)
-                } else if name == "x" || name == "a" {
+                } else if name_str == "x" || name_str == "a" {
                     0
-                } else if name == "y" || name == "b" {
+                } else if name_str == "y" || name_str == "b" {
                     1
                 } else {
                     let r = *num_inputs;
@@ -669,7 +671,7 @@ pub fn unflatten_instr(
     // Map input registers to Var instructions
     for (i, name) in input_names.iter().enumerate() {
         if i < MAX_VREGS {
-            values[i] = Some(Instr::Var(name.clone()));
+            values[i] = Some(Instr::Var(crate::optimizer::mcts_superoptimizer::StringInterner::intern(name)));
         }
     }
 

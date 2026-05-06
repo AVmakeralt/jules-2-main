@@ -634,10 +634,11 @@ impl PolyhedralOptimizer {
                     (AccessType::Write, AccessType::ReadWrite) => DependenceKind::Raw,
                     // Read → Write: WAR (anti-dependence)
                     (AccessType::Read, AccessType::Write) |
-                    (AccessType::ReadWrite, AccessType::Write) => DependenceKind::War,
+                    (AccessType::ReadWrite, AccessType::Write) |
+                    (AccessType::Read, AccessType::ReadWrite) => DependenceKind::War,
                     // Write → Write: WAW (output dependence)
                     (AccessType::Write, AccessType::Write) => DependenceKind::Waw,
-                    // ReadWrite → Read or Read → ReadWrite: treat as RAW if the first is a write-like access
+                    // ReadWrite → Read or ReadWrite → ReadWrite: treat as RAW
                     (AccessType::ReadWrite, AccessType::Read) |
                     (AccessType::ReadWrite, AccessType::ReadWrite) => DependenceKind::Raw,
                     // Read → Read: no dependence (both read the same data)
