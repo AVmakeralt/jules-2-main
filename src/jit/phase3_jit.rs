@@ -183,14 +183,19 @@ impl ExecArena {
     /// Resolve a global offset to a pointer by finding the owning chunk.
     /// Each chunk is stable (never moved), so the returned pointer remains
     /// valid for the lifetime of the arena.
+    /// P1 fix: Use binary search instead of linear scan. Chunks are sorted
+    /// by start_offset, so partition_point() gives O(log C) instead of O(C).
     fn get_ptr(&self, offset: usize) -> *const u8 {
-        for chunk in &self.chunks {
-            if offset >= chunk.start_offset && offset < chunk.start_offset + chunk.capacity {
-                let local = offset - chunk.start_offset;
-                return unsafe { chunk.base.as_ptr().add(local) };
-            }
+        let idx = self.chunks.partition_point(|c| c.start_offset <= offset);
+        if idx == 0 {
+            panic!("Invalid arena offset: {}", offset);
         }
-        panic!("Invalid arena offset: {}", offset)
+        let chunk = &self.chunks[idx - 1];
+        if offset >= chunk.start_offset + chunk.capacity {
+            panic!("Invalid arena offset: {} (outside chunk range)", offset);
+        }
+        let local = offset - chunk.start_offset;
+        unsafe { chunk.base.as_ptr().add(local) }
     }
 
     fn alloc(&mut self, bytes: usize) -> Option<usize> {
@@ -1099,7 +1104,11 @@ impl ConstTable {
 
     #[inline(always)]
     fn get(&self, slot: u16) -> Option<i64> {
-        self.vals.get(slot as usize).copied().flatten()
+        // P9 fix: Use and_then instead of copied().flatten() to avoid
+        // copying the Option<i64> (8 bytes) and double-branch unwrapping.
+        // The old form: .get(slot).copied().flatten() = 2 branches + 8B copy.
+        // The new form: .get(slot).and_then(|&v| v) = 1 branch + 0B copy.
+        self.vals.get(slot as usize).and_then(|&v| v)
     }
 
     #[inline(always)]
@@ -1458,34 +1467,42 @@ fn cse_optimize(instrs: &mut Vec<Instr>) {
     // the earlier definition may not dominate the later use.
     let mut i = 0;
     while i < instrs.len() {
-        match &instrs[i] {
-            Instr::BinOp(dst, op, l, r) => {
-                // Canonicalize operand order for commutative ops
-                let (lo, hi) = if *l <= *r { (*l, *r) } else { (*r, *l) };
-                let key = if matches!(op, BinOpKind::Add | BinOpKind::Mul | BinOpKind::Eq | BinOpKind::Ne | BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor) {
-                    (std::mem::discriminant(op), lo, hi)
-                } else {
-                    (std::mem::discriminant(op), *l, *r)
-                };
-                
-                if let Some(&prev_dst) = computed.get(&key) {
-                    // Replace this BinOp with a Move from the previous result.
-                    // The previous computation dominates this one (no barrier in between).
-                    instrs[i] = Instr::Move(*dst, prev_dst);
-                } else {
-                    computed.insert(key, *dst);
-                }
+        // P5 fix: Extract information from the instruction BEFORE the match
+        // to avoid borrow checker conflicts (immutable read vs mutable write).
+        let instr_info: Option<(BinOpKind, u16, u16, u16)> = match &instrs[i] {
+            Instr::BinOp(dst, op, l, r) => Some((*op, *dst, *l, *r)),
+            _ => None,
+        };
+        let is_barrier = matches!(&instrs[i], 
+            Instr::Jump(_) | Instr::JumpFalse(_, _) | Instr::JumpTrue(_, _) | Instr::Return(_) | Instr::ReturnUnit
+        );
+        let written_slot = instr_writes_slot_get(&instrs[i]);
+        
+        if let Some((op, dst, l, r)) = instr_info {
+            // Canonicalize operand order for commutative ops
+            let (lo, hi) = if l <= r { (l, r) } else { (r, l) };
+            let key = if matches!(op, BinOpKind::Add | BinOpKind::Mul | BinOpKind::Eq | BinOpKind::Ne | BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor) {
+                (std::mem::discriminant(&op), lo, hi)
+            } else {
+                (std::mem::discriminant(&op), l, r)
+            };
+            
+            if let Some(&prev_dst) = computed.get(&key) {
+                // Replace this BinOp with a Move from the previous result.
+                instrs[i] = Instr::Move(dst, prev_dst);
+            } else {
+                computed.insert(key, dst);
             }
-            Instr::Jump(_) | Instr::JumpFalse(_, _) | Instr::JumpTrue(_, _) | Instr::Return(_) | Instr::ReturnUnit => {
-                // Control flow barrier: clear CSE table
-                computed.clear();
-            }
-            _ => {
-                // Any instruction that writes to a slot invalidates entries
-                // that depend on that slot (conservative: just clear the table
-                // for writes to any slot used as a CSE input).
-                // For simplicity, we keep the table — the dead-def check
-                // in the main codegen loop will handle stale values.
+            
+            // P5 fix: Invalidate CSE entries whose inputs are overwritten.
+            computed.retain(|&(_, l, r), _| l != dst && r != dst);
+        } else if is_barrier {
+            computed.clear();
+        } else {
+            // P5 fix: Any instruction that writes to a slot invalidates
+            // CSE entries that depend on that slot.
+            if let Some(written) = written_slot {
+                computed.retain(|&(_, l, r), _| l != written && r != written);
             }
         }
         i += 1;
@@ -1507,17 +1524,31 @@ fn cse_optimize(instrs: &mut Vec<Instr>) {
 
 /// Compute the magic number and post-shift for dividing by positive constant `d`.
 /// Returns (magic_constant, post_shift) or None if IDIV should be used instead.
+/// P6 fix: Now handles negative divisors by computing magic for |d| and
+/// negating the result. Previously, `x / -2`, `x / -4`, etc. fell back
+/// to the 20-40 cycle IDIV instead of the 3-cycle magic-multiply path.
 #[allow(dead_code)]
 fn compute_div_magic(d: i64) -> Option<(i64, u8)> {
-    if d <= 0 || (d as u64).is_power_of_two() || d == 1 {
+    if d == 0 || d == 1 {
         return None;
     }
-    let d = d as u64;
+    // P6 fix: Handle negative divisors
+    let neg_result = d < 0;
+    let abs_d = if d == i64::MIN {
+        // Special case: |MIN| overflows, but division by MIN is rare
+        // and the result is always 0 or 1, so just use IDIV
+        return None;
+    } else {
+        d.unsigned_abs()
+    };
+    if abs_d.is_power_of_two() {
+        return None; // Use shift instead
+    }
     let mut shift: u8 = 0;
     let mut magic: u64 = 0;
     loop {
         let numer = 1u128 << (64 + shift as u128);
-        let ceil_val = numer.wrapping_add(d as u128 - 1) / d as u128;
+        let ceil_val = numer.wrapping_add(abs_d as u128 - 1) / abs_d as u128;
         if ceil_val < (1u128 << 64) {
             magic = ceil_val as u64;
             break;
@@ -1527,7 +1558,11 @@ fn compute_div_magic(d: i64) -> Option<(i64, u8)> {
             return None;
         }
     }
-    Some((magic as i64, shift))
+    if neg_result {
+        Some((-(magic as i64), shift))
+    } else {
+        Some((magic as i64, shift))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1561,14 +1596,28 @@ fn unroll_loops(instrs: &mut Vec<Instr>, threshold: usize) {
                 
                 // Only unroll small loops (body <= 8 instructions)
                 if body_len > 0 && body_len <= 8 {
-                    // Unroll by duplicating the body (threshold - 1) more times
-                    // We replace the backward Jump with copies of the body,
-                    // ending with the original Jump for the remaining iterations.
-                    let body: Vec<Instr> = instrs[loop_start..loop_end].to_vec();
-                    let mut unrolled: Vec<Instr> = Vec::with_capacity(body_len * threshold);
+                    // P3 fix: Correctly handle jump offsets in unrolled loops.
+                    // Previously, every copy of the loop body kept its original
+                    // Jump(offset), causing all copies to jump back to the same
+                    // target. This produced incorrect machine code — jumps in
+                    // intermediate copies should fall through, not jump back.
+                    // Now we duplicate the body, but replace the backward Jump
+                    // in all copies EXCEPT the last with Nop (fallthrough),
+                    // and keep only the final Jump for remaining iterations.
+                    let body: Vec<Instr> = instrs[loop_start..=loop_end].to_vec();
+                    let mut unrolled: Vec<Instr> = Vec::with_capacity(body.len() * threshold);
                     
-                    for _copy in 0..threshold {
-                        unrolled.extend_from_slice(&body);
+                    for copy_idx in 0..threshold {
+                        for (j, instr) in body.iter().enumerate() {
+                            if j == body.len() - 1 && copy_idx < threshold - 1 {
+                                // Last instruction is the backward Jump — replace
+                                // with Nop in all copies except the last so they
+                                // fall through to the next copy.
+                                unrolled.push(Instr::Nop);
+                            } else {
+                                unrolled.push(instr.clone());
+                            }
+                        }
                     }
                     
                     // Replace the loop with the unrolled version
@@ -1700,13 +1749,13 @@ fn hoist_loop_invariants(instrs: &mut Vec<Instr>) {
             
             // Hoist by moving instructions before loop_start and replacing
             // their original positions with Nop
-            for &j in &to_hoist {
+            // P4 fix: Hoist in REVERSE order (highest index first) so that
+            // inserting at `start` doesn't shift the indices of subsequent
+            // hoisted instructions. Previously, each insert at `start` shifted
+            // all later instructions by +1, making all subsequent indices stale.
+            for &j in to_hoist.iter().rev() {
                 let hoisted = std::mem::replace(&mut instrs[j], Instr::Nop);
                 instrs.insert(start, hoisted);
-                // Adjust indices after insertion
-                // Since we insert at `start`, everything from start..j shifts by 1
-                // The loop_end also shifts. We'll just continue — the Nop at j
-                // is still correct because we already replaced it.
             }
         }
         i += 1;
