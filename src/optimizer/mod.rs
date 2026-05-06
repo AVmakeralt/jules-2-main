@@ -3,6 +3,7 @@ pub mod advanced_optimizer;
 #[cfg(feature = "gnn-optimizer")]
 pub mod advanced_self_repair;
 pub mod autovec;
+pub mod autovec_bridge;
 #[cfg(feature = "gnn-optimizer")]
 pub mod gnn_egraph_optimizer;
 #[cfg(feature = "gnn-optimizer")]

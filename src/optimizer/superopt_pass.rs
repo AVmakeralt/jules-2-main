@@ -440,7 +440,7 @@ impl SuperoptPass {
 
             // ── Stage 3: MCTS Tree Search ────────────────────────────────
             let mcts_config = if is_hot {
-                MctsConfig::hotpath()
+                MctsConfig::maximum()
             } else {
                 MctsConfig::fast()
             };
