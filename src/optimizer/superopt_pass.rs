@@ -463,20 +463,22 @@ impl SuperoptPass {
                 MctsConfig::fast()
             };
 
-            // Initialize or reconfigure the MCTS optimizer
+            // Fix H3: Only recreate the MCTS optimizer when needed.
+            // Previously, BOTH branches of the if/else created a new optimizer,
+            // wasting CPUID/HardwareCostModel initialization cost every expression.
+            // Now we call reset_for_new_expr() to reuse the existing optimizer
+            // when only the expression changes (not the config).
             let need_new_optimizer = match &self.mcts_optimizer {
                 None => true,
-                Some(existing) => {
-                    // Check if config changed (hot vs non-hot)
-                    existing.simulations_run > 0 // Always reset for clean state
-                }
+                Some(existing) => existing.config_hash() != mcts_config.config_hash(),
             };
 
             if need_new_optimizer || self.mcts_optimizer.is_none() {
                 self.mcts_optimizer = Some(MctsSuperoptimizer::new(mcts_config));
             } else {
-                // Update config if it changed (hot vs non-hot)
-                self.mcts_optimizer = Some(MctsSuperoptimizer::new(mcts_config));
+                // Reuse the existing optimizer — just reset for the new expression.
+                // This avoids re-initializing CPUID, hardware cost model, etc.
+                self.mcts_optimizer.as_mut().unwrap().reset_for_new_expr();
             }
 
             let candidate_expr = match self.mcts_optimizer.as_mut().unwrap().optimize(expr) {
