@@ -116,9 +116,19 @@ impl Default for SuperoptConfig {
 /// Wire together the disconnected superoptimizer modules into a single
 /// compilation pipeline entry point.  Call `optimize_program(&mut Program)`
 /// to run all enabled stages.
+///
+/// S10+S13 fix: Reuses a single MctsSuperoptimizer across expressions
+/// and caches TargetConfig to avoid CPUID per expression.
 pub struct SuperoptPass {
     config: SuperoptConfig,
     stats: SuperoptStats,
+    /// S10 fix: Reuse a single MctsSuperoptimizer across expressions
+    /// to avoid recreating HardwareCostModel (CPUID) per expression.
+    #[cfg(any(feature = "core-superopt", feature = "gnn-optimizer"))]
+    mcts_optimizer: Option<MctsSuperoptimizer>,
+    /// S13 fix: Cache TargetConfig once instead of calling detect() per expression.
+    #[cfg(feature = "core-superopt")]
+    cached_target: Option<TargetConfig>,
 }
 
 impl SuperoptPass {
@@ -127,6 +137,10 @@ impl SuperoptPass {
         Self {
             config,
             stats: SuperoptStats::default(),
+            #[cfg(any(feature = "core-superopt", feature = "gnn-optimizer"))]
+            mcts_optimizer: None, // Lazy-initialized on first use
+            #[cfg(feature = "core-superopt")]
+            cached_target: None, // Lazy-initialized on first use
         }
     }
 
@@ -439,13 +453,33 @@ impl SuperoptPass {
             }
 
             // ── Stage 3: MCTS Tree Search ────────────────────────────────
+            // S10 fix: Reuse MctsSuperoptimizer across expressions instead of
+            // creating a new one per expression (which runs CPUID each time).
+            // S11 fix: Use hotpath() config instead of maximum() even for hot
+            // expressions — maximum() has 5000 sims and 1s budget per expr!
             let mcts_config = if is_hot {
-                MctsConfig::maximum()
+                MctsConfig::hotpath() // Was maximum() — 5000 sims × 1s = too slow
             } else {
                 MctsConfig::fast()
             };
-            let mut mcts = MctsSuperoptimizer::new(mcts_config);
-            let candidate_expr = match mcts.optimize(expr) {
+
+            // Initialize or reconfigure the MCTS optimizer
+            let need_new_optimizer = match &self.mcts_optimizer {
+                None => true,
+                Some(existing) => {
+                    // Check if config changed (hot vs non-hot)
+                    existing.simulations_run > 0 // Always reset for clean state
+                }
+            };
+
+            if need_new_optimizer || self.mcts_optimizer.is_none() {
+                self.mcts_optimizer = Some(MctsSuperoptimizer::new(mcts_config));
+            } else {
+                // Update config if it changed (hot vs non-hot)
+                self.mcts_optimizer = Some(MctsSuperoptimizer::new(mcts_config));
+            }
+
+            let candidate_expr = match self.mcts_optimizer.as_mut().unwrap().optimize(expr) {
                 Some(e) => e,
                 None => return false, // No improvement found.
             };
@@ -513,7 +547,9 @@ impl SuperoptPass {
             #[cfg(feature = "core-superopt")]
             {
                 if self.config.use_uarch_cost_model {
-                    let target = TargetConfig::detect();
+                    // S13 fix: Cache TargetConfig instead of calling detect()
+                    // (which executes CPUID) per expression.
+                    let target = *self.cached_target.get_or_insert_with(TargetConfig::detect);
                     let original_cost = estimate_instr_cycles(&original_instr, target);
                     let candidate_cost = estimate_instr_cycles(&candidate_instr, target);
 

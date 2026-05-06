@@ -378,10 +378,13 @@ fn interpret(instr: &Instr, inputs: &[u64], input_names: &[String]) -> Option<u6
         Instr::ConstInt(v) => Some(*v as u64),
         Instr::ConstFloat(bits) => Some(*bits),
         Instr::ConstBool(b) => Some(if *b { 1u64 } else { 0u64 }),
-        Instr::Var(name) => input_names
-            .iter()
-            .position(|n| n == name)
-            .map(|i| inputs.get(i).copied().unwrap_or(0)),
+        Instr::Var(idx) => {
+            let var_name = crate::optimizer::mcts_superoptimizer::StringInterner::get(*idx);
+            input_names
+                .iter()
+                .position(|n| n == var_name)
+                .map(|i| inputs.get(i).copied().unwrap_or(0))
+        }
         Instr::BinOp { op, lhs, rhs } => {
             let l = interpret(lhs, inputs, input_names)?;
             let r = interpret(rhs, inputs, input_names)?;

@@ -488,14 +488,16 @@ impl SemanticSuperoptimizer {
 
     /// Saturating bottom-up expression optimizer.
     /// Re-runs the rule set until no more rules fire (fixpoint).
+    /// S26 fix: Reduced cap from 32 to 8 — most useful rewrites converge
+    /// in 2-3 iterations, and scanning all 120 rules each iteration is wasteful.
     fn optimize_expr(&mut self, expr: Expr) -> Expr {
         // Bottom-up: recurse into children first.
         let mut expr = self.recurse_into_children(expr);
 
-        // Then apply rules in a fixpoint loop (max 32 iterations to be safe).
+        // Then apply rules in a fixpoint loop (max 8 iterations — S26 fix).
         let mut changed = true;
         let mut iters = 0;
-        while changed && iters < 32 {
+        while changed && iters < 8 {
             changed = false;
             iters += 1;
 

@@ -292,6 +292,10 @@ fn skylake_port_map() -> &'static PortMap {
         uops.insert("xor", alu_uop(alu.clone(), 0.25));
         uops.insert("shl", alu_uop(alu.clone(), 0.25));
         uops.insert("shr", alu_uop(alu.clone(), 0.25));
+        // x86-64 instruction selection: LEA, INC, DEC
+        uops.insert("lea", alu_uop(vec![Port::P1, Port::P5, Port::P6], 1.0));
+        uops.insert("inc", alu_uop(alu.clone(), 0.25));
+        uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P1], 3, 1.0, false));
         uops.insert("div", div_uop(vec![Port::P0], 35, 35.0));
         uops.insert("rem", div_uop(vec![Port::P0], 35, 35.0));
@@ -322,6 +326,9 @@ fn skylakex_port_map() -> &'static PortMap {
         uops.insert("xor", alu_uop(alu.clone(), 0.25));
         uops.insert("shl", alu_uop(alu.clone(), 0.25));
         uops.insert("shr", alu_uop(alu.clone(), 0.25));
+        uops.insert("lea", alu_uop(vec![Port::P1, Port::P5, Port::P6], 1.0));
+        uops.insert("inc", alu_uop(alu.clone(), 0.25));
+        uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P1], 3, 1.0, false));
         uops.insert("div", div_uop(vec![Port::P0], 35, 35.0));
         uops.insert("rem", div_uop(vec![Port::P0], 35, 35.0));
@@ -344,6 +351,9 @@ fn icelake_port_map() -> &'static PortMap {
         let mut uops = HashMap::new();
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
+        uops.insert("lea", alu_uop(vec![Port::P1, Port::P5, Port::P6], 1.0));
+        uops.insert("inc", alu_uop(alu.clone(), 0.25));
+        uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1, Port::P5], 3, 0.5, true));
         uops.insert("div", div_uop(vec![Port::P0], 30, 30.0));
         uops.insert("rem", div_uop(vec![Port::P0], 30, 30.0));
@@ -366,6 +376,9 @@ fn golden_cove_port_map() -> &'static PortMap {
         let mut uops = HashMap::new();
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
+        uops.insert("lea", alu_uop(vec![Port::P1, Port::P2, Port::P5], 1.0));
+        uops.insert("inc", alu_uop(alu.clone(), 0.25));
+        uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1, Port::P2, Port::P5], 3, 0.5, true));
         uops.insert("div", div_uop(vec![Port::P0], 28, 28.0));
         uops.insert("rem", div_uop(vec![Port::P0], 28, 28.0));
@@ -388,6 +401,9 @@ fn zen2_port_map() -> &'static PortMap {
         let mut uops = HashMap::new();
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
+        uops.insert("lea", alu_uop(vec![Port::P1, Port::P2, Port::P3], 1.0));
+        uops.insert("inc", alu_uop(alu.clone(), 0.25));
+        uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1], 3, 0.5, true));
         uops.insert("div", div_uop(vec![Port::P0], 40, 40.0));
         uops.insert("rem", div_uop(vec![Port::P0], 40, 40.0));
@@ -410,6 +426,9 @@ fn zen3_port_map() -> &'static PortMap {
         let mut uops = HashMap::new();
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
+        uops.insert("lea", alu_uop(vec![Port::P1, Port::P2, Port::P3], 1.0));
+        uops.insert("inc", alu_uop(alu.clone(), 0.25));
+        uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1, Port::P2, Port::P3], 3, 0.33, true));
         uops.insert("div", div_uop(vec![Port::P0], 35, 35.0));
         uops.insert("rem", div_uop(vec![Port::P0], 35, 35.0));
@@ -432,6 +451,9 @@ fn zen4_port_map() -> &'static PortMap {
         let mut uops = HashMap::new();
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
+        uops.insert("lea", alu_uop(vec![Port::P1, Port::P2, Port::P3], 1.0));
+        uops.insert("inc", alu_uop(alu.clone(), 0.25));
+        uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1, Port::P2, Port::P3], 3, 0.33, true));
         uops.insert("div", div_uop(vec![Port::P0], 30, 30.0));
         uops.insert("rem", div_uop(vec![Port::P0], 30, 30.0));
@@ -631,6 +653,7 @@ mod tests {
         assert_eq!(map.name, "Intel Skylake");
         assert!(map.uops.contains_key("add"));
         assert!(map.uops.contains_key("mul"));
+        assert!(map.uops.contains_key("lea")); // x86-64 LEA instruction support
     }
 
     #[test]

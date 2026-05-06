@@ -1509,7 +1509,7 @@ fn cse_optimize(instrs: &mut Vec<Instr>) {
 /// Returns (magic_constant, post_shift) or None if IDIV should be used instead.
 #[allow(dead_code)]
 fn compute_div_magic(d: i64) -> Option<(i64, u8)> {
-    if d <= 0 || d.is_power_of_two() || d == 1 {
+    if d <= 0 || (d as u64).is_power_of_two() || d == 1 {
         return None;
     }
     let d = d as u64;

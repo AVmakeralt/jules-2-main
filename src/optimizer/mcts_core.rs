@@ -400,6 +400,10 @@ impl FlatProgram {
             }
         }
 
+        // S27 fix: Move OpcodeTable outside the loop — creating it per
+        // instruction allocates a Vec each time, wasting cycles.
+        let table = OpcodeTable::standard();
+
         for instr in self.instrs.iter() {
             if instr.is_nop() {
                 break;
@@ -410,7 +414,7 @@ impl FlatProgram {
                 return false;
             }
 
-            let table = OpcodeTable::standard();
+            let table = &table;
             let info = table.get(instr.opcode);
 
             // Check source register bounds and use-before-def

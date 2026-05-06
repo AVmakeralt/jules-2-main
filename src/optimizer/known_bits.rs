@@ -535,8 +535,9 @@ pub fn analyze(instr: &Instr, env: &FxHashMap<String, KnownBits>) -> KnownBits {
         Instr::ConstBool(b) => {
             KnownBits::constant(if *b { 1 } else { 0 })
         }
-        Instr::Var(name) => {
-            env.get(name).copied().unwrap_or_else(KnownBits::unknown)
+        Instr::Var(idx) => {
+            let var_name = crate::optimizer::mcts_superoptimizer::StringInterner::get(*idx);
+            env.get(var_name).copied().unwrap_or_else(KnownBits::unknown)
         }
         Instr::BinOp { op, lhs, rhs } => {
             let a = analyze(lhs, env);
