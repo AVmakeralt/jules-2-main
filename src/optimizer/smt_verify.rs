@@ -216,7 +216,7 @@ impl CegisVerifier {
                     VerifyResult::CounterExample(ce_values) => {
                         self.stats.counterexamples_added += 1;
                         self.add_test_vector(ce_values.clone());
-                        if iteration + 1 >= self.max_iterations {
+                        if _iteration + 1 >= self.max_iterations {
                             self.stats.counterexample_count += 1;
                             return VerifyResult::CounterExample(ce_values);
                         }
@@ -511,10 +511,15 @@ fn encode_instr<'ctx>(
         Instr::ConstInt(v) => BV::from_u64(ctx, *v as u64, bitwidth),
         Instr::ConstFloat(bits) => BV::from_u64(ctx, *bits, bitwidth),
         Instr::ConstBool(b) => BV::from_u64(ctx, if *b { 1 } else { 0 }, bitwidth),
-        Instr::Var(name) => inputs
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| BV::from_u64(ctx, 0, bitwidth)),
+        Instr::Var(idx) => {
+            // Var now stores a u32 interned index, not a String.
+            // Resolve the index to the variable name for Z3 encoding.
+            let var_name = crate::optimizer::mcts_superoptimizer::StringInterner::get(*idx);
+            inputs
+                .get(var_name)
+                .cloned()
+                .unwrap_or_else(|| BV::from_u64(ctx, 0, bitwidth))
+        },
         Instr::BinOp { op, lhs, rhs } => {
             let l = encode_instr(ctx, lhs, inputs, bitwidth);
             let r = encode_instr(ctx, rhs, inputs, bitwidth);
@@ -569,12 +574,12 @@ fn encode_binop<'ctx>(
         BinOpKind::And => {
             let l_bool = l._eq(&zero()).not();
             let r_bool = r._eq(&zero()).not();
-            l_bool.and(&[&r_bool]).ite(&one(), &zero())
+            Bool::and(&ctx, &[&l_bool, &r_bool]).ite(&one(), &zero())
         }
         BinOpKind::Or => {
             let l_bool = l._eq(&zero()).not();
             let r_bool = r._eq(&zero()).not();
-            l_bool.or(&[&r_bool]).ite(&one(), &zero())
+            Bool::or(&ctx, &[&l_bool, &r_bool]).ite(&one(), &zero())
         }
     }
 }
@@ -605,37 +610,42 @@ mod tests {
     use super::*;
 
     fn make_x_times_2() -> Instr {
+        let x_idx = crate::optimizer::mcts_superoptimizer::StringInterner::intern("x");
         Instr::BinOp {
             op: BinOpKind::Mul,
-            lhs: Box::new(Instr::Var("x".to_string())),
+            lhs: Box::new(Instr::Var(x_idx)),
             rhs: Box::new(Instr::ConstInt(2)),
         }
     }
 
     fn make_x_shl_1() -> Instr {
+        let x_idx = crate::optimizer::mcts_superoptimizer::StringInterner::intern("x");
         Instr::BinOp {
             op: BinOpKind::Shl,
-            lhs: Box::new(Instr::Var("x".to_string())),
+            lhs: Box::new(Instr::Var(x_idx)),
             rhs: Box::new(Instr::ConstInt(1)),
         }
     }
 
     fn make_x_plus_0() -> Instr {
+        let x_idx = crate::optimizer::mcts_superoptimizer::StringInterner::intern("x");
         Instr::BinOp {
             op: BinOpKind::Add,
-            lhs: Box::new(Instr::Var("x".to_string())),
+            lhs: Box::new(Instr::Var(x_idx)),
             rhs: Box::new(Instr::ConstInt(0)),
         }
     }
 
     fn make_x() -> Instr {
-        Instr::Var("x".to_string())
+        let x_idx = crate::optimizer::mcts_superoptimizer::StringInterner::intern("x");
+        Instr::Var(x_idx)
     }
 
     fn make_x_plus_1() -> Instr {
+        let x_idx = crate::optimizer::mcts_superoptimizer::StringInterner::intern("x");
         Instr::BinOp {
             op: BinOpKind::Add,
-            lhs: Box::new(Instr::Var("x".to_string())),
+            lhs: Box::new(Instr::Var(x_idx)),
             rhs: Box::new(Instr::ConstInt(1)),
         }
     }
@@ -653,17 +663,19 @@ mod tests {
 
     #[test]
     fn test_interpret_var() {
+        let x_idx = crate::optimizer::mcts_superoptimizer::StringInterner::intern("x");
         assert_eq!(
-            interpret(&Instr::Var("x".to_string()), &[99], &["x".to_string()]),
+            interpret(&Instr::Var(x_idx), &[99], &["x".to_string()]),
             Some(99)
         );
     }
 
     #[test]
     fn test_interpret_add() {
+        let x_idx = crate::optimizer::mcts_superoptimizer::StringInterner::intern("x");
         let instr = Instr::BinOp {
             op: BinOpKind::Add,
-            lhs: Box::new(Instr::Var("x".to_string())),
+            lhs: Box::new(Instr::Var(x_idx)),
             rhs: Box::new(Instr::ConstInt(10)),
         };
         assert_eq!(interpret(&instr, &[5], &["x".to_string()]), Some(15));

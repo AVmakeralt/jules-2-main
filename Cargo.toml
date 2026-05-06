@@ -103,6 +103,8 @@ nix = { version = "0.28", features = ["sched"], optional = true }
 num_cpus = "1.16"
 windows = { version = "0.52", features = ["Win32_System_Threading"], optional = true }
 # SMT verification (CEGIS loop)
+# Uses bindgen + prebuilt Z3 from /home/z/.local (or system Z3).
+# Set Z3_SYS_Z3_HEADER and LIBCLANG_PATH env vars if needed.
 z3 = { version = "0.12", optional = true }
 # E-graph equality saturation
 egg = { version = "0.6", optional = true }
@@ -126,7 +128,7 @@ xla = []
 gnn-optimizer = []
 core-superopt = ["egg"]
 legacy-passes = []
-smt-verify = ["z3"]  # Requires libclang for z3-sys build
+smt-verify = ["z3"]  # Requires libclang + Z3 lib/headers (see README)
 ultra-fast = ["phase3-jit", "phase6-simd", "core-superopt"]
 full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "cranelift-backend", "phase4-llvm", "phase5-cow", "phase6-simd", "gnn-optimizer", "core-superopt", "legacy-passes"]
 
