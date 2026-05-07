@@ -106,8 +106,7 @@ windows = { version = "0.52", features = ["Win32_System_Threading"], optional = 
 # Uses bindgen + prebuilt Z3 from /home/z/.local (or system Z3).
 # Set Z3_SYS_Z3_HEADER and LIBCLANG_PATH env vars if needed.
 z3 = { version = "0.12", optional = true }
-# E-graph equality saturation
-egg = { version = "0.6", optional = true }
+# E-graph equality saturation — uses our own implementation, not the egg crate.
 
 [features]
 default = ["ffi-c", "phase1", "phase2", "phase3-jit", "core-superopt"]
@@ -126,7 +125,7 @@ phase5-cow = []
 phase6-simd = []
 xla = []
 gnn-optimizer = []
-core-superopt = ["egg"]
+core-superopt = []
 legacy-passes = []
 smt-verify = ["z3"]  # Requires libclang + Z3 lib/headers (see README)
 machine-instr-model = ["core-superopt"]  # Machine-instruction-aware optimization layer
