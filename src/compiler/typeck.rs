@@ -314,9 +314,18 @@ impl Diagnostic {
 #[derive(Debug, Default)]
 pub struct Diagnostics {
     pub items: Vec<Diagnostic>,
+    /// Symbols that have already produced "undeclared variable" errors.
+    /// Subsequent errors about the same symbol are suppressed to avoid cascading.
+    suppressed_symbols: std::collections::HashSet<String>,
 }
 
 impl Diagnostics {
+    pub fn new() -> Self {
+        Diagnostics {
+            items: Vec::new(),
+            suppressed_symbols: std::collections::HashSet::new(),
+        }
+    }
     pub fn push(&mut self, d: Diagnostic) {
         self.items.push(d);
     }
@@ -329,6 +338,28 @@ impl Diagnostics {
     pub fn note(&mut self, span: Span, msg: impl Into<String>) {
         self.push(Diagnostic::note(span, msg));
     }
+
+    /// Emit an "undeclared variable" error with cascade suppression.
+    /// After the first error about a given symbol, subsequent errors about
+    /// the same symbol are suppressed to avoid error avalanches.
+    pub fn undeclared_var(&mut self, span: Span, name: &str, extra: impl Into<String>) {
+        if self.suppressed_symbols.contains(name) {
+            // Already reported this undeclared variable — suppress cascade
+            return;
+        }
+        self.suppressed_symbols.insert(name.to_string());
+        let msg = format!(
+            "use of undeclared variable `{}` — {}",
+            name, extra.into()
+        );
+        self.push(Diagnostic::error(span, msg));
+        // Add a note about cascade suppression
+        self.push(Diagnostic::note(
+            span,
+            format!("additional errors about `{}` are suppressed to avoid cascading", name),
+        ));
+    }
+
     pub fn has_errors(&self) -> bool {
         self.items.iter().any(|d| d.is_fatal())
     }
@@ -1436,15 +1467,12 @@ impl TypeCk {
                     if Self::is_runtime_builtin_ident(name.as_str()) {
                         return self.infer.fresh();
                     }
-                    self.diag.error(
+                    self.diag.undeclared_var(
                         *span,
-                        format!(
-                            "use of undeclared variable `{}` — \
-                             declare it before use with `let {} = ...;`, \
-                             add it as a function parameter, or check for \
-                             a spelling mistake. Variable names are case-sensitive.",
-                            name, name
-                        ),
+                        name,
+                        format!("declare it before use with `let {} = ...;`, \
+                         add it as a function parameter, or check for \
+                         a spelling mistake. Variable names are case-sensitive.", name)
                     );
                     self.infer.fresh()
                 }
@@ -2978,16 +3006,30 @@ impl TypeCk {
                     );
                 }
                 for (i, (expected, actual)) in params.iter().zip(arg_tys.iter()).enumerate() {
-                    if !self.infer.unify(expected, actual) {
-                        self.diag.error(
-                            span,
-                            format!(
-                                "argument {} type mismatch: expected `{}`, got `{}`",
-                                i + 1,
-                                expected.display(),
-                                actual.display()
-                            ),
+                    // Clone resolved types to avoid borrow conflicts with self.infer
+                    let resolved_expected = self.infer.resolve(expected).clone();
+                    let resolved_actual = self.infer.resolve(actual).clone();
+                    let can_widen = self.can_widen_ints(&resolved_actual, &resolved_expected);
+                    if !self.infer.unify(expected, actual) && !can_widen {
+                        let mut msg = format!(
+                            "argument {} type mismatch: expected `{}`, got `{}`",
+                            i + 1,
+                            resolved_expected.display(),
+                            resolved_actual.display()
                         );
+                        // Suggest literal suffix for integer widening
+                        if let (Ty::Scalar(exp_elem), Ty::Scalar(act_elem)) = (&resolved_expected, &resolved_actual) {
+                            if self.can_widen_elem(act_elem, exp_elem) {
+                                msg.push_str(&format!(
+                                    "; try adding a suffix like `5{}`",
+                                    format!("{:?}", exp_elem).to_lowercase()
+                                ));
+                            }
+                        }
+                        self.diag.error(span, msg);
+                    } else if can_widen {
+                        // Widening is possible — unify by substituting the wider type
+                        self.infer.unify(expected, &resolved_expected);
                     }
                 }
                 *ret.clone()
@@ -3011,16 +3053,22 @@ impl TypeCk {
                             fi.params.iter().zip(arg_tys.iter()).enumerate()
                         {
                             if !self.infer.unify(expected, actual) && !self.can_widen_ints(actual, expected) {
-                                self.diag.error(
-                                    span,
-                                    format!(
-                                        "argument {} to `{}`: expected `{}`, got `{}`",
-                                        i + 1,
-                                        name,
-                                        expected.display(),
-                                        actual.display()
-                                    ),
+                                let mut msg = format!(
+                                    "argument {} to `{}`: expected `{}`, got `{}`",
+                                    i + 1,
+                                    name,
+                                    expected.display(),
+                                    actual.display()
                                 );
+                                if let (Ty::Scalar(exp_elem), Ty::Scalar(act_elem)) = (expected, actual) {
+                                    if self.can_widen_elem(act_elem, exp_elem) {
+                                        msg.push_str(&format!(
+                                            "; try a suffix like `5{}`",
+                                            format!("{:?}", exp_elem).to_lowercase()
+                                        ));
+                                    }
+                                }
+                                self.diag.error(span, msg);
                             }
                         }
                         return fi.ret.clone();

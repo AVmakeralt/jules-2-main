@@ -1,7 +1,10 @@
 pub mod ast;
 pub mod borrowck;
+pub mod diagnostic;
 pub mod formal_verify;
+pub mod ir;
 pub mod lexer;
+pub mod lower;
 pub mod parser;
 pub mod sema;
 pub mod typeck;

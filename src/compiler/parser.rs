@@ -2339,19 +2339,20 @@ impl Parser {
             });
         }
 
-        // Pipeline: collect all `|>` stages into Expr::Pipeline
+        // Pipeline: desugar `a |> f(x)` into `f(a, x)` immediately.
+        // This way the type checker sees a normal function call, not a Pipeline.
         if matches!(op, TokenKind::PipeGt) {
-            let mut stages = vec![lhs, self.parse_expr(r_bp)?];
+            let rhs = self.parse_expr(r_bp)?;
+            let desugared = Self::desugar_pipeline(lhs, rhs);
+
             // Keep collecting while we see more `|>` at the same level
+            let mut current = desugared;
             while self.is(&TokenKind::PipeGt) {
                 self.advance();
-                stages.push(self.parse_expr(r_bp)?);
+                let next_stage = self.parse_expr(r_bp)?;
+                current = Self::desugar_pipeline(current, next_stage);
             }
-            let last = stages.last().unwrap();
-            return Ok(Expr::Pipeline {
-                span: stages[0].span().merge(last.span()),
-                stages,
-            });
+            return Ok(current);
         }
 
         // Tensor-specific binary operators
@@ -2415,6 +2416,55 @@ impl Parser {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 })
+            }
+        }
+    }
+
+    /// Desugar a pipeline stage: `lhs |> rhs` into a normal function call.
+    ///
+    /// - `x |> f`     →  `f(x)`
+    /// - `x |> f(a)`  →  `f(x, a)`
+    /// - `x |> f(a,b)`→  `f(x, a, b)`
+    /// - `x |> obj.method(a)` → `obj.method(x, a)`
+    fn desugar_pipeline(lhs: Expr, rhs: Expr) -> Expr {
+        match rhs {
+            // f(a, b, ...) → f(lhs, a, b, ...)
+            Expr::Call { span, func, args, named } => {
+                let mut new_args = vec![lhs];
+                new_args.extend(args);
+                Expr::Call { span, func, args: new_args, named }
+            }
+            // obj.method(a, b) → obj.method(lhs, a, b)
+            Expr::MethodCall { span, receiver, method, args } => {
+                let mut new_args = vec![lhs];
+                new_args.extend(args);
+                Expr::MethodCall { span, receiver, method, args: new_args }
+            }
+            // Just an identifier `f` → f(lhs)
+            Expr::Ident { span, name } => {
+                Expr::Call {
+                    span,
+                    func: Box::new(Expr::Ident { span, name: name.clone() }),
+                    args: vec![lhs],
+                    named: vec![],
+                }
+            }
+            // Path like `std::math::sqrt` → std::math::sqrt(lhs)
+            Expr::Path { span, segments } => {
+                Expr::Call {
+                    span,
+                    func: Box::new(Expr::Path { span, segments: segments.clone() }),
+                    args: vec![lhs],
+                    named: vec![],
+                }
+            }
+            // Fallback: keep as Pipeline expression (shouldn't normally happen)
+            _ => {
+                let span = lhs.span().merge(rhs.span());
+                Expr::Pipeline {
+                    span,
+                    stages: vec![lhs, rhs],
+                }
             }
         }
     }
