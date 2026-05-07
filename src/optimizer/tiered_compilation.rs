@@ -351,7 +351,15 @@ impl TieredExecutionManager {
             crate::compiler::ast::Stmt::Spawn(_) |
             crate::compiler::ast::Stmt::Sync(_) |
             crate::compiler::ast::Stmt::Atomic(_) |
-            crate::compiler::ast::Stmt::Item(_) => 0,
+            crate::compiler::ast::Stmt::Item(_) |
+            crate::compiler::ast::Stmt::Effect { .. } |
+            crate::compiler::ast::Stmt::Region { .. } |
+            crate::compiler::ast::Stmt::TaskJoin { .. } |
+            crate::compiler::ast::Stmt::UnsafeBlock { .. } |
+            crate::compiler::ast::Stmt::IntrinsicsBlock { .. } |
+            crate::compiler::ast::Stmt::Requires { .. } |
+            crate::compiler::ast::Stmt::Ensures { .. } => 0,
+            crate::compiler::ast::Stmt::TaskSpawn { task_expr, .. } => Self::count_expr(task_expr),
         }
     }
 

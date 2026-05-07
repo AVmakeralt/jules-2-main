@@ -830,6 +830,11 @@ DiffCompiler::expr_mem_ops(e, c);
             | Expr::Ident { .. }
             | Expr::Path { .. }
             | Expr::TensorConcat { .. } => {}
+            Expr::Pipeline { stages, .. } => {
+                for s in stages { Self::expr_calls(s, c); }
+            }
+            Expr::Emit { value, .. } => Self::expr_calls(value, c),
+            Expr::Copy { inner, .. } => Self::expr_calls(inner, c),
         }
     }
 
@@ -917,6 +922,11 @@ DiffCompiler::expr_mem_ops(e, c);
             | Expr::Ident { .. }
             | Expr::Path { .. }
             | Expr::TensorConcat { .. } => {}
+            Expr::Pipeline { stages, .. } => {
+                for s in stages { Self::expr_mem_ops(s, c); }
+            }
+            Expr::Emit { value, .. } => Self::expr_mem_ops(value, c),
+            Expr::Copy { inner, .. } => Self::expr_mem_ops(inner, c),
         }
     }
 
@@ -1001,6 +1011,11 @@ DiffCompiler::expr_mem_ops(e, c);
             | Expr::Ident { .. }
             | Expr::Path { .. }
             | Expr::TensorConcat { .. } => {}
+            Expr::Pipeline { stages, .. } => {
+                for s in stages { Self::expr_arith(s, c); }
+            }
+            Expr::Emit { value, .. } => Self::expr_arith(value, c),
+            Expr::Copy { inner, .. } => Self::expr_arith(inner, c),
         }
     }
 
@@ -1061,6 +1076,11 @@ DiffCompiler::expr_mem_ops(e, c);
             | Expr::KronProd { .. }
             | Expr::OuterProd { .. }
             | Expr::Pow { .. } => {}
+            Expr::Pipeline { stages, .. } => {
+                for s in stages { Self::expr_branches(s, c); }
+            }
+            Expr::Emit { value, .. } => Self::expr_branches(value, c),
+            Expr::Copy { inner, .. } => Self::expr_branches(inner, c),
         }
     }
 
@@ -1146,6 +1166,11 @@ DiffCompiler::expr_mem_ops(e, c);
             | Expr::Ident { .. }
             | Expr::Path { .. }
             | Expr::TensorConcat { .. } => {}
+            Expr::Pipeline { stages, .. } => {
+                for s in stages { Self::expr_calls_self(s, name, flag); }
+            }
+            Expr::Emit { value, .. } => Self::expr_calls_self(value, name, flag),
+            Expr::Copy { inner, .. } => Self::expr_calls_self(inner, name, flag),
         }
     }
 

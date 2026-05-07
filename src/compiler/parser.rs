@@ -223,7 +223,19 @@ impl Parser {
                 | TokenKind::KwModel
                 | TokenKind::KwTrain
                 | TokenKind::KwStruct
-                | TokenKind::KwEnum => break,
+                | TokenKind::KwEnum
+                | TokenKind::KwEffect
+                | TokenKind::KwRegion
+                | TokenKind::KwUnsafe
+                | TokenKind::KwIntrinsics
+                | TokenKind::KwTask
+                | TokenKind::KwRequires
+                | TokenKind::KwEnsures
+                | TokenKind::KwEmit
+                | TokenKind::KwOwn
+                | TokenKind::KwCopy
+                | TokenKind::KwShared
+                | TokenKind::KwJoin => break,
                 TokenKind::RBrace => {
                     self.advance();
                     break;
@@ -441,6 +453,129 @@ impl Parser {
                 TokenKind::AtAll => {
                     self.advance();
                     Attribute::All
+                }
+                // ── Jules v2: compile-time pipeline modifiers ────────────────
+                TokenKind::AtTarget => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Target
+                }
+                TokenKind::AtPrefer => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Prefer
+                }
+                TokenKind::AtBackend => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Backend
+                }
+                TokenKind::AtVectorize => {
+                    self.advance();
+                    Attribute::Vectorize
+                }
+                TokenKind::AtFusion => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Fusion
+                }
+                TokenKind::AtHot => {
+                    self.advance();
+                    Attribute::Hot
+                }
+                TokenKind::AtIntent => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Intent
+                }
+                TokenKind::AtCost => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Cost
+                }
+                TokenKind::AtBudget => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Budget
+                }
+                TokenKind::AtDeterministic => {
+                    self.advance();
+                    Attribute::Deterministic
+                }
+                TokenKind::AtStochastic => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Stochastic
+                }
+                TokenKind::AtNofuse => {
+                    self.advance();
+                    Attribute::Nofuse
+                }
+                TokenKind::AtFuse => {
+                    self.advance();
+                    Attribute::Fuse
+                }
+                TokenKind::AtLayout => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Layout
+                }
+                TokenKind::AtAligned => {
+                    self.advance();
+                    let _args = if self.is(&TokenKind::LParen) {
+                        self.parse_named_attr_args().unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+                    Attribute::Aligned
+                }
+                TokenKind::AtExplain => {
+                    self.advance();
+                    Attribute::Explain
+                }
+                TokenKind::AtParallelSafe => {
+                    self.advance();
+                    Attribute::ParallelSafe
+                }
+                TokenKind::AtOpaque => {
+                    self.advance();
+                    Attribute::Opaque
                 }
                 // Named annotations with optional args
                 TokenKind::AtKernel
@@ -674,6 +809,28 @@ impl Parser {
             None
         };
 
+        // Parse optional `requires`, `ensures`, and `effect` clauses before the body.
+        let mut requires = Vec::new();
+        let mut ensures = Vec::new();
+        let mut effect = None;
+
+        while self.is(&TokenKind::KwRequires) || self.is(&TokenKind::KwEnsures) {
+            if self.is(&TokenKind::KwRequires) {
+                self.advance();
+                requires.push(self.parse_expr(0)?);
+            } else if self.is(&TokenKind::KwEnsures) {
+                self.advance();
+                ensures.push(self.parse_expr(0)?);
+            }
+        }
+
+        // Parse optional `effect <name>` clause
+        if self.is(&TokenKind::KwEffect) {
+            self.advance();
+            let (_, effect_name) = self.expect_ident()?;
+            effect = Some(effect_name);
+        }
+
         let body = if self.is(&TokenKind::LBrace) {
             let mut body = self.parse_block()?;
             if ret_ty.is_some() && body.tail.is_none() {
@@ -699,6 +856,9 @@ impl Parser {
             ret_ty,
             body,
             is_async,
+            requires,
+            ensures,
+            effect,
         })
     }
 
@@ -1177,6 +1337,24 @@ impl Parser {
                 Ok(Type::Never)
             }
 
+            // Ownership-qualified types
+            TokenKind::KwOwn => {
+                self.advance();
+                let inner = self.parse_type()?;
+                Ok(Type::Own(Box::new(inner)))
+            }
+            TokenKind::KwShared => {
+                self.advance();
+                let inner = self.parse_type()?;
+                Ok(Type::Shared(Box::new(inner)))
+            }
+            // `unique` is not a keyword, it's an identifier
+            TokenKind::Ident(s) if s == "unique" => {
+                self.advance();
+                let inner = self.parse_type()?;
+                Ok(Type::Unique(Box::new(inner)))
+            }
+
             // Infer: _
             TokenKind::Ident(s) if s == "_" => {
                 self.advance();
@@ -1473,6 +1651,68 @@ impl Parser {
             TokenKind::KwSync => self.parse_sync().map(Stmt::Sync),
             TokenKind::KwAtomic => self.parse_atomic().map(Stmt::Atomic),
 
+            // ── effect block ──────────────────────────────────────────────
+            TokenKind::KwEffect => {
+                let span = self.advance().span;
+                let (_, name) = self.expect_ident()?;
+                let body = self.parse_block()?;
+                Ok(Stmt::Effect { span, name, body })
+            }
+
+            // ── region block ──────────────────────────────────────────────
+            TokenKind::KwRegion => {
+                let span = self.advance().span;
+                let (_, name) = self.expect_ident()?;
+                let body = self.parse_block()?;
+                Ok(Stmt::Region { span, name, body })
+            }
+
+            // ── unsafe block ──────────────────────────────────────────────
+            TokenKind::KwUnsafe => {
+                let span = self.advance().span;
+                let body = self.parse_block()?;
+                Ok(Stmt::UnsafeBlock { span, body })
+            }
+
+            // ── intrinsics block ──────────────────────────────────────────
+            TokenKind::KwIntrinsics => {
+                let span = self.advance().span;
+                let decls = self.parse_intrinsics_block()?;
+                Ok(Stmt::IntrinsicsBlock { span, decls })
+            }
+
+            // ── requires / ensures constraints ────────────────────────────
+            TokenKind::KwRequires => {
+                let span = self.advance().span;
+                let condition = self.parse_expr(0)?;
+                self.eat(&TokenKind::Semicolon);
+                Ok(Stmt::Requires { span, condition })
+            }
+            TokenKind::KwEnsures => {
+                let span = self.advance().span;
+                let condition = self.parse_expr(0)?;
+                self.eat(&TokenKind::Semicolon);
+                Ok(Stmt::Ensures { span, condition })
+            }
+
+            // ── task spawn / join ──────────────────────────────────────────
+            TokenKind::KwTask => {
+                let span = self.advance().span;
+                let (_, name) = self.expect_ident()?;
+                self.expect(&TokenKind::Eq)?;
+                // Optional `spawn` keyword before the expression
+                self.eat(&TokenKind::KwSpawn);
+                let task_expr = self.parse_expr(0)?;
+                self.eat(&TokenKind::Semicolon);
+                Ok(Stmt::TaskSpawn { span, name, task_expr })
+            }
+            TokenKind::KwJoin => {
+                let span = self.advance().span;
+                let (_, name) = self.expect_ident()?;
+                self.eat(&TokenKind::Semicolon);
+                Ok(Stmt::TaskJoin { span, name })
+            }
+
             // ── nested item ───────────────────────────────────────────────────
             TokenKind::KwFn
             | TokenKind::KwStruct
@@ -1712,6 +1952,37 @@ impl Parser {
         let body = self.parse_block()?;
         Ok(AtomicBlock { span, body })
     }
+
+    /// Parse the body of an `intrinsics { ... }` block.
+    /// Declarations have the form: `name(param_types) -> ret_type`
+    fn parse_intrinsics_block(&mut self) -> ParseResult<Vec<IntrinsicDecl>> {
+        self.expect(&TokenKind::LBrace)?;
+        let mut decls = Vec::new();
+        while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            let decl_span = self.current_span();
+            let (_, name) = self.expect_ident()?;
+            self.expect(&TokenKind::LParen)?;
+            let mut params = Vec::new();
+            while !self.is(&TokenKind::RParen) && !self.at_eof() {
+                params.push(self.parse_type()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen)?;
+            self.expect(&TokenKind::Arrow)?;
+            let ret = self.parse_type()?;
+            decls.push(IntrinsicDecl {
+                span: decl_span,
+                name,
+                params,
+                ret,
+            });
+            self.eat(&TokenKind::Semicolon);
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(decls)
+    }
 }
 
 fn schedule_from_attrs(attrs: &[Attribute]) -> ScheduleKind {
@@ -1877,7 +2148,8 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8)> {
         | TokenKind::AmpEq
         | TokenKind::PipeEq
         | TokenKind::CaretEq
-        | TokenKind::MatMulEq => Some((2, 1)),
+        | TokenKind::MatMulEq
+        | TokenKind::ColonEq => Some((2, 1)),
 
         TokenKind::KwAs => Some((3, 4)), // cast
 
@@ -1885,6 +2157,10 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8)> {
 
         TokenKind::PipePipe => Some((7, 8)),
         TokenKind::AmpAmp => Some((9, 10)),
+
+        // Pipeline operator: lower than logical OR, left-assoc
+        // `a + b |> f` → `(a + b) |> f`
+        TokenKind::PipeGt => Some((6, 7)),
 
         TokenKind::EqEq
         | TokenKind::BangEq
@@ -2060,6 +2336,21 @@ impl Parser {
                 lo: Some(Box::new(lhs)),
                 hi: rhs,
                 inclusive,
+            });
+        }
+
+        // Pipeline: collect all `|>` stages into Expr::Pipeline
+        if matches!(op, TokenKind::PipeGt) {
+            let mut stages = vec![lhs, self.parse_expr(r_bp)?];
+            // Keep collecting while we see more `|>` at the same level
+            while self.is(&TokenKind::PipeGt) {
+                self.advance();
+                stages.push(self.parse_expr(r_bp)?);
+            }
+            let last = stages.last().unwrap();
+            return Ok(Expr::Pipeline {
+                span: stages[0].span().merge(last.span()),
+                stages,
             });
         }
 
@@ -2386,6 +2677,28 @@ impl Parser {
                 Ok(Expr::Ident { span, name })
             }
 
+            // ── emit effect_name expr ─────────────────────────────────────────
+            TokenKind::KwEmit => {
+                self.advance();
+                let (_, effect) = self.expect_ident()?;
+                let value = self.parse_expr(20)?; // parse one primary/postfix expression
+                Ok(Expr::Emit {
+                    span,
+                    effect,
+                    value: Box::new(value),
+                })
+            }
+
+            // ── copy expr ──────────────────────────────────────────────────────
+            TokenKind::KwCopy => {
+                self.advance();
+                let inner = self.parse_expr(20)?; // parse one primary/postfix expression
+                Ok(Expr::Copy {
+                    span,
+                    inner: Box::new(inner),
+                })
+            }
+
             other => Err(ParseError::new(
                 span,
                 format!("unexpected token `{other:?}` in expression"),
@@ -2430,6 +2743,7 @@ fn token_to_assign_op(kind: &TokenKind) -> Option<AssignOpKind> {
         TokenKind::PipeEq => AssignOpKind::BitOrAssign,
         TokenKind::CaretEq => AssignOpKind::BitXorAssign,
         TokenKind::MatMulEq => AssignOpKind::MatMulAssign,
+        TokenKind::ColonEq => AssignOpKind::MutAssign,
         _ => return None,
     })
 }

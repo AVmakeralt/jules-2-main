@@ -183,6 +183,14 @@ pub enum Type {
     Never,
     /// Type to be inferred: `_`
     Infer,
+
+    // ── Ownership-qualified types ─────────────────────────────────────
+    /// `own T` — explicitly owned, single owner, move semantics
+    Own(Box<Type>),
+    /// `unique T` — no aliasing possible (optimizer hint)
+    Unique(Box<Type>),
+    /// `shared T` — read-only shared reference, multiple readers
+    Shared(Box<Type>),
 }
 
 impl Type {
@@ -244,6 +252,26 @@ pub enum Attribute {
     All,             // @all — enable all superoptimizers
     // Free-form for future extensibility: `@inline`, `@deprecated(...)`, etc.
     Named { name: String, args: Vec<Expr> },
+
+    // ── Jules v2: compile-time pipeline modifiers ─────────────────────
+    Target,         // @target(zen4)
+    Prefer,         // @prefer(lea)
+    Backend,        // @backend(xla)
+    Vectorize,      // @vectorize
+    Fusion,         // @fusion(aggressive)
+    Hot,            // @hot
+    Intent,         // @intent("throughput")
+    Cost,           // @cost("low")
+    Budget,         // @budget(cycles=100)
+    Deterministic,  // @deterministic
+    Stochastic,     // @stochastic(seed=42)
+    Nofuse,         // @nofuse
+    Fuse,           // @fuse
+    Layout,         // @layout("NHWC")
+    Aligned,        // @aligned(64)
+    Explain,        // @explain
+    ParallelSafe,   // @parallel_safe
+    Opaque,         // @opaque
 }
 
 /// Superoptimizer mode for a file or module.
@@ -539,6 +567,28 @@ pub enum Expr {
         name: String,
         fields: Vec<(String, Expr)>,
     },
+
+    // ── Pipeline expression (v2) ───────────────────────────────────────
+    /// `x |> f |> g` — pipeline operator, chains function applications
+    Pipeline {
+        span: Span,
+        stages: Vec<Expr>,  // first is the source, rest are functions to apply
+    },
+
+    // ── Effect system (v2) ─────────────────────────────────────────────
+    /// `emit stdout "hello"` — explicit effect emission
+    Emit {
+        span: Span,
+        effect: String,     // effect name like "stdout", "io"
+        value: Box<Expr>,
+    },
+
+    // ── Ownership expressions (v2) ─────────────────────────────────────
+    /// `copy x` — explicit copy expression
+    Copy {
+        span: Span,
+        inner: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -574,6 +624,9 @@ impl Expr {
             Expr::Block(b) => b.span,
             Expr::Tuple { span, .. } => *span,
             Expr::StructLit { span, .. } => *span,
+            Expr::Pipeline { span, .. } => *span,
+            Expr::Emit { span, .. } => *span,
+            Expr::Copy { span, .. } => *span,
         }
     }
 
@@ -652,12 +705,13 @@ pub enum AssignOpKind {
     BitOrAssign,
     BitXorAssign,
     MatMulAssign, // @=
+    MutAssign,    // :=  — explicit mutation assignment
 }
 
 impl AssignOpKind {
-    /// True if this is a compound assignment (anything except plain `=`).
+    /// True if this is a compound assignment (anything except plain `=` and `:=`).
     pub fn is_compound(self) -> bool {
-        !matches!(self, AssignOpKind::Assign)
+        !matches!(self, AssignOpKind::Assign | AssignOpKind::MutAssign)
     }
 
     /// Return the corresponding binary operator for a compound assignment,
@@ -794,6 +848,58 @@ pub enum Stmt {
     Sync(SyncBlock),
     /// `atomic { … }` — indivisible region
     Atomic(AtomicBlock),
+
+    // ── Jules v2: effects, regions, tasks, constraints ────────────────
+    /// `effect name { body }` — explicit effect block
+    Effect {
+        span: Span,
+        name: String,
+        body: Block,
+    },
+
+    /// `region name { body }` — region-based memory block
+    Region {
+        span: Span,
+        name: String,
+        body: Block,
+    },
+
+    /// `task name = spawn expr` — structured concurrency task declaration
+    TaskSpawn {
+        span: Span,
+        name: String,
+        task_expr: Expr,  // spawn f(args) or spawn { ... }
+    },
+
+    /// `join name` — wait for task completion
+    TaskJoin {
+        span: Span,
+        name: String,
+    },
+
+    /// `unsafe { body }` — unsafe escape hatch
+    UnsafeBlock {
+        span: Span,
+        body: Block,
+    },
+
+    /// `intrinsics { decls }` — intrinsic declarations
+    IntrinsicsBlock {
+        span: Span,
+        decls: Vec<IntrinsicDecl>,
+    },
+
+    /// `requires expr` — precondition constraint
+    Requires {
+        span: Span,
+        condition: Expr,
+    },
+
+    /// `ensures expr` — postcondition constraint
+    Ensures {
+        span: Span,
+        condition: Expr,
+    },
 }
 
 impl Stmt {
@@ -816,6 +922,14 @@ impl Stmt {
             Stmt::Spawn(sb) => sb.span,
             Stmt::Sync(sb) => sb.span,
             Stmt::Atomic(ab) => ab.span,
+            Stmt::Effect { span, .. } => *span,
+            Stmt::Region { span, .. } => *span,
+            Stmt::TaskSpawn { span, .. } => *span,
+            Stmt::TaskJoin { span, .. } => *span,
+            Stmt::UnsafeBlock { span, .. } => *span,
+            Stmt::IntrinsicsBlock { span, .. } => *span,
+            Stmt::Requires { span, .. } => *span,
+            Stmt::Ensures { span, .. } => *span,
         }
     }
 }
@@ -1022,6 +1136,12 @@ pub struct FnDecl {
     pub ret_ty: Option<Type>,
     pub body: Option<Block>, // None for extern / trait declaration
     pub is_async: bool,
+    /// Precondition constraints: `requires n > 0`
+    pub requires: Vec<Expr>,
+    /// Postcondition constraints: `ensures result >= 0`
+    pub ensures: Vec<Expr>,
+    /// Effect annotation: `effect io`, `effect pure`
+    pub effect: Option<String>,
 }
 
 // ─── System (Feature 2) ──────────────────────────────────────────────────────
@@ -1490,6 +1610,31 @@ pub struct SyncBlock {
 pub struct AtomicBlock {
     pub span: Span,
     pub body: Block,
+}
+
+// =============================================================================
+// JULES v2 — INTRINSICS & TASK OWNERSHIP
+// =============================================================================
+
+/// A single intrinsic declaration inside an `intrinsics { ... }` block.
+/// `add(i32, i32) -> i32`
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntrinsicDecl {
+    pub span: Span,
+    pub name: String,
+    pub params: Vec<Type>,
+    pub ret: Type,
+}
+
+/// Describes how a task interacts with memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOwnership {
+    /// Data is moved into the task, no aliasing
+    Move,
+    /// Data is borrowed read-only
+    Ref,
+    /// Data is shared mutably via atomic
+    Shared,
 }
 
 // =============================================================================
@@ -2330,6 +2475,16 @@ pub fn walk_stmt<V: Visitor>(v: &mut V, s: &Stmt) {
         Stmt::Spawn(sb) => v.visit_block(&sb.body),
         Stmt::Sync(sb) => v.visit_block(&sb.body),
         Stmt::Atomic(ab) => v.visit_block(&ab.body),
+
+        // ── Jules v2 statements ──────────────────────────────────────────
+        Stmt::Effect { body, .. } => v.visit_block(body),
+        Stmt::Region { body, .. } => v.visit_block(body),
+        Stmt::TaskSpawn { task_expr, .. } => v.visit_expr(task_expr),
+        Stmt::TaskJoin { .. } => {}
+        Stmt::UnsafeBlock { body, .. } => v.visit_block(body),
+        Stmt::IntrinsicsBlock { .. } => {}
+        Stmt::Requires { condition, .. } => v.visit_expr(condition),
+        Stmt::Ensures { condition, .. } => v.visit_expr(condition),
     }
 }
 
@@ -2449,6 +2604,15 @@ pub fn walk_expr<V: Visitor>(v: &mut V, e: &Expr) {
         | Expr::StrLit { .. }
         | Expr::Ident { .. }
         | Expr::Path { .. } => {}
+
+        // ── Jules v2 expressions ──────────────────────────────────────
+        Expr::Pipeline { stages, .. } => {
+            for s in stages {
+                v.visit_expr(s);
+            }
+        }
+        Expr::Emit { value, .. } => v.visit_expr(value),
+        Expr::Copy { inner, .. } => v.visit_expr(inner),
     }
 }
 
@@ -3649,6 +3813,9 @@ mod tests_new {
             ret_ty: None,
             body: Some(Block::new(d())),
             is_async: false,
+            requires: vec![],
+            ensures: vec![],
+            effect: None,
         };
         assert!(!f.attrs.is_empty());
         assert!(matches!(&f.attrs[0], Attribute::Named { name, .. } if name == "kernel"));

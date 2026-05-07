@@ -76,7 +76,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::compiler::ast::{
-    AccessMode, AgentDecl, Attribute, BehaviorRule, Block, ComponentDecl, EntityQuery, Expr,
+    AccessMode, AgentDecl, AssignOpKind, Attribute, BehaviorRule, Block, ComponentDecl, EntityQuery, Expr,
     FnDecl, GoalDecl, Item, MatchArm, ModelDecl, ModelLayer, ParallelFor, Pattern, PerceptionKind,
     Program, Stmt, SystemDecl, TrainDecl,
 };
@@ -275,7 +275,7 @@ impl ScopeStack {
 #[derive(Debug, Clone, PartialEq)]
 enum CfFrame {
     /// Inside a `fn` / `system` / `kernel` body.
-    Function { is_async: bool, name: String },
+    Function { is_async: bool, name: String, effect: Option<String> },
     /// Inside a `loop`, `while`, or `for` loop — carries its optional label.
     Loop { label: Option<String> },
     /// Inside a `parallel for`.
@@ -286,6 +286,10 @@ enum CfFrame {
     Sync,
     /// Inside an `atomic { }` region.
     Atomic,
+    /// Inside an `effect` block.
+    Effect { name: String },
+    /// Inside a `region` block.
+    Region { name: String },
 }
 
 #[derive(Debug, Default)]
@@ -336,6 +340,30 @@ impl CfStack {
             CfFrame::Function { name, .. } => Some(name.as_str()),
             _ => None,
         })
+    }
+
+    /// Returns the effect annotation of the innermost enclosing function, if any.
+    fn current_fn_effect(&self) -> Option<&str> {
+        self.frames.iter().rev().find_map(|f| match f {
+            CfFrame::Function { effect, .. } => effect.as_deref(),
+            _ => None,
+        })
+    }
+
+    /// Returns true if we are inside an `effect` block.
+    fn in_effect_block(&self) -> bool {
+        self.frames
+            .iter()
+            .rev()
+            .any(|f| matches!(f, CfFrame::Effect { .. }))
+    }
+
+    /// Returns true if we are inside a `region` block.
+    fn in_region_block(&self) -> bool {
+        self.frames
+            .iter()
+            .rev()
+            .any(|f| matches!(f, CfFrame::Region { .. }))
     }
 }
 
@@ -482,6 +510,10 @@ pub struct SemaCtx {
     trained_agents: FxHashSet<String>,
     /// Whether to emit shadowing warnings (controlled by a lint flag).
     warn_shadow: bool,
+    /// Active task names declared with `task name = spawn ...` (for join validation).
+    active_tasks: Vec<String>,
+    /// Region names active in the current scope (for uniqueness validation).
+    active_regions: Vec<String>,
 }
 
 impl SemaCtx {
@@ -495,6 +527,8 @@ impl SemaCtx {
             system_sets: Vec::new(),
             trained_agents: FxHashSet::default(),
             warn_shadow: true,
+            active_tasks: Vec::new(),
+            active_regions: Vec::new(),
         }
     }
 
@@ -542,7 +576,7 @@ impl SemaCtx {
 
     fn use_var(&mut self, name: &str, _span: Span) {
         // Known built-ins that don't live in the scope stack.
-        if matches!(name, "world" | "self" | "true" | "false") {
+        if matches!(name, "world" | "self" | "true" | "false" | "result") {
             return;
         }
         if !self.scopes.mark_used(name) {
@@ -645,6 +679,7 @@ impl SemaCtx {
                 self.cf.push(CfFrame::Function {
                     is_async: false,
                     name: "<const>".into(),
+                    effect: None,
                 });
                 self.push_scope();
                 self.analyse_expr(&c.value);
@@ -671,6 +706,7 @@ impl SemaCtx {
         self.cf.push(CfFrame::Function {
             is_async: f.is_async,
             name: f.name.clone(),
+            effect: f.effect.clone(),
         });
         self.push_scope();
 
@@ -728,6 +764,7 @@ impl SemaCtx {
         self.cf.push(CfFrame::Function {
             is_async: false,
             name: s.name.clone(),
+            effect: None,
         });
         self.push_scope();
 
@@ -957,6 +994,7 @@ impl SemaCtx {
         self.cf.push(CfFrame::Function {
             is_async: false,
             name: format!("{}::{}", agent.name, rule.name),
+            effect: None,
         });
         self.push_scope();
 
@@ -1540,6 +1578,74 @@ impl SemaCtx {
                 self.pop_scope();
                 self.cf.pop();
             }
+
+            // ── Jules v2 statements ─────────────────────────────────────────
+            Stmt::Effect { span, name, body } => {
+                // Validate: emit must appear inside an effect block or a function
+                // with a declared effect.  This block itself provides the context.
+                if self.active_regions.contains(name) {
+                    self.err(*span, format!("effect block name `{}` conflicts with an active region", name));
+                }
+                self.cf.push(CfFrame::Effect { name: name.clone() });
+                self.push_scope();
+                self.analyse_block(body);
+                self.pop_scope();
+                self.cf.pop();
+            }
+            Stmt::Region { span, name, body } => {
+                // Region names must be unique within their scope.
+                if self.active_regions.contains(name) {
+                    self.err(*span, format!("region name `{}` is not unique within the current scope", name));
+                }
+                self.active_regions.push(name.clone());
+                self.cf.push(CfFrame::Region { name: name.clone() });
+                self.push_scope();
+                self.analyse_block(body);
+                self.pop_scope();
+                self.cf.pop();
+                // Remove the region name when leaving scope.
+                if let Some(pos) = self.active_regions.iter().rposition(|n| n == name) {
+                    self.active_regions.remove(pos);
+                }
+            }
+            Stmt::TaskSpawn { span, name, task_expr } => {
+                // Track the task name for later join validation.
+                self.active_tasks.push(name.clone());
+                self.analyse_expr(task_expr);
+                let _ = span;
+            }
+            Stmt::TaskJoin { span, name } => {
+                // join must reference a previously declared task.
+                if !self.active_tasks.contains(name) {
+                    self.err(*span, format!(
+                        "`join {name}` references an undeclared task; \
+                         declare with `task {name} = spawn ...` first"
+                    ));
+                }
+            }
+            Stmt::UnsafeBlock { span, body } => {
+                // Unsafe blocks should generate a warning unless specifically allowed.
+                self.warn(*span, "unsafe block used; ensure this is intentional and audited");
+                self.push_scope();
+                self.analyse_block(body);
+                self.pop_scope();
+            }
+            Stmt::IntrinsicsBlock { span, decls } => {
+                // Intrinsics blocks should only appear at module level.
+                // If we're inside a function, that's an error.
+                if self.cf.in_function() {
+                    self.err(*span, "`intrinsics` blocks can only appear at module level");
+                }
+                let _ = decls;
+            }
+            Stmt::Requires { span, condition } => {
+                self.analyse_expr(condition);
+                let _ = span;
+            }
+            Stmt::Ensures { span, condition } => {
+                self.analyse_expr(condition);
+                let _ = span;
+            }
         }
     }
 
@@ -1613,9 +1719,64 @@ impl SemaCtx {
                 self.analyse_expr(expr);
             }
 
-            Expr::Assign { target, value, .. } => {
-                // Check that the target is actually mutable.
-                self.check_lvalue_mutability(target);
+            Expr::Assign { target, value, op, .. } => {
+                match op {
+                    AssignOpKind::Assign => {
+                        // In Jules v2, `x = value` on an undeclared variable
+                        // creates a new binding (equivalent to `let x = value`).
+                        // When the variable is already declared, it's a rebinding/shadowing.
+                        if let Expr::Ident { span, name } = target.as_ref() {
+                            if self.scopes.lookup(name).is_none() {
+                                // Undeclared: treat as a new immutable binding.
+                                self.declare_var(name, *span, false);
+                            } else {
+                                // Already declared: this is a rebinding/shadowing.
+                                // Emit a shadowing warning if applicable, then declare
+                                // a new binding in the current scope.
+                                if self.warn_shadow && self.scopes.is_outer_name(name) {
+                                    self.warn(
+                                        *span,
+                                        format!("binding `{}` shadows an outer variable", name),
+                                    );
+                                }
+                                let wildcard = name == "_" || name.starts_with('_');
+                                self.scopes.declare(name, Binding::new(*span, false, wildcard));
+                            }
+                        } else {
+                            // Non-ident target (e.g. field, index): check mutability normally.
+                            self.check_lvalue_mutability(target);
+                        }
+                    }
+                    AssignOpKind::MutAssign => {
+                        // `:=` is explicit mutation.
+                        // In Jules v2 design: `:=` on an undeclared variable creates
+                        // a NEW MUTABLE binding (like `let mut x = ...`).
+                        // On an already-declared variable, it mutates it (variable must be mutable).
+                        if let Expr::Ident { span, name } = target.as_ref() {
+                            if let Some(b) = self.scopes.lookup(name) {
+                                if !b.mutable {
+                                    self.err(
+                                        *span,
+                                        format!(
+                                            "cannot mutate immutable variable `{}` with `:=`; \
+                                             use `=` to rebind or declare with `:=` initially",
+                                            name
+                                        ),
+                                    );
+                                }
+                            } else {
+                                // Undeclared: `:=` creates a new mutable binding.
+                                self.scopes.declare(name, Binding::new(*span, true, false));
+                            }
+                        } else {
+                            self.check_lvalue_mutability(target);
+                        }
+                    }
+                    _ => {
+                        // Compound assignment (+=, -=, etc.) — target must be mutable.
+                        self.check_lvalue_mutability(target);
+                    }
+                }
                 self.analyse_expr(target);
                 self.analyse_expr(value);
             }
@@ -1732,6 +1893,32 @@ impl SemaCtx {
             Expr::KronProd { lhs, rhs, .. } | Expr::OuterProd { lhs, rhs, .. } => {
                 self.analyse_expr(lhs);
                 self.analyse_expr(rhs);
+            }
+
+            // ── Jules v2 expressions ─────────────────────────────────────
+            Expr::Emit { span, value, .. } => {
+                // emit statements must appear inside an effect block or
+                // a function with a declared effect (not pure).
+                let in_effect = self.cf.in_effect_block();
+                let fn_effect = self.cf.current_fn_effect();
+                let allowed = in_effect
+                    || fn_effect.map_or(false, |e| e != "pure");
+                if !allowed {
+                    self.err(*span,
+                        "emit statement outside of an `effect` block or a function \
+                         with a declared effect; wrap in `effect name { ... }` or \
+                         annotate the function with `effect io`"
+                    );
+                }
+                self.analyse_expr(value);
+            }
+            Expr::Pipeline { stages, .. } => {
+                for s in stages {
+                    self.analyse_expr(s);
+                }
+            }
+            Expr::Copy { inner, .. } => {
+                self.analyse_expr(inner);
             }
         }
     }
@@ -1894,6 +2081,14 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::Spawn(sb) => sb.span,
         Stmt::Sync(sb) => sb.span,
         Stmt::Atomic(ab) => ab.span,
+        Stmt::Effect { span, .. } => *span,
+        Stmt::Region { span, .. } => *span,
+        Stmt::TaskSpawn { span, .. } => *span,
+        Stmt::TaskJoin { span, .. } => *span,
+        Stmt::UnsafeBlock { span, .. } => *span,
+        Stmt::IntrinsicsBlock { span, .. } => *span,
+        Stmt::Requires { span, .. } => *span,
+        Stmt::Ensures { span, .. } => *span,
     }
 }
 
@@ -2082,6 +2277,9 @@ mod tests {
             ret_ty: None,
             body: Some(body),
             is_async: false,
+            requires: vec![],
+            ensures: vec![],
+            effect: None,
         }
     }
 
@@ -3000,6 +3198,7 @@ mod tests {
         cf.push(CfFrame::Function {
             is_async: true,
             name: "fetch".into(),
+            effect: None,
         });
         assert!(cf.in_async_fn());
         assert!(cf.in_function());

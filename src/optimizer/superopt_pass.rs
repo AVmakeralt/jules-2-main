@@ -426,6 +426,17 @@ impl SuperoptPass {
                     self.walk_expr(val, is_hot, full_mode);
                 }
             }
+            Expr::Pipeline { stages, .. } => {
+                for s in stages.iter_mut() {
+                    self.walk_expr(s, is_hot, full_mode);
+                }
+            }
+            Expr::Emit { value, .. } => {
+                self.walk_expr(value, is_hot, full_mode);
+            }
+            Expr::Copy { inner, .. } => {
+                self.walk_expr(inner, is_hot, full_mode);
+            }
             // Leaf nodes — no children to recurse into.
             Expr::IntLit { .. }
             | Expr::FloatLit { .. }

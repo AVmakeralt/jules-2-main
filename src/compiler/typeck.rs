@@ -123,6 +123,14 @@ pub enum Ty {
     /// The ECS world handle: `world`.
     World,
 
+    // ── Ownership-qualified types (v2) ──────────────────────────────────────
+    /// `own<T>` — owned type with transfer semantics on assignment.
+    Own(Box<Ty>),
+    /// `unique<T>` — no-alias pointer; at most one mutable reference.
+    Unique(Box<Ty>),
+    /// `shared<T>` — read-only shared reference; multiple readers, no writers.
+    Shared(Box<Ty>),
+
     // ── Inference variable ────────────────────────────────────────────────────
     /// An unresolved `_` slot; ID is unique within the current `InferCtx`.
     Infer(u32),
@@ -176,6 +184,21 @@ impl Ty {
         }
     }
 
+    /// True if this type is `Option<_>` (after resolving inference vars).
+    pub fn is_option(&self) -> bool {
+        matches!(self, Ty::Option(_))
+    }
+
+    /// True if this type is `Result<_, _>` (after resolving inference vars).
+    pub fn is_result(&self) -> bool {
+        matches!(self, Ty::Result { .. })
+    }
+
+    /// True if this type is `Option<_>` or `Result<_, _>`.
+    pub fn is_option_or_result(&self) -> bool {
+        self.is_option() || self.is_result()
+    }
+
     /// A human-readable name for error messages.
     pub fn display(&self) -> String {
         match self {
@@ -220,6 +243,9 @@ impl Ty {
             Ty::Struct(name) => name.clone(),
             Ty::Enum(name) => name.clone(),
             Ty::Component(name) => name.clone(),
+            Ty::Own(inner) => format!("own<{}>", inner.display()),
+            Ty::Unique(inner) => format!("unique<{}>", inner.display()),
+            Ty::Shared(inner) => format!("shared<{}>", inner.display()),
             Ty::World => "world".into(),
             Ty::Infer(id) => format!("_#{}", id),
         }
@@ -364,6 +390,9 @@ impl InferCtx {
             }
             Ty::Option(inner) => self.occurs_in(id, inner),
             Ty::Result { ok, err } => self.occurs_in(id, ok) || self.occurs_in(id, err),
+            Ty::Own(inner) | Ty::Unique(inner) | Ty::Shared(inner) => {
+                self.occurs_in(id, inner)
+            }
             Ty::Tuple(ts) => ts.iter().any(|t| self.occurs_in(id, t)),
             Ty::Array { elem, .. } => self.occurs_in(id, elem),
             Ty::Slice(inner) => self.occurs_in(id, inner),
@@ -933,6 +962,11 @@ impl TypeCk {
                 ok: Box::new(self.lower_ast_type(ok, span)),
                 err: Box::new(self.lower_ast_type(err, span)),
             },
+
+            // ── Ownership-qualified types (v2) ──────────────────────────
+            Type::Own(inner) => Ty::Own(Box::new(self.lower_ast_type(inner, span))),
+            Type::Unique(inner) => Ty::Unique(Box::new(self.lower_ast_type(inner, span))),
+            Type::Shared(inner) => Ty::Shared(Box::new(self.lower_ast_type(inner, span))),
         }
     }
 
@@ -1029,8 +1063,67 @@ impl TypeCk {
             env.bind(param.name.clone(), ty);
         }
 
+        // ── Type-check requires constraints (must be bool). ────────────────
+        for req in &f.requires {
+            let req_ty = self.check_expr(req, &mut env);
+            if !matches!(self.infer.resolve(&req_ty), Ty::Bool) {
+                self.diag.error(
+                    req.span(),
+                    format!(
+                        "`requires` constraint must be `bool`, got `{}`",
+                        self.infer.resolve(&req_ty).display()
+                    ),
+                );
+            }
+        }
+
+        // ── Type-check ensures constraints (must be bool). ─────────────────
+        // In `ensures` clauses, `result` refers to the function's return value.
+        let ret_ty = f
+            .ret_ty
+            .as_ref()
+            .map(|t| self.lower_ast_type(t, f.span))
+            .unwrap_or(Ty::Unit);
+        // Temporarily bind `result` in the environment for ensures checking.
+        let had_result = env.lookup("result").is_some();
+        // Save the old `result` binding (if any) so we can restore it after.
+        let old_result_ty: Option<Ty> = if had_result {
+            env.lookup("result").cloned()
+        } else {
+            None
+        };
+        env.bind("result", ret_ty.clone());
+        for ens in &f.ensures {
+            let ens_ty = self.check_expr(ens, &mut env);
+            if !matches!(self.infer.resolve(&ens_ty), Ty::Bool) {
+                self.diag.error(
+                    ens.span(),
+                    format!(
+                        "`ensures` constraint must be `bool`, got `{}`",
+                        self.infer.resolve(&ens_ty).display()
+                    ),
+                );
+            }
+        }
+        // Restore the old `result` binding (or remove it if it wasn't there).
+        if had_result {
+            if let Some(old_ty) = old_result_ty {
+                env.bind("result", old_ty);
+            }
+        } else {
+            // Remove the `result` binding by removing from the innermost scope.
+            if let Some(scope) = env.scopes.last_mut() {
+                scope.remove("result");
+            }
+        }
+
         // Check body.
         if let Some(body) = &f.body {
+            // ── Effect checking: pure functions cannot emit effects. ────────
+            if f.effect.as_deref() == Some("pure") {
+                self.check_pure_body(body, f.span, &f.name);
+            }
+
             let body_ty = self.check_block(body, &mut env);
             let ret_ty = f
                 .ret_ty
@@ -1074,6 +1167,143 @@ impl TypeCk {
         }
 
         env.pop_scope();
+    }
+
+    /// Recursively check that a `pure` function body contains no `emit`
+    /// expressions or `effect` statements.
+    fn check_pure_body(&mut self, block: &Block, fn_span: Span, fn_name: &str) {
+        for stmt in &block.stmts {
+            self.check_pure_stmt(stmt, fn_span, fn_name);
+        }
+        if let Some(tail) = &block.tail {
+            self.check_pure_expr(tail, fn_span, fn_name);
+        }
+    }
+
+    fn check_pure_stmt(&mut self, stmt: &Stmt, fn_span: Span, fn_name: &str) {
+        match stmt {
+            Stmt::Effect { span, .. } => {
+                self.diag.error(
+                    *span,
+                    format!(
+                        "pure function `{}` cannot emit effects; \
+                         remove `effect pure` or move the effect out",
+                        fn_name
+                    ),
+                );
+            }
+            Stmt::Expr { expr, .. } => self.check_pure_expr(expr, fn_span, fn_name),
+            Stmt::Let { init, .. } => {
+                if let Some(e) = init {
+                    self.check_pure_expr(e, fn_span, fn_name);
+                }
+            }
+            Stmt::If { cond, then, else_, .. } => {
+                self.check_pure_expr(cond, fn_span, fn_name);
+                self.check_pure_body(then, fn_span, fn_name);
+                if let Some(e) = else_ {
+                    match e.as_ref() {
+                        crate::compiler::ast::IfOrBlock::If(s) => {
+                            self.check_pure_stmt(s, fn_span, fn_name)
+                        }
+                        crate::compiler::ast::IfOrBlock::Block(b) => {
+                            self.check_pure_body(b, fn_span, fn_name)
+                        }
+                    }
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                self.check_pure_expr(cond, fn_span, fn_name);
+                self.check_pure_body(body, fn_span, fn_name);
+            }
+            Stmt::Loop { body, .. } => self.check_pure_body(body, fn_span, fn_name),
+            Stmt::ForIn { iter, body, .. } => {
+                self.check_pure_expr(iter, fn_span, fn_name);
+                self.check_pure_body(body, fn_span, fn_name);
+            }
+            Stmt::Match { expr, arms, .. } => {
+                self.check_pure_expr(expr, fn_span, fn_name);
+                for arm in arms {
+                    self.check_pure_expr(&arm.body, fn_span, fn_name);
+                }
+            }
+            Stmt::Return { value, .. } | Stmt::Break { value, .. } => {
+                if let Some(v) = value {
+                    self.check_pure_expr(v, fn_span, fn_name);
+                }
+            }
+            Stmt::Region { body, .. } => self.check_pure_body(body, fn_span, fn_name),
+            Stmt::UnsafeBlock { body, .. } => self.check_pure_body(body, fn_span, fn_name),
+            Stmt::EntityFor { body, .. } => self.check_pure_body(body, fn_span, fn_name),
+            Stmt::ParallelFor(pf) => self.check_pure_body(&pf.body, fn_span, fn_name),
+            _ => {}
+        }
+    }
+
+    fn check_pure_expr(&mut self, expr: &Expr, fn_span: Span, fn_name: &str) {
+        match expr {
+            Expr::Emit { span, .. } => {
+                self.diag.error(
+                    *span,
+                    format!(
+                        "pure function `{}` cannot emit effects; \
+                         use `match` or `?` to handle the value, \
+                         or remove `effect pure` from the function",
+                        fn_name
+                    ),
+                );
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                self.check_pure_expr(lhs, fn_span, fn_name);
+                self.check_pure_expr(rhs, fn_span, fn_name);
+            }
+            Expr::UnOp { expr, .. } => self.check_pure_expr(expr, fn_span, fn_name),
+            Expr::Call { func, args, .. } => {
+                self.check_pure_expr(func, fn_span, fn_name);
+                for a in args {
+                    self.check_pure_expr(a, fn_span, fn_name);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                self.check_pure_expr(receiver, fn_span, fn_name);
+                for a in args {
+                    self.check_pure_expr(a, fn_span, fn_name);
+                }
+            }
+            Expr::IfExpr { cond, then, else_, .. } => {
+                self.check_pure_expr(cond, fn_span, fn_name);
+                self.check_pure_body(then, fn_span, fn_name);
+                if let Some(e) = else_ {
+                    self.check_pure_body(e, fn_span, fn_name);
+                }
+            }
+            Expr::Block(b) => self.check_pure_body(b, fn_span, fn_name),
+            Expr::Tuple { elems, .. } | Expr::ArrayLit { elems, .. } => {
+                for e in elems {
+                    self.check_pure_expr(e, fn_span, fn_name);
+                }
+            }
+            Expr::Assign { target, value, .. } => {
+                self.check_pure_expr(target, fn_span, fn_name);
+                self.check_pure_expr(value, fn_span, fn_name);
+            }
+            Expr::Field { object, .. } => self.check_pure_expr(object, fn_span, fn_name),
+            Expr::Index { object, indices, .. } => {
+                self.check_pure_expr(object, fn_span, fn_name);
+                for i in indices {
+                    self.check_pure_expr(i, fn_span, fn_name);
+                }
+            }
+            Expr::Closure { body, .. } => self.check_pure_expr(body, fn_span, fn_name),
+            Expr::Pipeline { stages, .. } => {
+                for s in stages {
+                    self.check_pure_expr(s, fn_span, fn_name);
+                }
+            }
+            Expr::Copy { inner, .. } => self.check_pure_expr(inner, fn_span, fn_name),
+            _ => {}
+        }
+        let _ = fn_span;
     }
 
     // =========================================================================
@@ -1183,6 +1413,20 @@ impl TypeCk {
             Expr::Ident { span, name } => match env.lookup(name) {
                 Some(ty) => ty.clone(),
                 None => {
+                    // `result` is valid inside ensures clauses; it should be
+                    // bound by the ensures-checking logic. If it's still not
+                    // found here, provide a more specific error.
+                    if name == "result" {
+                        self.diag.error(
+                            *span,
+                            "`result` is only valid inside `ensures` clauses — \
+                             it refers to the function's return value. \
+                             Move this expression into an `ensures` postcondition, \
+                             or use the actual return expression directly."
+                                .to_string(),
+                        );
+                        return self.infer.fresh();
+                    }
                     if let Some(fi) = self.symbols.fns.get(name.as_str()) {
                         return Ty::FnPtr {
                             params: fi.params.iter().map(|(_, t)| t.clone()).collect(),
@@ -1369,27 +1613,105 @@ impl TypeCk {
             // ── Assignment ────────────────────────────────────────────────────
             Expr::Assign {
                 span,
-                op: _,
+                op,
                 target,
                 value,
             } => {
-                let t_ty = self.check_expr(target, env);
-                let v_ty = self.check_expr(value, env);
-                if !self.infer.unify(&t_ty, &v_ty) {
-                    self.diag.error(
-                        *span,
-                        format!(
-                            "type mismatch in assignment: cannot assign `{}` to a \
-                             binding of type `{}` — the value type must exactly match \
-                             the target type. Use an explicit cast (`value as {}`) \
-                             or change the binding's declared type.",
-                            v_ty.display(),
-                            t_ty.display(),
-                            t_ty.display()
-                        ),
-                    );
+                use crate::compiler::ast::AssignOpKind;
+                match op {
+                    AssignOpKind::Assign => {
+                        // In Jules v2, `x = value` where x is undeclared creates a
+                        // new binding. When x is already declared, it's a rebinding.
+                        if let Expr::Ident { name, .. } = target.as_ref() {
+                            let v_ty = self.check_expr(value, env);
+                            if env.lookup(name).is_none() && !self.symbols.fns.contains_key(name) && !Self::is_runtime_builtin_ident(name) {
+                                // New binding — bind with the value's type.
+                                env.bind(name.clone(), v_ty.clone());
+                            }
+                            // For already-declared vars, unify (rebinding/shadowing handled by sema).
+                            Ty::Unit
+                        } else {
+                            // Non-ident target: check normally.
+                            let t_ty = self.check_expr(target, env);
+                            let v_ty = self.check_expr(value, env);
+                            if !self.can_assign(&t_ty, &v_ty) {
+                                self.diag.error(
+                                    *span,
+                                    format!(
+                                        "type mismatch in assignment: cannot assign `{}` to a \
+                                         binding of type `{}` — use an explicit cast \
+                                         (`value as {}`) or change the binding's declared type.",
+                                        v_ty.display(),
+                                        t_ty.display(),
+                                        t_ty.display()
+                                    ),
+                                );
+                            }
+                            Ty::Unit
+                        }
+                    }
+                    AssignOpKind::MutAssign => {
+                        // `:=` is explicit mutation.
+                        // On undeclared variable: creates new mutable binding (like `let mut`).
+                        // On declared variable: mutates it.
+                        if let Expr::Ident { name, .. } = target.as_ref() {
+                            if env.lookup(name).is_none() {
+                                // Undeclared: create new mutable binding with value's type
+                                let v_ty = self.check_expr(value, env);
+                                env.bind(name, v_ty.clone());
+                                Ty::Unit
+                            } else {
+                                // Declared: type-check mutation
+                                let t_ty = self.check_expr(target, env);
+                                let v_ty = self.check_expr(value, env);
+                                if !self.can_assign(&t_ty, &v_ty) {
+                                    self.diag.error(
+                                        *span,
+                                        format!(
+                                            "type mismatch in mutation assignment: cannot assign `{}` \
+                                             to a variable of type `{}`",
+                                            v_ty.display(),
+                                            t_ty.display()
+                                        ),
+                                    );
+                                }
+                                Ty::Unit
+                            }
+                        } else {
+                            let t_ty = self.check_expr(target, env);
+                            let v_ty = self.check_expr(value, env);
+                            if !self.can_assign(&t_ty, &v_ty) {
+                                self.diag.error(
+                                    *span,
+                                    format!(
+                                        "type mismatch in mutation assignment: cannot assign `{}` \
+                                         to a variable of type `{}`",
+                                        v_ty.display(),
+                                        t_ty.display()
+                                    ),
+                                );
+                            }
+                            Ty::Unit
+                        }
+                    }
+                    _ => {
+                        // Compound assignment (+=, -=, etc.)
+                        let t_ty = self.check_expr(target, env);
+                        let v_ty = self.check_expr(value, env);
+                        if !self.can_assign(&t_ty, &v_ty) {
+                            self.diag.error(
+                                *span,
+                                format!(
+                                    "type mismatch in compound assignment: cannot assign `{}` \
+                                     to a variable of type `{}`",
+                                    v_ty.display(),
+                                    t_ty.display()
+                                ),
+                            );
+                        }
+                        Ty::Unit
+                    }
                 }
-                Ty::Unit
             }
 
             // ── Field access ───────────────────────────────────────────────────
@@ -1773,7 +2095,152 @@ impl TypeCk {
                     self.infer.fresh()
                 }
             }
+
+            // ── Pipeline expression (v2) ───────────────────────────────────
+            Expr::Pipeline { span, stages } => {
+                if stages.is_empty() {
+                    self.diag.error(*span, "pipeline expression must have at least one stage");
+                    return self.infer.fresh();
+                }
+                let mut ty = self.check_expr(&stages[0], env);
+                for stage in &stages[1..] {
+                    // Each stage after the first should be a function call.
+                    // `y |> add(5)` means `add(y, 5)` — the pipeline value
+                    // becomes the first argument of the call.
+                    match stage {
+                        Expr::Call { func, args, named, span: call_span } => {
+                            // Type-check the function being called.
+                            let func_ty = self.check_expr(func, env);
+                            // The pipeline value is prepended as the first argument.
+                            // Check if this is consistent with the function signature.
+                            if let Ty::FnPtr { params, ret } = &func_ty {
+                                // Check that the pipeline value type matches the
+                                // first parameter (with widening allowed).
+                                if !params.is_empty() {
+                                    if !self.infer.unify(&params[0], &ty)
+                                        && !self.can_widen_ints(&ty, &params[0])
+                                    {
+                                        self.diag.error(
+                                            *call_span,
+                                            format!(
+                                                "pipeline stage type mismatch: \
+                                                 first parameter expects `{}` but pipeline \
+                                                 provides `{}`",
+                                                params[0].display(),
+                                                ty.display()
+                                            ),
+                                        );
+                                    }
+                                }
+                                ty = ret.as_ref().clone();
+                            } else {
+                                // Function type not resolved; just propagate.
+                                // Still type-check the arguments for cascading errors.
+                                for a in args {
+                                    self.check_expr(a, env);
+                                }
+                                for (_, a) in named {
+                                    self.check_expr(a, env);
+                                }
+                                ty = self.infer.fresh();
+                            }
+                        }
+                        _ => {
+                            // Non-call stage: try to use as a simple function.
+                            let func_ty = self.check_expr(stage, env);
+                            if let Ty::FnPtr { params, ret } = &func_ty {
+                                if !params.is_empty() {
+                                    if !self.infer.unify(&params[0], &ty)
+                                        && !self.can_widen_ints(&ty, &params[0])
+                                    {
+                                        self.diag.error(
+                                            stage.span(),
+                                            format!(
+                                                "pipeline stage type mismatch: expected `{}` but got `{}`",
+                                                params[0].display(),
+                                                ty.display()
+                                            ),
+                                        );
+                                    }
+                                    ty = ret.as_ref().clone();
+                                } else {
+                                    ty = ret.as_ref().clone();
+                                }
+                            } else {
+                                // Not a function pointer; just propagate the type
+                                ty = func_ty;
+                            }
+                        }
+                    }
+                }
+                ty
+            }
+
+            // ── Emit expression (v2) ──────────────────────────────────────
+            Expr::Emit { span, value, .. } => {
+                let _ = self.check_expr(value, env);
+                self.infer.fresh() // emit returns unit
+            }
+
+            // ── Copy expression (v2) ──────────────────────────────────────
+            Expr::Copy { inner, .. } => self.check_expr(inner, env).clone(),
         }
+    }
+
+    // =========================================================================
+    // INTEGER WIDENING
+    // =========================================================================
+
+    /// Check if two integer scalar types can be implicitly widened.
+    /// Returns true if one type can be widened to the other (e.g. i32 → i64).
+    /// This is symmetric — it returns true if either direction works.
+    fn can_widen_ints(&self, a: &Ty, b: &Ty) -> bool {
+        match (self.infer.resolve(a), self.infer.resolve(b)) {
+            (Ty::Scalar(ea), Ty::Scalar(eb)) => {
+                self.can_widen_elem(ea, eb) || self.can_widen_elem(eb, ea)
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if `from` can be implicitly widened to `to`.
+    fn can_widen_elem(&self, from: &ElemType, to: &ElemType) -> bool {
+        use ElemType::*;
+        match (from, to) {
+            // Same signed family widening
+            (I8, I16 | I32 | I64) => true,
+            (I16, I32 | I64) => true,
+            (I32, I64) => true,
+            // Same unsigned family widening
+            (U8, U16 | U32 | U64) => true,
+            (U16, U32 | U64) => true,
+            (U32, U64) => true,
+            // Unsigned to signed widening (safe when the signed type is larger)
+            (U8, I16 | I32 | I64) => true,
+            (U16, I32 | I64) => true,
+            (U32, I64) => true,
+            // Reverse direction: the wider type is already the target
+            (I16 | I32 | I64, I8) => false,
+            (I32 | I64, I16) => false,
+            (I64, I32) => false,
+            (U16 | U32 | U64, U8) => false,
+            (U32 | U64, U16) => false,
+            (U64, U32) => false,
+            // Usize is 64-bit
+            (Usize, U64) | (U64, Usize) => true,
+            (U8 | U16 | U32, Usize) => true,
+            (I8 | I16 | I32, Usize) => true,
+            _ => false,
+        }
+    }
+
+    /// Check if `value_ty` can be assigned to `target_ty`, considering
+    /// implicit integer widening.
+    fn can_assign(&mut self, target_ty: &Ty, value_ty: &Ty) -> bool {
+        if self.infer.unify(target_ty, value_ty) {
+            return true;
+        }
+        self.can_widen_ints(value_ty, target_ty)
     }
 
     // =========================================================================
@@ -1799,12 +2266,62 @@ impl TypeCk {
             | BinOpKind::Le
             | BinOpKind::Gt
             | BinOpKind::Ge => {
-                if !self.infer.unify(&l, &r) {
+                // ── Total types: disallow comparing Option<T> with T ──────
+                let l_resolved = self.infer.resolve(&l);
+                let r_resolved = self.infer.resolve(&r);
+                if l_resolved.is_option() && !r_resolved.is_option() {
+                    self.diag.error(
+                        span,
+                        format!(
+                            "cannot compare `{}` with `{}` — \
+                             comparing `Option<T>` with `T` is not allowed; \
+                             use `match` or `?` to extract the value first",
+                            l.display(),
+                            r.display()
+                        ),
+                    );
+                } else if r_resolved.is_option() && !l_resolved.is_option() {
+                    self.diag.error(
+                        span,
+                        format!(
+                            "cannot compare `{}` with `{}` — \
+                             comparing `T` with `Option<T>` is not allowed; \
+                             use `match` or `?` to extract the value first",
+                            l.display(),
+                            r.display()
+                        ),
+                    );
+                } else if l_resolved.is_result() && !r_resolved.is_result() {
+                    self.diag.error(
+                        span,
+                        format!(
+                            "cannot compare `{}` with `{}` — \
+                             comparing `Result<T, E>` with a non-Result type is not allowed; \
+                             use `match` or `?` to extract the value first",
+                            l.display(),
+                            r.display()
+                        ),
+                    );
+                } else if r_resolved.is_result() && !l_resolved.is_result() {
+                    self.diag.error(
+                        span,
+                        format!(
+                            "cannot compare `{}` with `{}` — \
+                             comparing a non-Result type with `Result<T, E>` is not allowed; \
+                             use `match` or `?` to extract the value first",
+                            l.display(),
+                            r.display()
+                        ),
+                    );
+                }
+
+                if !self.infer.unify(&l, &r) && !self.can_widen_ints(&l, &r) {
                     self.diag.error(
                         span,
                         format!(
                             "cannot compare `{lty}` with `{rty}` — both sides of a \
-                             comparison operator must have the same type. \
+                             comparison operator must have the same type (or be \
+                             implicitly widening integer types). \
                              Cast one side to match the other (e.g. `x as {rty}`) \
                              or ensure both operands are produced by the same type.",
                             lty = l.display(),
@@ -1842,6 +2359,32 @@ impl TypeCk {
             | BinOpKind::Div
             | BinOpKind::Rem
             | BinOpKind::FloorDiv => {
+                // ── Total types: Option/Result cannot be used in arithmetic ──
+                let l_resolved = self.infer.resolve(&l);
+                let r_resolved = self.infer.resolve(&r);
+                if l_resolved.is_option_or_result() {
+                    self.diag.error(
+                        span,
+                        format!(
+                            "cannot use Option/Result value in arithmetic without unwrapping; \
+                             use `match` or `?` to extract the value. \
+                             Left operand has type `{}`",
+                            l.display()
+                        ),
+                    );
+                }
+                if r_resolved.is_option_or_result() {
+                    self.diag.error(
+                        span,
+                        format!(
+                            "cannot use Option/Result value in arithmetic without unwrapping; \
+                             use `match` or `?` to extract the value. \
+                             Right operand has type `{}`",
+                            r.display()
+                        ),
+                    );
+                }
+
                 // Vector × scalar or scalar × vector
                 if let (Ty::Vec { size, family }, ref rty) | (ref rty, Ty::Vec { size, family }) =
                     (&l, &r)
@@ -1920,13 +2463,14 @@ impl TypeCk {
                     }
                 }
                 // Plain numeric
-                if !self.infer.unify(&l, &r) {
+                if !self.infer.unify(&l, &r) && !self.can_widen_ints(&l, &r) {
                     self.diag.error(
                         span,
                         format!(
                             "type mismatch in arithmetic: \
                              cannot apply `{op}` to `{lt}` and `{rt}`. \
-                             Both operands must have the same numeric type. \
+                             Both operands must have the same numeric type (or \
+                             be implicitly widening integer types). \
                              Use an explicit cast: `lhs as {rt}` or `rhs as {lt}`.",
                             op = format!("{:?}", op).to_lowercase(),
                             lt = l.display(),
@@ -1943,6 +2487,17 @@ impl TypeCk {
             | BinOpKind::BitXor
             | BinOpKind::Shl
             | BinOpKind::Shr => {
+                // ── Total types: Option/Result cannot be used in bitwise ops ──
+                let l_resolved = self.infer.resolve(&l);
+                let r_resolved = self.infer.resolve(&r);
+                if l_resolved.is_option_or_result() || r_resolved.is_option_or_result() {
+                    self.diag.error(
+                        span,
+                        "cannot use Option/Result value in bitwise operations without unwrapping; \
+                         use `match` or `?` to extract the value".to_string(),
+                    );
+                }
+
                 if !l.is_numeric() || !r.is_numeric() {
                     self.diag.error(
                         span,
@@ -2455,7 +3010,7 @@ impl TypeCk {
                         for (i, ((_, expected), actual)) in
                             fi.params.iter().zip(arg_tys.iter()).enumerate()
                         {
-                            if !self.infer.unify(expected, actual) {
+                            if !self.infer.unify(expected, actual) && !self.can_widen_ints(actual, expected) {
                                 self.diag.error(
                                     span,
                                     format!(
@@ -2634,7 +3189,7 @@ impl TypeCk {
                     .map(|e| self.check_expr(e, env))
                     .unwrap_or_else(|| self.infer.fresh());
 
-                if !self.infer.unify(&declared, &init_ty) {
+                if !self.infer.unify(&declared, &init_ty) && !self.can_widen_ints(&init_ty, &declared) {
                     self.diag.error(
                         *span,
                         format!(
@@ -2646,6 +3201,7 @@ impl TypeCk {
                 }
 
                 // Bind pattern names.
+                // When widening applies, use the declared (wider) type.
                 self.bind_pattern(pattern, &declared, env);
             }
 
@@ -2820,6 +3376,28 @@ impl TypeCk {
             }
             Stmt::Atomic(ab) => {
                 self.check_block(&ab.body, env);
+            }
+
+            // ── Jules v2 statements ────────────────────────────────────────
+            Stmt::Effect { body, .. } => {
+                self.check_block(body, env);
+            }
+            Stmt::Region { body, .. } => {
+                self.check_block(body, env);
+            }
+            Stmt::TaskSpawn { task_expr, .. } => {
+                self.check_expr(task_expr, env);
+            }
+            Stmt::TaskJoin { .. } => {}
+            Stmt::UnsafeBlock { body, .. } => {
+                self.check_block(body, env);
+            }
+            Stmt::IntrinsicsBlock { .. } => {}
+            Stmt::Requires { condition, .. } => {
+                self.check_expr(condition, env);
+            }
+            Stmt::Ensures { condition, .. } => {
+                self.check_expr(condition, env);
             }
         }
     }
@@ -4527,6 +5105,9 @@ mod tests {
                 tail: None,
             }),
             is_async: false,
+            requires: vec![],
+            ensures: vec![],
+            effect: None,
         };
 
         let program = Program {
@@ -4795,6 +5376,20 @@ fn annotate_stmt(stmt: &mut Stmt) {
         Stmt::Atomic(ab) => {
             annotate_block(&mut ab.body);
         }
+        Stmt::Effect { body, .. } => annotate_block(body),
+        Stmt::Region { body, .. } => annotate_block(body),
+        Stmt::TaskSpawn { task_expr, .. } => {
+            annotate_expr_with_default(task_expr, ElemType::I64);
+        }
+        Stmt::TaskJoin { .. } => {}
+        Stmt::UnsafeBlock { body, .. } => annotate_block(body),
+        Stmt::IntrinsicsBlock { .. } => {}
+        Stmt::Requires { condition, .. } => {
+            annotate_expr_with_default(condition, ElemType::I64);
+        }
+        Stmt::Ensures { condition, .. } => {
+            annotate_expr_with_default(condition, ElemType::I64);
+        }
     }
 }
 
@@ -4904,6 +5499,13 @@ fn annotate_expr_with_default(expr: &mut Expr, default: ElemType) {
                 annotate_expr_with_default(e, default.clone());
             }
         }
+        Expr::Pipeline { stages, .. } => {
+            for s in stages {
+                annotate_expr_with_default(s, default.clone());
+            }
+        }
+        Expr::Emit { value, .. } => annotate_expr_with_default(value, default),
+        Expr::Copy { inner, .. } => annotate_expr_with_default(inner, default),
         // Leaf expressions with no sub-expressions to walk.
         Expr::FloatLit { .. }
         | Expr::BoolLit { .. }

@@ -1151,8 +1151,16 @@ impl BytecodeCompiler {
             Stmt::Item(_) => {
                 // Nested items not supported in bytecode compilation
             }
-            Stmt::ParallelFor(_) | Stmt::Spawn(_) | Stmt::Sync(_) | Stmt::Atomic(_) => {
-                // Parallelism statements not yet supported in bytecode
+            Stmt::ParallelFor(_) | Stmt::Spawn(_) | Stmt::Sync(_) | Stmt::Atomic(_) |
+            Stmt::Effect { .. } | Stmt::Region { .. } | Stmt::TaskJoin { .. } |
+            Stmt::UnsafeBlock { .. } | Stmt::IntrinsicsBlock { .. } |
+            Stmt::Requires { .. } | Stmt::Ensures { .. } => {
+                // Parallelism / v2 statements not yet supported in bytecode
+                self.emit(Instr::Nop);
+            }
+            Stmt::TaskSpawn { task_expr, .. } => {
+                // Task spawn not yet supported in bytecode; compile expr as side-effect
+                let _ = task_expr;
                 self.emit(Instr::Nop);
             }
         }
@@ -1565,6 +1573,33 @@ impl BytecodeCompiler {
             Expr::TensorConcat { .. } | Expr::KronProd { .. } | Expr::OuterProd { .. } => {
                 // Tensor operations not fully supported in bytecode yet
                 self.emit(Instr::LoadConstUnit { dst });
+            }
+
+            // ── v2 expressions ──────────────────────────────────────────────
+            Expr::Pipeline { stages, .. } => {
+                // Pipeline: compile each stage, last one writes to dst
+                if stages.is_empty() {
+                    self.emit(Instr::LoadConstUnit { dst });
+                } else {
+                    for (i, stage) in stages.iter().enumerate() {
+                        if i == stages.len() - 1 {
+                            self.compile_expr(stage, dst)?;
+                        } else {
+                            let scratch = self.alloc_slot();
+                            self.compile_expr(stage, scratch)?;
+                        }
+                    }
+                }
+            }
+            Expr::Emit { value, .. } => {
+                // Emit: compile the value, result is unit
+                let scratch = self.alloc_slot();
+                self.compile_expr(value, scratch)?;
+                self.emit(Instr::LoadConstUnit { dst });
+            }
+            Expr::Copy { inner, .. } => {
+                // Copy: compile inner expression
+                self.compile_expr(inner, dst)?;
             }
         }
         Ok(())

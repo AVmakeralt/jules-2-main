@@ -238,6 +238,42 @@ pub enum TokenKind {
     /// `atomic`      — `atomic { … }` single-instruction atomic region
     KwAtomic,
 
+    // ── Ownership / effects system keywords ────────────────────────────
+    /// `own`       — explicit owned value marker
+    KwOwn,
+    /// `copy`      — explicit copy expression: `copy x`
+    KwCopy,
+    /// `shared`    — shared ownership marker: `shared atomic(x)`
+    KwShared,
+
+    // ── Structured concurrency keywords ────────────────────────────────
+    /// `task`      — declares a task abstraction: `task t = spawn f()`
+    KwTask,
+    /// `join`      — waits for task completion: `join t`
+    KwJoin,
+
+    // ── Effects system keywords ────────────────────────────────────────
+    /// `effect`    — declares an effect block: `effect io { ... }`
+    KwEffect,
+    /// `emit`      — emits an effect: `emit stdout "hello"`
+    KwEmit,
+
+    // ── Memory model keywords ──────────────────────────────────────────
+    /// `region`    — region-based memory block: `region R { ... }`
+    KwRegion,
+
+    // ── Constraints / contracts keywords ───────────────────────────────
+    /// `requires`  — precondition: `requires n > 0`
+    KwRequires,
+    /// `ensures`   — postcondition: `ensures result >= 0`
+    KwEnsures,
+
+    // ── Safety keywords ────────────────────────────────────────────────
+    /// `unsafe`    — unsafe escape hatch block: `unsafe { ... }`
+    KwUnsafe,
+    /// `intrinsics` — intrinsics block: `intrinsics { ... }`
+    KwIntrinsics,
+
     // ── Neural-network keywords (Unique Feature 1) ────────────────────────
     /// `model`       — declares a neural-network model
     KwModel,
@@ -335,6 +371,27 @@ pub enum TokenKind {
     AtBenchmark,   // @benchmark   — mark function as a microbenchmark
     AtDeprecated,  // @deprecated  — emit deprecation warning at call sites
     AtAi,          // @ai          — neural network injection into agent
+
+    // ── New Jules v2 annotations ──────────────────────────────────────
+    AtTarget,        // @target(zen4)     — target architecture
+    AtPrefer,        // @prefer(lea)      — instruction preference hint
+    AtBackend,       // @backend(xla)     — backend selection
+    AtVectorize,     // @vectorize         — force vectorization
+    AtFusion,        // @fusion(aggressive) — fusion control
+    AtHot,           // @hot              — hot path annotation
+    AtIntent,        // @intent("throughput") — execution intent
+    AtCost,          // @cost("low")      — cost annotation
+    AtBudget,        // @budget(cycles=100) — cycle budget
+    AtDeterministic, // @deterministic    — reproducibility flag
+    AtStochastic,    // @stochastic(seed=42) — stochastic control
+    AtNofuse,        // @nofuse           — prevent fusion
+    AtFuse,          // @fuse             — enable fusion
+    AtLayout,        // @layout("NHWC")   — data layout control
+    AtAligned,       // @aligned(64)      — alignment control
+    AtExplain,       // @explain          — IR introspection
+    AtParallelSafe,  // @parallel_safe    — safe for parallel execution
+    AtOpaque,        // @opaque           — prevent optimization
+
     AtCustom(String), // @PPO, @DQN, @SAC, etc.
 
     // ── Superoptimizer selection (file-level directives) ─────────────────
@@ -366,6 +423,7 @@ pub enum TokenKind {
     // Bitwise
     Ampersand,   // &
     Pipe,        // |
+    PipeGt,        // |>  — pipeline operator
     Caret,       // ^
     Tilde,       // ~
     LtLt,        // <<
@@ -395,6 +453,7 @@ pub enum TokenKind {
     PipeEq,      // |=
     CaretEq,     // ^=
     MatMulEq,    // @=  — in-place matrix multiply
+    ColonEq,        // :=  — mutation assignment
 
     // Other
     Arrow,       // ->
@@ -436,6 +495,8 @@ impl fmt::Display for TokenKind {
             TokenKind::HadamardMul           => write!(f, "`.*`"),
             TokenKind::HadamardDiv           => write!(f, "`./`"),
             TokenKind::TensorConcat          => write!(f, "`++`"),
+            TokenKind::ColonEq              => write!(f, "`:=`"),
+            TokenKind::PipeGt               => write!(f, "`|>`"),
             TokenKind::Eof                   => write!(f, "<eof>"),
             other                            => write!(f, "{:?}", other),
         }
@@ -537,6 +598,30 @@ fn keyword(s: &str) -> Option<TokenKind> {
         "spawn"       => TokenKind::KwSpawn,
         "sync"        => TokenKind::KwSync,
         "atomic"      => TokenKind::KwAtomic,
+
+        // Ownership / effects
+        "own"       => TokenKind::KwOwn,
+        "copy"      => TokenKind::KwCopy,
+        "shared"    => TokenKind::KwShared,
+
+        // Structured concurrency
+        "task"      => TokenKind::KwTask,
+        "join"      => TokenKind::KwJoin,
+
+        // Effects system
+        "effect"    => TokenKind::KwEffect,
+        "emit"      => TokenKind::KwEmit,
+
+        // Memory model
+        "region"    => TokenKind::KwRegion,
+
+        // Constraints / contracts
+        "requires"  => TokenKind::KwRequires,
+        "ensures"   => TokenKind::KwEnsures,
+
+        // Safety
+        "unsafe"    => TokenKind::KwUnsafe,
+        "intrinsics" => TokenKind::KwIntrinsics,
 
         // Neural-network (Unique Feature 1)
         "model"       => TokenKind::KwModel,
@@ -1108,6 +1193,25 @@ impl<'src> Lexer<'src> {
             "benchmark"   => TokenKind::AtBenchmark,
             "deprecated"  => TokenKind::AtDeprecated,
             "ai"          => TokenKind::AtAi,
+            // ── New Jules v2 annotations ──────────────────────────────────
+            "target"       => TokenKind::AtTarget,
+            "prefer"       => TokenKind::AtPrefer,
+            "backend"      => TokenKind::AtBackend,
+            "vectorize"    => TokenKind::AtVectorize,
+            "fusion"       => TokenKind::AtFusion,
+            "hot"          => TokenKind::AtHot,
+            "intent"       => TokenKind::AtIntent,
+            "cost"         => TokenKind::AtCost,
+            "budget"       => TokenKind::AtBudget,
+            "deterministic" => TokenKind::AtDeterministic,
+            "stochastic"   => TokenKind::AtStochastic,
+            "nofuse"       => TokenKind::AtNofuse,
+            "fuse"         => TokenKind::AtFuse,
+            "layout"       => TokenKind::AtLayout,
+            "aligned"      => TokenKind::AtAligned,
+            "explain"      => TokenKind::AtExplain,
+            "parallel_safe" => TokenKind::AtParallelSafe,
+            "opaque"       => TokenKind::AtOpaque,
             // ── Superoptimizer selection ──────────────────────────────────
             "ml_superopt"   => TokenKind::AtMlSuperopt,
             "mcts_superopt" => TokenKind::AtMctsSuperopt,
@@ -1258,6 +1362,8 @@ impl<'src> Lexer<'src> {
             '|' => {
                 if self.eat('|') {
                     tok!(TokenKind::PipePipe, "||")
+                } else if self.eat('>') {
+                    tok!(TokenKind::PipeGt, "|>")
                 } else if self.eat('=') {
                     tok!(TokenKind::PipeEq, "|=")
                 } else {
@@ -1320,7 +1426,9 @@ impl<'src> Lexer<'src> {
 
             // ── Colon ─────────────────────────────────────────────────────
             ':' => {
-                if self.eat(':') {
+                if self.eat('=') {
+                    tok!(TokenKind::ColonEq, ":=")
+                } else if self.eat(':') {
                     tok!(TokenKind::ColonColon, "::")
                 } else {
                     tok!(TokenKind::Colon, ":")

@@ -452,7 +452,10 @@ impl PartialEvaluator {
             | Expr::VecCtor { .. }
             | Expr::Path { .. }
             | Expr::MethodCall { .. }
-            | Expr::Assign { .. } => BindingTime::Dynamic,
+            | Expr::Assign { .. }
+            | Expr::Pipeline { .. }
+            | Expr::Emit { .. }
+            | Expr::Copy { .. } => BindingTime::Dynamic,
         }
     }
 

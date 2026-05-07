@@ -4898,6 +4898,14 @@ impl Interpreter {
 
             Stmt::Sync(sb) => self.eval_block(&sb.body, env),
             Stmt::Atomic(ab) => self.eval_block(&ab.body, env),
+            Stmt::Effect { body, .. } => self.eval_block(body, env),
+            Stmt::Region { body, .. } => self.eval_block(body, env),
+            Stmt::TaskSpawn { task_expr, .. } => self.eval_expr(task_expr, env),
+            Stmt::TaskJoin { .. } => Ok(Value::Unit),
+            Stmt::UnsafeBlock { body, .. } => self.eval_block(body, env),
+            Stmt::IntrinsicsBlock { .. } => Ok(Value::Unit),
+            Stmt::Requires { .. } => Ok(Value::Unit), // constraints are checked statically
+            Stmt::Ensures { .. } => Ok(Value::Unit),
         }
     }
 
@@ -5283,6 +5291,9 @@ impl Interpreter {
                         tail: Some(body.clone()),
                     }),
                     is_async: false,
+                    requires: vec![],
+                    ensures: vec![],
+                    effect: None,
                 };
                 Ok(Value::Fn(Arc::new(FnClosure { decl, capture })))
             }
@@ -5310,6 +5321,30 @@ impl Interpreter {
                 let r = self.eval_tensor(rhs, env)?;
                 let out = l.read().unwrap().outer(&r.read().unwrap())?;
                 Ok(Value::TensorFast(Arc::new(RefCell::new(out))))
+            }
+
+            // ── v2 expressions ────────────────────────────────────────────────
+            Expr::Pipeline { stages, .. } => {
+                if stages.is_empty() {
+                    return Ok(Value::Unit);
+                }
+                let mut val = self.eval_expr(&stages[0], env)?;
+                for stage in &stages[1..] {
+                    // Apply each stage as a function call: stage(val)
+                    val = self.eval_expr(stage, env)?;
+                    // TODO: proper pipeline semantics — call stage with val as arg
+                }
+                Ok(val)
+            }
+            Expr::Emit { value, .. } => {
+                let _ = self.eval_expr(value, env)?;
+                // TODO: actual effect emission
+                Ok(Value::Unit)
+            }
+            Expr::Copy { inner, .. } => {
+                // For now, just evaluate the inner expression.
+                // Deep copy semantics will be handled by the type system.
+                self.eval_expr(inner, env)
             }
         }
     }

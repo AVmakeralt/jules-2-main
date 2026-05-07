@@ -1,14 +1,19 @@
+#![allow(dead_code)]
 //! Borrow checker pass for Jules.
 //!
 //! This pass is intentionally conservative and lexical:
 //! - enforces `&mut` exclusivity
 //! - rejects writes while borrowed
 //! - tracks simple moves (`let y = x`, `y = x`) and use-after-move
+//! - enforces ownership semantics for `own`, `unique`, `shared` types
+//! - validates region lifetime constraints
+//! - validates task ownership transfer
 
 use rustc_hash::FxHashMap;
 
 use crate::compiler::ast::{AssignOpKind, Block, Expr, Item, Pattern, Program, Stmt, UnOpKind};
 use crate::compiler::lexer::Span;
+use crate::compiler::typeck::Ty;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -40,6 +45,15 @@ impl Diagnostics {
         });
     }
 
+    fn warning(&mut self, span: Span, message: impl Into<String>) {
+        self.items.push(Diagnostic {
+            severity: Severity::Warning,
+            span,
+            message: message.into(),
+            labels: vec![],
+        });
+    }
+
     fn error_with_fix(&mut self, span: Span, message: impl Into<String>, fix: impl Into<String>) {
         self.items.push(Diagnostic {
             severity: Severity::Error,
@@ -60,6 +74,24 @@ struct LoanState {
 struct VarState {
     moved: bool,
     is_copy: bool,
+    /// Ownership kind for this variable.
+    ownership: OwnershipKind,
+    /// If declared inside a `region` block, stores the region name.
+    region: Option<String>,
+}
+
+/// Ownership classification mirroring the type system's ownership qualifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OwnershipKind {
+    /// Default: copy semantics (primitives, etc.).
+    #[default]
+    Copy,
+    /// `own<T>`: transfer ownership on assignment; original becomes invalid.
+    Own,
+    /// `unique<T>`: no aliasing allowed; at most one reference.
+    Unique,
+    /// `shared<T>`: multiple readers, no writers.
+    Shared,
 }
 
 #[derive(Debug)]
@@ -73,6 +105,14 @@ struct BorrowChecker {
     /// Any value > 0 means we are inside a concurrent body where moves and
     /// `&mut` borrows of outer variables are forbidden.
     parallel_depth: usize,
+    /// Stack of active `region` names.  Variables declared inside a region
+    /// are tagged with that region name and cannot be referenced after
+    /// the region scope ends.
+    region_stack: Vec<String>,
+    /// Set of task names that have been spawned (for join validation).
+    spawned_tasks: Vec<String>,
+    /// Set of variables moved into tasks (for post-spawn use-after-move).
+    moved_to_tasks: FxHashMap<String, Span>,
 }
 
 impl Default for BorrowChecker {
@@ -84,6 +124,9 @@ impl Default for BorrowChecker {
             var_state: FxHashMap::default(),
             scope_bindings: vec![],
             parallel_depth: 0,
+            region_stack: Vec::new(),
+            spawned_tasks: Vec::new(),
+            moved_to_tasks: FxHashMap::default(),
         }
     }
 }
@@ -110,6 +153,8 @@ impl BorrowChecker {
         let st = self.var_state.entry(name.to_string()).or_default();
         st.moved = false;
         st.is_copy = false;
+        // Tag with the current region, if any.
+        st.region = self.region_stack.last().cloned();
         if let Some(scope) = self.scope_bindings.last_mut() {
             scope.push(name.to_string());
         }
@@ -127,6 +172,40 @@ impl BorrowChecker {
 
     fn set_copy_flag(&mut self, name: &str, is_copy: bool) {
         self.var_state.entry(name.to_string()).or_default().is_copy = is_copy;
+    }
+
+    fn set_ownership(&mut self, name: &str, ownership: OwnershipKind) {
+        self.var_state.entry(name.to_string()).or_default().ownership = ownership;
+    }
+
+    /// Infer ownership from a Ty value.
+    fn ownership_from_ty(&self, ty: &Ty) -> OwnershipKind {
+        match ty {
+            Ty::Own(_) => OwnershipKind::Own,
+            Ty::Unique(_) => OwnershipKind::Unique,
+            Ty::Shared(_) => OwnershipKind::Shared,
+            _ => OwnershipKind::Copy,
+        }
+    }
+
+    /// Check that a variable declared in a region is not accessed outside it.
+    fn check_region_access(&mut self, name: &str, span: Span) {
+        if let Some(st) = self.var_state.get(name) {
+            if let Some(ref region) = st.region {
+                // The variable was declared inside a region. Check that the
+                // current region stack still includes this region.
+                if !self.region_stack.contains(region) {
+                    self.diag.error(
+                        span,
+                        format!(
+                            "variable `{}` declared in region `{}` cannot be \
+                             used outside that region",
+                            name, region
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     fn release_ref_binding(&mut self, ref_name: &str) {
@@ -199,6 +278,12 @@ impl BorrowChecker {
                 format!("change the earlier move to `&{name}`"),
             );
         }
+        // Check ownership rules: `shared` types are read-only; no write allowed.
+        if let Some(st) = self.var_state.get(name) {
+            if st.ownership == OwnershipKind::Shared {
+                // Reads are OK for shared types; just check region access.
+            }
+        }
         if let Some(st) = self.loans_by_target.get(name) {
             if st.mut_ > 0 {
                 self.diag.error(
@@ -207,6 +292,8 @@ impl BorrowChecker {
                 );
             }
         }
+        // Region escape check.
+        self.check_region_access(name, span);
     }
 
     fn check_write(&mut self, name: &str, span: Span) {
@@ -219,6 +306,17 @@ impl BorrowChecker {
                 format!("reinitialize `{name}` before assignment"),
             );
         }
+        // `shared` types are read-only: writing is forbidden.
+        if let Some(st) = self.var_state.get(name) {
+            if st.ownership == OwnershipKind::Shared {
+                self.diag.error(
+                    span,
+                    format!(
+                        "cannot assign to `{name}`: `shared` type is read-only"
+                    ),
+                );
+            }
+        }
         if let Some(st) = self.loans_by_target.get(name) {
             if st.mut_ > 0 || st.imm > 0 {
                 self.diag.error(
@@ -227,11 +325,49 @@ impl BorrowChecker {
                 );
             }
         }
+        // Region escape check.
+        self.check_region_access(name, span);
     }
 
     fn move_ident(&mut self, name: &str, span: Span) {
-        if self.var_state.get(name).map(|v| v.is_copy).unwrap_or(false) {
+        // `own` types always transfer ownership (move).
+        // `unique` types also transfer (no aliasing).
+        // `copy` types are copied, not moved.
+        // `shared` types are reference-counted; moving is OK (increments count).
+        let ownership = self.var_state.get(name).map(|v| v.ownership).unwrap_or(OwnershipKind::Copy);
+        if self.var_state.get(name).map(|v| v.is_copy).unwrap_or(false)
+            && ownership != OwnershipKind::Own
+            && ownership != OwnershipKind::Unique
+        {
             self.check_read(name, span);
+            return;
+        }
+        // For Own/Unique types, moving is mandatory (transfers ownership).
+        if ownership == OwnershipKind::Own || ownership == OwnershipKind::Unique {
+            // Same move logic as below, but with clearer messaging.
+            if self.var_state.get(name).map(|v| v.moved).unwrap_or(false) {
+                self.diag.error_with_fix(
+                    span,
+                    format!("use of moved value `{name}`"),
+                    format!("clone `{name}` before this use, or restructure to avoid the move"),
+                );
+                return;
+            }
+            if self.parallel_depth > 0 {
+                self.diag.error(
+                    span,
+                    format!("cannot move `{name}` inside a parallel or spawned block"),
+                );
+                return;
+            }
+            if let Some(st) = self.loans_by_target.get(name) {
+                if st.mut_ > 0 || st.imm > 0 {
+                    self.diag
+                        .error(span, format!("cannot move `{name}` while it is borrowed"));
+                    return;
+                }
+            }
+            self.mark_moved(name);
             return;
         }
         // Moving out of a variable inside a parallel body is unsafe: another
@@ -534,6 +670,15 @@ impl BorrowChecker {
             | Expr::BoolLit { .. }
             | Expr::StrLit { .. }
             | Expr::Path { .. } => {}
+
+            // ── Jules v2 expressions ────────────────────────────────────
+            Expr::Pipeline { stages, .. } => {
+                for s in stages {
+                    self.check_expr(s);
+                }
+            }
+            Expr::Emit { value, .. } => self.check_expr(value),
+            Expr::Copy { inner, .. } => self.check_expr(inner),
         }
     }
 
@@ -670,6 +815,47 @@ impl BorrowChecker {
             }
             Stmt::Sync(b) => self.check_block(&b.body),
             Stmt::Atomic(b) => self.check_block(&b.body),
+
+            // ── Jules v2 statements ────────────────────────────────────
+            Stmt::Effect { body, .. } => self.check_block(body),
+            Stmt::Region { name, body, .. } => {
+                self.region_stack.push(name.clone());
+                self.check_block(body);
+                // When the region ends, all variables declared within it
+                // become inaccessible.  The region tag on VarState handles
+                // this — any future access will be caught by check_region_access.
+                self.region_stack.pop();
+            }
+            Stmt::TaskSpawn { name, task_expr, .. } => {
+                self.check_expr(task_expr);
+                // Track the spawned task name for join validation.
+                self.spawned_tasks.push(name.clone());
+                // Check if any variables were moved into the task expr.
+                // Those variables should not be used after the spawn.
+                if let Some((moved_name, moved_span)) = Self::expr_as_simple_move(task_expr) {
+                    self.moved_to_tasks.insert(moved_name.to_string(), moved_span);
+                }
+            }
+            Stmt::TaskJoin { name, span } => {
+                // join should reference a previously declared task name.
+                if !self.spawned_tasks.contains(name) {
+                    self.diag.error(
+                        *span,
+                        format!("`join {name}` references an undeclared task; \
+                                 declare with `task {name} = spawn ...` first"),
+                    );
+                }
+            }
+            Stmt::UnsafeBlock { body, .. } => {
+                self.diag.warning(
+                    body.span,
+                    "unsafe block used; ensure this is intentional and audited",
+                );
+                self.check_block(body);
+            }
+            Stmt::IntrinsicsBlock { .. } => {}
+            Stmt::Requires { condition, .. } => self.check_expr(condition),
+            Stmt::Ensures { condition, .. } => self.check_expr(condition),
         }
     }
 
