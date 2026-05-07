@@ -67,6 +67,10 @@ name = "bench-inferno"
 path = "benches/bench_inferno.rs"
 
 [[bin]]
+name = "quick-inferno"
+path = "benches/quick_inferno.rs"
+
+[[bin]]
 name = "bench-adversarial"
 path = "src/tools/bench_adversarial.rs"
 
