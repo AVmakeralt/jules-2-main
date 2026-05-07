@@ -49,7 +49,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 // ── Top-level constants ───────────────────────────────────────────────────────
 
 /// Number of independent stride streams to track simultaneously.
-const STRIDE_STREAMS: usize = 4;
+const STRIDE_STREAMS: usize = 16;
 
 /// Minimum successive confirmations before acting on a predicted stride.
 const STRIDE_CONFIDENCE_THRESHOLD: u8 = 3;
@@ -178,24 +178,29 @@ impl CpuTopology {
 /// Algorithm: each observed address is matched against `(last_addr, stride)`
 /// pairs. If the delta matches the stored stride, confidence increments.
 /// At `STRIDE_CONFIDENCE_THRESHOLD`, a prefetch address is emitted.
+///
+/// Eviction uses confidence-weighted LRU: the slot with the LOWEST confidence
+/// score is evicted instead of round-robin. A regional filter (4KB page
+/// granularity) coalesces same-page accesses into existing streams.
 #[derive(Debug, Clone)]
 struct StridePredictor {
     last_addr:  [usize; STRIDE_STREAMS],
     stride:     [isize; STRIDE_STREAMS],
     confidence: [u8;    STRIDE_STREAMS],
-    evict_ptr:  usize, // round-robin eviction cursor
 }
 
 impl StridePredictor {
     const fn new() -> Self {
         Self { last_addr: [0; STRIDE_STREAMS], stride: [0; STRIDE_STREAMS],
-               confidence: [0; STRIDE_STREAMS], evict_ptr: 0 }
+               confidence: [0; STRIDE_STREAMS] }
     }
 
     /// Observe a load from `addr`. Returns `Some(prefetch_target)` when a
     /// confirmed stride is detected. `lookahead` = strides to predict ahead.
     #[inline(always)]
     fn observe(&mut self, addr: usize, lookahead: usize) -> Option<usize> {
+        const PAGE_SIZE: usize = 4096;
+
         // Search existing streams for a match.
         for i in 0..STRIDE_STREAMS {
             if self.last_addr[i] == 0 { continue; }
@@ -203,9 +208,9 @@ impl StridePredictor {
             let delta = (addr as isize).wrapping_sub(self.last_addr[i] as isize);
 
             if delta == self.stride[i] && delta != 0 {
-                // Stride confirmed — increase confidence, maybe emit prefetch.
+                // Stride confirmed
                 self.confidence[i] = self.confidence[i].saturating_add(1);
-                self.last_addr[i]  = addr;
+                self.last_addr[i] = addr;
                 return if self.confidence[i] >= STRIDE_CONFIDENCE_THRESHOLD {
                     let target = (addr as isize)
                         .wrapping_add(delta * lookahead as isize) as usize;
@@ -215,21 +220,33 @@ impl StridePredictor {
                 };
             }
 
-            // Same region, different delta → update stride, reset confidence.
-            if self.last_addr[i].abs_diff(addr) < 4096 {
-                self.stride[i]     = delta;
+            // Regional filter: same 4KB page, different delta → update stride, reset confidence
+            if (self.last_addr[i] & !(PAGE_SIZE - 1)) == (addr & !(PAGE_SIZE - 1)) {
+                self.stride[i] = delta;
                 self.confidence[i] = 1;
-                self.last_addr[i]  = addr;
+                self.last_addr[i] = addr;
                 return None;
             }
         }
 
-        // No matching stream → evict the oldest slot (round-robin).
-        let slot = self.evict_ptr;
-        self.evict_ptr = (self.evict_ptr + 1) % STRIDE_STREAMS;
-        self.last_addr[slot]  = addr;
-        self.stride[slot]     = 0;
-        self.confidence[slot] = 0;
+        // No matching stream → evict slot with lowest confidence
+        let mut min_conf = u8::MAX;
+        let mut evict_slot = 0;
+        for i in 0..STRIDE_STREAMS {
+            if self.last_addr[i] == 0 {
+                // Empty slot — use it
+                evict_slot = i;
+                break;
+            }
+            if self.confidence[i] < min_conf {
+                min_conf = self.confidence[i];
+                evict_slot = i;
+            }
+        }
+
+        self.last_addr[evict_slot] = addr;
+        self.stride[evict_slot] = 0;
+        self.confidence[evict_slot] = 0;
         None
     }
 
@@ -238,6 +255,105 @@ impl StridePredictor {
     fn invalidate(&mut self) {
         self.last_addr  = [0; STRIDE_STREAMS];
         self.confidence = [0; STRIDE_STREAMS];
+    }
+
+    /// Return the number of active (non-empty) streams.
+    #[inline(always)]
+    fn observe_count(&self) -> usize {
+        self.last_addr.iter().filter(|&&a| a != 0).count()
+    }
+}
+
+// ── CorrelationPredictor ──────────────────────────────────────────────────────
+
+/// Correlation table entry for pointer-chase detection
+#[derive(Debug, Clone, Copy)]
+struct CorrelationEntry {
+    /// Source address (the load address)
+    source_addr: usize,
+    /// Target address (the loaded value, if it looks like a pointer)
+    target_addr: usize,
+    /// Number of confirmations for this correlation
+    confirmations: u8,
+    /// Whether this correlation is confirmed (above threshold)
+    confirmed: bool,
+}
+
+const CORRELATION_ENTRIES: usize = 16;
+const CORRELATION_THRESHOLD: u8 = 2;
+
+/// Correlated prefetch engine for pointer-chasing patterns
+#[derive(Debug, Clone)]
+struct CorrelationPredictor {
+    entries: [CorrelationEntry; CORRELATION_ENTRIES],
+    entry_count: usize,
+}
+
+impl CorrelationPredictor {
+    const fn new() -> Self {
+        Self {
+            entries: [CorrelationEntry {
+                source_addr: 0, target_addr: 0, confirmations: 0, confirmed: false
+            }; CORRELATION_ENTRIES],
+            entry_count: 0,
+        }
+    }
+
+    /// Observe a load from `addr` that returned value `loaded_value`.
+    /// Returns Some(prefetch_target) if a correlation is confirmed.
+    fn observe(&mut self, addr: usize, loaded_value: usize) -> Option<usize> {
+        // Check if loaded_value looks like a valid pointer (aligned, non-zero)
+        let looks_like_ptr = loaded_value != 0 && (loaded_value & 0x7) == 0;
+
+        if looks_like_ptr {
+            // Check if we already have a correlation for this source
+            for entry in &mut self.entries[..self.entry_count.min(CORRELATION_ENTRIES)] {
+                if entry.source_addr == addr {
+                    if entry.target_addr == loaded_value {
+                        entry.confirmations = entry.confirmations.saturating_add(1);
+                        if entry.confirmations >= CORRELATION_THRESHOLD {
+                            entry.confirmed = true;
+                            return Some(loaded_value);
+                        }
+                    } else {
+                        // Different target — update
+                        entry.target_addr = loaded_value;
+                        entry.confirmations = 1;
+                        entry.confirmed = false;
+                    }
+                    return None;
+                }
+            }
+
+            // New entry
+            if self.entry_count < CORRELATION_ENTRIES {
+                self.entries[self.entry_count] = CorrelationEntry {
+                    source_addr: addr,
+                    target_addr: loaded_value,
+                    confirmations: 1,
+                    confirmed: false,
+                };
+                self.entry_count += 1;
+            }
+        }
+
+        // Check if addr matches a confirmed correlation source → prefetch target
+        for entry in &self.entries[..self.entry_count.min(CORRELATION_ENTRIES)] {
+            if entry.confirmed && entry.source_addr == addr {
+                return Some(entry.target_addr);
+            }
+        }
+
+        None
+    }
+
+    fn invalidate(&mut self) {
+        self.entry_count = 0;
+        for entry in &mut self.entries {
+            *entry = CorrelationEntry {
+                source_addr: 0, target_addr: 0, confirmations: 0, confirmed: false
+            };
+        }
     }
 }
 
@@ -569,10 +685,13 @@ pub struct PrefetchEngine {
     branch_density:  u8,            // 1 B
     _pad0:           [u8; 49],      // align remainder to 64 B total
 
-    // ── Cache lines 1-2: warm — stride predictor ~88 B ───────────────────────
+    // ── Cache lines 1-2: warm — stride predictor ~352 B ──────────────────────
     stride: StridePredictor,
 
-    // ── Cache lines 3+: cold — written infrequently ──────────────────────────
+    // ── Cache lines 3: warm — correlation predictor ──────────────────────────
+    correlation: CorrelationPredictor,
+
+    // ── Cache lines 4+: cold — written infrequently ──────────────────────────
     topology:   CpuTopology,
     calibrator: LatencyCalibrator,
 
@@ -603,6 +722,7 @@ impl PrefetchEngine {
             branch_density:  3,
             _pad0:           [0u8; 49],
             stride:          StridePredictor::new(),
+            correlation:     CorrelationPredictor::new(),
             topology,
             calibrator:      LatencyCalibrator::new(),
             miss_rate:       AtomicU32::new(0),
@@ -639,7 +759,11 @@ impl PrefetchEngine {
     /// * May trigger a latency re-calibration if the TSC interval elapsed.
     #[inline(always)]
     pub fn tick(&mut self, branch_density: u8) {
-        self.throttle_budget = EPOCH_BUDGET;
+        // MSHR-aware budget: fill available MSHR slots without overflowing
+        let estimated_outstanding = self.stride.observe_count(); // rough estimate
+        let mshr_budget = (self.topology.mshr_count.saturating_mul(2))
+            .saturating_sub(estimated_outstanding) as u32;
+        self.throttle_budget = mshr_budget.clamp(32, EPOCH_BUDGET * 2);
         self.branch_density  = branch_density;
         self.epoch_counter   = self.epoch_counter.wrapping_add(1);
         if self.epoch_counter & 0xF == 0 {
@@ -652,6 +776,7 @@ impl PrefetchEngine {
     #[inline(always)]
     pub fn notify_control_transfer(&mut self) {
         self.stride.invalidate();
+        self.correlation.invalidate();
     }
 
     #[cold]
@@ -819,22 +944,23 @@ impl PrefetchEngine {
         _insn_base: *const I, _pc: usize, _insn_len: usize,
         slot_base:  *mut   S, slot: usize, slot_len:  usize,
     ) {
-        // Cost: 1 write-intent hint only.
-        // The instruction stream (insn_base) is intentionally ignored — the
-        // hardware prefetcher handles sequential PC increments for free.
-        const COST: u32 = 1;
+        const COST: u32 = 2; // 2 budget units for multi-slot write prefetch
         let (new_budget, underflow) = self.throttle_budget.overflowing_sub(COST);
         if underflow { return; }
         self.throttle_budget = new_budget;
 
         let slot_last = slot_len.saturating_sub(1);
-        let sw = slot.saturating_add(self.dist.slot_l1 as usize).min(slot_last);
 
-        // PREFETCHW acquires the cache line in Modified state, eliminating the
-        // Read-For-Ownership stall that a cold write would otherwise incur.
-        // This is the only hint that consistently beats the hardware prefetcher
-        // on a write-heavy dispatch loop.
-        unsafe { prefetch_write_l1(slot_base.add(sw).cast()) }
+        // Issue PREFETCHW at slot + slot_l1 AND slot + slot_l2
+        let sw1 = slot.saturating_add(self.dist.slot_l1 as usize).min(slot_last);
+        let sw2 = slot.saturating_add(self.dist.slot_l2 as usize).min(slot_last);
+
+        unsafe {
+            prefetch_write_l1(slot_base.add(sw1).cast());
+            if sw2 != sw1 {
+                prefetch_write_l1(slot_base.add(sw2).cast());
+            }
+        }
     }
 
     /// **Triple-stream prefetch** — instruction + two independent slot streams.

@@ -127,11 +127,16 @@ pub struct ReorgTask {
     pub confidence: f32,
 }
 
-/// Layout predictor using simple ML model
+/// Layout predictor using EMA-tracked access pattern metrics
 pub struct LayoutPredictor {
     /// Historical patterns
     patterns: Vec<AccessPattern>,
-    /// Simple threshold model
+    // EMA-tracked access pattern metrics
+    ema_sequential: f64,
+    ema_random: f64,
+    ema_strided: f64,
+    // EMA alpha = 2 / (N + 1) where N = 500 observations
+    ema_alpha: f64,
     aos_threshold: f32,
     soa_threshold: f32,
 }
@@ -140,33 +145,51 @@ impl LayoutPredictor {
     pub fn new() -> Self {
         Self {
             patterns: Vec::new(),
+            ema_sequential: 0.0,
+            ema_random: 0.0,
+            ema_strided: 0.0,
+            ema_alpha: 2.0 / (500.0 + 1.0), // ~0.004
             aos_threshold: 0.7,
             soa_threshold: 0.7,
         }
     }
 
-    /// Predict optimal layout based on access pattern
+    /// Update EMA with new access pattern observation
+    pub fn update_ema(&mut self, pattern: &AccessPattern) {
+        let total = pattern.total_accesses.max(1) as f64;
+        let seq_ratio = pattern.sequential_count as f64 / total;
+        let rand_ratio = pattern.random_count as f64 / total;
+        let stride_ratio = pattern.strided_count as f64 / total;
+
+        self.ema_sequential = self.ema_alpha * seq_ratio + (1.0 - self.ema_alpha) * self.ema_sequential;
+        self.ema_random = self.ema_alpha * rand_ratio + (1.0 - self.ema_alpha) * self.ema_random;
+        self.ema_strided = self.ema_alpha * stride_ratio + (1.0 - self.ema_alpha) * self.ema_strided;
+    }
+
+    /// Predict optimal layout using EMA-weighted metrics
     pub fn predict(&self, pattern: &AccessPattern) -> MemoryLayout {
+        // Use EMA values for prediction (more stable than raw ratios)
+        let total = pattern.total_accesses.max(1) as f64;
+        let seq_ratio = if total > 100.0 { self.ema_sequential } else { pattern.sequential_count as f64 / total };
+        let rand_ratio = if total > 100.0 { self.ema_random } else { pattern.random_count as f64 / total };
+        let stride_ratio = if total > 100.0 { self.ema_strided } else { pattern.strided_count as f64 / total };
+
         if pattern.confidence() < 0.5 {
-            return MemoryLayout::ArrayOfStructures; // Default safe choice
+            return MemoryLayout::ArrayOfStructures;
         }
 
-        if pattern.is_aos_pattern() && pattern.hot_components.len() > 2 {
-            // AoS pattern with hot components -> Hybrid
+        if rand_ratio > 0.7 && pattern.hot_components.len() > 2 {
             return MemoryLayout::Hybrid;
         }
 
-        if pattern.is_soa_pattern() && pattern.avg_stride < 4.0 {
-            // Sequential access -> SoA
+        if seq_ratio > 0.7 && pattern.avg_stride < 4.0 {
             return MemoryLayout::StructureOfArrays;
         }
 
-        if pattern.is_strided_pattern() {
-            // Strided access -> Aligned AoS
+        if stride_ratio > 0.5 {
             return MemoryLayout::ArrayOfStructuresAligned;
         }
 
-        // Fallback: split hot/cold
         if !pattern.hot_components.is_empty() && !pattern.cold_components.is_empty() {
             return MemoryLayout::SplitSoA;
         }
@@ -174,16 +197,10 @@ impl LayoutPredictor {
         MemoryLayout::ArrayOfStructures
     }
 
-    /// Train the predictor (simplified)
-    pub fn train(&mut self, pattern: &AccessPattern, optimal_layout: MemoryLayout) {
+    /// Train the predictor with EMA update
+    pub fn train(&mut self, pattern: &AccessPattern, _optimal_layout: MemoryLayout) {
         self.patterns.push(pattern.clone());
-
-        // Update thresholds based on outcome
-        if optimal_layout == MemoryLayout::StructureOfArrays {
-            self.soa_threshold = self.soa_threshold * 0.95 + 0.05;
-        } else if optimal_layout == MemoryLayout::ArrayOfStructures {
-            self.aos_threshold = self.aos_threshold * 0.95 + 0.05;
-        }
+        self.update_ema(pattern);
     }
 }
 

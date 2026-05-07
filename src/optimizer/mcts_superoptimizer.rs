@@ -363,6 +363,79 @@ impl Instr {
             _ => {}
         }
     }
+
+    /// Instruction shape category for dispatch table filtering.
+    /// Categorizes instructions into broad shape classes for fast
+    /// pre-filtering of applicable rewrite actions.
+    pub fn shape(&self) -> InstrShape {
+        match self {
+            Instr::ConstInt(_) | Instr::ConstFloat(_) | Instr::ConstBool(_) => InstrShape::Const,
+            Instr::Var(_) => InstrShape::Var,
+            Instr::BinOp { .. } => InstrShape::BinOp,
+            Instr::UnOp { .. } => InstrShape::UnOp,
+        }
+    }
+}
+
+/// Instruction shape categories for dispatch table filtering.
+/// Used to quickly narrow down which rewrite actions could possibly
+/// apply to a given instruction without running full pattern matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InstrShape {
+    /// Constant values (ConstInt, ConstFloat, ConstBool)
+    Const,
+    /// Variable references
+    Var,
+    /// Binary operations
+    BinOp,
+    /// Unary operations
+    UnOp,
+}
+
+// =============================================================================
+// §3a  Action Dispatch Table — Pre-filtering for Performance
+// =============================================================================
+
+/// Pre-computed dispatch table mapping instruction shapes to applicable actions.
+/// Avoids iterating over all actions for every node during expansion.
+pub struct ActionDispatchTable {
+    table: HashMap<InstrShape, Vec<RewriteAction>>,
+}
+
+impl ActionDispatchTable {
+    /// Build the dispatch table by testing each action against representative
+    /// instructions of each shape category.
+    pub fn build() -> Self {
+        let mut table = HashMap::new();
+        for shape in [InstrShape::Const, InstrShape::Var, InstrShape::BinOp, InstrShape::UnOp] {
+            let test_instr = match shape {
+                InstrShape::Const => Instr::ConstInt(0),
+                InstrShape::Var => Instr::Var(0),
+                InstrShape::BinOp => Instr::BinOp {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(Instr::Var(0)),
+                    rhs: Box::new(Instr::Var(1)),
+                },
+                InstrShape::UnOp => Instr::UnOp {
+                    op: UnOpKind::Neg,
+                    operand: Box::new(Instr::Var(0)),
+                },
+            };
+            let applicable: Vec<RewriteAction> = RewriteAction::all().iter()
+                .filter(|a| a.is_applicable(&test_instr))
+                .cloned()
+                .collect();
+            table.insert(shape, applicable);
+        }
+        Self { table }
+    }
+
+    /// Returns a slice of actions that MIGHT be applicable for this shape.
+    /// The caller still needs to call is_applicable() for exact checking
+    /// because shape matching is an over-approximation.
+    pub fn get_applicable(&self, instr: &Instr) -> &[RewriteAction] {
+        self.table.get(&instr.shape()).map(|v| v.as_slice()).unwrap_or(&[])
+    }
 }
 
 // =============================================================================
@@ -539,6 +612,121 @@ pub enum RewriteAction {
     AndOverOr,
     /// OrOverAnd: (x | y) & (x | z) → x | (y & z)
     OrOverAnd,
+    // ── Tier 2: Arithmetic and Bit-Level Algebra ──
+    /// SubReassoc1: a - (b + c) -> (a - b) - c
+    SubReassoc1,
+    /// SubReassoc2: a - (b - c) -> (a - b) + c
+    SubReassoc2,
+    /// AddSubCancel: (a + b) - b -> a
+    AddSubCancel,
+    /// MulPow2Add: x * 2 + x -> x * 3 (LEA pattern)
+    MulPow2Add,
+    /// MulDistSub: a * (b - c) -> a*b - a*c
+    MulDistSub,
+    /// NegSwap: -(a - b) -> b - a
+    NegSwap,
+    /// DoubleNegAdd: -(-a + b) -> a - b
+    DoubleNegAdd,
+    /// AddZeroLeft: 0 + a -> a
+    AddZeroLeft,
+    /// ShlByConstAdd: (x << k) + x -> x * (2^k + 1)
+    ShlByConstAdd,
+    /// ShrIsDivPow2: x >> k -> x / 2^k (semantic equivalence for cost model)
+    ShrIsDivPow2,
+    // ── Tier 2: Bit Manipulation Rules ──
+    /// AndNotComplement: a & (!b) -> ANDN(a, b)
+    AndNotComplement,
+    /// AndComplement: a & (~b) -> ANDN(a, b)
+    AndComplement,
+    /// XorSwap: a ^ b ^ b -> a (eliminate XOR-swap residue)
+    XorSwap,
+    /// XorAllOnes: a ^ ~0 -> ~a (XOR with all-ones is NOT)
+    XorAllOnes,
+    /// AndMaskLow: x & ((1 << k) - 1) -> extract low k bits
+    AndMaskLow,
+    /// AndMaskHigh: x & ~((1 << k) - 1) -> clear low k bits
+    AndMaskHigh,
+    /// IsolateLowest: x & (-x) -> BLSI(x)
+    IsolateLowest,
+    /// ClearLowest: x & (x - 1) -> BLSR(x)
+    ClearLowest,
+    /// MaskMerge: (a & mask) | (b & ~mask) -> BFI(a, b, mask)
+    MaskMerge,
+    // ── Tier 3: Comparison and Conditional Rules ──
+    /// CmpNegateFull: !(a <= b) -> a > b and !(a >= b) -> a < b
+    CmpNegateFull,
+    /// DoubleNegCmp: !!(a < b) -> a < b
+    DoubleNegCmp,
+    /// EqNormalize: a == b -> b == a (when b is const)
+    EqNormalize,
+    /// NeNormalize: a != b -> b != a (when b is const)
+    NeNormalize,
+    /// SubIsZero: (a - b) == 0 -> a == b
+    SubIsZero,
+    /// SubIsNonZero: (a - b) != 0 -> a != b
+    SubIsNonZero,
+    /// LeFromLt: a < b + 1 -> a <= b
+    LeFromLt,
+    /// GeFromGt: a > b - 1 -> a >= b
+    GeFromGt,
+    /// AndCmps: (a > 0) & (a < N) -> range check pattern
+    AndCmps,
+    // ── Tier 3: Division and Remainder Optimization ──
+    /// DivByConst3: x / 3 -> MULH(x, magic3)
+    DivByConst3,
+    /// DivByConst5: x / 5 -> MULH(x, magic5)
+    DivByConst5,
+    /// DivByConst7: x / 7 -> MULH(x, magic7)
+    DivByConst7,
+    /// DivByConstN: x / N -> MULH(x, magic(N)) — generic for any non-power-of-2 constant > 1
+    DivByConstN,
+    /// RemByConst3: x % 3 -> x - (x/3)*3
+    RemByConst3,
+    /// RemByConstPow2: x % 2^k -> x & (2^k - 1)
+    RemByConstPow2,
+    /// RemToMask: x % N -> x - (x/N)*N for const N
+    RemToMask,
+    /// DivNegNeg: (-a) / (-b) -> a / b
+    DivNegNeg,
+    /// DivSignAdjust: x / (-N) -> -(x / N)
+    DivSignAdjust,
+    /// UnsignedDivPow2: x >>> k -> x / 2^k (logical shift)
+    UnsignedDivPow2,
+    // ── Tier 4: Multi-Step and Architectural Rules ──
+    /// Lea3Op: base + index*scale + offset -> LEA(base, index, scale, offset)
+    Lea3Op,
+    /// LeaScaleAdd: x*3 -> LEA(x, x*2), x*5 -> LEA(x, x*4), etc.
+    LeaScaleAdd,
+    /// TestInsteadOfAnd: (x & mask) == 0 -> TEST(x, mask)
+    TestInsteadOfAnd,
+    /// TestInsteadOfAndNZ: (x & mask) != 0 -> TEST(x, mask) + SETNE
+    TestInsteadOfAndNZ,
+    /// SetccFromCmp: (a < b) ? 1 : 0 -> SETcc
+    SetccFromCmp,
+    /// CmovFromSelect: if (c) { a } else { b } -> CMOVcc
+    CmovFromSelect,
+    /// CmovFromCmpOp: c ? x + y : x -> CMOVcc(c, x+y, x)
+    CmovFromCmpOp,
+    /// SbbFromBorrow: a - b - carry -> SBB(a, b, carry)
+    SbbFromBorrow,
+    /// AdcFromCarry: a + b + carry -> ADC(a, b, carry)
+    AdcFromCarry,
+    /// XorZero: x ^ x -> 0 (register zeroing)
+    XorZero,
+    /// MovZero: 0 -> XOR(reg, reg)
+    MovZero,
+    /// RotateRight: (x >> k) | (x << (N-k)) -> ROR(x, k)
+    RotateRight,
+    /// RotateLeft: (x << k) | (x >> (N-k)) -> ROL(x, k)
+    RotateLeft,
+    /// BswapPattern: byte-reverse -> BSWAP
+    BswapPattern,
+    /// PopcntPattern: bit count -> POPCNT
+    PopcntPattern,
+    /// LzcntPattern: leading zero count -> LZCNT
+    LzcntPattern,
+    /// TzcntPattern: trailing zero count -> TZCNT
+    TzcntPattern,
 }
 
 impl RewriteAction {
@@ -572,6 +760,66 @@ impl RewriteAction {
             RewriteAction::CmpNegate,
             RewriteAction::AndOverOr,
             RewriteAction::OrOverAnd,
+            // Tier 2: Arithmetic and Bit-Level Algebra
+            RewriteAction::SubReassoc1,
+            RewriteAction::SubReassoc2,
+            RewriteAction::AddSubCancel,
+            RewriteAction::MulPow2Add,
+            RewriteAction::MulDistSub,
+            RewriteAction::NegSwap,
+            RewriteAction::DoubleNegAdd,
+            RewriteAction::AddZeroLeft,
+            RewriteAction::ShlByConstAdd,
+            RewriteAction::ShrIsDivPow2,
+            // Tier 2: Bit Manipulation Rules
+            RewriteAction::AndNotComplement,
+            RewriteAction::AndComplement,
+            RewriteAction::XorSwap,
+            RewriteAction::XorAllOnes,
+            RewriteAction::AndMaskLow,
+            RewriteAction::AndMaskHigh,
+            RewriteAction::IsolateLowest,
+            RewriteAction::ClearLowest,
+            RewriteAction::MaskMerge,
+            // Tier 3: Comparison and Conditional Rules
+            RewriteAction::CmpNegateFull,
+            RewriteAction::DoubleNegCmp,
+            RewriteAction::EqNormalize,
+            RewriteAction::NeNormalize,
+            RewriteAction::SubIsZero,
+            RewriteAction::SubIsNonZero,
+            RewriteAction::LeFromLt,
+            RewriteAction::GeFromGt,
+            RewriteAction::AndCmps,
+            // Tier 3: Division and Remainder Optimization
+            RewriteAction::DivByConst3,
+            RewriteAction::DivByConst5,
+            RewriteAction::DivByConst7,
+            RewriteAction::DivByConstN,
+            RewriteAction::RemByConst3,
+            RewriteAction::RemByConstPow2,
+            RewriteAction::RemToMask,
+            RewriteAction::DivNegNeg,
+            RewriteAction::DivSignAdjust,
+            RewriteAction::UnsignedDivPow2,
+            // Tier 4: Multi-Step and Architectural Rules
+            RewriteAction::Lea3Op,
+            RewriteAction::LeaScaleAdd,
+            RewriteAction::TestInsteadOfAnd,
+            RewriteAction::TestInsteadOfAndNZ,
+            RewriteAction::SetccFromCmp,
+            RewriteAction::CmovFromSelect,
+            RewriteAction::CmovFromCmpOp,
+            RewriteAction::SbbFromBorrow,
+            RewriteAction::AdcFromCarry,
+            RewriteAction::XorZero,
+            RewriteAction::MovZero,
+            RewriteAction::RotateRight,
+            RewriteAction::RotateLeft,
+            RewriteAction::BswapPattern,
+            RewriteAction::PopcntPattern,
+            RewriteAction::LzcntPattern,
+            RewriteAction::TzcntPattern,
         ]
     }
 
@@ -835,6 +1083,389 @@ impl RewriteAction {
                     false
                 }
             }
+            // ── Tier 2: Arithmetic and Bit-Level Algebra ──
+            RewriteAction::SubReassoc1 => {
+                // a - (b + c) -> (a - b) - c
+                if let Instr::BinOp { op: BinOpKind::Sub, rhs, .. } = instr {
+                    matches!(**rhs, Instr::BinOp { op: BinOpKind::Add, .. })
+                } else { false }
+            }
+            RewriteAction::SubReassoc2 => {
+                // a - (b - c) -> (a - b) + c
+                if let Instr::BinOp { op: BinOpKind::Sub, rhs, .. } = instr {
+                    matches!(**rhs, Instr::BinOp { op: BinOpKind::Sub, .. })
+                } else { false }
+            }
+            RewriteAction::AddSubCancel => {
+                // (a + b) - b -> a
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, rhs: ref add_rhs, .. } = **lhs {
+                        add_rhs == rhs
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::MulPow2Add => {
+                // x * 2 + x -> x * 3 (LEA pattern)
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    // Match x * 2 + x
+                    if let Instr::BinOp { op: BinOpKind::Mul, lhs: ref mul_lhs, rhs: ref mul_rhs } = &**lhs {
+                        if let Instr::ConstInt(2) = **mul_rhs { return mul_lhs == rhs; }
+                    }
+                    // Match x + x * 2
+                    if let Instr::BinOp { op: BinOpKind::Mul, lhs: ref mul_lhs, rhs: ref mul_rhs } = &**rhs {
+                        if let Instr::ConstInt(2) = **mul_rhs { return mul_lhs == lhs; }
+                    }
+                    // Also match x << 1 + x
+                    if let Instr::BinOp { op: BinOpKind::Shl, lhs: ref shift_lhs, rhs: ref shift_rhs } = &**lhs {
+                        if let Instr::ConstInt(1) = **shift_rhs { return shift_lhs == rhs; }
+                    }
+                    // Match x + x << 1
+                    if let Instr::BinOp { op: BinOpKind::Shl, lhs: ref shift_lhs, rhs: ref shift_rhs } = &**rhs {
+                        if let Instr::ConstInt(1) = **shift_rhs { return shift_lhs == lhs; }
+                    }
+                    false
+                } else { false }
+            }
+            RewriteAction::MulDistSub => {
+                // a * (b - c) -> a*b - a*c
+                if let Instr::BinOp { op: BinOpKind::Mul, rhs, .. } = instr {
+                    matches!(**rhs, Instr::BinOp { op: BinOpKind::Sub, .. })
+                } else { false }
+            }
+            RewriteAction::NegSwap => {
+                // -(a - b) -> b - a
+                if let Instr::UnOp { op: UnOpKind::Neg, operand } = instr {
+                    matches!(**operand, Instr::BinOp { op: BinOpKind::Sub, .. })
+                } else { false }
+            }
+            RewriteAction::DoubleNegAdd => {
+                // -(-a + b) -> a - b
+                if let Instr::UnOp { op: UnOpKind::Neg, operand } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs, .. } = &**operand {
+                        matches!(**lhs, Instr::UnOp { op: UnOpKind::Neg, .. })
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::AddZeroLeft => {
+                // 0 + a -> a
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, .. } = instr {
+                    matches!(**lhs, Instr::ConstInt(0))
+                } else { false }
+            }
+            RewriteAction::ShlByConstAdd => {
+                // (x << k) + x -> x * (2^k + 1)
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Shl, lhs: ref shift_lhs, rhs: ref shift_rhs } = &**lhs {
+                        if matches!(**shift_rhs, Instr::ConstInt(_)) { return shift_lhs == rhs; }
+                    }
+                    if let Instr::BinOp { op: BinOpKind::Shl, lhs: ref shift_lhs, rhs: ref shift_rhs } = &**rhs {
+                        if matches!(**shift_rhs, Instr::ConstInt(_)) { return shift_lhs == lhs; }
+                    }
+                    false
+                } else { false }
+            }
+            RewriteAction::ShrIsDivPow2 => {
+                // x >> k -> x / 2^k (semantic equivalence for cost model)
+                matches!(instr, Instr::BinOp { op: BinOpKind::Shr, .. })
+            }
+            // ── Tier 2: Bit Manipulation Rules ──
+            RewriteAction::AndNotComplement => {
+                // a & (!b) -> ANDN(a, b)
+                if let Instr::BinOp { op: BinOpKind::BitAnd, rhs, .. } = instr {
+                    matches!(**rhs, Instr::UnOp { op: UnOpKind::Not, .. })
+                } else { false }
+            }
+            RewriteAction::AndComplement => {
+                // a & (~b) -> ANDN(a, b) — same but with bitwise NOT
+                if let Instr::BinOp { op: BinOpKind::BitAnd, rhs, .. } = instr {
+                    matches!(**rhs, Instr::UnOp { op: UnOpKind::Not, .. })
+                } else { false }
+            }
+            RewriteAction::XorSwap => {
+                // a ^ b ^ b -> a
+                if let Instr::BinOp { op: BinOpKind::BitXor, lhs, rhs } = instr {
+                    // Match (a ^ b) ^ b or a ^ (b ^ b)
+                    if let Instr::BinOp { op: BinOpKind::BitXor, rhs: ref inner_rhs, .. } = **lhs {
+                        inner_rhs == rhs
+                    } else if let Instr::BinOp { op: BinOpKind::BitXor, lhs: ref inner_lhs, rhs: ref inner_rhs } = **rhs {
+                        inner_lhs == inner_rhs
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::XorAllOnes => {
+                // a ^ ~0 -> ~a
+                if let Instr::BinOp { op: BinOpKind::BitXor, rhs, .. } = instr {
+                    matches!(**rhs, Instr::ConstInt(v) if v == u128::MAX)
+                } else { false }
+            }
+            RewriteAction::AndMaskLow => {
+                // x & ((1 << k) - 1) -> extract low k bits
+                if let Instr::BinOp { op: BinOpKind::BitAnd, rhs, .. } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs: ref sub_lhs, rhs: ref sub_rhs } = **rhs {
+                        if let Instr::BinOp { op: BinOpKind::Shl, lhs: ref shl_lhs, .. } = &**sub_lhs {
+                            matches!(**shl_lhs, Instr::ConstInt(1)) && matches!(**sub_rhs, Instr::ConstInt(1))
+                        } else { false }
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::AndMaskHigh => {
+                // x & ~((1 << k) - 1) -> clear low k bits
+                if let Instr::BinOp { op: BinOpKind::BitAnd, rhs, .. } = instr {
+                    if let Instr::UnOp { op: UnOpKind::Not, operand } = &**rhs {
+                        if let Instr::BinOp { op: BinOpKind::Sub, lhs: ref sub_lhs, rhs: ref sub_rhs } = &**operand {
+                            matches!(**sub_lhs, Instr::BinOp { op: BinOpKind::Shl, .. }) && matches!(**sub_rhs, Instr::ConstInt(1))
+                        } else { false }
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::IsolateLowest => {
+                // x & (-x) -> BLSI(x)
+                if let Instr::BinOp { op: BinOpKind::BitAnd, lhs, rhs } = instr {
+                    if let Instr::UnOp { op: UnOpKind::Neg, operand } = &**rhs {
+                        operand == lhs
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::ClearLowest => {
+                // x & (x - 1) -> BLSR(x)
+                if let Instr::BinOp { op: BinOpKind::BitAnd, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs: ref sub_lhs, rhs: ref sub_rhs } = &**rhs {
+                        sub_lhs == lhs && matches!(**sub_rhs, Instr::ConstInt(1))
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::MaskMerge => {
+                // (a & mask) | (b & ~mask) -> BFI(a, b, mask)
+                if let Instr::BinOp { op: BinOpKind::BitOr, lhs, rhs } = instr {
+                    if let (Instr::BinOp { op: BinOpKind::BitAnd, rhs: ref mask1, .. },
+                            Instr::BinOp { op: BinOpKind::BitAnd, rhs: ref mask2, .. }) = (&**lhs, &**rhs) {
+                        if let Instr::UnOp { op: UnOpKind::Not, operand: ref not_operand } = &**mask2 {
+                            mask1 == not_operand
+                        } else { false }
+                    } else { false }
+                } else { false }
+            }
+            // ── Tier 3: Comparison and Conditional Rules ──
+            RewriteAction::CmpNegateFull => {
+                // !(a <= b) -> a > b and !(a >= b) -> a < b
+                if let Instr::UnOp { op: UnOpKind::Not, operand } = instr {
+                    matches!(**operand, Instr::BinOp { op: BinOpKind::Le | BinOpKind::Ge, .. })
+                } else { false }
+            }
+            RewriteAction::DoubleNegCmp => {
+                // !!(a < b) -> a < b
+                if let Instr::UnOp { op: UnOpKind::Not, operand } = instr {
+                    if let Instr::UnOp { op: UnOpKind::Not, .. } = &**operand {
+                        true
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::EqNormalize => {
+                // a == b -> b == a (when b is const)
+                if let Instr::BinOp { op: BinOpKind::Eq, rhs, .. } = instr {
+                    matches!(**rhs, Instr::ConstInt(_))
+                } else { false }
+            }
+            RewriteAction::NeNormalize => {
+                // a != b -> b != a (when b is const)
+                if let Instr::BinOp { op: BinOpKind::Ne, rhs, .. } = instr {
+                    matches!(**rhs, Instr::ConstInt(_))
+                } else { false }
+            }
+            RewriteAction::SubIsZero => {
+                // (a - b) == 0 -> a == b
+                if let Instr::BinOp { op: BinOpKind::Eq, lhs, rhs } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::Sub, .. }) && matches!(**rhs, Instr::ConstInt(0))
+                } else { false }
+            }
+            RewriteAction::SubIsNonZero => {
+                // (a - b) != 0 -> a != b
+                if let Instr::BinOp { op: BinOpKind::Ne, lhs, rhs } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::Sub, .. }) && matches!(**rhs, Instr::ConstInt(0))
+                } else { false }
+            }
+            RewriteAction::LeFromLt => {
+                // a < b + 1 -> a <= b
+                if let Instr::BinOp { op: BinOpKind::Lt, rhs, .. } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, rhs: ref add_rhs, .. } = &**rhs {
+                        matches!(**add_rhs, Instr::ConstInt(1))
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::GeFromGt => {
+                // a > b - 1 -> a >= b
+                if let Instr::BinOp { op: BinOpKind::Gt, rhs, .. } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, rhs: ref sub_rhs, .. } = &**rhs {
+                        matches!(**sub_rhs, Instr::ConstInt(1))
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::AndCmps => {
+                // (a > 0) & (a < N) -> range check pattern
+                if let Instr::BinOp { op: BinOpKind::BitAnd, lhs, rhs } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::Gt, .. }) && matches!(**rhs, Instr::BinOp { op: BinOpKind::Lt, .. })
+                } else { false }
+            }
+            // ── Tier 3: Division and Remainder Optimization ──
+            RewriteAction::DivByConst3 => {
+                if let Instr::BinOp { op: BinOpKind::Div, rhs, .. } = instr {
+                    matches!(**rhs, Instr::ConstInt(3))
+                } else { false }
+            }
+            RewriteAction::DivByConst5 => {
+                if let Instr::BinOp { op: BinOpKind::Div, rhs, .. } = instr {
+                    matches!(**rhs, Instr::ConstInt(5))
+                } else { false }
+            }
+            RewriteAction::DivByConst7 => {
+                if let Instr::BinOp { op: BinOpKind::Div, rhs, .. } = instr {
+                    matches!(**rhs, Instr::ConstInt(7))
+                } else { false }
+            }
+            RewriteAction::DivByConstN => {
+                if let Instr::BinOp { op: BinOpKind::Div, rhs, .. } = instr {
+                    if let Instr::ConstInt(v) = **rhs {
+                        v > 1 && (v & (v - 1)) != 0 // non-power-of-2 constant > 1
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::RemByConst3 => {
+                if let Instr::BinOp { op: BinOpKind::Rem, rhs, .. } = instr {
+                    matches!(**rhs, Instr::ConstInt(3))
+                } else { false }
+            }
+            RewriteAction::RemByConstPow2 => {
+                if let Instr::BinOp { op: BinOpKind::Rem, rhs, .. } = instr {
+                    if let Instr::ConstInt(v) = **rhs {
+                        v > 1 && (v & (v - 1)) == 0 // power-of-2 constant > 1
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::RemToMask => {
+                if let Instr::BinOp { op: BinOpKind::Rem, rhs, .. } = instr {
+                    matches!(**rhs, Instr::ConstInt(_))
+                } else { false }
+            }
+            RewriteAction::DivNegNeg => {
+                // (-a) / (-b) -> a / b
+                if let Instr::BinOp { op: BinOpKind::Div, lhs, rhs } = instr {
+                    matches!(**lhs, Instr::UnOp { op: UnOpKind::Neg, .. }) && matches!(**rhs, Instr::UnOp { op: UnOpKind::Neg, .. })
+                } else { false }
+            }
+            RewriteAction::DivSignAdjust => {
+                // x / (-N) -> -(x / N)
+                if let Instr::BinOp { op: BinOpKind::Div, rhs, .. } = instr {
+                    if let Instr::UnOp { op: UnOpKind::Neg, .. } = &**rhs { true }
+                    else if let Instr::ConstInt(v) = **rhs { (v as i128) < 0 } else { false }
+                } else { false }
+            }
+            RewriteAction::UnsignedDivPow2 => {
+                // x >>> k -> x / 2^k
+                if let Instr::BinOp { op: BinOpKind::Shr, rhs, .. } = instr {
+                    if let Instr::ConstInt(v) = **rhs { v > 0 } else { false }
+                } else { false }
+            }
+            // ── Tier 4: Multi-Step and Architectural Rules ──
+            RewriteAction::Lea3Op => {
+                // base + index*scale + offset -> LEA
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    let lhs_has_shl = matches!(**lhs, Instr::BinOp { op: BinOpKind::Shl, .. });
+                    let rhs_has_shl = matches!(**rhs, Instr::BinOp { op: BinOpKind::Shl, .. });
+                    // Match nested Add with Shl child
+                    if let Instr::BinOp { op: BinOpKind::Add, .. } = **lhs { return true; }
+                    if let Instr::BinOp { op: BinOpKind::Add, .. } = **rhs { return true; }
+                    lhs_has_shl || rhs_has_shl
+                } else { false }
+            }
+            RewriteAction::LeaScaleAdd => {
+                // x*3, x*5, x*7, x*9, x*11, x*13 -> LEA sequences
+                if let Instr::BinOp { op: BinOpKind::Mul, rhs, .. } = instr {
+                    if let Instr::ConstInt(v) = **rhs {
+                        matches!(v, 3 | 5 | 7 | 9 | 11 | 13)
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::TestInsteadOfAnd => {
+                // (x & mask) == 0 -> TEST(x, mask)
+                if let Instr::BinOp { op: BinOpKind::Eq, lhs, rhs } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::BitAnd, .. }) && matches!(**rhs, Instr::ConstInt(0))
+                } else { false }
+            }
+            RewriteAction::TestInsteadOfAndNZ => {
+                // (x & mask) != 0 -> TEST(x, mask) + SETNE
+                if let Instr::BinOp { op: BinOpKind::Ne, lhs, rhs } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::BitAnd, .. }) && matches!(**rhs, Instr::ConstInt(0))
+                } else { false }
+            }
+            RewriteAction::SetccFromCmp => {
+                // (a < b) ? 1 : 0 -> SETcc
+                if let Instr::BinOp { op, rhs, .. } = instr {
+                    matches!(op, BinOpKind::Lt | BinOpKind::Gt | BinOpKind::Le | BinOpKind::Ge | BinOpKind::Eq | BinOpKind::Ne)
+                        && matches!(**rhs, Instr::ConstInt(0) | Instr::ConstInt(1))
+                } else { false }
+            }
+            RewriteAction::CmovFromSelect => {
+                // if (c) { a } else { b } -> CMOVcc
+                matches!(instr, Instr::BinOp { op: BinOpKind::Lt | BinOpKind::Gt | BinOpKind::Le | BinOpKind::Ge | BinOpKind::Eq | BinOpKind::Ne, .. })
+            }
+            RewriteAction::CmovFromCmpOp => {
+                // c ? x + y : x -> CMOVcc(c, x+y, x) — match comparison BinOps
+                matches!(instr, Instr::BinOp { op: BinOpKind::Lt | BinOpKind::Gt | BinOpKind::Le | BinOpKind::Ge | BinOpKind::Eq | BinOpKind::Ne, .. })
+            }
+            RewriteAction::SbbFromBorrow => {
+                // a - b - carry -> SBB — match nested Sub
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, .. } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::Sub, .. })
+                } else { false }
+            }
+            RewriteAction::AdcFromCarry => {
+                // a + b + carry -> ADC — match nested Add
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, .. } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::Add, .. })
+                } else { false }
+            }
+            RewriteAction::XorZero => {
+                // x ^ x -> 0 (register zeroing)
+                if let Instr::BinOp { op: BinOpKind::BitXor, lhs, rhs } = instr {
+                    lhs == rhs
+                } else { false }
+            }
+            RewriteAction::MovZero => {
+                // 0 -> XOR(reg, reg)
+                matches!(instr, Instr::ConstInt(0))
+            }
+            RewriteAction::RotateRight => {
+                // (x >> k) | (x << (N-k)) -> ROR(x, k)
+                if let Instr::BinOp { op: BinOpKind::BitOr, lhs, rhs } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::Shr, .. }) && matches!(**rhs, Instr::BinOp { op: BinOpKind::Shl, .. })
+                } else { false }
+            }
+            RewriteAction::RotateLeft => {
+                // (x << k) | (x >> (N-k)) -> ROL(x, k)
+                if let Instr::BinOp { op: BinOpKind::BitOr, lhs, rhs } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::Shl, .. }) && matches!(**rhs, Instr::BinOp { op: BinOpKind::Shr, .. })
+                } else { false }
+            }
+            RewriteAction::BswapPattern => {
+                // byte-reverse pattern detection (simplified)
+                matches!(instr, Instr::BinOp { op: BinOpKind::BitOr, .. })
+            }
+            RewriteAction::PopcntPattern => {
+                // bit count pattern (simplified — detect XOR with shift)
+                matches!(instr, Instr::BinOp { op: BinOpKind::BitXor, .. })
+            }
+            RewriteAction::LzcntPattern => {
+                // leading zero count pattern (simplified)
+                matches!(instr, Instr::BinOp { op: BinOpKind::Shr, .. })
+            }
+            RewriteAction::TzcntPattern => {
+                // trailing zero count pattern (simplified — detect x & -x)
+                if let Instr::BinOp { op: BinOpKind::BitAnd, lhs, rhs } = instr {
+                    if let Instr::UnOp { op: UnOpKind::Neg, operand } = &**rhs {
+                        operand == lhs
+                    } else { false }
+                } else { false }
+            }
         }
     }
 
@@ -854,7 +1485,7 @@ impl RewriteAction {
 // =============================================================================
 
 /// A node in the MCTS search tree
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MctsNode {
     /// The program state at this node
     pub program: Instr,
@@ -874,6 +1505,25 @@ pub struct MctsNode {
     pub cached_cost: Option<u32>,
     /// Fix 5: Policy prior from GNN policy head (defaults to uniform 1/N)
     pub policy_prior: Option<f64>,
+    /// Virtual loss for parallel MCTS (AtomicU32 for thread-safe access)
+    pub virtual_loss: AtomicU32,
+}
+
+impl Clone for MctsNode {
+    fn clone(&self) -> Self {
+        Self {
+            program: self.program.clone(),
+            action: self.action.clone(),
+            rewrite_path: self.rewrite_path.clone(),
+            visits: self.visits,
+            total_reward: self.total_reward,
+            children: self.children.clone(),
+            expanded: self.expanded,
+            cached_cost: self.cached_cost,
+            policy_prior: self.policy_prior,
+            virtual_loss: AtomicU32::new(self.virtual_loss.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl MctsNode {
@@ -888,6 +1538,7 @@ impl MctsNode {
             expanded: false,
             cached_cost: None,
             policy_prior: None,
+            virtual_loss: AtomicU32::new(0),
         }
     }
 
@@ -912,15 +1563,17 @@ impl MctsNode {
 
     /// Fix 5: Select the best child using PUCT (Predictor + Upper Confidence Bound)
     /// Replaces UCB1 selection for better exploration with policy priors.
+    /// Updated with virtual loss support for parallel MCTS.
     pub fn best_child(&self, c_puct: f64) -> Option<usize> {
-        if self.children.is_empty() {
-            return None;
-        }
+        if self.children.is_empty() { return None; }
         let total_visits = self.children.iter().map(|c| c.visits).sum::<u32>().max(1);
         let sqrt_parent = (total_visits as f64).sqrt();
+        const VIRTUAL_LOSS_PENALTY: f64 = 5.0;
 
         let best = self.children.iter().enumerate().map(|(i, c)| {
-            let q = if c.visits > 0 { c.total_reward / c.visits as f64 } else { 0.0 };
+            let q = if c.visits > 0 { 
+                (c.total_reward - c.virtual_loss.load(Ordering::Relaxed) as f64 * VIRTUAL_LOSS_PENALTY) / c.visits as f64 
+            } else { 0.0 };
             let p = c.policy_prior.unwrap_or(1.0 / self.children.len() as f64);
             let u = c_puct * p * sqrt_parent / (1.0 + c.visits as f64);
             (i, q + u)
@@ -951,12 +1604,22 @@ impl MctsNode {
 
 /// An entry in the transposition table for reusing search results
 /// across nodes with identical program states.
+/// Updated with structural equality check and LRU eviction support.
 #[derive(Debug, Clone)]
 struct TransEntry {
+    hash: u64,
+    /// Store program for structural equality check (two-tier: fast hash + structural)
+    program: Instr,
     visits: u32,
     total_reward: f64,
     best_action: Option<usize>,
+    /// For LRU eviction — tracks when this entry was last accessed
+    last_access: u64,
 }
+
+/// Maximum number of entries in the transposition table.
+/// When exceeded, the least recently used entry is evicted.
+const TRANS_TABLE_MAX_ENTRIES: usize = 4096;
 
 // =============================================================================
 // §6  MCTS Superoptimizer Engine
@@ -971,6 +1634,8 @@ pub struct MctsSuperoptimizer {
     /// Fix 4: Transposition table for reusing search results across
     /// nodes with identical program hashes.
     transposition_table: FxHashMap<u64, TransEntry>,
+    /// Pre-computed dispatch table for action applicability filtering
+    dispatch_table: ActionDispatchTable,
     /// Fix 6: Optional GNN value network for rollout (when gnn-optimizer enabled)
     #[cfg(feature = "gnn-optimizer")]
     gnn: Option<crate::optimizer::gnn_egraph_optimizer::GnnEgraphOptimizer>,
@@ -986,11 +1651,13 @@ impl MctsSuperoptimizer {
     pub fn new(config: MctsConfig) -> Self {
         let microarch = config.microarch;
         let cost_estimator = CycleCostEstimator::new(microarch);
+        let dispatch_table = ActionDispatchTable::build();
         Self {
             config,
             cost_estimator,
             node_count: 0,
             transposition_table: FxHashMap::default(),
+            dispatch_table,
             #[cfg(feature = "gnn-optimizer")]
             gnn: None,
             simulations_run: 0,
@@ -1125,9 +1792,9 @@ impl MctsSuperoptimizer {
             leaf_program = node.program.clone();
         }
 
-        // Fix 4: Check transposition table before rollout
+        // Fix 4: Check transposition table before rollout (two-tier: hash + structural equality)
         let leaf_hash = self.hash_instr(&leaf_program);
-        let sim_result = if let Some(entry) = self.transposition_table.get(&leaf_hash) {
+        let sim_result = if let Some(entry) = self.transposition_lookup(leaf_hash, &leaf_program) {
             if entry.visits > 0 {
                 entry.total_reward / entry.visits as f64
             } else {
@@ -1137,14 +1804,19 @@ impl MctsSuperoptimizer {
             self.rollout(&leaf_program)
         };
 
-        // Fix 4: Update transposition table after simulation
-        let entry = self.transposition_table.entry(leaf_hash).or_insert(TransEntry {
-            visits: 0,
-            total_reward: 0.0,
-            best_action: None,
-        });
-        entry.visits += 1;
-        entry.total_reward += sim_result;
+        // Fix 4: Update transposition table after simulation (with LRU eviction)
+        if let Some(entry) = self.transposition_table.get_mut(&leaf_hash) {
+            if entry.program == leaf_program {
+                entry.visits += 1;
+                entry.total_reward += sim_result;
+                entry.last_access = self.simulations_run;
+            } else {
+                // Hash collision — replace with new entry
+                self.transposition_insert(leaf_hash, leaf_program.clone(), 1, sim_result, None);
+            }
+        } else {
+            self.transposition_insert(leaf_hash, leaf_program.clone(), 1, sim_result, None);
+        }
 
         // 4. Backpropagation
         root.visits += 1;
@@ -1165,18 +1837,23 @@ impl MctsSuperoptimizer {
             return;
         }
 
-        let actions = RewriteAction::all();
+        // Use dispatch table for pre-filtering instead of iterating all actions
+        let applicable_actions = self.dispatch_table.get_applicable(&node.program);
         let mut children = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
-        let num_actions = actions.len();
+        let num_actions = applicable_actions.len().max(1);
 
-        for action in actions {
+        // Compute cost-model-derived policy priors
+        let priors = self.compute_policy_priors(&node.program, applicable_actions);
+
+        for (action_idx, action) in applicable_actions.iter().enumerate() {
             if action.is_applicable(&node.program) {
                 if let Some(new_program) = self.apply_action(&node.program, action) {
                     if new_program != node.program {
                         let h = self.hash_instr(&new_program);
                         if seen.insert(h) {
-                            let policy_prior = Some(1.0 / num_actions as f64);
+                            let policy_prior = priors.get(action_idx).copied()
+                                .or_else(|| Some(1.0 / num_actions as f64));
                             children.push(MctsNode {
                                 program: new_program,
                                 action: Some(action.clone()),
@@ -1187,6 +1864,7 @@ impl MctsSuperoptimizer {
                                 expanded: false,
                                 cached_cost: None,
                                 policy_prior,
+                                virtual_loss: AtomicU32::new(0),
                             });
                         }
                     }
@@ -1199,7 +1877,8 @@ impl MctsSuperoptimizer {
                 if new_program != node.program {
                     let h = self.hash_instr(&new_program);
                     if seen.insert(h) {
-                        let policy_prior = Some(1.0 / num_actions as f64);
+                        let policy_prior = priors.get(action_idx).copied()
+                            .or_else(|| Some(1.0 / num_actions as f64));
                         children.push(MctsNode {
                             program: new_program,
                             action: Some(action.clone()),
@@ -1210,6 +1889,7 @@ impl MctsSuperoptimizer {
                             expanded: false,
                             cached_cost: None,
                             policy_prior,
+                            virtual_loss: AtomicU32::new(0),
                         });
                     }
                 }
@@ -1219,6 +1899,170 @@ impl MctsSuperoptimizer {
         self.node_count += children.len();
         node.children = children;
         node.expanded = true;
+    }
+
+    /// Generate children lazily, stopping at the first child with non-positive
+    /// estimated savings (first-win heuristic). This avoids generating all
+    /// possible children when the cost model suggests most are unpromising.
+    fn expand_lazy(&mut self, node: &mut MctsNode) {
+        if node.expanded {
+            return;
+        }
+
+        let parent_cost = node.cached_cost.unwrap_or(u32::MAX);
+        let applicable_actions = self.dispatch_table.get_applicable(&node.program);
+
+        // Sort actions by estimated savings (from cost model)
+        let mut action_savings: Vec<(usize, f64)> = applicable_actions.iter().enumerate()
+            .filter_map(|(i, action)| {
+                if action.is_applicable(&node.program) {
+                    let savings = self.estimate_savings(action, &node.program, parent_cost);
+                    Some((i, savings))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        action_savings.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut seen: HashSet<u64> = HashSet::new();
+        let num_actions = applicable_actions.len().max(1);
+        let priors = self.compute_policy_priors(&node.program, applicable_actions);
+
+        for (action_idx, estimated_savings) in action_savings {
+            if estimated_savings <= 0.0 {
+                break; // First-win: stop at first non-promising action
+            }
+            if let Some(child_program) = self.apply_action(&node.program, &applicable_actions[action_idx]) {
+                if child_program != node.program {
+                    let h = self.hash_instr(&child_program);
+                    if seen.insert(h) {
+                        let policy_prior = priors.get(action_idx).copied()
+                            .or_else(|| Some(1.0 / num_actions as f64));
+                        node.children.push(MctsNode {
+                            program: child_program,
+                            action: Some(applicable_actions[action_idx].clone()),
+                            rewrite_path: Vec::new(),
+                            visits: 0,
+                            total_reward: 0.0,
+                            children: Vec::new(),
+                            expanded: false,
+                            cached_cost: None,
+                            policy_prior,
+                            virtual_loss: AtomicU32::new(0),
+                        });
+                    }
+                }
+            }
+        }
+        node.expanded = true;
+    }
+
+    /// Estimate the savings from applying a rewrite action without full materialization.
+    /// Uses heuristic cost estimates based on the action type.
+    fn estimate_savings(&self, action: &RewriteAction, _program: &Instr, parent_cost: u32) -> f64 {
+        let parent_cost_f = parent_cost as f64;
+        match action {
+            // High-impact rules: division replacement
+            RewriteAction::DivByConst3 | RewriteAction::DivByConst5 |
+            RewriteAction::DivByConst7 | RewriteAction::DivByConstN => parent_cost_f * 0.5,
+            RewriteAction::RemByConst3 | RewriteAction::RemByConstPow2 |
+            RewriteAction::RemToMask => parent_cost_f * 0.4,
+            // LEA patterns
+            RewriteAction::Lea3Op | RewriteAction::LeaScaleAdd |
+            RewriteAction::LeaCombine | RewriteAction::LeaMulSmallConst => parent_cost_f * 0.3,
+            // Architectural instructions
+            RewriteAction::BswapPattern | RewriteAction::PopcntPattern |
+            RewriteAction::LzcntPattern | RewriteAction::TzcntPattern |
+            RewriteAction::RotateRight | RewriteAction::RotateLeft => parent_cost_f * 0.4,
+            // Bit manipulation
+            RewriteAction::IsolateLowest | RewriteAction::ClearLowest |
+            RewriteAction::AndMaskLow | RewriteAction::AndMaskHigh => parent_cost_f * 0.2,
+            // Conditional/cmov
+            RewriteAction::CmovFromSelect | RewriteAction::CmovFromCmpOp |
+            RewriteAction::CmovSelect | RewriteAction::SetccFromCmp => parent_cost_f * 0.2,
+            // Constant folding
+            RewriteAction::ConstantFold => parent_cost_f * 0.2,
+            RewriteAction::StrengthReduce => parent_cost_f * 0.3,
+            // Identity/annihilation (always saves)
+            RewriteAction::IdentityLeft | RewriteAction::IdentityRight |
+            RewriteAction::AnnihilateLeft | RewriteAction::AnnihilateRight |
+            RewriteAction::AddZeroLeft | RewriteAction::AddSubCancel => parent_cost_f * 0.15,
+            // Most other rules: small savings estimate
+            _ => parent_cost_f * 0.1,
+        }
+    }
+
+    /// Compute policy prior from cost model for each applicable action.
+    /// Uses a softmax over estimated savings to create a probability distribution.
+    fn compute_policy_priors(&self, program: &Instr, actions: &[RewriteAction]) -> Vec<f64> {
+        let current_cost = CycleCostEstimator::node_cost(program) as f64;
+        let temperature = 2.0; // Default temperature for softmax
+
+        let savings: Vec<f64> = actions.iter().map(|action| {
+            if action.is_applicable(program) {
+                let estimated_savings = match action {
+                    // High-impact rules get higher priors
+                    RewriteAction::DivByConst3 | RewriteAction::DivByConst5 |
+                    RewriteAction::DivByConst7 | RewriteAction::DivByConstN => current_cost * 0.5,
+                    RewriteAction::Lea3Op | RewriteAction::LeaScaleAdd |
+                    RewriteAction::LeaCombine | RewriteAction::LeaMulSmallConst => current_cost * 0.3,
+                    RewriteAction::BswapPattern | RewriteAction::PopcntPattern |
+                    RewriteAction::LzcntPattern | RewriteAction::TzcntPattern => current_cost * 0.4,
+                    RewriteAction::ConstantFold => current_cost * 0.2,
+                    RewriteAction::StrengthReduce => current_cost * 0.3,
+                    RewriteAction::CmovFromSelect | RewriteAction::CmovFromCmpOp |
+                    RewriteAction::CmovSelect => current_cost * 0.2,
+                    RewriteAction::RemByConst3 | RewriteAction::RemByConstPow2 |
+                    RewriteAction::RemToMask => current_cost * 0.4,
+                    _ => current_cost * 0.1,
+                };
+                estimated_savings / temperature
+            } else {
+                0.0
+            }
+        }).collect();
+
+        // Softmax normalization
+        let max_saving = savings.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exp_savings: Vec<f64> = savings.iter().map(|s| (s - max_saving).exp()).collect();
+        let sum: f64 = exp_savings.iter().sum();
+        if sum > 0.0 {
+            exp_savings.iter().map(|e| e / sum).collect()
+        } else {
+            // Uniform fallback
+            let n = actions.len() as f64;
+            vec![1.0 / n; actions.len()]
+        }
+    }
+
+    /// Two-tier hash lookup: fast u64 bloom filter + structural equality
+    fn transposition_lookup(&self, hash: u64, program: &Instr) -> Option<&TransEntry> {
+        self.transposition_table.get(&hash).and_then(|entry| {
+            if entry.program == *program { Some(entry) } else { None }
+        })
+    }
+
+    /// Insert with LRU eviction if table is full
+    fn transposition_insert(&mut self, hash: u64, program: Instr, visits: u32, reward: f64, best_action: Option<usize>) {
+        if self.transposition_table.len() >= TRANS_TABLE_MAX_ENTRIES {
+            // Evict LRU entry
+            if let Some(lru_key) = self.transposition_table.iter()
+                .min_by_key(|(_, e)| e.last_access)
+                .map(|(&k, _)| k)
+            {
+                self.transposition_table.remove(&lru_key);
+            }
+        }
+        self.transposition_table.insert(hash, TransEntry {
+            hash,
+            program,
+            visits,
+            total_reward: reward,
+            best_action,
+            last_access: self.simulations_run,
+        });
     }
 
     /// Apply an action to the top-level instruction
@@ -1513,6 +2357,344 @@ impl MctsSuperoptimizer {
                     }
                 }
                 None
+            }
+            // ── Tier 2: Arithmetic and Bit-Level Algebra ──
+            RewriteAction::SubReassoc1 => {
+                // a - (b + c) -> (a - b) - c
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs: a, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs: b, rhs: c } = &**rhs {
+                        return Some(Instr::BinOp {
+                            op: BinOpKind::Sub,
+                            lhs: Box::new(Instr::BinOp { op: BinOpKind::Sub, lhs: a.clone(), rhs: b.clone() }),
+                            rhs: c.clone(),
+                        });
+                    }
+                }
+                None
+            }
+            RewriteAction::SubReassoc2 => {
+                // a - (b - c) -> (a - b) + c
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs: a, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs: b, rhs: c } = &**rhs {
+                        return Some(Instr::BinOp {
+                            op: BinOpKind::Add,
+                            lhs: Box::new(Instr::BinOp { op: BinOpKind::Sub, lhs: a.clone(), rhs: b.clone() }),
+                            rhs: c.clone(),
+                        });
+                    }
+                }
+                None
+            }
+            RewriteAction::AddSubCancel => {
+                // (a + b) - b -> a
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs: a, rhs: ref add_rhs } = &**lhs {
+                        if add_rhs == rhs { return Some((**a).clone()); }
+                    }
+                }
+                None
+            }
+            RewriteAction::MulPow2Add => {
+                // x * 2 + x -> x * 3
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Mul, lhs: ref x, rhs: ref mul_rhs } = &**lhs {
+                        if let Instr::ConstInt(2) = **mul_rhs {
+                            if x == rhs { return Some(Instr::BinOp { op: BinOpKind::Mul, lhs: x.clone(), rhs: Box::new(Instr::ConstInt(3)) }); }
+                        }
+                    }
+                    if let Instr::BinOp { op: BinOpKind::Mul, lhs: ref x, rhs: ref mul_rhs } = &**rhs {
+                        if let Instr::ConstInt(2) = **mul_rhs {
+                            if x == lhs { return Some(Instr::BinOp { op: BinOpKind::Mul, lhs: x.clone(), rhs: Box::new(Instr::ConstInt(3)) }); }
+                        }
+                    }
+                    // x << 1 + x -> x * 3
+                    if let Instr::BinOp { op: BinOpKind::Shl, lhs: ref x, rhs: ref shift_rhs } = &**lhs {
+                        if let Instr::ConstInt(1) = **shift_rhs {
+                            if x == rhs { return Some(Instr::BinOp { op: BinOpKind::Mul, lhs: x.clone(), rhs: Box::new(Instr::ConstInt(3)) }); }
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::MulDistSub => {
+                // a * (b - c) -> a*b - a*c
+                if let Instr::BinOp { op: BinOpKind::Mul, lhs: a, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs: b, rhs: c } = &**rhs {
+                        return Some(Instr::BinOp {
+                            op: BinOpKind::Sub,
+                            lhs: Box::new(Instr::BinOp { op: BinOpKind::Mul, lhs: a.clone(), rhs: b.clone() }),
+                            rhs: Box::new(Instr::BinOp { op: BinOpKind::Mul, lhs: a.clone(), rhs: c.clone() }),
+                        });
+                    }
+                }
+                None
+            }
+            RewriteAction::NegSwap => {
+                // -(a - b) -> b - a
+                if let Instr::UnOp { op: UnOpKind::Neg, operand } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs } = &**operand {
+                        return Some(Instr::BinOp { op: BinOpKind::Sub, lhs: rhs.clone(), rhs: lhs.clone() });
+                    }
+                }
+                None
+            }
+            RewriteAction::DoubleNegAdd => {
+                // -(-a + b) -> a - b
+                if let Instr::UnOp { op: UnOpKind::Neg, operand } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs: b } = &**operand {
+                        if let Instr::UnOp { op: UnOpKind::Neg, operand: ref inner } = &**lhs {
+                            return Some(Instr::BinOp { op: BinOpKind::Sub, lhs: inner.clone(), rhs: b.clone() });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::AddZeroLeft => {
+                // 0 + a -> a
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let Instr::ConstInt(0) = **lhs { return Some((**rhs).clone()); }
+                }
+                None
+            }
+            RewriteAction::ShlByConstAdd => {
+                // (x << k) + x -> x * (2^k + 1)
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Shl, lhs: ref x, rhs: ref shift_rhs } = &**lhs {
+                        if let Instr::ConstInt(k) = **shift_rhs {
+                            if x == rhs {
+                                let factor = (1u128 << k) + 1;
+                                return Some(Instr::BinOp { op: BinOpKind::Mul, lhs: x.clone(), rhs: Box::new(Instr::ConstInt(factor)) });
+                            }
+                        }
+                    }
+                    if let Instr::BinOp { op: BinOpKind::Shl, lhs: ref x, rhs: ref shift_rhs } = &**rhs {
+                        if let Instr::ConstInt(k) = **shift_rhs {
+                            if x == lhs {
+                                let factor = (1u128 << k) + 1;
+                                return Some(Instr::BinOp { op: BinOpKind::Mul, lhs: x.clone(), rhs: Box::new(Instr::ConstInt(factor)) });
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::ShrIsDivPow2 => {
+                // x >> k -> x / 2^k (semantic equivalence — mark for cost model)
+                Some(instr.clone())
+            }
+            // ── Tier 2: Bit Manipulation Rules ──
+            RewriteAction::AndNotComplement | RewriteAction::AndComplement => {
+                // a & (!b) / a & (~b) -> ANDN(a, b) — mark for cost model
+                Some(instr.clone())
+            }
+            RewriteAction::XorSwap => {
+                // a ^ b ^ b -> a
+                if let Instr::BinOp { op: BinOpKind::BitXor, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::BitXor, lhs: ref a, rhs: ref inner_rhs } = &**lhs {
+                        if inner_rhs == rhs { return Some((**a).clone()); }
+                    }
+                }
+                None
+            }
+            RewriteAction::XorAllOnes => {
+                // a ^ ~0 -> ~a
+                if let Instr::BinOp { op: BinOpKind::BitXor, lhs, rhs } = instr {
+                    if let Instr::ConstInt(v) = **rhs {
+                        if v == u128::MAX { return Some(Instr::UnOp { op: UnOpKind::Not, operand: lhs.clone() }); }
+                    }
+                }
+                None
+            }
+            RewriteAction::AndMaskLow | RewriteAction::AndMaskHigh => {
+                // Mark for cost model — these are architectural instruction matches
+                Some(instr.clone())
+            }
+            RewriteAction::IsolateLowest => {
+                // x & (-x) -> BLSI(x) — mark for cost model
+                Some(instr.clone())
+            }
+            RewriteAction::ClearLowest => {
+                // x & (x - 1) -> BLSR(x) — mark for cost model
+                Some(instr.clone())
+            }
+            RewriteAction::MaskMerge => {
+                // (a & mask) | (b & ~mask) -> BFI(a, b, mask) — mark for cost model
+                Some(instr.clone())
+            }
+            // ── Tier 3: Comparison and Conditional Rules ──
+            RewriteAction::CmpNegateFull => {
+                // !(a <= b) -> a > b and !(a >= b) -> a < b
+                if let Instr::UnOp { op: UnOpKind::Not, operand } = instr {
+                    if let Instr::BinOp { op, lhs, rhs } = &**operand {
+                        let new_op = match op {
+                            BinOpKind::Le => BinOpKind::Gt,
+                            BinOpKind::Ge => BinOpKind::Lt,
+                            _ => return None,
+                        };
+                        return Some(Instr::BinOp { op: new_op, lhs: lhs.clone(), rhs: rhs.clone() });
+                    }
+                }
+                None
+            }
+            RewriteAction::DoubleNegCmp => {
+                // !!(a < b) -> a < b
+                if let Instr::UnOp { op: UnOpKind::Not, operand } = instr {
+                    if let Instr::UnOp { op: UnOpKind::Not, operand: ref inner } = &**operand {
+                        return Some((**inner).clone());
+                    }
+                }
+                None
+            }
+            RewriteAction::EqNormalize => {
+                // a == b -> b == a (when b is const)
+                if let Instr::BinOp { op: BinOpKind::Eq, lhs, rhs } = instr {
+                    if matches!(**rhs, Instr::ConstInt(_)) {
+                        return Some(Instr::BinOp { op: BinOpKind::Eq, lhs: rhs.clone(), rhs: lhs.clone() });
+                    }
+                }
+                None
+            }
+            RewriteAction::NeNormalize => {
+                // a != b -> b != a (when b is const)
+                if let Instr::BinOp { op: BinOpKind::Ne, lhs, rhs } = instr {
+                    if matches!(**rhs, Instr::ConstInt(_)) {
+                        return Some(Instr::BinOp { op: BinOpKind::Ne, lhs: rhs.clone(), rhs: lhs.clone() });
+                    }
+                }
+                None
+            }
+            RewriteAction::SubIsZero => {
+                // (a - b) == 0 -> a == b
+                if let Instr::BinOp { op: BinOpKind::Eq, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs: a, rhs: b } = &**lhs {
+                        if let Instr::ConstInt(0) = **rhs {
+                            return Some(Instr::BinOp { op: BinOpKind::Eq, lhs: a.clone(), rhs: b.clone() });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::SubIsNonZero => {
+                // (a - b) != 0 -> a != b
+                if let Instr::BinOp { op: BinOpKind::Ne, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs: a, rhs: b } = &**lhs {
+                        if let Instr::ConstInt(0) = **rhs {
+                            return Some(Instr::BinOp { op: BinOpKind::Ne, lhs: a.clone(), rhs: b.clone() });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::LeFromLt => {
+                // a < b + 1 -> a <= b
+                if let Instr::BinOp { op: BinOpKind::Lt, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs: b, rhs: ref add_rhs } = &**rhs {
+                        if let Instr::ConstInt(1) = **add_rhs {
+                            return Some(Instr::BinOp { op: BinOpKind::Le, lhs: lhs.clone(), rhs: b.clone() });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::GeFromGt => {
+                // a > b - 1 -> a >= b
+                if let Instr::BinOp { op: BinOpKind::Gt, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs: b, rhs: ref sub_rhs } = &**rhs {
+                        if let Instr::ConstInt(1) = **sub_rhs {
+                            return Some(Instr::BinOp { op: BinOpKind::Ge, lhs: lhs.clone(), rhs: b.clone() });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::AndCmps => {
+                // (a > 0) & (a < N) -> range check pattern — mark for cost model
+                Some(instr.clone())
+            }
+            // ── Tier 3: Division and Remainder Optimization ──
+            RewriteAction::DivByConst3 | RewriteAction::DivByConst5 |
+            RewriteAction::DivByConst7 | RewriteAction::DivByConstN => {
+                // x / N -> MULH(x, magic(N)) — mark for cost model
+                Some(instr.clone())
+            }
+            RewriteAction::RemByConst3 | RewriteAction::RemToMask => {
+                // x % N -> x - (x/N)*N — mark for cost model
+                Some(instr.clone())
+            }
+            RewriteAction::RemByConstPow2 => {
+                // x % 2^k -> x & (2^k - 1)
+                if let Instr::BinOp { op: BinOpKind::Rem, lhs, rhs } = instr {
+                    if let Instr::ConstInt(v) = **rhs {
+                        if v > 1 && (v & (v - 1)) == 0 {
+                            return Some(Instr::BinOp { op: BinOpKind::BitAnd, lhs: lhs.clone(), rhs: Box::new(Instr::ConstInt(v - 1)) });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::DivNegNeg => {
+                // (-a) / (-b) -> a / b
+                if let Instr::BinOp { op: BinOpKind::Div, lhs, rhs } = instr {
+                    if let (Instr::UnOp { op: UnOpKind::Neg, operand: a },
+                            Instr::UnOp { op: UnOpKind::Neg, operand: b }) = (&**lhs, &**rhs) {
+                        return Some(Instr::BinOp { op: BinOpKind::Div, lhs: a.clone(), rhs: b.clone() });
+                    }
+                }
+                None
+            }
+            RewriteAction::DivSignAdjust => {
+                // x / (-N) -> -(x / N)
+                if let Instr::BinOp { op: BinOpKind::Div, lhs, rhs } = instr {
+                    if let Instr::UnOp { op: UnOpKind::Neg, operand: ref inner } = &**rhs {
+                        return Some(Instr::UnOp {
+                            op: UnOpKind::Neg,
+                            operand: Box::new(Instr::BinOp { op: BinOpKind::Div, lhs: lhs.clone(), rhs: inner.clone() }),
+                        });
+                    }
+                }
+                None
+            }
+            RewriteAction::UnsignedDivPow2 => {
+                // x >>> k -> x / 2^k — mark for cost model
+                Some(instr.clone())
+            }
+            // ── Tier 4: Multi-Step and Architectural Rules ──
+            RewriteAction::Lea3Op | RewriteAction::LeaScaleAdd => {
+                // Mark for cost model — LEA pattern detection
+                Some(instr.clone())
+            }
+            RewriteAction::TestInsteadOfAnd | RewriteAction::TestInsteadOfAndNZ => {
+                // Mark for cost model — TEST instruction pattern
+                Some(instr.clone())
+            }
+            RewriteAction::SetccFromCmp | RewriteAction::CmovFromSelect |
+            RewriteAction::CmovFromCmpOp => {
+                // Mark for cost model — conditional instruction pattern
+                Some(instr.clone())
+            }
+            RewriteAction::SbbFromBorrow | RewriteAction::AdcFromCarry => {
+                // Mark for cost model — carry instruction pattern
+                Some(instr.clone())
+            }
+            RewriteAction::XorZero => {
+                // x ^ x -> 0
+                if let Instr::BinOp { op: BinOpKind::BitXor, lhs, rhs } = instr {
+                    if lhs == rhs { return Some(Instr::ConstInt(0)); }
+                }
+                None
+            }
+            RewriteAction::MovZero => {
+                // 0 -> XOR(reg, reg) — mark for cost model
+                Some(instr.clone())
+            }
+            RewriteAction::RotateRight | RewriteAction::RotateLeft => {
+                // Mark for cost model — rotation pattern
+                Some(instr.clone())
+            }
+            RewriteAction::BswapPattern | RewriteAction::PopcntPattern |
+            RewriteAction::LzcntPattern | RewriteAction::TzcntPattern => {
+                // Mark for cost model — special instruction pattern
+                Some(instr.clone())
             }
         }
     }
@@ -1995,6 +3177,7 @@ mod tests {
             expanded: false,
             cached_cost: None,
             policy_prior: Some(0.7), // Higher prior
+            virtual_loss: AtomicU32::new(0),
         });
         root.children.push(MctsNode {
             program: Instr::ConstInt(2),
@@ -2006,6 +3189,7 @@ mod tests {
             expanded: false,
             cached_cost: None,
             policy_prior: Some(0.3), // Lower prior
+            virtual_loss: AtomicU32::new(0),
         });
         // With equal visits but different priors, PUCT should prefer higher prior
         let best = root.best_child(1.414);

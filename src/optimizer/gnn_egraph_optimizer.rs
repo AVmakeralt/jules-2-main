@@ -1821,6 +1821,66 @@ fn apply_rewrite(instr: &Instr, action: &RewriteAction) -> Option<Instr> {
         | RewriteAction::CmpNegate
         | RewriteAction::AndOverOr
         | RewriteAction::OrOverAnd => None,
+        // Tier 2: Arithmetic and Bit-Level Algebra
+        | RewriteAction::SubReassoc1
+        | RewriteAction::SubReassoc2
+        | RewriteAction::AddSubCancel
+        | RewriteAction::MulPow2Add
+        | RewriteAction::MulDistSub
+        | RewriteAction::NegSwap
+        | RewriteAction::DoubleNegAdd
+        | RewriteAction::AddZeroLeft
+        | RewriteAction::ShlByConstAdd
+        | RewriteAction::ShrIsDivPow2
+        // Tier 2: Bit Manipulation Rules
+        | RewriteAction::AndNotComplement
+        | RewriteAction::AndComplement
+        | RewriteAction::XorSwap
+        | RewriteAction::XorAllOnes
+        | RewriteAction::AndMaskLow
+        | RewriteAction::AndMaskHigh
+        | RewriteAction::IsolateLowest
+        | RewriteAction::ClearLowest
+        | RewriteAction::MaskMerge
+        // Tier 3: Comparison and Conditional Rules
+        | RewriteAction::CmpNegateFull
+        | RewriteAction::DoubleNegCmp
+        | RewriteAction::EqNormalize
+        | RewriteAction::NeNormalize
+        | RewriteAction::SubIsZero
+        | RewriteAction::SubIsNonZero
+        | RewriteAction::LeFromLt
+        | RewriteAction::GeFromGt
+        | RewriteAction::AndCmps
+        // Tier 3: Division and Remainder Optimization
+        | RewriteAction::DivByConst3
+        | RewriteAction::DivByConst5
+        | RewriteAction::DivByConst7
+        | RewriteAction::DivByConstN
+        | RewriteAction::RemByConst3
+        | RewriteAction::RemByConstPow2
+        | RewriteAction::RemToMask
+        | RewriteAction::DivNegNeg
+        | RewriteAction::DivSignAdjust
+        | RewriteAction::UnsignedDivPow2
+        // Tier 4: Multi-Step and Architectural Rules
+        | RewriteAction::Lea3Op
+        | RewriteAction::LeaScaleAdd
+        | RewriteAction::TestInsteadOfAnd
+        | RewriteAction::TestInsteadOfAndNZ
+        | RewriteAction::SetccFromCmp
+        | RewriteAction::CmovFromSelect
+        | RewriteAction::CmovFromCmpOp
+        | RewriteAction::SbbFromBorrow
+        | RewriteAction::AdcFromCarry
+        | RewriteAction::XorZero
+        | RewriteAction::MovZero
+        | RewriteAction::RotateRight
+        | RewriteAction::RotateLeft
+        | RewriteAction::BswapPattern
+        | RewriteAction::PopcntPattern
+        | RewriteAction::LzcntPattern
+        | RewriteAction::TzcntPattern => None,
     }
 }
 
