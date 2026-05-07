@@ -1116,8 +1116,8 @@ mod tests {
         
         let matmul_expr = Expr::BinOp {
             op: BinOpKind::MatMul,
-            lhs: Box::new(Expr::IntLit { value: 0, span: Span::dummy() }),
-            rhs: Box::new(Expr::IntLit { value: 0, span: Span::dummy() }),
+            lhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 0, ty: None }),
+            rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 0, ty: None }),
             span: Span::dummy(),
         };
         
@@ -1132,8 +1132,8 @@ mod tests {
         
         let add_expr = Expr::BinOp {
             op: BinOpKind::Add,
-            lhs: Box::new(Expr::IntLit { value: 0, span: Span::dummy() }),
-            rhs: Box::new(Expr::IntLit { value: 0, span: Span::dummy() }),
+            lhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 0, ty: None }),
+            rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 0, ty: None }),
             span: Span::dummy(),
         };
         

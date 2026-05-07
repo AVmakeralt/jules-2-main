@@ -2216,7 +2216,7 @@ impl Parser {
             // Literals
             TokenKind::IntLit { value, .. } => {
                 self.advance();
-                Ok(Expr::IntLit { span, value })
+                Ok(Expr::IntLit { span, value, ty: None })
             }
             TokenKind::FloatLit { value } => {
                 self.advance();

@@ -431,7 +431,7 @@ impl SemanticSuperoptimizer {
         if let Some(tail) = &mut block.tail {
             let old = std::mem::replace(
                 tail.as_mut(),
-                Expr::IntLit { span: Span::dummy(), value: 0 },
+                Expr::IntLit { span: Span::dummy(), value: 0, ty: None },
             );
             **tail = self.optimize_expr(old);
         }
@@ -442,7 +442,7 @@ impl SemanticSuperoptimizer {
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
                 let old = std::mem::replace(
                     expr,
-                    Expr::IntLit { span: Span::dummy(), value: 0 },
+                    Expr::IntLit { span: Span::dummy(), value: 0, ty: None },
                 );
                 *expr = self.optimize_expr(old);
             }
@@ -462,7 +462,7 @@ impl SemanticSuperoptimizer {
             Stmt::If { cond, then, else_, .. } => {
                 let old = std::mem::replace(
                     cond,
-                    Expr::IntLit { span: Span::dummy(), value: 0 },
+                    Expr::IntLit { span: Span::dummy(), value: 0, ty: None },
                 );
                 *cond = self.optimize_expr(old);
                 self.optimize_block(then);
@@ -475,7 +475,7 @@ impl SemanticSuperoptimizer {
             Stmt::Return { value: Some(expr), .. } => {
                 let old = std::mem::replace(
                     expr,
-                    Expr::IntLit { span: Span::dummy(), value: 0 },
+                    Expr::IntLit { span: Span::dummy(), value: 0, ty: None },
                 );
                 *expr = self.optimize_expr(old);
             }
@@ -571,7 +571,7 @@ impl SemanticSuperoptimizer {
         if let Expr::BinOp { op: eop, lhs, rhs, span } = expr {
             if *eop == op {
                 if let (Some(a), Some(b)) = (Self::as_int_lit(lhs), Self::as_int_lit(rhs)) {
-                    return Some(Expr::IntLit { span: *span, value: f(a, b) });
+                    return Some(Expr::IntLit { span: *span, value: f(a, b), ty: None });
                 }
             }
         }
@@ -589,7 +589,7 @@ impl SemanticSuperoptimizer {
             if *eop == op {
                 if let (Some(a), Some(b)) = (Self::as_int_lit(lhs), Self::as_int_lit(rhs)) {
                     if let Some(result) = f(a, b) {
-                        return Some(Expr::IntLit { span: *span, value: result });
+                        return Some(Expr::IntLit { span: *span, value: result, ty: None });
                     }
                 }
             }
@@ -603,7 +603,7 @@ impl SemanticSuperoptimizer {
             if let (Some(b), Some(e)) = (Self::as_int_lit(base), Self::as_int_lit(exp)) {
                 if e <= 16 {
                     let result = b.wrapping_pow(e as u32);
-                    return Some(Expr::IntLit { span: *span, value: result });
+                    return Some(Expr::IntLit { span: *span, value: result, ty: None });
                 }
             }
         }
@@ -621,7 +621,7 @@ impl SemanticSuperoptimizer {
                             BinOpKind::Shr => a >> b,
                             _ => return None,
                         };
-                        return Some(Expr::IntLit { span: *span, value: result });
+                        return Some(Expr::IntLit { span: *span, value: result, ty: None });
                     }
                 }
             }
@@ -633,7 +633,7 @@ impl SemanticSuperoptimizer {
     fn cf_neg(&self, expr: &Expr) -> Option<Expr> {
         if let Expr::UnOp { op: UnOpKind::Neg, expr: inner, span } = expr {
             if let Some(v) = Self::as_int_lit(inner) {
-                return Some(Expr::IntLit { span: *span, value: v.wrapping_neg() });
+                return Some(Expr::IntLit { span: *span, value: v.wrapping_neg(), ty: None });
             }
         }
         None
@@ -706,7 +706,7 @@ impl SemanticSuperoptimizer {
     fn annihilator_right(&self, expr: &Expr, op: BinOpKind, ann: u128) -> Option<Expr> {
         if let Expr::BinOp { op: eop, rhs, span, .. } = expr {
             if *eop == op && Self::is_int_lit(rhs, ann) {
-                return Some(Expr::IntLit { span: *span, value: ann });
+                return Some(Expr::IntLit { span: *span, value: ann, ty: None });
             }
         }
         None
@@ -715,7 +715,7 @@ impl SemanticSuperoptimizer {
     fn annihilator_left(&self, expr: &Expr, op: BinOpKind, ann: u128) -> Option<Expr> {
         if let Expr::BinOp { op: eop, lhs, span, .. } = expr {
             if *eop == op && Self::is_int_lit(lhs, ann) {
-                return Some(Expr::IntLit { span: *span, value: ann });
+                return Some(Expr::IntLit { span: *span, value: ann, ty: None });
             }
         }
         None
@@ -725,7 +725,7 @@ impl SemanticSuperoptimizer {
         // 0 / x → 0 (x might be non-zero; we can't prove it, but it is safe for integers)
         if let Expr::BinOp { op: BinOpKind::Div, lhs, span, .. } = expr {
             if Self::is_int_lit(lhs, 0) {
-                return Some(Expr::IntLit { span: *span, value: 0 });
+                return Some(Expr::IntLit { span: *span, value: 0, ty: None });
             }
         }
         None
@@ -735,7 +735,7 @@ impl SemanticSuperoptimizer {
         // x ^ 0 → 1
         if let Expr::Pow { exp, span, .. } = expr {
             if Self::is_int_lit(exp, 0) {
-                return Some(Expr::IntLit { span: *span, value: 1 });
+                return Some(Expr::IntLit { span: *span, value: 1, ty: None });
             }
         }
         None
@@ -755,7 +755,7 @@ impl SemanticSuperoptimizer {
         // 1 ^ x → 1
         if let Expr::Pow { base, span, .. } = expr {
             if Self::is_int_lit(base, 1) {
-                return Some(Expr::IntLit { span: *span, value: 1 });
+                return Some(Expr::IntLit { span: *span, value: 1, ty: None });
             }
         }
         None
@@ -781,7 +781,7 @@ impl SemanticSuperoptimizer {
     fn sub_self(&self, expr: &Expr) -> Option<Expr> {
         if let Expr::BinOp { op: BinOpKind::Sub, lhs, rhs, span } = expr {
             if Self::exprs_equal(lhs, rhs) {
-                return Some(Expr::IntLit { span: *span, value: 0 });
+                return Some(Expr::IntLit { span: *span, value: 0, ty: None });
             }
         }
         None
@@ -790,7 +790,7 @@ impl SemanticSuperoptimizer {
     fn div_self(&self, expr: &Expr) -> Option<Expr> {
         if let Expr::BinOp { op: BinOpKind::Div, lhs, rhs, span } = expr {
             if Self::exprs_equal(lhs, rhs) && !Self::is_int_lit(lhs, 0) {
-                return Some(Expr::IntLit { span: *span, value: 1 });
+                return Some(Expr::IntLit { span: *span, value: 1, ty: None });
             }
         }
         None
@@ -799,7 +799,7 @@ impl SemanticSuperoptimizer {
     fn xor_self(&self, expr: &Expr) -> Option<Expr> {
         if let Expr::BinOp { op: BinOpKind::BitXor, lhs, rhs, span } = expr {
             if Self::exprs_equal(lhs, rhs) {
-                return Some(Expr::IntLit { span: *span, value: 0 });
+                return Some(Expr::IntLit { span: *span, value: 0, ty: None });
             }
         }
         None
@@ -964,7 +964,7 @@ impl SemanticSuperoptimizer {
                 return Some(Expr::BinOp {
                     span,
                     op: BinOpKind::Mul,
-                    lhs: Box::new(Expr::IntLit { span, value: 2 }),
+                    lhs: Box::new(Expr::IntLit { span, value: 2, ty: None }),
                     rhs: lhs.clone(),
                 });
             }
@@ -1043,7 +1043,7 @@ impl SemanticSuperoptimizer {
     fn rem_one(&self, expr: &Expr) -> Option<Expr> {
         if let Expr::BinOp { op: BinOpKind::Rem, rhs, span, .. } = expr {
             if Self::is_int_lit(rhs, 1) {
-                return Some(Expr::IntLit { span: *span, value: 0 });
+                return Some(Expr::IntLit { span: *span, value: 0, ty: None });
             }
         }
         None
@@ -1052,7 +1052,7 @@ impl SemanticSuperoptimizer {
     fn rem_self(&self, expr: &Expr) -> Option<Expr> {
         if let Expr::BinOp { op: BinOpKind::Rem, lhs, rhs, span } = expr {
             if Self::exprs_equal(lhs, rhs) {
-                return Some(Expr::IntLit { span: *span, value: 0 });
+                return Some(Expr::IntLit { span: *span, value: 0, ty: None });
             }
         }
         None
@@ -1089,7 +1089,7 @@ impl SemanticSuperoptimizer {
                             span,
                             op: BinOpKind::Shl,
                             lhs: Box::new(*other_side.clone()),
-                            rhs: Box::new(Expr::IntLit { span, value: k }),
+                            rhs: Box::new(Expr::IntLit { span, value: k, ty: None }),
                         });
                     }
                 }
@@ -1109,7 +1109,7 @@ impl SemanticSuperoptimizer {
                         span,
                         op: BinOpKind::Shr,
                         lhs: lhs.clone(),
-                        rhs: Box::new(Expr::IntLit { span, value: k }),
+                        rhs: Box::new(Expr::IntLit { span, value: k, ty: None }),
                     });
                 }
             }
@@ -1128,7 +1128,7 @@ impl SemanticSuperoptimizer {
                         span,
                         op: BinOpKind::BitAnd,
                         lhs: lhs.clone(),
-                        rhs: Box::new(Expr::IntLit { span, value: mask }),
+                        rhs: Box::new(Expr::IntLit { span, value: mask, ty: None }),
                     });
                 }
             }
@@ -1159,7 +1159,7 @@ impl SemanticSuperoptimizer {
                         span,
                         op: BinOpKind::Shl,
                         lhs: Box::new(x.clone()),
-                        rhs: Box::new(Expr::IntLit { span, value: k }),
+                        rhs: Box::new(Expr::IntLit { span, value: k, ty: None }),
                     }),
                     rhs: Box::new(x.clone()),
                 });
@@ -1178,8 +1178,8 @@ impl SemanticSuperoptimizer {
             return Some(Expr::BinOp {
                 span,
                 op: BinOpKind::Add,
-                lhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 2 }) }),
-                rhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 1 }) }),
+                lhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 2, ty: None }) }),
+                rhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }) }),
             });
         }
         None
@@ -1195,7 +1195,7 @@ impl SemanticSuperoptimizer {
             return Some(Expr::BinOp {
                 span,
                 op: BinOpKind::Sub,
-                lhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 3 }) }),
+                lhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 3, ty: None }) }),
                 rhs: Box::new(x.clone()),
             });
         }
@@ -1212,8 +1212,8 @@ impl SemanticSuperoptimizer {
             return Some(Expr::BinOp {
                 span,
                 op: BinOpKind::Add,
-                lhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 3 }) }),
-                rhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 1 }) }),
+                lhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 3, ty: None }) }),
+                rhs: Box::new(Expr::BinOp { span, op: BinOpKind::Shl, lhs: Box::new(x.clone()), rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }) }),
             });
         }
         None
@@ -1240,7 +1240,7 @@ impl SemanticSuperoptimizer {
                                 span,
                                 op,
                                 lhs: x.clone(),
-                                rhs: Box::new(Expr::IntLit { span, value: a + b }),
+                                rhs: Box::new(Expr::IntLit { span, value: a + b, ty: None }),
                             });
                         }
                     }
@@ -1404,7 +1404,7 @@ impl SemanticSuperoptimizer {
                         span,
                         op: BinOpKind::Lt,
                         lhs: lhs.clone(),
-                        rhs: Box::new(Expr::IntLit { span, value: v1 }),
+                        rhs: Box::new(Expr::IntLit { span, value: v1, ty: None }),
                     });
                 }
             }
@@ -1495,7 +1495,7 @@ impl SemanticSuperoptimizer {
                             span,
                             op: BinOpKind::Add,
                             lhs: Box::new(n.clone()),
-                            rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                            rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
                         };
                         return Some(Self::build_triangular_formula(span, &n1));
                     }
@@ -1516,7 +1516,7 @@ impl SemanticSuperoptimizer {
                         span,
                         op: BinOpKind::Add,
                         lhs: Box::new(n.clone()),
-                        rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                        rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
                     };
                     return Some(Self::build_sum_of_cubes_formula(span, &n1));
                 }
@@ -1538,7 +1538,7 @@ impl SemanticSuperoptimizer {
             if let Expr::Ident { name, .. } = func.as_ref() {
                 if name == "factorial" && args.len() == 1 {
                     if Self::is_int_lit(&args[0], arg_val) {
-                        return Some(Expr::IntLit { span: *span, value: result });
+                        return Some(Expr::IntLit { span: *span, value: result, ty: None });
                     }
                 }
             }
@@ -1557,7 +1557,7 @@ impl SemanticSuperoptimizer {
                 if name == "factorial" && args.len() == 1 {
                     if let Some(n) = Self::as_int_lit(&args[0]) {
                         if (n as usize) < FACT.len() {
-                            return Some(Expr::IntLit { span: *span, value: FACT[n as usize] });
+                            return Some(Expr::IntLit { span: *span, value: FACT[n as usize], ty: None });
                         }
                     }
                 }
@@ -1742,16 +1742,16 @@ impl SemanticSuperoptimizer {
                         op: BinOpKind::Sub,
                         lhs: Box::new(Expr::BinOp {
                             op: BinOpKind::Shl,
-                            lhs: Box::new(Expr::IntLit { span, value: 1 }),
+                            lhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
                             rhs: Box::new(Expr::BinOp {
                                 op: BinOpKind::Sub,
-                                lhs: Box::new(Expr::IntLit { span, value: 64 }),
+                                lhs: Box::new(Expr::IntLit { span, value: 64, ty: None }),
                                 rhs: k_outer.clone(),
                                 span,
                             }),
                             span,
                         }),
-                        rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                        rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
                         span,
                     };
                     return Some(Expr::BinOp {
@@ -1814,7 +1814,7 @@ impl SemanticSuperoptimizer {
                     return Some(Expr::Call {
                         span,
                         func: Box::new(Expr::Ident { span, name: "pow_fast".to_string() }),
-                        args: vec![*base.clone(), Expr::IntLit { span, value: n }],
+                        args: vec![*base.clone(), Expr::IntLit { span, value: n, ty: None }],
                         named: vec![],
                     });
                 }
@@ -1926,7 +1926,7 @@ impl SemanticSuperoptimizer {
         let span = expr.span();
         let x_name = terms.first()?.1.clone()?;
 
-        let mut horner = Expr::IntLit { span, value: terms.last()?.0 };
+        let mut horner = Expr::IntLit { span, value: terms.last()?.0, ty: None };
         for (coeff, _var) in terms.iter().rev().skip(1) {
             horner = Expr::BinOp {
                 span,
@@ -1937,7 +1937,7 @@ impl SemanticSuperoptimizer {
                     lhs: Box::new(horner),
                     rhs: Box::new(Expr::Ident { span, name: x_name.clone() }),
                 }),
-                rhs: Box::new(Expr::IntLit { span, value: *coeff }),
+                rhs: Box::new(Expr::IntLit { span, value: *coeff, ty: None }),
             };
         }
 
@@ -2018,15 +2018,15 @@ impl SemanticSuperoptimizer {
                 lhs: Box::new(Expr::Pow {
                     span,
                     base: Box::new(Expr::Ident { span, name: r.clone() }),
-                    exp:  Box::new(Expr::IntLit { span, value: n }),
+                    exp:  Box::new(Expr::IntLit { span, value: n, ty: None }),
                 }),
-                rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
             }),
             rhs: Box::new(Expr::BinOp {
                 span,
                 op: BinOpKind::Sub,
                 lhs: Box::new(Expr::Ident { span, name: r }),
-                rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
             }),
         };
 
@@ -2051,7 +2051,7 @@ impl SemanticSuperoptimizer {
         let result = n * (n + 1) * (2 * n + 1) / 6;
         Some(SemanticOptResult {
             original: expr.clone(),
-            optimized: Expr::IntLit { span, value: result },
+            optimized: Expr::IntLit { span, value: result, ty: None },
             pattern_name: "sum_of_squares".to_string(),
             estimated_speedup: 1000.0,
         })
@@ -2071,7 +2071,7 @@ impl SemanticSuperoptimizer {
         let result     = triangular * triangular;
         Some(SemanticOptResult {
             original: expr.clone(),
-            optimized: Expr::IntLit { span, value: result },
+            optimized: Expr::IntLit { span, value: result, ty: None },
             pattern_name: "sum_of_cubes".to_string(),
             estimated_speedup: 1000.0,
         })
@@ -2261,7 +2261,7 @@ impl SemanticSuperoptimizer {
                     span,
                     op: BinOpKind::Sub,
                     lhs: Box::new(n_expr.clone()),
-                    rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                    rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
                 }
             };
             return Some(assign(Self::build_triangular_formula(span, &n_adjusted)));
@@ -2455,10 +2455,10 @@ impl SemanticSuperoptimizer {
                     span,
                     op: BinOpKind::Add,
                     lhs: Box::new(n.clone()),
-                    rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                    rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
                 }),
             }),
-            rhs: Box::new(Expr::IntLit { span, value: 2 }),
+            rhs: Box::new(Expr::IntLit { span, value: 2, ty: None }),
         }
     }
 
@@ -2478,7 +2478,7 @@ impl SemanticSuperoptimizer {
                         span,
                         op: BinOpKind::Add,
                         lhs: Box::new(n.clone()),
-                        rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                        rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
                     }),
                 }),
                 rhs: Box::new(Expr::BinOp {
@@ -2487,13 +2487,13 @@ impl SemanticSuperoptimizer {
                     lhs: Box::new(Expr::BinOp {
                         span,
                         op: BinOpKind::Mul,
-                        lhs: Box::new(Expr::IntLit { span, value: 2 }),
+                        lhs: Box::new(Expr::IntLit { span, value: 2, ty: None }),
                         rhs: Box::new(n.clone()),
                     }),
-                    rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                    rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
                 }),
             }),
-            rhs: Box::new(Expr::IntLit { span, value: 6 }),
+            rhs: Box::new(Expr::IntLit { span, value: 6, ty: None }),
         }
     }
 
@@ -2523,7 +2523,7 @@ impl SemanticSuperoptimizer {
                     lhs: Box::new(Expr::BinOp {
                         span,
                         op: BinOpKind::Mul,
-                        lhs: Box::new(Expr::IntLit { span, value: 2 }),
+                        lhs: Box::new(Expr::IntLit { span, value: 2, ty: None }),
                         rhs: Box::new(a.clone()),
                     }),
                     rhs: Box::new(Expr::BinOp {
@@ -2533,13 +2533,13 @@ impl SemanticSuperoptimizer {
                             span,
                             op: BinOpKind::Sub,
                             lhs: Box::new(n.clone()),
-                            rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                            rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
                         }),
                         rhs: Box::new(d.clone()),
                     }),
                 }),
             }),
-            rhs: Box::new(Expr::IntLit { span, value: 2 }),
+            rhs: Box::new(Expr::IntLit { span, value: 2, ty: None }),
         }
     }
 
@@ -2556,13 +2556,13 @@ impl SemanticSuperoptimizer {
                     base: Box::new(r.clone()),
                     exp:  Box::new(n.clone()),
                 }),
-                rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
             }),
             rhs: Box::new(Expr::BinOp {
                 span,
                 op: BinOpKind::Sub,
                 lhs: Box::new(r.clone()),
-                rhs: Box::new(Expr::IntLit { span, value: 1 }),
+                rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
             }),
         }
     }
@@ -2603,8 +2603,8 @@ impl SemanticSuperoptimizer {
             lhs: Box::new(Expr::BinOp {
                 span,
                 op: BinOpKind::Div,
-                lhs: Box::new(Expr::IntLit { span, value: n }),
-                rhs: Box::new(Expr::IntLit { span, value: 2 }),
+                lhs: Box::new(Expr::IntLit { span, value: n, ty: None }),
+                rhs: Box::new(Expr::IntLit { span, value: 2, ty: None }),
             }),
             rhs: Box::new(Expr::BinOp {
                 span,
@@ -2612,13 +2612,13 @@ impl SemanticSuperoptimizer {
                 lhs: Box::new(Expr::BinOp {
                     span,
                     op: BinOpKind::Mul,
-                    lhs: Box::new(Expr::IntLit { span, value: 2 }),
+                    lhs: Box::new(Expr::IntLit { span, value: 2, ty: None }),
                     rhs: Box::new(base.clone()),
                 }),
                 rhs: Box::new(Expr::BinOp {
                     span,
                     op: BinOpKind::Mul,
-                    lhs: Box::new(Expr::IntLit { span, value: n - 1 }),
+                    lhs: Box::new(Expr::IntLit { span, value: n - 1, ty: None }),
                     rhs: Box::new(step.clone()),
                 }),
             }),
@@ -3012,7 +3012,7 @@ impl SemanticSuperoptimizer {
                 span: Span::dummy(),
                 op: BinOpKind::Add,
                 lhs: Box::new(n.clone()),
-                rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+                rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1, ty: None }),
             };
             if Self::exprs_equal(lhs, &n1) && Self::exprs_equal(rhs, &n1) { return true; }
         }
@@ -3041,7 +3041,7 @@ mod tests {
     }
 
     fn int(v: u128) -> Expr {
-        Expr::IntLit { span: span(), value: v }
+        Expr::IntLit { span: span(), value: v, ty: None }
     }
 
     fn binop(op: BinOpKind, lhs: Expr, rhs: Expr) -> Expr {

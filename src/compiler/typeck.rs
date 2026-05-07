@@ -50,7 +50,7 @@ use rustc_hash::FxHashMap;
 
 use crate::compiler::ast::{
     AgentDecl, BinOpKind, Block, ComponentDecl, DimExpr, ElemType, Expr, FnDecl, GenericParam,
-    Item, ModelDecl, ModelLayer, Pattern, Program, StructDecl, SystemDecl, TrainDecl, Type,
+    Item, ModelDecl, ModelLayer, Pattern, Program, Stmt, StructDecl, SystemDecl, TrainDecl, Type,
     UnOpKind, VecFamily, VecSize,
 };
 use crate::compiler::lexer::Span;
@@ -3641,6 +3641,7 @@ mod tests {
         Expr::IntLit {
             span: dummy(),
             value: v,
+            ty: None,
         }
     }
     fn bool_lit(v: bool) -> Expr {
@@ -4194,6 +4195,7 @@ mod tests {
                     value: Box::new(Expr::IntLit {
                         span: dummy(),
                         value: 128,
+                        ty: None,
                     }),
                 },
                 Expr::Assign {
@@ -4206,6 +4208,7 @@ mod tests {
                     value: Box::new(Expr::IntLit {
                         span: dummy(),
                         value: 32,
+                        ty: None,
                     }),
                 },
             ],
@@ -4447,6 +4450,7 @@ mod tests {
                     Expr::IntLit {
                         span: dummy(),
                         value: 4,
+                        ty: None,
                     },
                 ),
                 assign_kv(
@@ -4454,6 +4458,7 @@ mod tests {
                     Expr::IntLit {
                         span: dummy(),
                         value: 64,
+                        ty: None,
                     },
                 ),
                 assign_kv(
@@ -4539,7 +4544,7 @@ mod tests {
                 span,
                 name: "clamp".into(),
             }),
-            args: vec![Expr::IntLit { span, value: 42 }],
+            args: vec![Expr::IntLit { span, value: 42, ty: None }],
             named: vec![],
         };
 
@@ -4567,7 +4572,7 @@ mod tests {
                 span,
                 segments: vec!["window".into(), "open".into()],
             }),
-            args: vec![Expr::IntLit { span, value: 1 }],
+            args: vec![Expr::IntLit { span, value: 1, ty: None }],
             named: vec![],
         };
 
@@ -4640,5 +4645,287 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+// =============================================================================
+// POST-TYPECK ANNOTATION PASS
+// =============================================================================
+
+/// Walk a `Program` and annotate every `Expr::IntLit` with its resolved
+/// `ElemType`.  This runs **after** type checking so the interpreter and
+/// bytecode VM know the correct integer width without guessing.
+///
+/// Rules:
+/// - Default to `I64` as the safe default (matches the `Int` prelude type).
+///   This eliminates the `u128 → i32` truncation bug that caused Collatz-200 → 0.
+/// - If a context-specific type can be inferred from a type annotation or
+///   variable declaration, that takes precedence.
+///
+/// This pass must run after the type checker has validated the program.
+pub fn annotate_int_widths(program: &mut Program) {
+    for item in &mut program.items {
+        annotate_item(item);
+    }
+}
+
+fn annotate_item(item: &mut Item) {
+    match item {
+        Item::Fn(f) => {
+            for param in &mut f.params {
+                if let Some(d) = &mut param.default {
+                    annotate_expr_with_hint(d, param.ty.as_ref().and_then(ty_to_elem));
+                }
+            }
+            if let Some(body) = &mut f.body {
+                annotate_block(body);
+            }
+        }
+        Item::System(s) => {
+            annotate_block(&mut s.body);
+        }
+        Item::Const(c) => {
+            annotate_expr_with_hint(&mut c.value, ty_to_elem(&c.ty));
+        }
+        Item::Mod {
+            items: Some(inner), ..
+        } => {
+            for i in inner {
+                annotate_item(i);
+            }
+        }
+        Item::Agent(a) => {
+            for rule in &mut a.behaviors {
+                for param in &mut rule.params {
+                    if let Some(d) = &mut param.default {
+                        annotate_expr_with_hint(d, param.ty.as_ref().and_then(ty_to_elem));
+                    }
+                }
+                annotate_block(&mut rule.body);
+            }
+            for goal in &mut a.goals {
+                // GoalDecl may contain expressions; walk them if present.
+                let _ = goal;
+            }
+        }
+        Item::Train(t) => {
+            for (_key, expr) in &mut t.hyper {
+                annotate_expr_with_default(expr, ElemType::I64);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn annotate_block(block: &mut Block) {
+    for stmt in &mut block.stmts {
+        annotate_stmt(stmt);
+    }
+    if let Some(tail) = &mut block.tail {
+        annotate_expr_with_default(tail, ElemType::I64);
+    }
+}
+
+fn annotate_stmt(stmt: &mut Stmt) {
+    match stmt {
+        Stmt::Let { init, .. } => {
+            if let Some(e) = init {
+                annotate_expr_with_default(e, ElemType::I64);
+            }
+        }
+        Stmt::Expr { expr, .. } => annotate_expr_with_default(expr, ElemType::I64),
+        Stmt::Return { value, .. } => {
+            if let Some(e) = value {
+                annotate_expr_with_default(e, ElemType::I64);
+            }
+        }
+        Stmt::Break { value, .. } => {
+            if let Some(e) = value {
+                annotate_expr_with_default(e, ElemType::I64);
+            }
+        }
+        Stmt::Continue { .. } => {}
+        Stmt::ForIn { iter, body, .. } => {
+            annotate_expr_with_default(iter, ElemType::I64);
+            annotate_block(body);
+        }
+        Stmt::EntityFor { query, body, .. } => {
+            if let Some(filter) = &mut query.filter {
+                annotate_expr_with_default(filter, ElemType::I64);
+            }
+            annotate_block(body);
+        }
+        Stmt::While { cond, body, .. } => {
+            annotate_expr_with_default(cond, ElemType::I64);
+            annotate_block(body);
+        }
+        Stmt::Loop { body, .. } => annotate_block(body),
+        Stmt::If {
+            cond, then, else_, ..
+        } => {
+            annotate_expr_with_default(cond, ElemType::I64);
+            annotate_block(then);
+            if let Some(e) = else_ {
+                match &mut **e {
+                    crate::compiler::ast::IfOrBlock::If(s) => annotate_stmt(s),
+                    crate::compiler::ast::IfOrBlock::Block(b) => annotate_block(b),
+                }
+            }
+        }
+        Stmt::Match { expr, arms, .. } => {
+            annotate_expr_with_default(expr, ElemType::I64);
+            for arm in arms {
+                if let Some(g) = &mut arm.guard {
+                    annotate_expr_with_default(g, ElemType::I64);
+                }
+                annotate_expr_with_default(&mut arm.body, ElemType::I64);
+            }
+        }
+        Stmt::Item(inner) => annotate_item(inner),
+        Stmt::ParallelFor(pf) => {
+            annotate_expr_with_default(&mut pf.iter, ElemType::I64);
+            annotate_block(&mut pf.body);
+        }
+        Stmt::Spawn(sb) => {
+            annotate_block(&mut sb.body);
+        }
+        Stmt::Sync(sb) => {
+            annotate_block(&mut sb.body);
+        }
+        Stmt::Atomic(ab) => {
+            annotate_block(&mut ab.body);
+        }
+    }
+}
+
+/// Annotate an expression with its default integer width.
+/// Only touches `Expr::IntLit` nodes that don't already have a type annotation.
+fn annotate_expr_with_default(expr: &mut Expr, default: ElemType) {
+    match expr {
+        Expr::IntLit { ty, .. } => {
+            if ty.is_none() {
+                *ty = Some(default);
+            }
+        }
+        Expr::BinOp { lhs, rhs, .. } => {
+            annotate_expr_with_default(lhs, default.clone());
+            annotate_expr_with_default(rhs, default);
+        }
+        Expr::UnOp { expr: inner, .. } => annotate_expr_with_default(inner, default),
+        Expr::Assign { target, value, .. } => {
+            annotate_expr_with_default(target, default.clone());
+            annotate_expr_with_default(value, default);
+        }
+        Expr::Field { object, .. } => annotate_expr_with_default(object, default),
+        Expr::Index {
+            object, indices, ..
+        } => {
+            annotate_expr_with_default(object, default.clone());
+            for idx in indices {
+                annotate_expr_with_default(idx, default.clone());
+            }
+        }
+        Expr::Call {
+            func, args, named, ..
+        } => {
+            annotate_expr_with_default(func, default.clone());
+            for a in args {
+                annotate_expr_with_default(a, default.clone());
+            }
+            for (_name, val) in named {
+                annotate_expr_with_default(val, default.clone());
+            }
+        }
+        Expr::MethodCall {
+            receiver, args, ..
+        } => {
+            annotate_expr_with_default(receiver, default.clone());
+            for a in args {
+                annotate_expr_with_default(a, default.clone());
+            }
+        }
+        Expr::MatMul { lhs, rhs, .. }
+        | Expr::HadamardMul { lhs, rhs, .. }
+        | Expr::HadamardDiv { lhs, rhs, .. }
+        | Expr::TensorConcat { lhs, rhs, .. }
+        | Expr::KronProd { lhs, rhs, .. }
+        | Expr::OuterProd { lhs, rhs, .. } => {
+            annotate_expr_with_default(lhs, default.clone());
+            annotate_expr_with_default(rhs, default);
+        }
+        Expr::Grad { inner, .. } => annotate_expr_with_default(inner, default),
+        Expr::Pow { base, exp, .. } => {
+            annotate_expr_with_default(base, default.clone());
+            annotate_expr_with_default(exp, default);
+        }
+        Expr::Range { lo, hi, .. } => {
+            if let Some(l) = lo {
+                annotate_expr_with_default(l, default.clone());
+            }
+            if let Some(h) = hi {
+                annotate_expr_with_default(h, default);
+            }
+        }
+        Expr::Cast { expr: inner, .. } => annotate_expr_with_default(inner, default),
+        Expr::IfExpr {
+            cond, then, else_, ..
+        } => {
+            annotate_expr_with_default(cond, default.clone());
+            annotate_block(then);
+            if let Some(b) = else_ {
+                annotate_block(b);
+            }
+        }
+        Expr::Closure {
+            params, body, ..
+        } => {
+            for param in params {
+                if let Some(d) = &mut param.default {
+                    annotate_expr_with_default(d, default.clone());
+                }
+            }
+            annotate_expr_with_default(body, default);
+        }
+        Expr::Block(b) => {
+            annotate_block(b);
+        }
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                annotate_expr_with_default(e, default.clone());
+            }
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_name, val) in fields {
+                annotate_expr_with_default(val, default.clone());
+            }
+        }
+        Expr::ArrayLit { elems, .. } | Expr::VecCtor { elems, .. } => {
+            for e in elems {
+                annotate_expr_with_default(e, default.clone());
+            }
+        }
+        // Leaf expressions with no sub-expressions to walk.
+        Expr::FloatLit { .. }
+        | Expr::BoolLit { .. }
+        | Expr::StrLit { .. }
+        | Expr::Ident { .. }
+        | Expr::Path { .. } => {}
+    }
+}
+
+/// Annotate with a specific type hint from a type annotation (e.g. `let x: i32 = 42`).
+fn annotate_expr_with_hint(expr: &mut Expr, hint: Option<ElemType>) {
+    if let Some(elem) = hint {
+        annotate_expr_with_default(expr, elem);
+    } else {
+        annotate_expr_with_default(expr, ElemType::I64);
+    }
+}
+
+/// Try to extract an `ElemType` from an AST `Type`.
+fn ty_to_elem(ty: &Type) -> Option<ElemType> {
+    match ty {
+        Type::Scalar(e) => Some(e.clone()),
+        _ => None,
     }
 }

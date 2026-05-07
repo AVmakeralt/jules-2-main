@@ -112,7 +112,7 @@ impl PartialValue {
     /// Convert a PartialValue back into an Expr for the residual program.
     pub fn to_expr(&self, span: Span) -> Expr {
         match self {
-            PartialValue::Int(n) => Expr::IntLit { span, value: *n },
+            PartialValue::Int(n) => Expr::IntLit { span, value: *n, ty: None },
             PartialValue::Float(f) => Expr::FloatLit { span, value: *f },
             PartialValue::Bool(b) => Expr::BoolLit { span, value: *b },
             PartialValue::Str(s) => Expr::StrLit { span, value: s.clone() },
@@ -980,7 +980,7 @@ mod tests {
         let expr2 = Expr::BinOp {
             span: Span::dummy(),
             op: BinOpKind::Add,
-            lhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+            lhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1, ty: None }),
             rhs: Box::new(Expr::Ident { span: Span::dummy(), name: "x".into() }),
         };
         assert_eq!(pe.expr_binding_time(&expr2, &env), BindingTime::Static);
@@ -1030,7 +1030,7 @@ mod tests {
         let expr = Expr::Call {
             span: Span::dummy(),
             func: Box::new(Expr::Ident { span: Span::dummy(), name: "my_pure_fn".into() }),
-            args: vec![Expr::IntLit { span: Span::dummy(), value: 1 }],
+            args: vec![Expr::IntLit { span: Span::dummy(), value: 1, ty: None }],
             named: vec![],
         };
         assert_eq!(pe.expr_binding_time(&expr, &env), BindingTime::Dynamic);
@@ -1046,8 +1046,8 @@ mod tests {
         let expr = Expr::BinOp {
             span: Span::dummy(),
             op: BinOpKind::Add,
-            lhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 3 }),
-            rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 4 }),
+            lhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 3, ty: None }),
+            rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 4, ty: None }),
         };
         let result = PartialEvaluator::eval_expr(&expr, &env);
         assert_eq!(result, Some(PartialValue::Int(7)));

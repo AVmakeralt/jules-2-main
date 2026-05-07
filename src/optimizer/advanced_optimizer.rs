@@ -173,7 +173,7 @@ impl ConstantFolder {
             self.fold_stmt_mut(stmt);
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.fold_expr(old);
         }
     }
@@ -181,14 +181,14 @@ impl ConstantFolder {
     fn fold_stmt_mut(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.fold_expr(old);
             }
             Stmt::ForIn { body, .. } | Stmt::While { body, .. } | Stmt::EntityFor { body, .. } => {
                 self.fold_block_mut(body);
             }
             Stmt::If { cond, then, else_, .. } => {
-                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *cond = self.fold_expr(old);
                 self.fold_block_mut(then);
                 if let Some(else_box) = else_ {
@@ -199,14 +199,14 @@ impl ConstantFolder {
                 }
             }
             Stmt::Return { value: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.fold_expr(old);
             }
             Stmt::Match { expr, arms, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.fold_expr(old);
                 for arm in arms {
-                    let old_body = std::mem::replace(&mut arm.body, Expr::IntLit { span: Span::dummy(), value: 0 });
+                    let old_body = std::mem::replace(&mut arm.body, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                     arm.body = self.fold_expr(old_body);
                 }
             }
@@ -236,7 +236,7 @@ impl ConstantFolder {
                     BinOpKind::Shr => Some(l.checked_shr((*r).try_into().unwrap_or(128)).unwrap_or(0)),
                     _ => None,
                 };
-                result.map(|v| Expr::IntLit { span, value: v })
+                result.map(|v| Expr::IntLit { span, value: v, ty: None })
             }
             (Expr::FloatLit { value: l, .. }, Expr::FloatLit { value: r, .. }) => {
                 let result = match op {
@@ -271,8 +271,8 @@ impl ConstantFolder {
     fn try_fold_unop(span: Span, op: UnOpKind, expr: &Expr) -> Option<Expr> {
         match expr {
             Expr::IntLit { value, .. } => match op {
-                UnOpKind::Neg => Some(Expr::IntLit { span, value: (*value as i128).wrapping_neg() as u128 }),
-                UnOpKind::Not => Some(Expr::IntLit { span, value: !*value }),
+                UnOpKind::Neg => Some(Expr::IntLit { span, value: (*value as i128).wrapping_neg() as u128, ty: None }),
+                UnOpKind::Not => Some(Expr::IntLit { span, value: !*value, ty: None }),
                 _ => None,
             },
             Expr::FloatLit { value, .. } => match op {
@@ -313,7 +313,7 @@ impl ConstantPropagator {
                 Stmt::Let { pattern, init: Some(expr), .. } => {
                     // 1. Substitute known constants into the initialiser.
                     if !env.is_empty() {
-                        let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                         *expr = self.substitute(old, &env);
                     }
                     // 2. After substitution, record this binding if it is now a constant.
@@ -337,7 +337,7 @@ impl ConstantPropagator {
                 }
                 Stmt::Expr { expr, .. } => {
                     if !env.is_empty() {
-                        let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                         *expr = self.substitute(old, &env);
                     }
                     // An assignment expression may clobber a tracked constant
@@ -356,14 +356,14 @@ impl ConstantPropagator {
                 }
                 Stmt::Return { value: Some(expr), .. } => {
                     if !env.is_empty() {
-                        let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                         *expr = self.substitute(old, &env);
                     }
                 }
                 Stmt::If { cond, then, else_, .. } => {
                     // Substitute into the condition.
                     if !env.is_empty() {
-                        let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                         *cond = self.substitute(old, &env);
                     }
                     // Propagate into branches.
@@ -407,7 +407,7 @@ impl ConstantPropagator {
                     let cond_substitutable = !cond_reads.iter().any(|v| body_writes.contains(v));
 
                     if !env.is_empty() && cond_substitutable {
-                        let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                        let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                         *cond = self.substitute(old, &env);
                     }
                     self.propagate_block(body);
@@ -438,7 +438,7 @@ impl ConstantPropagator {
 
         if let Some(tail) = &mut block.tail {
             if !env.is_empty() {
-                let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 **tail = self.substitute(old, &env);
             }
         }
@@ -569,7 +569,7 @@ impl AlgebraicSimplifier {
             self.simplify_stmt_mut(stmt);
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.simplify_expr(old);
         }
     }
@@ -577,14 +577,14 @@ impl AlgebraicSimplifier {
     fn simplify_stmt_mut(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.simplify_expr(old);
             }
             Stmt::ForIn { body, .. } | Stmt::While { body, .. } | Stmt::EntityFor { body, .. } => {
                 self.simplify_block_mut(body);
             }
             Stmt::If { cond, then, else_, .. } => {
-                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *cond = self.simplify_expr(old);
                 self.simplify_block_mut(then);
                 if let Some(else_box) = else_ {
@@ -594,7 +594,7 @@ impl AlgebraicSimplifier {
                 }
             }
             Stmt::Return { value: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.simplify_expr(old);
             }
             _ => {}
@@ -642,7 +642,7 @@ impl AlgebraicSimplifier {
                 if Self::expr_eq(lhs, rhs) {
                     let span = lhs.span();
                     if matches!(lhs, Expr::IntLit { .. }) {
-                        return Some(Expr::IntLit { span, value: 0 });
+                        return Some(Expr::IntLit { span, value: 0, ty: None });
                     }
                     return Some(Expr::FloatLit { span, value: 0.0 });
                 }
@@ -660,10 +660,10 @@ impl AlgebraicSimplifier {
                 if Self::is_float_one(rhs) { return Some(lhs.clone()); }
                 // x * -1 = -x
                 const NEG_ONE: u128 = u128::MAX;
-                if let Expr::IntLit { value: NEG_ONE, span } = lhs {
+                if let Expr::IntLit { value: NEG_ONE, span, ty: None } = lhs {
                     return Some(Expr::UnOp { span: *span, op: UnOpKind::Neg, expr: Box::new(rhs.clone()) });
                 }
-                if let Expr::IntLit { value: NEG_ONE, span } = rhs {
+                if let Expr::IntLit { value: NEG_ONE, span, ty: None } = rhs {
                     return Some(Expr::UnOp { span: *span, op: UnOpKind::Neg, expr: Box::new(lhs.clone()) });
                 }
             }
@@ -675,7 +675,7 @@ impl AlgebraicSimplifier {
                 if Self::expr_eq(lhs, rhs) {
                     let span = lhs.span();
                     if matches!(lhs, Expr::IntLit { .. }) {
-                        return Some(Expr::IntLit { span, value: 1 });
+                        return Some(Expr::IntLit { span, value: 1, ty: None });
                     }
                     return Some(Expr::FloatLit { span, value: 1.0 });
                 }
@@ -686,11 +686,11 @@ impl AlgebraicSimplifier {
             // ── Remainder ─────────────────────────────────────────────────
             BinOpKind::Rem => {
                 if Self::is_int_one(rhs) {
-                    return Some(Expr::IntLit { span: rhs.span(), value: 0 });
+                    return Some(Expr::IntLit { span: rhs.span(), value: 0, ty: None });
                 }
                 if Self::expr_eq(lhs, rhs) {
                     if let Expr::IntLit { span, .. } = lhs {
-                        return Some(Expr::IntLit { span: *span, value: 0 });
+                        return Some(Expr::IntLit { span: *span, value: 0, ty: None });
                     }
                 }
                 if Self::is_int_zero(lhs) { return Some(lhs.clone()); }
@@ -716,7 +716,7 @@ impl AlgebraicSimplifier {
                 if Self::is_int_zero(lhs) { return Some(rhs.clone()); }
                 if Self::is_int_zero(rhs) { return Some(lhs.clone()); }
                 if Self::expr_eq(lhs, rhs) {
-                    return Some(Expr::IntLit { span: lhs.span(), value: 0 });
+                    return Some(Expr::IntLit { span: lhs.span(), value: 0, ty: None });
                 }
             }
 
@@ -819,7 +819,7 @@ impl StrengthReducer {
             self.reduce_stmt_mut(stmt);
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.reduce_expr(old);
         }
     }
@@ -827,14 +827,14 @@ impl StrengthReducer {
     fn reduce_stmt_mut(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.reduce_expr(old);
             }
             Stmt::ForIn { body, .. } | Stmt::While { body, .. } | Stmt::EntityFor { body, .. } => {
                 self.reduce_block_mut(body);
             }
             Stmt::If { cond, then, else_, .. } => {
-                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *cond = self.reduce_expr(old);
                 self.reduce_block_mut(then);
                 if let Some(else_box) = else_ {
@@ -844,7 +844,7 @@ impl StrengthReducer {
                 }
             }
             Stmt::Return { value: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.reduce_expr(old);
             }
             _ => {}
@@ -875,7 +875,7 @@ impl StrengthReducer {
                         return Some(Expr::BinOp {
                             span, op: BinOpKind::Shl,
                             lhs: Box::new(lhs.clone()),
-                            rhs: Box::new(Expr::IntLit { span, value: shift as u128 }),
+                            rhs: Box::new(Expr::IntLit { span, value: shift as u128, ty: None }),
                         });
                     }
                 }
@@ -884,7 +884,7 @@ impl StrengthReducer {
                         return Some(Expr::BinOp {
                             span, op: BinOpKind::Shl,
                             lhs: Box::new(rhs.clone()),
-                            rhs: Box::new(Expr::IntLit { span, value: shift as u128 }),
+                            rhs: Box::new(Expr::IntLit { span, value: shift as u128, ty: None }),
                         });
                     }
                 }
@@ -900,7 +900,7 @@ impl StrengthReducer {
                         return Some(Expr::BinOp {
                             span, op: BinOpKind::Shr,
                             lhs: Box::new(lhs.clone()),
-                            rhs: Box::new(Expr::IntLit { span, value: shift as u128 }),
+                            rhs: Box::new(Expr::IntLit { span, value: shift as u128, ty: None }),
                         });
                     }
                 }
@@ -923,7 +923,7 @@ impl StrengthReducer {
                         return Some(Expr::BinOp {
                             span, op: BinOpKind::BitAnd,
                             lhs: Box::new(lhs.clone()),
-                            rhs: Box::new(Expr::IntLit { span, value: (1u128 << shift) - 1 }),
+                            rhs: Box::new(Expr::IntLit { span, value: (1u128 << shift) - 1, ty: None }),
                         });
                     }
                 }
@@ -957,7 +957,7 @@ impl BitwiseOptimizer {
             self.optimize_stmt_mut(stmt);
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.optimize_expr(old);
         }
     }
@@ -965,14 +965,14 @@ impl BitwiseOptimizer {
     fn optimize_stmt_mut(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.optimize_expr(old);
             }
             Stmt::ForIn { body, .. } | Stmt::While { body, .. } | Stmt::EntityFor { body, .. } => {
                 self.optimize_block_mut(body);
             }
             Stmt::If { cond, then, else_, .. } => {
-                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *cond = self.optimize_expr(old);
                 self.optimize_block_mut(then);
                 if let Some(else_box) = else_ {
@@ -982,7 +982,7 @@ impl BitwiseOptimizer {
                 }
             }
             Stmt::Return { value: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.optimize_expr(old);
             }
             _ => {}
@@ -1037,10 +1037,10 @@ impl BitwiseOptimizer {
         match op {
             UnOpKind::Not => {
                 if let Expr::IntLit { value: 0, .. } = inner {
-                    return Some(Expr::IntLit { span, value: u128::MAX });
+                    return Some(Expr::IntLit { span, value: u128::MAX, ty: None });
                 }
                 if let Expr::IntLit { value: u128::MAX, .. } = inner {
-                    return Some(Expr::IntLit { span, value: 0 });
+                    return Some(Expr::IntLit { span, value: 0, ty: None });
                 }
             }
             _ => {}
@@ -1069,7 +1069,7 @@ impl ComparisonCanonicalizer {
             self.canonicalize_stmt_mut(stmt);
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.canonicalize_expr(old);
         }
     }
@@ -1077,14 +1077,14 @@ impl ComparisonCanonicalizer {
     fn canonicalize_stmt_mut(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.canonicalize_expr(old);
             }
             Stmt::ForIn { body, .. } | Stmt::While { body, .. } | Stmt::EntityFor { body, .. } => {
                 self.canonicalize_block_mut(body);
             }
             Stmt::If { cond, then, else_, .. } => {
-                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *cond = self.canonicalize_expr(old);
                 self.canonicalize_block_mut(then);
                 if let Some(else_box) = else_ {
@@ -1094,7 +1094,7 @@ impl ComparisonCanonicalizer {
                 }
             }
             Stmt::Return { value: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.canonicalize_expr(old);
             }
             _ => {}
@@ -1178,7 +1178,7 @@ impl ExpressionReassociator {
             self.reassociate_stmt_mut(stmt);
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.reassociate_expr(old);
         }
     }
@@ -1186,14 +1186,14 @@ impl ExpressionReassociator {
     fn reassociate_stmt_mut(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.reassociate_expr(old);
             }
             Stmt::ForIn { body, .. } | Stmt::While { body, .. } | Stmt::EntityFor { body, .. } => {
                 self.reassociate_block_mut(body);
             }
             Stmt::If { cond, then, else_, .. } => {
-                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *cond = self.reassociate_expr(old);
                 self.reassociate_block_mut(then);
                 if let Some(else_box) = else_ {
@@ -1203,7 +1203,7 @@ impl ExpressionReassociator {
                 }
             }
             Stmt::Return { value: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.reassociate_expr(old);
             }
             _ => {}
@@ -1266,7 +1266,7 @@ impl ExpressionReassociator {
                     BinOpKind::BitXor => Some(*l ^ *r),
                     _ => None,
                 };
-                result.map(|v| Expr::IntLit { span: lhs.span(), value: v })
+                result.map(|v| Expr::IntLit { span: lhs.span(), value: v, ty: None })
             }
             (Expr::FloatLit { value: l, .. }, Expr::FloatLit { value: r, .. }) => {
                 let result = match op {
@@ -1344,7 +1344,7 @@ impl CommonSubexprEliminator {
 
         if let Some(tail) = &mut block.tail {
             let mut emitted2: FxHashMap<u64, ()> = FxHashMap::default();
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             let (processed, _extra) = self.eliminate_expr_collecting(old, &mut emitted2);
             **tail = processed;
         }
@@ -2340,14 +2340,14 @@ impl FunctionInliner {
         for stmt in &mut block.stmts {
             match stmt {
                 Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                    let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                    let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                     *expr = self.substitute_expr(&old, &env);
                 }
                 _ => {}
             }
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.substitute_expr(&old, &env);
         }
     }
@@ -2847,7 +2847,7 @@ impl StochasticSuperoptimizer {
             self.optimize_stmt_mut(stmt);
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.optimize_expr(old);
         }
     }
@@ -2855,14 +2855,14 @@ impl StochasticSuperoptimizer {
     fn optimize_stmt_mut(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.optimize_expr(old);
             }
             Stmt::ForIn { body, .. } | Stmt::While { body, .. } | Stmt::EntityFor { body, .. } => {
                 self.optimize_block_mut(body);
             }
             Stmt::If { cond, then, else_, .. } => {
-                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *cond = self.optimize_expr(old);
                 self.optimize_block_mut(then);
                 if let Some(else_box) = else_ {
@@ -2872,14 +2872,14 @@ impl StochasticSuperoptimizer {
                 }
             }
             Stmt::Return { value: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.optimize_expr(old);
             }
             Stmt::Match { expr, arms, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.optimize_expr(old);
                 for arm in arms {
-                    let old_body = std::mem::replace(&mut arm.body, Expr::IntLit { span: Span::dummy(), value: 0 });
+                    let old_body = std::mem::replace(&mut arm.body, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                     arm.body = self.optimize_expr(old_body);
                 }
             }
@@ -3412,7 +3412,7 @@ impl StochasticSuperoptimizer {
             bank.push(Expr::Ident { span, name: v.clone() });
         }
         for c in consts {
-            bank.push(Expr::IntLit { span, value: *c });
+            bank.push(Expr::IntLit { span, value: *c, ty: None });
         }
         // ── Sub-expression bank: add all collected sub-expressions ────────
         // These are real parts of the original expression that can be used
@@ -3769,12 +3769,12 @@ impl StochasticSuperoptimizer {
     /// Called exactly once per search — only when a winner is found.
     fn build_winner_expr(pool: &[TermNode], start: usize, span: Span) -> Expr {
         if start >= pool.len() {
-            return Expr::IntLit { span, value: 0 };
+            return Expr::IntLit { span, value: 0, ty: None };
         }
         match &pool[start] {
-            TermNode::Atom(_) => Expr::IntLit { span, value: 0 },
+            TermNode::Atom(_) => Expr::IntLit { span, value: 0, ty: None },
             TermNode::AtomVal(v) => match v {
-                Value::Int(n)   => Expr::IntLit  { span, value: *n },
+                Value::Int(n)   => Expr::IntLit  { span, value: *n, ty: None },
                 Value::Float(b) => Expr::FloatLit{ span, value: f64::from_bits(*b) },
                 Value::Bool(b)  => Expr::BoolLit { span, value: *b },
             },
@@ -5052,15 +5052,15 @@ impl EGraph {
     /// triggered; it is present purely as a defensive measure.
     fn materialize(&self, class: EClassId, best: &FxHashMap<EClassId, (f64, ENodeId)>, span: Span, depth: usize) -> Expr {
         if depth == 0 {
-            return Expr::IntLit { span, value: 0 };
+            return Expr::IntLit { span, value: 0, ty: None };
         }
         let canon = self.uf.find_imm(class);
         let &(_cost, nid) = match best.get(&canon) {
             Some(e) if e.0 < f64::INFINITY => e,
-            _ => return Expr::IntLit { span, value: 0 },
+            _ => return Expr::IntLit { span, value: 0, ty: None },
         };
         match &self.nodes[nid as usize] {
-            ENode::IntLit(v)    => Expr::IntLit  { span, value: *v },
+            ENode::IntLit(v)    => Expr::IntLit  { span, value: *v, ty: None },
             ENode::FloatBits(b) => Expr::FloatLit { span, value: f64::from_bits(*b) },
             ENode::Bool(v)      => Expr::BoolLit  { span, value: *v },
             ENode::Var(name)    => Expr::Ident    { span, name: name.clone() },
@@ -5123,7 +5123,7 @@ impl EGraphOptimizer {
             self.opt_stmt(stmt);
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.opt_expr(old);
         }
 
@@ -5134,15 +5134,15 @@ impl EGraphOptimizer {
     fn opt_stmt(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.opt_expr(old);
             }
             Stmt::Return { value: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.opt_expr(old);
             }
             Stmt::If { cond, then, else_, .. } => {
-                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *cond = self.opt_expr(old);
                 self.optimize_block(then);
                 if let Some(eb) = else_ {
@@ -5157,10 +5157,10 @@ impl EGraphOptimizer {
                 self.optimize_block(body);
             }
             Stmt::Match { expr, arms, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.opt_expr(old);
                 for arm in arms {
-                    let old_body = std::mem::replace(&mut arm.body, Expr::IntLit { span: Span::dummy(), value: 0 });
+                    let old_body = std::mem::replace(&mut arm.body, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                     arm.body = self.opt_expr(old_body);
                 }
             }

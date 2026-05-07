@@ -582,7 +582,7 @@ impl DeadFieldEliminator {
                     // (in case it has side effects).
                     let rhs = std::mem::replace(
                         value.as_mut(),
-                        Expr::IntLit { span: Span::dummy(), value: 0 },
+                        Expr::IntLit { span: Span::dummy(), value: 0, ty: None },
                     );
                     *expr = rhs;
                 }

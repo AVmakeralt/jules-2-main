@@ -297,7 +297,7 @@ impl Instr {
     /// Convert an Instr back to an Expr
     pub fn to_expr(&self, span: Span) -> Expr {
         match self {
-            Instr::ConstInt(v) => Expr::IntLit { span, value: *v },
+            Instr::ConstInt(v) => Expr::IntLit { span, value: *v, ty: None },
             Instr::ConstFloat(bits) => Expr::FloatLit {
                 span,
                 value: f64::from_bits(*bits),
@@ -3277,8 +3277,8 @@ mod tests {
         let expr = Expr::BinOp {
             span: dummy_span(),
             op: BinOpKind::Add,
-            lhs: Box::new(Expr::IntLit { span: dummy_span(), value: 1 }),
-            rhs: Box::new(Expr::IntLit { span: dummy_span(), value: 2 }),
+            lhs: Box::new(Expr::IntLit { span: dummy_span(), value: 1, ty: None }),
+            rhs: Box::new(Expr::IntLit { span: dummy_span(), value: 2, ty: None }),
         };
         let instr = Instr::from_expr(&expr).unwrap();
         match instr {

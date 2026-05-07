@@ -78,7 +78,7 @@ macro_rules! hot_path {
 use crate::compiler::ast::{
     Activation, AgentDecl, AssignOpKind, BinOpKind, Block, ElemType, EntityQuery, Expr, FnDecl,
     Item, ModelDecl, ModelLayer, NormKind, OptimizerKind, ParallelismHint, Pattern, PoolOp,
-    Program, RecurrentCell, Stmt, SystemDecl, TrainDecl, UnOpKind, VecSize,
+    Program, RecurrentCell, Stmt, SystemDecl, TrainDecl, Type, UnOpKind, VecSize,
 };
 use crate::game::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderCommand, RenderState};
 use crate::compiler::lexer::Span;
@@ -2955,8 +2955,19 @@ impl Compiler {
     /// Compile an expression, placing the result in `dst`.
     fn compile_expr_into(&mut self, expr: &Expr, dst: u16) {
         match expr {
-            Expr::IntLit { value, .. } => {
-                self.emit(Instr::LoadI32(dst, *value as i32));
+            Expr::IntLit { value, ty, .. } => {
+                // Use the type annotation to pick the right instruction.
+                // When ty is None (no annotation), use I64 to avoid truncation.
+                match ty {
+                    Some(ElemType::I8) | Some(ElemType::I16) | Some(ElemType::I32) => {
+                        self.emit(Instr::LoadI32(dst, *value as i32));
+                    }
+                    _ => {
+                        // I64, U32, U64, or no annotation — use the I64 path
+                        let val = *value as i64;
+                        self.emit(Instr::LoadI64(dst, val));
+                    }
+                }
             }
             Expr::FloatLit { value, .. } => {
                 self.emit(Instr::LoadF32(dst, *value as f32));
@@ -4299,6 +4310,14 @@ pub struct Interpreter {
     /// Tracks observed runtime values and creates specialized code versions.
     pub data_dependent_jit: crate::optimizer::data_dependent_jit::DataDependentJIT,
     ecs_query_scratch: Vec<EntityId>,
+    /// Loop iteration counter — incremented every time a `while`/`loop` body
+    /// completes one iteration.  Reset at the start of each top-level `while`/`loop`.
+    loop_step_counter: u64,
+    /// Maximum number of iterations a `while`/`loop` may execute before the
+    /// interpreter kills it with a RuntimeError.  Prevents infinite loops from
+    /// hanging the process (the bytecode VM already has EntropyWatchdog; the
+    /// tree-walker had zero protection).
+    max_loop_iterations: u64,
 }
 
 impl Interpreter {
@@ -4342,6 +4361,8 @@ impl Interpreter {
             jit_fallback_calls: 0,
             data_dependent_jit: crate::optimizer::data_dependent_jit::DataDependentJIT::new(),
             ecs_query_scratch: Vec::new(),
+            loop_step_counter: 0,
+            max_loop_iterations: 10_000_000, // 10M iterations — generous but finite
         }
     }
 
@@ -4350,6 +4371,12 @@ impl Interpreter {
         self.jit_native_calls = 0;
         self.jit_vm_calls = 0;
         self.jit_fallback_calls = 0;
+    }
+
+    /// Set the maximum number of loop iterations before the interpreter
+    /// raises a runtime error.  Set to `u64::MAX` to disable the watchdog.
+    pub fn set_max_loop_iterations(&mut self, limit: u64) {
+        self.max_loop_iterations = limit;
     }
 
     /// Return `(native_jit, vm_jit, treewalk_fallback)` call counts.
@@ -4665,11 +4692,18 @@ impl Interpreter {
     #[inline]
     pub fn eval_stmt(&mut self, stmt: &Stmt, env: &mut Env) -> Result<Value, RuntimeError> {
         match stmt {
-            Stmt::Let { pattern, init, .. } => {
+            Stmt::Let { pattern, init, ty, .. } => {
                 let val = if let Some(e) = init {
                     self.eval_expr(e, env)?
                 } else {
-                    Value::Unit
+                    // Uninitialized variable.  If the declared type is Option<T>,
+                    // bind to None (not Unit) — this matches user expectation
+                    // and prevents silent None→Unit mismatches in later code.
+                    // For all other types, bind to Unit as before.
+                    match ty {
+                        Some(Type::Option(_)) => Value::None,
+                        _ => Value::Unit,
+                    }
                 };
                 self.bind_pattern(pattern, val, env);
                 Ok(Value::Unit)
@@ -4748,10 +4782,18 @@ impl Interpreter {
             } => self.eval_entity_for(var, query, body, *parallelism, env),
 
             Stmt::While { cond, body, .. } => {
+                self.loop_step_counter = 0;
                 loop {
                     let c = self.eval_expr(cond, env)?;
                     if !c.is_truthy() {
                         break;
+                    }
+                    self.loop_step_counter += 1;
+                    if self.loop_step_counter > self.max_loop_iterations {
+                        return rt_err!(
+                            "loop exceeded maximum iterations ({}); possible infinite loop",
+                            self.max_loop_iterations
+                        );
                     }
                     let r = self.eval_block(body, env)?;
                     match r {
@@ -4764,15 +4806,25 @@ impl Interpreter {
                 Ok(Value::Unit)
             }
 
-            Stmt::Loop { body, .. } => loop {
-                let r = self.eval_block(body, env)?;
-                match r {
-                    Value::Break(v) => return Ok(v.map(|b| *b).unwrap_or(Value::Unit)),
-                    Value::Continue => continue,
-                    v if v.is_signal() => return Ok(v),
-                    _ => {}
+            Stmt::Loop { body, .. } => {
+                self.loop_step_counter = 0;
+                loop {
+                    self.loop_step_counter += 1;
+                    if self.loop_step_counter > self.max_loop_iterations {
+                        return rt_err!(
+                            "loop exceeded maximum iterations ({}); possible infinite loop",
+                            self.max_loop_iterations
+                        );
+                    }
+                    let r = self.eval_block(body, env)?;
+                    match r {
+                        Value::Break(v) => return Ok(v.map(|b| *b).unwrap_or(Value::Unit)),
+                        Value::Continue => continue,
+                        v if v.is_signal() => return Ok(v),
+                        _ => {}
+                    }
                 }
-            },
+            }
 
             Stmt::If {
                 cond, then, else_, ..
@@ -4955,8 +5007,30 @@ impl Interpreter {
     #[inline]
     pub fn eval_expr(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, RuntimeError> {
         match expr {
-            Expr::IntLit { value, .. } => Ok(Value::I32(*value as i32)),
-            Expr::FloatLit { value, .. } => Ok(Value::F32(*value as f32)),
+            Expr::IntLit { value, ty, .. } => {
+                // Use the type annotation from the type checker to pick the
+                // correct Value width.  If no annotation exists (e.g. in tests
+                // or before typeck runs), default to I64 to avoid silent
+                // truncation — this matches the bytecode VM's behaviour.
+                match ty {
+                    Some(ElemType::I8)   => Ok(Value::I8(*value as i8)),
+                    Some(ElemType::I16)  => Ok(Value::I16(*value as i16)),
+                    Some(ElemType::I32)  => Ok(Value::I32(*value as i32)),
+                    Some(ElemType::I64)  => Ok(Value::I64(*value as i64)),
+                    Some(ElemType::U8)   => Ok(Value::U8(*value as u8)),
+                    Some(ElemType::U16)  => Ok(Value::U16(*value as u16)),
+                    Some(ElemType::U32)  => Ok(Value::U32(*value as u32)),
+                    Some(ElemType::U64)  => Ok(Value::U64(*value as u64)),
+                    // No type annotation — default to I64 to prevent silent
+                    // truncation.  The bytecode VM already uses I64 for IntLit;
+                    // matching it here eliminates the cross-engine discrepancy
+                    // that caused Collatz-200 → 0 (u128→i32 wrap).
+                    None                 => Ok(Value::I64(*value as i64)),
+                    // Float ElemTypes shouldn't appear on IntLit, but handle safely:
+                    _                    => Ok(Value::I64(*value as i64)),
+                }
+            }
+            Expr::FloatLit { value, .. } => Ok(Value::F64(*value)),
             Expr::BoolLit { value, .. } => Ok(Value::Bool(*value)),
             Expr::StrLit { value, .. } => Ok(Value::Str(value.clone())),
 
@@ -9046,6 +9120,28 @@ impl GpuBackend for JulesGpuAdapter {
 /// numeric type dispatch on every inner-loop iteration.
 #[inline(always)]
 fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, RuntimeError> {
+    // ── Reject None / Option values at the gate ───────────────────────────
+    // Previously, None values silently fell through to the catch-all which
+    // used `unwrap_or(0)`, producing "valid but wrong" results like
+    // None + i64 → i64(0).  This is exactly the class of bug that makes
+    // superoptimizers dangerous.
+    match (&l, &r) {
+        (Value::None, _) | (_, Value::None) => {
+            return rt_err!(
+                "cannot apply operator {:?} to None — use pattern matching or \
+                 .unwrap() to extract Option values before arithmetic",
+                op
+            );
+        }
+        (Value::Some(_), _) | (_, Value::Some(_)) => {
+            return rt_err!(
+                "cannot apply operator {:?} to Some(_) — unwrap the Option first",
+                op
+            );
+        }
+        _ => {}
+    }
+
     // ── Ultra-fast path: I32 × I32 (loop counters, indices, most arithmetic) ──
     if let (Value::I32(a), Value::I32(b)) = (&l, &r) {
         let (a, b) = (*a, *b);
@@ -9302,9 +9398,19 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             Ok(Value::F32(arith_f64(op, a, b)? as f32))
         }
         _ => {
-            let a = l.as_i64().unwrap_or(0);
-            let b = r.as_i64().unwrap_or(0);
-            Ok(Value::I32(arith_i64(op, a, b)? as i32))
+            let a = l.as_i64().ok_or_else(|| {
+                RuntimeError::new(format!(
+                    "cannot use left operand of type {:?} in arithmetic",
+                    l.type_tag()
+                ))
+            })?;
+            let b = r.as_i64().ok_or_else(|| {
+                RuntimeError::new(format!(
+                    "cannot use right operand of type {:?} in arithmetic",
+                    r.type_tag()
+                ))
+            })?;
+            Ok(Value::I64(arith_i64(op, a, b)?))
         }
     }
 }
@@ -10267,10 +10373,21 @@ mod tests {
 
     #[test]
     fn test_interp_int_lit() {
+        // Without type annotation, IntLit defaults to I64 (no truncation).
         assert!(matches!(
             eval(&Expr::IntLit {
                 span: sp(),
-                value: 42
+                value: 42,
+                ty: None,
+            }),
+            Value::I64(42)
+        ));
+        // With explicit I32 type annotation, produces I32.
+        assert!(matches!(
+            eval(&Expr::IntLit {
+                span: sp(),
+                value: 42,
+                ty: Some(ElemType::I32),
             }),
             Value::I32(42)
         ));
@@ -10283,7 +10400,7 @@ mod tests {
                 span: sp(),
                 value: 3.14
             }),
-            Value::F32(_)
+            Value::F64(_)
         ));
     }
 
@@ -10306,13 +10423,15 @@ mod tests {
             lhs: Box::new(Expr::IntLit {
                 span: sp(),
                 value: 3,
+                ty: None,
             }),
             rhs: Box::new(Expr::IntLit {
                 span: sp(),
                 value: 4,
+                ty: None,
             }),
         };
-        assert!(matches!(eval(&e), Value::I32(7)));
+        assert!(matches!(eval(&e), Value::I64(7)));
     }
 
     #[test]
@@ -10323,10 +10442,12 @@ mod tests {
             lhs: Box::new(Expr::IntLit {
                 span: sp(),
                 value: 3,
+                ty: None,
             }),
             rhs: Box::new(Expr::IntLit {
                 span: sp(),
                 value: 5,
+                ty: None,
             }),
         };
         assert!(matches!(eval(&e), Value::Bool(true)));
@@ -10340,10 +10461,12 @@ mod tests {
             lhs: Box::new(Expr::IntLit {
                 span: sp(),
                 value: 10,
+                ty: None,
             }),
             rhs: Box::new(Expr::IntLit {
                 span: sp(),
                 value: 0,
+                ty: None,
             }),
         };
         let mut i = mk_interp();
@@ -10402,6 +10525,7 @@ mod tests {
             init: Some(Expr::IntLit {
                 span: sp(),
                 value: 99,
+                ty: None,
             }),
             mutable: false,
         };
@@ -10434,6 +10558,7 @@ mod tests {
                 tail: Some(Box::new(Expr::IntLit {
                     span: sp(),
                     value: 1,
+                    ty: None,
                 })),
             }),
             else_: Some(Box::new(Block {
@@ -10442,6 +10567,7 @@ mod tests {
                 tail: Some(Box::new(Expr::IntLit {
                     span: sp(),
                     value: 2,
+                    ty: None,
                 })),
             })),
         };
@@ -11344,6 +11470,7 @@ mod tests {
                     value: Some(Expr::IntLit {
                         span: sp(),
                         value: 42,
+                        ty: None,
                     }),
                 },
                 Stmt::Expr {
@@ -11352,6 +11479,7 @@ mod tests {
                     expr: Expr::IntLit {
                         span: sp(),
                         value: 0,
+                        ty: None,
                     },
                 },
             ],
@@ -11407,6 +11535,7 @@ mod tests {
                     init: Some(Expr::IntLit {
                         span: sp(),
                         value: 0,
+                        ty: None,
                     }),
                     mutable: true,
                 },
@@ -11422,10 +11551,12 @@ mod tests {
                         lo: Some(Box::new(Expr::IntLit {
                             span: sp(),
                             value: 0,
+                            ty: None,
                         })),
                         hi: Some(Box::new(Expr::IntLit {
                             span: sp(),
                             value: 5,
+                            ty: None,
                         })),
                         inclusive: false,
                     },
@@ -11482,6 +11613,7 @@ mod tests {
                     init: Some(Expr::IntLit {
                         span: sp(),
                         value: 0,
+                        ty: None,
                     }),
                     mutable: true,
                 },
@@ -11511,6 +11643,7 @@ mod tests {
                                 value: Box::new(Expr::IntLit {
                                     span: sp(),
                                     value: 1,
+                                    ty: None,
                                 }),
                             },
                         }],

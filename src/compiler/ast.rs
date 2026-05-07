@@ -346,6 +346,11 @@ pub enum Expr {
     IntLit {
         span: Span,
         value: u128,
+        /// Resolved integer width from the type checker.
+        /// `None` means "not yet annotated" — defaults to I32 for backward compat.
+        /// The type checker fills this in during `check_expr`; the interpreter
+        /// reads it to pick the correct Value variant (I8/I16/I32/I64/U8/U16/U32/U64).
+        ty: Option<ElemType>,
     },
     FloatLit {
         span: Span,

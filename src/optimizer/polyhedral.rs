@@ -303,7 +303,7 @@ impl PolyhedralOptimizer {
         if let Some(tail) = &mut block.tail {
             let optimized = self.optimize_expr(std::mem::replace(
                 tail.as_mut(),
-                Expr::IntLit { span: Span::dummy(), value: 0 },
+                Expr::IntLit { span: Span::dummy(), value: 0, ty: None },
             ));
             **tail = optimized;
         }
@@ -345,7 +345,7 @@ impl PolyhedralOptimizer {
                 }
             }
             Stmt::Let { init: Some(expr), .. } | Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.optimize_expr(old);
             }
             Stmt::Loop { body, .. } => {
@@ -944,14 +944,14 @@ impl PolyhedralOptimizer {
                         span: Span::dummy(),
                         op: BinOpKind::FloorDiv,
                         lhs: Box::new(upper_bound.clone()),
-                        rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: tile_size as u128 }),
+                        rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: tile_size as u128, ty: None }),
                     }),
-                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1, ty: None }),
                 };
 
                 let tile_iter = Expr::Range {
                     span: Span::dummy(),
-                    lo: Some(Box::new(Expr::IntLit { span: Span::dummy(), value: 0 })),
+                    lo: Some(Box::new(Expr::IntLit { span: Span::dummy(), value: 0, ty: None })),
                     hi: Some(Box::new(num_tiles_expr)),
                     inclusive: false,
                 };
@@ -967,7 +967,7 @@ impl PolyhedralOptimizer {
                     span: Span::dummy(),
                     op: BinOpKind::Mul,
                     lhs: Box::new(Expr::Ident { span: Span::dummy(), name: tile_var.clone() }),
-                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: tile_size as u128 }),
+                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: tile_size as u128, ty: None }),
                 };
 
                 let hi_inner = Expr::BinOp {
@@ -977,9 +977,9 @@ impl PolyhedralOptimizer {
                         span: Span::dummy(),
                         op: BinOpKind::Add,
                         lhs: Box::new(Expr::Ident { span: Span::dummy(), name: tile_var }),
-                        rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+                        rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1, ty: None }),
                     }),
-                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: tile_size as u128 }),
+                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: tile_size as u128, ty: None }),
                 };
 
                 let hi_expr = Expr::Call {
@@ -1262,13 +1262,13 @@ impl PolyhedralOptimizer {
                                 span: Span::dummy(),
                                 op: BinOpKind::Add,
                                 lhs: Box::new((**hi_expr).clone()),
-                                rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+                                rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1, ty: None }),
                             }
                         } else {
                             (**hi_expr).clone()
                         }
                     }
-                    None => Expr::IntLit { span: Span::dummy(), value: 1024 },
+                    None => Expr::IntLit { span: Span::dummy(), value: 1024, ty: None },
                 }
             }
             Expr::BinOp { op: BinOpKind::Lt, rhs, .. } => {
@@ -1280,7 +1280,7 @@ impl PolyhedralOptimizer {
                     span: Span::dummy(),
                     op: BinOpKind::Add,
                     lhs: Box::new((**rhs).clone()),
-                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1 }),
+                    rhs: Box::new(Expr::IntLit { span: Span::dummy(), value: 1, ty: None }),
                 }
             }
             Expr::Call { func, args, .. } => {
@@ -1289,9 +1289,9 @@ impl PolyhedralOptimizer {
                         return args[0].clone();
                     }
                 }
-                Expr::IntLit { span: Span::dummy(), value: 1024 }
+                Expr::IntLit { span: Span::dummy(), value: 1024, ty: None }
             }
-            _ => Expr::IntLit { span: Span::dummy(), value: 1024 },
+            _ => Expr::IntLit { span: Span::dummy(), value: 1024, ty: None },
         }
     }
 
@@ -1499,7 +1499,7 @@ mod tests {
 
     /// Helper: create an integer literal expression
     fn int_lit(val: u128) -> Expr {
-        Expr::IntLit { span: d(), value: val }
+        Expr::IntLit { span: d(), value: val, ty: None }
     }
 
     /// Helper: create a range expression `lo..hi`

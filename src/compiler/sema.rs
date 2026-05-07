@@ -2111,6 +2111,7 @@ mod tests {
         Expr::IntLit {
             span: sp(),
             value: v,
+            ty: None,
         }
     }
 

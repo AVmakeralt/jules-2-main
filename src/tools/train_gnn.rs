@@ -27,17 +27,17 @@ fn make_training_expressions() -> Vec<(String, Expr)> {
     exprs.push(("x+0".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Add,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
     }));
     exprs.push(("x*1".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Mul,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 1 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 1, ty: None }),
     }));
     exprs.push(("x*0".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Mul,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
     }));
     exprs.push(("x-x".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Sub,
@@ -48,35 +48,35 @@ fn make_training_expressions() -> Vec<(String, Expr)> {
     // Constant folding
     exprs.push(("3+5".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Add,
-        lhs: Box::new(Expr::IntLit { span: sp(), value: 3 }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 5 }),
+        lhs: Box::new(Expr::IntLit { span: sp(), value: 3, ty: None }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 5, ty: None }),
     }));
     exprs.push(("10-3".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Sub,
-        lhs: Box::new(Expr::IntLit { span: sp(), value: 10 }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 3 }),
+        lhs: Box::new(Expr::IntLit { span: sp(), value: 10, ty: None }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 3, ty: None }),
     }));
 
     // Strength reduction
     exprs.push(("x*8".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Mul,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 8 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 8, ty: None }),
     }));
     exprs.push(("x*4".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Mul,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 4 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 4, ty: None }),
     }));
     exprs.push(("x/16".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Div,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 16 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 16, ty: None }),
     }));
     exprs.push(("x/32".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Div,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 32 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 32, ty: None }),
     }));
 
     // Nested patterns
@@ -85,9 +85,9 @@ fn make_training_expressions() -> Vec<(String, Expr)> {
         lhs: Box::new(Expr::BinOp {
             span: sp(), op: BinOpKind::Add,
             lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-            rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+            rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
         }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 1 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 1, ty: None }),
     }));
 
     // Deep nested
@@ -98,14 +98,14 @@ fn make_training_expressions() -> Vec<(String, Expr)> {
             lhs: Box::new(Expr::BinOp {
                 span: sp(), op: BinOpKind::Mul,
                 lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-                rhs: Box::new(Expr::IntLit { span: sp(), value: 1 }),
+                rhs: Box::new(Expr::IntLit { span: sp(), value: 1, ty: None }),
             }),
-            rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+            rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
         }),
         rhs: Box::new(Expr::BinOp {
             span: sp(), op: BinOpKind::Add,
             lhs: Box::new(Expr::Ident { span: sp(), name: "y".into() }),
-            rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+            rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
         }),
     }));
 
@@ -132,12 +132,12 @@ fn make_training_expressions() -> Vec<(String, Expr)> {
             lhs: Box::new(Expr::BinOp {
                 span: sp(), op: BinOpKind::Add,
                 lhs: Box::new(Expr::Ident { span: sp(), name: "a".into() }),
-                rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+                rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
             }),
             rhs: Box::new(Expr::BinOp {
                 span: sp(), op: BinOpKind::Mul,
                 lhs: Box::new(Expr::Ident { span: sp(), name: "b".into() }),
-                rhs: Box::new(Expr::IntLit { span: sp(), value: 1 }),
+                rhs: Box::new(Expr::IntLit { span: sp(), value: 1, ty: None }),
             }),
         }),
         rhs: Box::new(Expr::BinOp {
@@ -157,14 +157,14 @@ fn make_training_expressions() -> Vec<(String, Expr)> {
                 lhs: Box::new(Expr::BinOp {
                     span: sp(), op: BinOpKind::Add,
                     lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-                    rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+                    rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
                 }),
-                rhs: Box::new(Expr::IntLit { span: sp(), value: 1 }),
+                rhs: Box::new(Expr::IntLit { span: sp(), value: 1, ty: None }),
             }),
             rhs: Box::new(Expr::BinOp {
                 span: sp(), op: BinOpKind::Mul,
                 lhs: Box::new(Expr::Ident { span: sp(), name: "y".into() }),
-                rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+                rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
             }),
         }),
         rhs: Box::new(Expr::BinOp {
@@ -172,7 +172,7 @@ fn make_training_expressions() -> Vec<(String, Expr)> {
             lhs: Box::new(Expr::BinOp {
                 span: sp(), op: BinOpKind::Div,
                 lhs: Box::new(Expr::Ident { span: sp(), name: "z".into() }),
-                rhs: Box::new(Expr::IntLit { span: sp(), value: 1 }),
+                rhs: Box::new(Expr::IntLit { span: sp(), value: 1, ty: None }),
             }),
             rhs: Box::new(Expr::BinOp {
                 span: sp(), op: BinOpKind::Sub,
@@ -218,12 +218,12 @@ fn make_training_expressions() -> Vec<(String, Expr)> {
     exprs.push(("x-0".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Sub,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
     }));
     exprs.push(("x/1".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::Div,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 1 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 1, ty: None }),
     }));
 
     // x^x
@@ -237,14 +237,14 @@ fn make_training_expressions() -> Vec<(String, Expr)> {
     exprs.push(("x&0".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::BitAnd,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
     }));
 
     // x|0
     exprs.push(("x|0".into(), Expr::BinOp {
         span: sp(), op: BinOpKind::BitOr,
         lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
     }));
 
     exprs
@@ -379,9 +379,9 @@ fn main() {
         lhs: Box::new(Expr::BinOp {
             span: sp(), op: BinOpKind::Mul,
             lhs: Box::new(Expr::Ident { span: sp(), name: "x".into() }),
-            rhs: Box::new(Expr::IntLit { span: sp(), value: 1 }),
+            rhs: Box::new(Expr::IntLit { span: sp(), value: 1, ty: None }),
         }),
-        rhs: Box::new(Expr::IntLit { span: sp(), value: 0 }),
+        rhs: Box::new(Expr::IntLit { span: sp(), value: 0, ty: None }),
     };
 
     // MCTS throughput

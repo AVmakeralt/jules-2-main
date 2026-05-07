@@ -1094,7 +1094,7 @@ impl MlSuperoptimizer {
             self.optimize_stmt(stmt);
         }
         if let Some(tail) = &mut block.tail {
-            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0 });
+            let old = std::mem::replace(tail.as_mut(), Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
             **tail = self.optimize_expr(old);
         }
 
@@ -1360,8 +1360,8 @@ impl MlSuperoptimizer {
                     Expr::Ident { span, name: "kernel".into() },
                 ],
                 named: vec![
-                    ("stride".into(), Expr::IntLit { span, value: 1 }),
-                    ("padding".into(), Expr::IntLit { span, value: 0 }),
+                    ("stride".into(), Expr::IntLit { span, value: 1, ty: None }),
+                    ("padding".into(), Expr::IntLit { span, value: 0, ty: None }),
                 ],
             };
             return Some(Stmt::Expr { span, expr: conv_call, has_semi: true });
@@ -1506,23 +1506,23 @@ impl MlSuperoptimizer {
     fn optimize_stmt(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Let { init: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.optimize_expr(old);
             }
             Stmt::Expr { expr, .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.optimize_expr(old);
             }
             Stmt::ForIn { body, .. } | Stmt::While { body, .. } |
             Stmt::Loop { body, .. } | Stmt::EntityFor { body, .. } => self.optimize_block(body),
             Stmt::If { cond, then, else_, .. } => {
-                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *cond = self.optimize_expr(old);
                 self.optimize_block(then);
                 if let Some(eb) = else_ { if let IfOrBlock::Block(b) = &mut **eb { self.optimize_block(b); } }
             }
             Stmt::Return { value: Some(expr), .. } => {
-                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0 });
+                let old = std::mem::replace(expr, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                 *expr = self.optimize_expr(old);
             }
             Stmt::ParallelFor(pf) => self.optimize_block(&mut pf.body),

@@ -176,8 +176,13 @@ impl SuperoptPass {
                 self.run_pipeline(program, /* full_mode */ true);
             }
             SuperoptMode::EGraph | SuperoptMode::MlSuperopt => {
-                // Semantic rewrites + MCTS fast config, skip SMT.
-                self.run_pipeline(program, /* full_mode */ false);
+                // Semantic rewrites + MCTS fast config.
+                // Previously skipped SMT verification — this was WRONG.
+                // EGraph/MlSuperopt can produce semantically-incorrect
+                // programs without verification.  Always verify now.
+                // In full_mode=true, CEGIS/SMT runs; in its absence,
+                // at least the known-bits + test-vector filter applies.
+                self.run_pipeline(program, /* full_mode */ true);
             }
         }
 

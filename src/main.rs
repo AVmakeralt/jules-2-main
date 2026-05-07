@@ -580,6 +580,13 @@ impl Pipeline {
             return PipelineResult::HaltedAt(PassName::TypeCheck);
         }
 
+        // ── Pass 3b: Annotate integer widths ─────────────────────────────────
+        // After type checking succeeds, walk the AST and fill in the `ty` field
+        // on every `Expr::IntLit` so the interpreter/VM uses the correct width.
+        // Without this, IntLit always truncates to i32, causing silent wrong
+        // answers (e.g. Collatz-200 → 0).
+        crate::compiler::typeck::annotate_int_widths(&mut program);
+
         // ── Pass 4: Semantic analysis ─────────────────────────────────────────
         let mut sema = crate::compiler::sema::SemaCtx::new();
         sema.analyse(&program);
@@ -771,6 +778,30 @@ impl Pipeline {
                 eprintln!("[opt/DeadField] fields_removed={} dead_writes_elim={} bytes_saved={} speedup={:.1}x",
                     result.dead_fields_removed, result.dead_writes_eliminated,
                     result.bytes_saved, result.estimated_speedup);
+            }
+        }
+
+        // ── Pass 13: Post-Optimization Validity Check ──────────────────────────
+        // The optimizer mutates the AST after type checking and borrow checking.
+        // Without this pass, the optimizer could introduce type mismatches or
+        // borrow-unsafe code that the earlier passes already validated.
+        // This is a lightweight structural check — it re-runs the borrow checker
+        // and annotates any new IntLit nodes.
+        {
+            // Re-annotate integer widths (optimizer may have introduced new IntLits).
+            crate::compiler::typeck::annotate_int_widths(&mut program);
+
+            // Re-run borrow check to verify the optimizer hasn't broken aliasing.
+            let post_borrow_diags = crate::compiler::borrowck::jules_borrowck(&program);
+            for d in post_borrow_diags.items {
+                // Only promote to warning — don't block compilation on post-opt
+                // borrow issues (they're often false positives from inlining).
+                if matches!(d.severity, crate::compiler::borrowck::Severity::Error) {
+                    unit.diags.push(Diag::warning(
+                        d.span,
+                        format!("[post-opt] borrow check: {}", d.message),
+                    ));
+                }
             }
         }
 
