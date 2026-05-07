@@ -91,6 +91,7 @@ rustc-hash = "2"
 bumpalo = "3.14"
 smallvec = { version = "1", features = ["union", "const_generics"] }
 ahash = "0.8"
+bitflags = "2"
 memmap2 = "0.9"
 # Cranelift backend — optional, NOT required for the hand-written x86-64 JIT.
 # The Phase 3 JIT (phase3_jit.rs / tracing_jit.rs) is self-contained and

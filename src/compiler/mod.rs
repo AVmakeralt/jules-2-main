@@ -1,11 +1,13 @@
 pub mod ast;
 pub mod borrowck;
+pub mod diagnostic;
 pub mod diff_opt;
 pub mod error_codes;
 pub mod formal_verify;
 pub mod hw_feedback;
 pub mod ir;
 pub mod lexer;
+pub mod lower;
 pub mod loom_model_check;
 pub mod parser;
 pub mod sat_smt_solver;

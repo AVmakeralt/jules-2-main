@@ -498,6 +498,13 @@ impl CompileUnit {
         self.diags.iter().filter(|d| d.is_error()).count()
     }
 
+    /// Convert all diagnostics into a rich `DiagnosticCollector` with full
+    /// causality tracking, cascade suppression, dataflow info, teaching notes,
+    /// and structured JSON output.
+    pub fn rich_diagnostics(&self, phase: crate::compiler::diagnostic::Phase) -> crate::compiler::diagnostic::DiagnosticCollector {
+        collect_rich_diagnostics(self, phase)
+    }
+
     /// Human-readable one-line summary: "2 errors, 1 warning".
     pub fn summary(&self) -> String {
         let e = self.error_count();
@@ -774,6 +781,12 @@ impl Pipeline {
             }
         }
 
+        // ── Convert diagnostics to rich format for check/explain commands ────
+        // After all passes complete, build the rich diagnostic collector so
+        // callers (jules check, jules explain) can access teaching notes,
+        // causality chains, and structured JSON output.
+        // (Done lazily via CompileUnit::rich_diagnostics() when needed.)
+
         // ── Promote warnings to errors if requested ───────────────────────────
         if self.warn_as_error {
             for d in &mut unit.diags {
@@ -908,6 +921,65 @@ fn adapt_runtime_error(e: crate::interp::RuntimeError) -> Diag {
 }
 
 // =============================================================================
+// §5b  BRIDGE: Diag → rich diagnostic::Diagnostic
+// =============================================================================
+
+/// Convert a pipeline `Diag` into a rich `diagnostic::Diagnostic` for the
+/// unified diagnostic collector.  This bridge allows incremental adoption
+/// of the world-class diagnostic system without rewriting every pass at once.
+fn diag_to_rich(d: &Diag, phase: crate::compiler::diagnostic::Phase) -> crate::compiler::diagnostic::Diagnostic {
+    use crate::compiler::diagnostic::{Diagnostic as RichDiag, Severity as RichSev, DiagCode, Label};
+
+    let severity = match d.severity {
+        DiagSeverity::Note => RichSev::Note,
+        DiagSeverity::Warning => RichSev::Warning,
+        DiagSeverity::Error => RichSev::Error,
+    };
+
+    let code_num: u16 = d.code
+        .and_then(|c| c.strip_prefix('E').and_then(|n| n.parse().ok()))
+        .unwrap_or(9999);
+
+    let span = d.span.unwrap_or_else(Span::dummy);
+
+    let mut rich = RichDiag::error(code_num, phase, span, &d.message);
+    // Override severity for warnings/notes
+    let rich = match severity {
+        RichSev::Warning => RichDiag::warning(code_num, phase, span, &d.message),
+        RichSev::Note => RichDiag::note(code_num, phase, span, &d.message),
+        _ => rich,
+    };
+
+    // Add labels as secondary labels
+    let mut rich = rich;
+    for (label_span, label_msg) in &d.labels {
+        rich = rich.secondary_label(*label_span, label_msg.as_str());
+    }
+
+    // Add hint as a possible fix-it
+    if let Some(ref hint) = d.hint {
+        rich = rich.fix_possible(span, "", hint.as_str());
+    }
+
+    rich
+}
+
+/// Convert all `Diag` items from a compile unit into a `DiagnosticCollector`
+/// with full rich diagnostic support — causality tracking, cascade suppression,
+/// dataflow info, teaching notes, and structured JSON output.
+fn collect_rich_diagnostics(
+    unit: &CompileUnit,
+    phase: crate::compiler::diagnostic::Phase,
+) -> crate::compiler::diagnostic::DiagnosticCollector {
+    let mut collector = crate::compiler::diagnostic::DiagnosticCollector::new();
+    for d in &unit.diags {
+        let rich = diag_to_rich(d, phase);
+        collector.emit(rich);
+    }
+    collector
+}
+
+// =============================================================================
 // §6  SUMMARY LINE
 // =============================================================================
 
@@ -1007,6 +1079,7 @@ pub enum Command {
     Estimate,
     Version,
     Compile, // AOT native compilation to ELF binaries
+    Explain, // jules explain E4001 — explain an error code
 }
 
 impl CliArgs {
@@ -1071,6 +1144,14 @@ impl CliArgs {
             Some("compile") | Some("build") => {
                 out.command = Command::Compile;
                 it.next();
+            }
+            Some("explain") => {
+                out.command = Command::Explain;
+                it.next();
+                // The next argument is the error code to explain
+                if let Some(code) = it.next() {
+                    out.rest_args.push(code.clone());
+                }
             }
             Some("help") | Some("--help") | Some("-h") | None => {
                 out.command = Command::Help;
@@ -1274,6 +1355,120 @@ fn cmd_version() {
     println!("tensor-first game-and-AI programming language");
 }
 
+/// `jules explain E4001` — print a detailed explanation of an error code.
+fn cmd_explain(args: &CliArgs) {
+    use crate::compiler::diagnostic::ErrorExplanationDatabase;
+
+    let code_str = args.rest_args.first().map(|s| s.as_str()).unwrap_or("");
+    if code_str.is_empty() {
+        eprintln!("jules explain <CODE>   — example: jules explain E4001");
+        eprintln!("\nTo list all error codes by category, run: jules explain --list");
+        eprintln!("To explain diagnostics from a file, run: jules explain <file.jules>");
+        return;
+    }
+
+    if code_str == "--list" {
+        let db = ErrorExplanationDatabase::new();
+        db.print_all_codes();
+        return;
+    }
+
+    // If a file was provided, run the pipeline and use the rich DiagnosticCollector
+    // to show diagnostics with teaching notes and causality chains.
+    if let Some(path) = &args.file {
+        let source = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("jules: cannot read `{}`: {e}", path.display());
+                return;
+            }
+        };
+        let filename = path.to_string_lossy();
+        let mut unit = CompileUnit::new(filename.as_ref(), &source);
+        let mut pipeline = Pipeline::new();
+        pipeline.opt_level = args.opt_level;
+        pipeline.quiet = true;
+        pipeline.run(&mut unit);
+
+        let rich = unit.rich_diagnostics(crate::compiler::diagnostic::Phase::SemanticAnalysis);
+
+        if rich.diagnostics.is_empty() {
+            println!("jules explain: no diagnostics found in {}", filename);
+            return;
+        }
+
+        // If JSON output requested, emit structured JSON
+        if args.json_diag {
+            println!("{}", rich.to_json(&filename));
+            return;
+        }
+
+        // Render with teaching notes enabled
+        let render_cfg = crate::compiler::diagnostic::RenderConfig {
+            teaching_mode: true,
+            ..crate::compiler::diagnostic::RenderConfig::default()
+        };
+        let renderer = crate::compiler::diagnostic::DiagnosticRenderer::new(
+            &source, &filename, render_cfg,
+        );
+        println!("{}", renderer.render_all(&rich.diagnostics));
+
+        // Print summary with root/dependent counts
+        println!("{}", rich.summary_line());
+        return;
+    }
+
+    // Strip the 'E' prefix if present and parse the numeric code.
+    let num_str = code_str.strip_prefix('E').unwrap_or(code_str);
+    let num: u16 = match num_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("jules explain: invalid error code `{code_str}` (expected format like E4001)");
+            return;
+        }
+    };
+
+    let db = ErrorExplanationDatabase::new();
+    match db.get(num) {
+        Some(expl) => {
+            println!("error[E{num:04}]: {}", expl.title);
+            println!();
+            println!("{}", expl.description);
+            if !expl.examples.is_empty() {
+                println!("\n  examples:");
+                for (i, ex) in expl.examples.iter().enumerate() {
+                    println!("\n  --- example {} ---", i + 1);
+                    println!("  problematic code:");
+                    for line in ex.bad_code.lines() {
+                        println!("    {line}");
+                    }
+                    println!("  corrected code:");
+                    for line in ex.good_code.lines() {
+                        println!("    {line}");
+                    }
+                    if !ex.explanation.is_empty() {
+                        println!("  {}", ex.explanation);
+                    }
+                }
+            }
+            if !expl.fixes.is_empty() {
+                println!("\n  common fixes:");
+                for fix in &expl.fixes {
+                    println!("    - {fix}");
+                }
+            }
+            if !expl.related_codes.is_empty() {
+                let related: Vec<String> = expl.related_codes.iter().map(|c| format!("E{c:04}")).collect();
+                println!("\n  related: {}", related.join(", "));
+            }
+        }
+        None => {
+            eprintln!("jules explain: no explanation found for E{num:04}");
+            eprintln!("  Run `jules explain --list` to see all known error codes.");
+        }
+    }
+}
+
 fn cmd_help() {
     println!("{JULES_BANNER}");
     println!("USAGE:");
@@ -1288,6 +1483,7 @@ fn cmd_help() {
     println!("    estimate           Estimate Jules training time/resources");
     println!("    repl               Interactive REPL / playground");
     println!("    version            Print version information");
+    println!("    explain <E0001>    Explain an error code in detail");
     println!("    help               Print this message\n");
     println!("OPTIONS:");
     println!("    --no-color         Disable ANSI colour output");
@@ -1939,7 +2135,13 @@ fn cmd_check(args: &CliArgs) -> i32 {
     pipeline.run(&mut unit);
     unit.diags.extend(detect_silent_issues(&source));
 
-    emit_diagnostics(&unit.diags, &source, &filename, &cfg, args.json_diag);
+    // Use rich diagnostics for JSON output or teaching notes
+    if args.json_diag {
+        let rich = unit.rich_diagnostics(crate::compiler::diagnostic::Phase::SemanticAnalysis);
+        println!("{}", rich.to_json(&filename));
+    } else {
+        emit_diagnostics(&unit.diags, &source, &filename, &cfg, false);
+    }
     print_summary(&unit, &cfg);
     store_incremental_check_cache(
         path,
@@ -3192,6 +3394,10 @@ pub fn main() {
         }
         Command::Version => {
             cmd_version();
+            0
+        }
+        Command::Explain => {
+            cmd_explain(&args);
             0
         }
         Command::Check => cmd_check(&args),

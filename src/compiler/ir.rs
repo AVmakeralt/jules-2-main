@@ -352,6 +352,78 @@ pub enum IrReduceOp {
 // §8  SUPPORTING TYPES
 // =============================================================================
 
+/// ECS entity query in the IR.
+#[derive(Debug, Clone)]
+pub struct IrEntityQuery {
+    pub with_components: Vec<String>,
+    pub without_components: Vec<String>,
+}
+
+/// Component access pattern in an ECS loop.
+#[derive(Debug, Clone)]
+pub struct IrComponentAccess {
+    pub component: String,
+    pub mode: IrAccessMode,
+}
+
+/// Access mode for a component in an ECS query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrAccessMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// Parallelism hint in the IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrParallelismHint {
+    Auto,
+    Sequential,
+    Parallel,
+    Simd,
+    Gpu,
+}
+
+/// Alias kind annotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrAliasKind {
+    Unique,
+    Shared,
+}
+
+/// Alias metadata for load/store instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasKind {
+    /// No alias information — assume may alias anything.
+    Unknown,
+    /// No other pointer aliases this memory location.
+    NoAlias,
+    /// The memory is only read, not written.
+    ReadOnly,
+    /// The memory is only written, not read before.
+    WriteOnly,
+    /// No other pointer accesses overlapping memory.
+    Restrict,
+}
+
+impl Default for AliasKind {
+    fn default() -> Self {
+        AliasKind::Unknown
+    }
+}
+
+impl fmt::Display for AliasKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AliasKind::Unknown => write!(f, "unknown"),
+            AliasKind::NoAlias => write!(f, "noalias"),
+            AliasKind::ReadOnly => write!(f, "readonly"),
+            AliasKind::WriteOnly => write!(f, "writeonly"),
+            AliasKind::Restrict => write!(f, "restrict"),
+        }
+    }
+}
+
 /// IR-level function parameter.
 #[derive(Debug, Clone)]
 pub struct IrParam {
@@ -391,6 +463,17 @@ pub enum IrConst {
     Float(f64),
     Bool(bool),
     Str(String),
+}
+
+/// ML computation graph mode — determines execution and optimization strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrGraphMode {
+    /// Execute immediately, no tracing.
+    Eager,
+    /// Trace operations for later compilation.
+    Traced,
+    /// Static computation graph, fully known at compile time.
+    Static,
 }
 
 // =============================================================================
@@ -518,6 +601,123 @@ pub enum IrExpr {
 
     // ── Cost annotation for superoptimizer ─────────────────────────────
     WithCost { inner: ValueId, cost: CostHint },
+
+    // ── Effect emission ────────────────────────────────────────────────
+    /// `emit stdout "hello"` — explicit effect emission.
+    Emit { effect_name: String, value: ValueId, effect: Effect },
+
+    // ── Explicit copy ─────────────────────────────────────────────────
+    /// `copy x` — explicit copy expression.
+    Copy { value: ValueId, ty: Ty },
+
+    // ── Await expression ───────────────────────────────────────────────
+    /// Await the result of an async task.
+    Await { value: ValueId, ty: Ty },
+
+    // ── ECS entity query loop ──────────────────────────────────────────
+    /// Entity-for loop — iterates over ECS entities matching a query.
+    EntityFor {
+        query: IrEntityQuery,
+        body_func: ValueId,
+        access_pattern: Vec<IrComponentAccess>,
+        parallelism: IrParallelismHint,
+        ty: Ty,
+    },
+
+    // ── Parallel for loop ──────────────────────────────────────────────
+    /// Parallel iteration over a collection with optional chunking.
+    ParallelFor {
+        iter: ValueId,
+        body_func: ValueId,
+        chunk_size: Option<u64>,
+        ty: Ty,
+        effect: Effect,
+    },
+
+    // ── Filter operation (pure, vectorizable) ──────────────────────────
+    /// Filter elements of an iterable by a predicate.
+    Filter { iter: ValueId, predicate: ValueId, ty: Ty },
+
+    // ── Batch operation ────────────────────────────────────────────────
+    /// Batch elements of an iterable into fixed-size groups.
+    Batch { iter: ValueId, size: ValueId, ty: Ty },
+
+    // ── Kernel abstraction ─────────────────────────────────────────────
+    /// Named compute kernel (GPU/TPU or SIMD).
+    Kernel {
+        name: String,
+        body: IrFunction,
+        inputs: Vec<ValueId>,
+        ty: Ty,
+        effect: Effect,
+    },
+
+    // ── Break with optional value ──────────────────────────────────────
+    /// Break out of the innermost loop, optionally yielding a value.
+    Break { value: Option<ValueId> },
+
+    // ── Continue ───────────────────────────────────────────────────────
+    /// Continue to the next iteration of the innermost loop.
+    Continue,
+
+    // ── Alias annotation (unique/shared) ───────────────────────────────
+    /// Annotate a value with aliasing information for the optimiser.
+    AliasAnnotation { value: ValueId, alias_kind: IrAliasKind, ty: Ty },
+
+    // ── Determinism flag ───────────────────────────────────────────────
+    /// Mark a value as guaranteed-deterministic (or not).
+    Deterministic { value: ValueId, guaranteed: bool, ty: Ty },
+
+    // ── Cost budget ────────────────────────────────────────────────────
+    /// Annotate a value with a cost budget (e.g. `@budget(1000)`).
+    CostBudget { value: ValueId, budget: u64, ty: Ty },
+
+    // ── Compile-time execution ──────────────────────────────────────────
+    /// Compile-time evaluated expression — result is baked into the binary.
+    Comptime { inner: ValueId, ty: Ty },
+    /// Compile-time constant table lookup.
+    ComptimeTable { name: String, index: ValueId, ty: Ty },
+
+    // ── Intent-based parallelism ────────────────────────────────────────
+    /// Parallel reduction with associative operator — compiler decides
+    /// thread count, SIMD width, chunking, and GPU offload.
+    ParallelReduce {
+        iter: ValueId,
+        init: ValueId,
+        op: IrReduceOp,
+        body_func: ValueId,
+        ty: Ty,
+    },
+
+    // ── Shader stage dispatch ───────────────────────────────────────────
+    /// Dispatch a compute shader with explicit workgroup size.
+    ShaderDispatch {
+        shader: String,
+        inputs: Vec<ValueId>,
+        workgroup_size: (u32, u32, u32),
+        ty: Ty,
+        effect: Effect,
+    },
+
+    // ── ML graph operation ──────────────────────────────────────────────
+    /// An ML graph operation with explicit execution mode.
+    GraphOp {
+        op_name: String,
+        inputs: Vec<ValueId>,
+        mode: IrGraphMode,
+        ty: Ty,
+    },
+
+    // ── Trait method call ───────────────────────────────────────────────
+    /// Dynamic dispatch through a trait vtable.
+    TraitCall {
+        trait_name: String,
+        method: String,
+        receiver: ValueId,
+        args: Vec<ValueId>,
+        ty: Ty,
+        effect: Effect,
+    },
 }
 
 // =============================================================================
@@ -578,8 +778,25 @@ pub struct IrStructDef {
 #[derive(Debug, Clone)]
 pub struct IrEnumDef {
     pub name: String,
-    /// (variant_name, payload_types).
-    pub variants: Vec<(String, Vec<Ty>)>,
+    pub variants: Vec<IrEnumVariant>,
+}
+
+/// A single variant in an IR-level enum definition.
+#[derive(Debug, Clone)]
+pub struct IrEnumVariant {
+    pub name: String,
+    pub fields: IrEnumVariantFields,
+}
+
+/// The payload of an enum variant — unit, tuple, or named fields.
+#[derive(Debug, Clone)]
+pub enum IrEnumVariantFields {
+    /// No payload: `None`
+    Unit,
+    /// Positional payload: `Some(T, U)`
+    Tuple(Vec<Ty>),
+    /// Named payload: `Point { x: f64, y: f64 }`
+    Named(Vec<(String, Ty)>),
 }
 
 /// IR-level component definition.
@@ -613,6 +830,24 @@ pub struct IrEffectDef {
     pub operations: Vec<String>,
 }
 
+/// IR-level module definition.
+#[derive(Debug, Clone)]
+pub struct IrModuleDef {
+    pub name: String,
+    /// Exported function names.
+    pub functions: Vec<String>,
+    /// Exported struct names.
+    pub structs: Vec<String>,
+}
+
+/// IR-level use/import declaration.
+#[derive(Debug, Clone)]
+pub struct IrUseDecl {
+    pub path: String,
+    pub alias: Option<String>,
+    pub is_glob: bool,
+}
+
 /// A complete IR module.
 #[derive(Debug, Clone)]
 pub struct IrModule {
@@ -624,6 +859,10 @@ pub struct IrModule {
     pub constants: Vec<IrConstDef>,
     pub regions: Vec<IrRegionDef>,
     pub effects: Vec<IrEffectDef>,
+    /// Sub-module definitions.
+    pub modules: Vec<IrModuleDef>,
+    /// Use/import declarations.
+    pub uses: Vec<IrUseDecl>,
 }
 
 // =============================================================================
@@ -654,6 +893,13 @@ impl fmt::Display for Ownership {
             Ownership::Copy => write!(f, "copy"),
         }
     }
+}
+
+impl Ownership {
+    /// Alias for MutRef — used by the flat IR.
+    pub const MUT_BORROW: Ownership = Ownership::MutRef;
+    /// Alias for Owned — used by the flat IR.
+    pub const OWN: Ownership = Ownership::Owned;
 }
 
 impl fmt::Display for CostHint {
@@ -689,6 +935,103 @@ impl fmt::Display for ValueId {
 impl fmt::Display for BlockId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "bb{}", self.0)
+    }
+}
+
+impl fmt::Display for IrAccessMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrAccessMode::Read => write!(f, "read"),
+            IrAccessMode::Write => write!(f, "write"),
+            IrAccessMode::ReadWrite => write!(f, "read_write"),
+        }
+    }
+}
+
+impl fmt::Display for IrParallelismHint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrParallelismHint::Auto => write!(f, "auto"),
+            IrParallelismHint::Sequential => write!(f, "sequential"),
+            IrParallelismHint::Parallel => write!(f, "parallel"),
+            IrParallelismHint::Simd => write!(f, "simd"),
+            IrParallelismHint::Gpu => write!(f, "gpu"),
+        }
+    }
+}
+
+impl fmt::Display for IrAliasKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrAliasKind::Unique => write!(f, "unique"),
+            IrAliasKind::Shared => write!(f, "shared"),
+        }
+    }
+}
+
+impl fmt::Display for IrEntityQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "with=[{}] without=[{}]",
+            self.with_components.join(", "),
+            self.without_components.join(", "))
+    }
+}
+
+impl fmt::Display for IrComponentAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.component, self.mode)
+    }
+}
+
+impl fmt::Display for IrEnumVariantFields {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrEnumVariantFields::Unit => write!(f, "()"),
+            IrEnumVariantFields::Tuple(tys) => {
+                write!(f, "(")?;
+                for (i, _ty) in tys.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "Ty")?;
+                }
+                write!(f, ")")
+            }
+            IrEnumVariantFields::Named(fields) => {
+                write!(f, "{{ ")?;
+                for (i, (name, _ty)) in fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{name}: Ty")?;
+                }
+                write!(f, " }}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for IrEnumVariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", self.name, self.fields)
+    }
+}
+
+impl fmt::Display for IrModuleDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "module {} (fns: [{}], structs: [{}])",
+            self.name,
+            self.functions.join(", "),
+            self.structs.join(", "))
+    }
+}
+
+impl fmt::Display for IrUseDecl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "use {}", self.path)?;
+        if let Some(alias) = &self.alias {
+            write!(f, " as {alias}")?;
+        }
+        if self.is_glob {
+            write!(f, ".*")?;
+        }
+        Ok(())
     }
 }
 
@@ -802,6 +1145,59 @@ impl IrExpr {
 
             // ── Cost annotation — delegates to inner ──
             IrExpr::WithCost { .. } => Effect::Pure,
+
+            // ── Effect emission — always IO ──
+            IrExpr::Emit { effect, .. } => *effect,
+
+            // ── Explicit copy — pure (copies bits) ──
+            IrExpr::Copy { .. } => Effect::Pure,
+
+            // ── Await — async ──
+            IrExpr::Await { .. } => Effect::Async,
+
+            // ── ECS entity query loop — may read/write components ──
+            IrExpr::EntityFor { .. } => Effect::Mutation,
+
+            // ── Parallel for — explicitly annotated ──
+            IrExpr::ParallelFor { effect, .. } => *effect,
+
+            // ── Filter — pure, vectorizable ──
+            IrExpr::Filter { .. } => Effect::Pure,
+
+            // ── Batch — pure ──
+            IrExpr::Batch { .. } => Effect::Pure,
+
+            // ── Kernel — explicitly annotated ──
+            IrExpr::Kernel { effect, .. } => *effect,
+
+            // ── Break / Continue — control flow ──
+            IrExpr::Break { .. } => Effect::ControlFlow,
+            IrExpr::Continue => Effect::ControlFlow,
+
+            // ── Alias annotation — pure (metadata only) ──
+            IrExpr::AliasAnnotation { .. } => Effect::Pure,
+
+            // ── Determinism flag — pure (metadata only) ──
+            IrExpr::Deterministic { .. } => Effect::Pure,
+
+            // ── Cost budget — pure (metadata only) ──
+            IrExpr::CostBudget { .. } => Effect::Pure,
+
+            // ── Compile-time execution — pure (baked into binary) ──
+            IrExpr::Comptime { .. } => Effect::Pure,
+            IrExpr::ComptimeTable { .. } => Effect::Pure,
+
+            // ── Parallel reduce — pure (associative, no side effects) ──
+            IrExpr::ParallelReduce { .. } => Effect::Pure,
+
+            // ── Shader dispatch — GPU + IO ──
+            IrExpr::ShaderDispatch { effect, .. } => *effect,
+
+            // ── ML graph op — pure (deferred computation) ──
+            IrExpr::GraphOp { .. } => Effect::Pure,
+
+            // ── Trait method call — explicitly annotated ──
+            IrExpr::TraitCall { effect, .. } => *effect,
         }
     }
 }
@@ -941,6 +1337,73 @@ impl IrBuilder {
     /// Consume the builder and return the completed IrFunction.
     pub fn build(self) -> IrFunction {
         self.func
+    }
+
+    // ── Convenience methods for new IR nodes ────────────────────────────
+
+    /// Define an Emit expression and return the result ValueId.
+    pub fn emit_effect(&mut self, effect_name: String, value: ValueId, effect: Effect, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty, ownership, IrExpr::Emit { effect_name, value, effect }, span)
+    }
+
+    /// Define a Copy expression and return the result ValueId.
+    pub fn copy_value(&mut self, value: ValueId, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty.clone(), ownership, IrExpr::Copy { value, ty }, span)
+    }
+
+    /// Define an Await expression and return the result ValueId.
+    pub fn await_value(&mut self, value: ValueId, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty.clone(), ownership, IrExpr::Await { value, ty }, span)
+    }
+
+    /// Define an EntityFor expression and return the result ValueId.
+    pub fn entity_for(&mut self, query: IrEntityQuery, body_func: ValueId, access_pattern: Vec<IrComponentAccess>, parallelism: IrParallelismHint, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty, ownership, IrExpr::EntityFor { query, body_func, access_pattern, parallelism, ty: Ty::Unit }, span)
+    }
+
+    /// Define a ParallelFor expression and return the result ValueId.
+    pub fn parallel_for(&mut self, iter: ValueId, body_func: ValueId, chunk_size: Option<u64>, ty: Ty, effect: Effect, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty, ownership, IrExpr::ParallelFor { iter, body_func, chunk_size, ty: Ty::Unit, effect }, span)
+    }
+
+    /// Define a Filter expression and return the result ValueId.
+    pub fn filter(&mut self, iter: ValueId, predicate: ValueId, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty.clone(), ownership, IrExpr::Filter { iter, predicate, ty }, span)
+    }
+
+    /// Define a Batch expression and return the result ValueId.
+    pub fn batch(&mut self, iter: ValueId, size: ValueId, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty.clone(), ownership, IrExpr::Batch { iter, size, ty }, span)
+    }
+
+    /// Define a Kernel expression and return the result ValueId.
+    pub fn kernel(&mut self, name: String, body: IrFunction, inputs: Vec<ValueId>, ty: Ty, effect: Effect, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty, ownership, IrExpr::Kernel { name, body, inputs, ty: Ty::Unit, effect }, span)
+    }
+
+    /// Define a Break expression (no result ValueId — control flow).
+    pub fn break_loop(&mut self, value: Option<ValueId>, span: Span) {
+        self.discard(IrExpr::Break { value }, span);
+    }
+
+    /// Define a Continue expression (no result ValueId — control flow).
+    pub fn continue_loop(&mut self, span: Span) {
+        self.discard(IrExpr::Continue, span);
+    }
+
+    /// Define an AliasAnnotation expression and return the result ValueId.
+    pub fn alias_annotation(&mut self, value: ValueId, alias_kind: IrAliasKind, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty.clone(), ownership, IrExpr::AliasAnnotation { value, alias_kind, ty }, span)
+    }
+
+    /// Define a Deterministic annotation and return the result ValueId.
+    pub fn deterministic(&mut self, value: ValueId, guaranteed: bool, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty.clone(), ownership, IrExpr::Deterministic { value, guaranteed, ty }, span)
+    }
+
+    /// Define a CostBudget annotation and return the result ValueId.
+    pub fn cost_budget(&mut self, value: ValueId, budget: u64, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
+        self.define(ty.clone(), ownership, IrExpr::CostBudget { value, budget, ty }, span)
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
@@ -1357,6 +1820,104 @@ impl IrValidator {
             IrExpr::WithCost { inner, .. } => {
                 Self::check_vid(*inner, max_vid, fname, diags);
             }
+
+            // ── New variants ─────────────────────────────────────────────
+
+            IrExpr::Emit { value, .. } => {
+                Self::check_vid(*value, max_vid, fname, diags);
+            }
+
+            IrExpr::Copy { value, .. } => {
+                Self::check_vid(*value, max_vid, fname, diags);
+            }
+
+            IrExpr::Await { value, .. } => {
+                Self::check_vid(*value, max_vid, fname, diags);
+            }
+
+            IrExpr::EntityFor { query, body_func, access_pattern, .. } => {
+                Self::check_vid(*body_func, max_vid, fname, diags);
+                for access in access_pattern {
+                    let _ = access; // component names are strings, not value refs
+                }
+                let _ = query; // query contains only string names
+            }
+
+            IrExpr::ParallelFor { iter, body_func, .. } => {
+                Self::check_vid(*iter, max_vid, fname, diags);
+                Self::check_vid(*body_func, max_vid, fname, diags);
+            }
+
+            IrExpr::Filter { iter, predicate, .. } => {
+                Self::check_vid(*iter, max_vid, fname, diags);
+                Self::check_vid(*predicate, max_vid, fname, diags);
+            }
+
+            IrExpr::Batch { iter, size, .. } => {
+                Self::check_vid(*iter, max_vid, fname, diags);
+                Self::check_vid(*size, max_vid, fname, diags);
+            }
+
+            IrExpr::Kernel { inputs, .. } => {
+                for vid in inputs {
+                    Self::check_vid(*vid, max_vid, fname, diags);
+                }
+            }
+
+            IrExpr::Break { value } => {
+                if let Some(vid) = value {
+                    Self::check_vid(*vid, max_vid, fname, diags);
+                }
+            }
+
+            IrExpr::Continue => {}
+
+            IrExpr::AliasAnnotation { value, .. } => {
+                Self::check_vid(*value, max_vid, fname, diags);
+            }
+
+            IrExpr::Deterministic { value, .. } => {
+                Self::check_vid(*value, max_vid, fname, diags);
+            }
+
+            IrExpr::CostBudget { value, .. } => {
+                Self::check_vid(*value, max_vid, fname, diags);
+            }
+
+            // ── Semantic unification variants ───────────────────────────
+
+            IrExpr::Comptime { inner, .. } => {
+                Self::check_vid(*inner, max_vid, fname, diags);
+            }
+
+            IrExpr::ComptimeTable { index, .. } => {
+                Self::check_vid(*index, max_vid, fname, diags);
+            }
+
+            IrExpr::ParallelReduce { iter, init, body_func, .. } => {
+                Self::check_vid(*iter, max_vid, fname, diags);
+                Self::check_vid(*init, max_vid, fname, diags);
+                Self::check_vid(*body_func, max_vid, fname, diags);
+            }
+
+            IrExpr::ShaderDispatch { inputs, .. } => {
+                for vid in inputs {
+                    Self::check_vid(*vid, max_vid, fname, diags);
+                }
+            }
+
+            IrExpr::GraphOp { inputs, .. } => {
+                for vid in inputs {
+                    Self::check_vid(*vid, max_vid, fname, diags);
+                }
+            }
+
+            IrExpr::TraitCall { receiver, args, .. } => {
+                Self::check_vid(*receiver, max_vid, fname, diags);
+                for vid in args {
+                    Self::check_vid(*vid, max_vid, fname, diags);
+                }
+            }
         }
     }
 
@@ -1567,6 +2128,8 @@ impl IrModule {
             constants: vec![],
             regions: vec![],
             effects: vec![],
+            modules: vec![],
+            uses: vec![],
         }
     }
 
@@ -1579,4 +2142,575 @@ impl IrModule {
     pub fn find_function_mut(&mut self, name: &str) -> Option<&mut IrFunction> {
         self.functions.iter_mut().find(|f| f.name == name)
     }
+}
+
+// =============================================================================
+// §18  SEMANTIC UNIFICATION — EFFECT CAPABILITY SET (bitflags)
+// =============================================================================
+
+bitflags::bitflags! {
+    /// Unified effect capability set — effects are NOT mutually exclusive.
+    /// A function can perform IO + Allocation + Async simultaneously.
+    /// This is the core of the semantic unification: every construct's
+    /// effects are represented as a set, enabling:
+    ///   - Purity checking (EffectCapSet::empty() == pure)
+    ///   - Effect inference (union of subexpressions)
+    ///   - Capability gating (function declares required caps)
+    ///   - JIT caching (same caps → same cache key)
+    ///   - Automatic parallelization (no Mutation/IO → parallel-safe)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct EffectCapSet: u32 {
+        /// No effects — pure expression, freely reorderable.
+        const PURE = 0;
+        /// Reads or writes external state (I/O, network, files).
+        const IO = 1 << 0;
+        /// Mutates heap or stack state.
+        const MUTATE = 1 << 1;
+        /// Allocates memory (region or heap).
+        const ALLOC = 1 << 2;
+        /// Affects control flow (break, continue, return, panic).
+        const CONTROL_FLOW = 1 << 3;
+        /// Async task spawning / joining.
+        const ASYNC = 1 << 4;
+        /// GPU dispatch / compute shader execution.
+        const GPU = 1 << 5;
+        /// SIMD vector operations.
+        const SIMD = 1 << 6;
+        /// Effect not yet determined (conservative — assume anything).
+        const UNKNOWN = 1 << 7;
+    }
+}
+
+impl EffectCapSet {
+    /// True if no bits set (or only PURE, which is 0).
+    pub fn is_pure(self) -> bool {
+        self.bits() == 0
+    }
+
+    /// True if no IO/MUTATE/ASYNC — safe to parallelize.
+    pub fn is_parallel_safe(self) -> bool {
+        !(self.contains(Self::IO) || self.contains(Self::MUTATE) || self.contains(Self::ASYNC))
+    }
+
+    /// True if no IO/ASYNC/UNKNOWN — deterministic result.
+    pub fn is_deterministic(self) -> bool {
+        !(self.contains(Self::IO) || self.contains(Self::ASYNC) || self.contains(Self::UNKNOWN))
+    }
+
+    /// Convert from the legacy Effect enum.
+    pub fn from_legacy(e: Effect) -> Self {
+        match e {
+            Effect::Pure => Self::empty(),
+            Effect::IO => Self::IO,
+            Effect::Mutation => Self::MUTATE,
+            Effect::Allocation => Self::ALLOC,
+            Effect::ControlFlow => Self::CONTROL_FLOW,
+            Effect::Async => Self::ASYNC,
+            Effect::Unknown => Self::UNKNOWN,
+        }
+    }
+
+    /// Convert back to the legacy Effect enum (picks the dominant effect).
+    pub fn to_legacy(self) -> Effect {
+        if self.is_pure() {
+            return Effect::Pure;
+        }
+        // Pick the most significant effect in priority order.
+        if self.contains(Self::IO) {
+            return Effect::IO;
+        }
+        if self.contains(Self::ASYNC) {
+            return Effect::Async;
+        }
+        if self.contains(Self::MUTATE) {
+            return Effect::Mutation;
+        }
+        if self.contains(Self::ALLOC) {
+            return Effect::Allocation;
+        }
+        if self.contains(Self::CONTROL_FLOW) {
+            return Effect::ControlFlow;
+        }
+        if self.contains(Self::UNKNOWN) {
+            return Effect::Unknown;
+        }
+        Effect::Pure
+    }
+}
+
+impl fmt::Display for EffectCapSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_pure() {
+            return write!(f, "pure");
+        }
+        let mut first = true;
+        let mut flag = |name: &str, present: bool| -> fmt::Result {
+            if present {
+                if !first { write!(f, "|")?; }
+                first = false;
+                write!(f, "{name}")?;
+            }
+            Ok(())
+        };
+        flag("io", self.contains(Self::IO))?;
+        flag("mutate", self.contains(Self::MUTATE))?;
+        flag("alloc", self.contains(Self::ALLOC))?;
+        flag("control_flow", self.contains(Self::CONTROL_FLOW))?;
+        flag("async", self.contains(Self::ASYNC))?;
+        flag("gpu", self.contains(Self::GPU))?;
+        flag("simd", self.contains(Self::SIMD))?;
+        flag("unknown", self.contains(Self::UNKNOWN))?;
+        Ok(())
+    }
+}
+
+impl Default for EffectCapSet {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+// =============================================================================
+// §19  FLAT INSTRUCTION IR — IrType, IrOp, TaskOwnership, EffectFlags
+// =============================================================================
+
+/// Flat IR type — used by the instruction-level IR (lower-level than IrExpr).
+#[derive(Debug, Clone, PartialEq)]
+pub enum IrType {
+    Unit,
+    Bool,
+    Int { width: u32, signed: bool },
+    Float { width: u32 },
+    String,
+    Struct { name: String, fields: Vec<(String, IrType)> },
+    Enum { name: String, variants: Vec<(String, Vec<IrType>)> },
+    Array { elem: Box<IrType>, len: Option<u64> },
+    Tensor { elem: Box<IrType>, shape: Vec<u64> },
+    Slice(Box<IrType>),
+    Ref(Box<IrType>),
+    MutRef(Box<IrType>),
+    FnPtr { params: Vec<IrType>, ret: Box<IrType> },
+    Never,
+    Unknown,
+}
+
+impl fmt::Display for IrType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrType::Unit => write!(f, "()"),
+            IrType::Bool => write!(f, "bool"),
+            IrType::Int { width, signed } => {
+                write!(f, "{}{}", if *signed { "i" } else { "u" }, width)
+            }
+            IrType::Float { width } => write!(f, "f{}", width),
+            IrType::String => write!(f, "str"),
+            IrType::Struct { name, .. } => write!(f, "{name}"),
+            IrType::Enum { name, .. } => write!(f, "{name}"),
+            IrType::Array { elem, len } => {
+                match len {
+                    Some(l) => write!(f, "[{}; {l}]", elem),
+                    None => write!(f, "[{}]", elem),
+                }
+            }
+            IrType::Tensor { elem, shape } => {
+                write!(f, "tensor<{}; ", elem)?;
+                for (i, d) in shape.iter().enumerate() {
+                    if i > 0 { write!(f, "×")?; }
+                    write!(f, "{d}")?;
+                }
+                write!(f, ">")
+            }
+            IrType::Slice(elem) => write!(f, "[{}]", elem),
+            IrType::Ref(inner) => write!(f, "&{}", inner),
+            IrType::MutRef(inner) => write!(f, "&mut {}", inner),
+            IrType::FnPtr { params, ret } => {
+                write!(f, "fn(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{p}")?;
+                }
+                write!(f, ") -> {ret}")
+            }
+            IrType::Never => write!(f, "!"),
+            IrType::Unknown => write!(f, "?"),
+        }
+    }
+}
+
+/// Task ownership transfer model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOwnership {
+    Move,
+    Copy,
+    Ref,
+}
+
+impl fmt::Display for TaskOwnership {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskOwnership::Move => write!(f, "move"),
+            TaskOwnership::Copy => write!(f, "copy"),
+            TaskOwnership::Ref => write!(f, "ref"),
+        }
+    }
+}
+
+/// Flat IR operation — one operation per instruction.
+#[derive(Debug, Clone)]
+pub enum IrOp {
+    // Constants
+    ConstInt { value: i128, ty: IrType },
+    ConstFloat { bits: u64, ty: IrType },
+    ConstBool { value: bool },
+    ConstStr { idx: u32 },
+    ConstUnit,
+    // Arithmetic
+    BinOp { op: crate::compiler::ast::BinOpKind, lhs: ValueId, rhs: ValueId },
+    UnOp { op: crate::compiler::ast::UnOpKind, operand: ValueId },
+    // Memory
+    Alloca { ty: IrType, align: u32 },
+    Store { ptr: ValueId, value: ValueId },
+    Load { ptr: ValueId, ty: IrType },
+    Move { src: ValueId },
+    // Control flow
+    Ret { value: Option<ValueId> },
+    Nop,
+    // Tensor
+    MatMul { lhs: ValueId, rhs: ValueId },
+    HadamardMul { lhs: ValueId, rhs: ValueId },
+    HadamardDiv { lhs: ValueId, rhs: ValueId },
+    TensorConcat { lhs: ValueId, rhs: ValueId },
+    KronProd { lhs: ValueId, rhs: ValueId },
+    OuterProd { lhs: ValueId, rhs: ValueId },
+    // Calls
+    Call { func: String, args: Vec<ValueId> },
+    Intrinsic { name: String, args: Vec<ValueId> },
+    // Parallelism
+    ParallelStart { region_id: u32 },
+    ParallelEnd { region_id: u32 },
+    // Region
+    RegionAlloc { region: u32, ty: IrType },
+    // Tasks
+    TaskSpawn { func: String, args: Vec<ValueId>, ownership: TaskOwnership },
+    TaskJoin { task: ValueId },
+    // Control flow (flat IR)
+    CondBr { cond: ValueId, if_true: BlockId, if_false: BlockId },
+    Jump { target: BlockId },
+    Phi { incoming: Vec<(BlockId, ValueId)> },
+    // Type operations
+    TypeCheck { value: ValueId, expected: IrType },
+    Cast { src: ValueId, target_ty: IrType },
+    // Copy (explicit bit-copy, distinct from Move which transfers ownership)
+    Copy { src: ValueId },
+    // Effect emission
+    Emit { effect: String, value: ValueId },
+}
+
+impl IrOp {
+    /// Returns true if this operation is a terminator (ends a basic block).
+    pub fn is_terminator(&self) -> bool {
+        matches!(self, IrOp::Ret { .. } | IrOp::CondBr { .. } | IrOp::Jump { .. })
+    }
+}
+
+/// Effect flags for flat IR instructions — bitflags.
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct EffectFlags: u32 {
+        const PURE = 0;
+        const IO = 1 << 0;
+        const ALLOC = 1 << 1;
+        const WRITE = 1 << 2;
+        const READONLY = 1 << 3;
+        const PARALLEL = 1 << 4;
+        const TERMINATES = 1 << 5;
+    }
+}
+
+impl EffectFlags {
+    /// Create a pure (no-effect) flags set.
+    pub fn pure() -> Self {
+        Self::empty()
+    }
+
+    /// Alias for pure() — no effect flags.
+    pub fn none() -> Self {
+        Self::empty()
+    }
+
+    /// Returns true if no effect flags are set.
+    pub fn is_pure(self) -> bool {
+        self.bits() == 0
+    }
+}
+
+impl fmt::Display for EffectFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_pure() {
+            return write!(f, "pure");
+        }
+        let mut first = true;
+        let mut flag = |name: &str, present: bool| -> fmt::Result {
+            if present {
+                if !first { write!(f, "|")?; }
+                first = false;
+                write!(f, "{name}")?;
+            }
+            Ok(())
+        };
+        flag("io", self.contains(Self::IO))?;
+        flag("alloc", self.contains(Self::ALLOC))?;
+        flag("write", self.contains(Self::WRITE))?;
+        flag("readonly", self.contains(Self::READONLY))?;
+        flag("parallel", self.contains(Self::PARALLEL))?;
+        flag("terminates", self.contains(Self::TERMINATES))?;
+        Ok(())
+    }
+}
+
+impl Default for EffectFlags {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+// =============================================================================
+// §20  FLAT IrInstr, FlatBlock, FlatIrFunction, IrIntrinsic, FlatIrModule
+// =============================================================================
+
+/// A single flat IR instruction.
+#[derive(Debug, Clone)]
+pub struct IrInstr {
+    pub dst: Option<ValueId>,
+    pub op: IrOp,
+    pub span: Span,
+    pub effects: EffectFlags,
+    pub ownership: Ownership,
+    pub cost: CostHint,
+    /// Alias metadata for load/store instructions.
+    pub alias: AliasKind,
+}
+
+/// A basic block for the flat instruction IR.
+#[derive(Debug, Clone)]
+pub struct FlatBlock {
+    pub id: BlockId,
+    pub instrs: Vec<IrInstr>,
+    pub span: Span,
+}
+
+impl FlatBlock {
+    pub fn new(id: BlockId) -> Self {
+        FlatBlock { id, instrs: vec![], span: Span::dummy() }
+    }
+
+    pub fn is_terminated(&self) -> bool {
+        self.instrs.last().map_or(false, |i| i.op.is_terminator())
+    }
+}
+
+/// A function in the flat instruction IR — what lower.rs produces.
+#[derive(Debug, Clone)]
+pub struct FlatIrFunction {
+    pub name: String,
+    pub params: Vec<(ValueId, IrType)>,
+    pub ret_ty: IrType,
+    pub blocks: Vec<FlatBlock>,
+    pub entry: BlockId,
+    pub effects: EffectFlags,
+    pub requires: Vec<ValueId>,
+    pub ensures: Vec<ValueId>,
+    pub span: Span,
+}
+
+/// An intrinsic function declaration.
+#[derive(Debug, Clone)]
+pub struct IrIntrinsic {
+    pub name: String,
+    pub param_types: Vec<IrType>,
+    pub ret_type: IrType,
+    pub effects: EffectFlags,
+}
+
+/// A module in the flat instruction IR.
+#[derive(Debug, Clone)]
+pub struct FlatIrModule {
+    pub functions: Vec<FlatIrFunction>,
+    pub intrinsics: Vec<IrIntrinsic>,
+    pub span: Span,
+}
+
+// =============================================================================
+// §21  SEMANTIC UNIFICATION — NEW IR TYPES
+// =============================================================================
+
+/// Visibility / access control for module items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IrVisibility {
+    /// Private to the current module (default).
+    Private,
+    /// Visible within the current crate.
+    PubCrate,
+    /// Visible to the entire world (public API).
+    Public,
+    /// Visible only to a specific module (e.g. pub(in crate::submodule)).
+    PubIn(String),
+}
+
+impl fmt::Display for IrVisibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrVisibility::Private => write!(f, "private"),
+            IrVisibility::PubCrate => write!(f, "pub(crate)"),
+            IrVisibility::Public => write!(f, "pub"),
+            IrVisibility::PubIn(path) => write!(f, "pub(in {path})"),
+        }
+    }
+}
+
+impl Default for IrVisibility {
+    fn default() -> Self {
+        IrVisibility::Private
+    }
+}
+
+/// Shader pipeline stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrShaderStage {
+    Vertex,
+    Fragment,
+    Compute,
+    Geometry,
+    TessControl,
+    TessEval,
+}
+
+impl fmt::Display for IrShaderStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrShaderStage::Vertex => write!(f, "vertex"),
+            IrShaderStage::Fragment => write!(f, "fragment"),
+            IrShaderStage::Compute => write!(f, "compute"),
+            IrShaderStage::Geometry => write!(f, "geometry"),
+            IrShaderStage::TessControl => write!(f, "tess_control"),
+            IrShaderStage::TessEval => write!(f, "tess_eval"),
+        }
+    }
+}
+
+/// A resource binding for shader stages.
+#[derive(Debug, Clone)]
+pub struct IrResourceBinding {
+    pub group: u32,
+    pub binding: u32,
+    pub name: String,
+    pub ty: Ty,
+    pub access: IrAccessMode,
+}
+
+/// A shader program definition with explicit stages and resource bindings.
+#[derive(Debug, Clone)]
+pub struct IrShaderDef {
+    pub name: String,
+    pub stages: Vec<(IrShaderStage, IrFunction)>,
+    pub bindings: Vec<IrResourceBinding>,
+    pub push_constants: Vec<IrParam>,
+}
+
+/// ECS system scheduling metadata — explicit read/write declarations.
+#[derive(Debug, Clone)]
+pub struct IrSystemSchedule {
+    pub system_name: String,
+    pub reads: Vec<String>,
+    pub writes: Vec<String>,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+    pub parallel_with: Vec<String>,
+}
+
+/// A trait (interface) definition.
+#[derive(Debug, Clone)]
+pub struct IrTraitDef {
+    pub name: String,
+    pub methods: Vec<IrTraitMethod>,
+    pub associated_types: Vec<String>,
+}
+
+/// A method signature in a trait definition.
+#[derive(Debug, Clone)]
+pub struct IrTraitMethod {
+    pub name: String,
+    pub params: Vec<IrParam>,
+    pub ret_ty: Ty,
+    pub effect: Effect,
+    pub has_default: bool,
+}
+
+/// A trait implementation for a specific type.
+#[derive(Debug, Clone)]
+pub struct IrTraitImpl {
+    pub trait_name: String,
+    pub for_type: String,
+    pub methods: Vec<IrFunction>,
+}
+
+/// Per-field layout metadata — alignment, offset, padding.
+#[derive(Debug, Clone)]
+pub struct IrFieldLayout {
+    pub name: String,
+    pub ty: Ty,
+    pub ownership: Ownership,
+    pub alignment: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+/// IR-level struct definition with full layout metadata.
+#[derive(Debug, Clone)]
+pub struct IrStructDefFull {
+    pub name: String,
+    pub fields: Vec<IrFieldLayout>,
+    pub is_component: bool,
+    pub layout: IrDataLayout,
+    pub total_size: u32,
+    pub total_alignment: u32,
+}
+
+/// Extended IR module with semantic unification fields.
+#[derive(Debug, Clone)]
+pub struct IrModuleFull {
+    pub name: String,
+    pub functions: Vec<IrFunction>,
+    pub structs: Vec<IrStructDef>,
+    pub enums: Vec<IrEnumDef>,
+    pub components: Vec<IrComponentDef>,
+    pub constants: Vec<IrConstDef>,
+    pub regions: Vec<IrRegionDef>,
+    pub effects: Vec<IrEffectDef>,
+    pub modules: Vec<IrModuleDef>,
+    pub uses: Vec<IrUseDecl>,
+    /// Shader program definitions.
+    pub shaders: Vec<IrShaderDef>,
+    /// Trait definitions.
+    pub traits: Vec<IrTraitDef>,
+    /// Trait implementations.
+    pub trait_impls: Vec<IrTraitImpl>,
+    /// ECS system scheduling metadata.
+    pub system_schedules: Vec<IrSystemSchedule>,
+}
+
+// =============================================================================
+// §22  EXTENDED IrFunction — graph_mode, capabilities, visibility
+// =============================================================================
+
+/// Extended IrFunction with semantic unification fields.
+#[derive(Debug, Clone)]
+pub struct IrFunctionFull {
+    pub inner: IrFunction,
+    /// ML graph execution mode (if applicable).
+    pub graph_mode: Option<IrGraphMode>,
+    /// Unified effect capabilities.
+    pub capabilities: EffectCapSet,
+    /// Visibility / access control.
+    pub visibility: IrVisibility,
 }

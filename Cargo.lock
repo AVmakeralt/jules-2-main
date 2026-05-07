@@ -510,6 +510,7 @@ name = "jules"
 version = "0.2.0"
 dependencies = [
  "ahash",
+ "bitflags 2.11.0",
  "bumpalo",
  "clap",
  "colored",

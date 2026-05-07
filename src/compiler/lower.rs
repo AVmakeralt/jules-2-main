@@ -3,10 +3,12 @@
 //
 // AST → Unified Semantic SSA IR lowering pass.
 //
-// Converts the high-level AST (from ast.rs) into the low-level SSA IR
+// Converts the high-level AST (from ast.rs) into the low-level flat SSA IR
 // (from ir.rs). Every AST node is mapped to one or more IR instructions
-// with SSA value numbering, basic block construction, effect metadata,
+// with SSA value numbering, flat block construction, effect metadata,
 // and ownership annotations.
+//
+// Output: FlatIrModule (flat instruction IR), not the structured IrModule.
 // =============================================================================
 
 use crate::compiler::ast::*;
@@ -15,13 +17,24 @@ use crate::compiler::ir::*;
 use crate::compiler::lexer::Span;
 use std::fmt;
 
-/// Lower an AST Program into a Unified IR Module.
-pub fn lower_program(program: &Program) -> IrModule {
+/// Loop context for break/continue lowering.
+#[allow(dead_code)]
+struct LoopContext {
+    /// The block to jump to on `break`.
+    break_block: BlockId,
+    /// The block to jump to on `continue`.
+    continue_block: BlockId,
+    /// State variables for the loop (for future SSA loop-carried values).
+    loop_state_vars: Vec<(ValueId, IrType)>,
+}
+
+/// Lower an AST Program into a Flat IR Module.
+pub fn lower_program(program: &Program) -> FlatIrModule {
     let mut ctx = LowerCtx::new();
     for item in &program.items {
         ctx.lower_item(item);
     }
-    IrModule {
+    FlatIrModule {
         functions: ctx.functions,
         intrinsics: ctx.intrinsics,
         span: program.span,
@@ -31,12 +44,12 @@ pub fn lower_program(program: &Program) -> IrModule {
 // ─── Lowering Context ──────────────────────────────────────────────────────────
 
 struct LowerCtx {
-    functions: Vec<IrFunction>,
+    functions: Vec<FlatIrFunction>,
     intrinsics: Vec<IrIntrinsic>,
     next_value: u32,
     next_block: u32,
-    /// Currently-building basic blocks for the function being lowered.
-    current_blocks: Vec<BasicBlock>,
+    /// Currently-building flat blocks for the function being lowered.
+    current_blocks: Vec<FlatBlock>,
     /// ID of the current block being filled.
     current_block_id: BlockId,
     /// Name → ValueId mapping for the current scope.
@@ -49,6 +62,8 @@ struct LowerCtx {
     next_region: u32,
     /// Currently-building function name (for diagnostics).
     current_fn: String,
+    /// Loop context stack — push on loop entry, pop on loop exit.
+    loop_stack: Vec<LoopContext>,
 }
 
 impl LowerCtx {
@@ -65,6 +80,7 @@ impl LowerCtx {
             strings: vec![],
             next_region: 0,
             current_fn: String::new(),
+            loop_stack: vec![],
         }
     }
 
@@ -119,7 +135,7 @@ impl LowerCtx {
 
     // ── Instruction Emission ────────────────────────────────────────────────
 
-    /// Emit an instruction to the current basic block.
+    /// Emit an instruction to the current flat block.
     /// Returns the ValueId of the result, if the instruction produces one.
     fn emit(&mut self, op: IrOp, span: Span, effects: EffectFlags, ownership: Ownership) -> Option<ValueId> {
         let dst = if op.is_terminator() {
@@ -134,6 +150,7 @@ impl LowerCtx {
             effects,
             ownership,
             cost: CostHint::default(),
+            alias: AliasKind::default(),
         };
         self.current_block_mut().instrs.push(instr);
         dst
@@ -149,20 +166,21 @@ impl LowerCtx {
             effects,
             ownership: Ownership::Copy,
             cost: CostHint::default(),
+            alias: AliasKind::default(),
         };
         self.current_block_mut().instrs.push(instr);
     }
 
-    /// Get a mutable reference to the current basic block.
-    fn current_block_mut(&mut self) -> &mut BasicBlock {
+    /// Get a mutable reference to the current flat block.
+    fn current_block_mut(&mut self) -> &mut FlatBlock {
         let id = self.current_block_id;
         self.current_blocks.iter_mut().find(|b| b.id == id).expect("current block must exist")
     }
 
-    /// Create a new basic block and return its ID.
+    /// Create a new flat block and return its ID.
     fn create_block(&mut self) -> BlockId {
         let id = self.fresh_block();
-        self.current_blocks.push(BasicBlock::new(id));
+        self.current_blocks.push(FlatBlock::new(id));
         id
     }
 
@@ -197,8 +215,8 @@ impl LowerCtx {
                 let _ = decl;
             }
             Item::Const(decl) => {
-                // Lower constant as a function that returns the value
-                let _ = decl;
+                // Lower constant as a function that returns the constant value
+                self.lower_const(decl);
             }
             Item::Use(path) => {
                 let _ = path;
@@ -251,7 +269,7 @@ impl LowerCtx {
 
         // Create entry block
         let entry = self.fresh_block();
-        self.current_blocks.push(BasicBlock::new(entry));
+        self.current_blocks.push(FlatBlock::new(entry));
         self.current_block_id = entry;
 
         // Bind parameters as SSA values
@@ -310,7 +328,7 @@ impl LowerCtx {
         let ret_ty = decl.ret_ty.as_ref().map(|t| self.lower_type(t)).unwrap_or(IrType::Unit);
 
         // Finalize function
-        let func = IrFunction {
+        let func = FlatIrFunction {
             name: decl.name.clone(),
             params,
             ret_ty,
@@ -336,7 +354,7 @@ impl LowerCtx {
         self.next_block = 0;
 
         let entry = self.fresh_block();
-        self.current_blocks.push(BasicBlock::new(entry));
+        self.current_blocks.push(FlatBlock::new(entry));
         self.current_block_id = entry;
 
         let mut params = Vec::new();
@@ -357,13 +375,60 @@ impl LowerCtx {
             );
         }
 
-        let func = IrFunction {
+        let func = FlatIrFunction {
             name: format!("__system_{}", decl.name),
             params,
             ret_ty: IrType::Unit,
             blocks: std::mem::take(&mut self.current_blocks),
             entry,
             effects: EffectFlags::PARALLEL,
+            requires: vec![],
+            ensures: vec![],
+            span: decl.span,
+        };
+        self.functions.push(func);
+    }
+
+    // ── Const Lowering ─────────────────────────────────────────────────────
+
+    fn lower_const(&mut self, decl: &ConstDecl) {
+        // Lower a constant as a function named __const_{name} that returns the value.
+        self.current_fn = format!("__const_{}", decl.name);
+        self.env.clear();
+        self.scope_stack.clear();
+        self.current_blocks.clear();
+        self.next_value = 0;
+        self.next_block = 0;
+        self.loop_stack.clear();
+
+        // Create entry block
+        let entry = self.fresh_block();
+        self.current_blocks.push(FlatBlock::new(entry));
+        self.current_block_id = entry;
+
+        // Lower the constant's expression
+        let val_vid = self.lower_expr(&decl.value);
+
+        // Return the value
+        if !self.is_terminated() {
+            self.emit_terminator(
+                IrOp::Ret { value: val_vid },
+                decl.span,
+                EffectFlags::TERMINATES,
+            );
+        }
+
+        // Compute return type
+        let ret_ty = self.lower_type(&decl.ty);
+
+        // Finalize function
+        let func = FlatIrFunction {
+            name: format!("__const_{}", decl.name),
+            params: vec![],
+            ret_ty,
+            blocks: std::mem::take(&mut self.current_blocks),
+            entry,
+            effects: EffectFlags::PURE,
             requires: vec![],
             ensures: vec![],
             span: decl.span,
@@ -400,10 +465,10 @@ impl LowerCtx {
                     // Uninitialized binding — allocate a slot
                     let ir_ty = ty.as_ref().map(|t| self.lower_type(t)).unwrap_or(IrType::Unit);
                     let ptr = self.emit(
-                        IrOp::Alloca { ty: ir_ty.clone(), align: 8 },
+                        IrOp::Alloca { ty: ir_ty, align: 8 },
                         *span,
                         EffectFlags::ALLOC,
-                        if *mutable { Ownership::MutBorrow } else { Ownership::Own },
+                        if *mutable { Ownership::MUT_BORROW } else { Ownership::OWN },
                     );
                     if let Some(ptr) = ptr {
                         self.bind_pattern(pattern, ptr, *mutable);
@@ -428,24 +493,42 @@ impl LowerCtx {
 
             Stmt::Break { span, .. } => {
                 // Break is lowered as a jump to the loop exit block.
-                // For now, emit a placeholder Nop — real break lowering
-                // requires loop context tracking.
-                self.emit(
-                    IrOp::Nop,
-                    *span,
-                    EffectFlags::none(),
-                    Ownership::Copy,
-                );
+                if let Some(ctx) = self.loop_stack.last() {
+                    let break_block = ctx.break_block;
+                    self.emit_terminator(
+                        IrOp::Jump { target: break_block },
+                        *span,
+                        EffectFlags::TERMINATES,
+                    );
+                } else {
+                    // Break outside of a loop — emit a placeholder Nop.
+                    self.emit(
+                        IrOp::Nop,
+                        *span,
+                        EffectFlags::none(),
+                        Ownership::Copy,
+                    );
+                }
             }
 
             Stmt::Continue { span, .. } => {
-                // Continue is lowered as a jump to the loop header.
-                self.emit(
-                    IrOp::Nop,
-                    *span,
-                    EffectFlags::none(),
-                    Ownership::Copy,
-                );
+                // Continue is lowered as a jump to the loop header/continue block.
+                if let Some(ctx) = self.loop_stack.last() {
+                    let continue_block = ctx.continue_block;
+                    self.emit_terminator(
+                        IrOp::Jump { target: continue_block },
+                        *span,
+                        EffectFlags::TERMINATES,
+                    );
+                } else {
+                    // Continue outside of a loop — emit a placeholder Nop.
+                    self.emit(
+                        IrOp::Nop,
+                        *span,
+                        EffectFlags::none(),
+                        Ownership::Copy,
+                    );
+                }
             }
 
             Stmt::If { cond, then, else_, span } => {
@@ -464,24 +547,149 @@ impl LowerCtx {
                 self.lower_for_in(pattern, iter, body, *span);
             }
 
-            Stmt::EntityFor { var, body, span, .. } => {
-                // EntityFor is a specialized for-loop over entities.
-                // Lower as a for-in loop with the world as iterator.
+            Stmt::EntityFor { var, body, query, span, .. } => {
+                // EntityFor is a specialized for-loop over entities matching a query.
+                // Lower as: __entity_query_begin → loop { __entity_iter → body → continue } → __entity_query_end
                 self.push_scope();
-                let iter_vid = self.emit(
-                    IrOp::ConstUnit,
+
+                // Look up or create a world value
+                let world_vid = self.lookup("world").unwrap_or_else(|| {
+                    self.emit(
+                        IrOp::ConstUnit,
+                        *span,
+                        EffectFlags::pure(),
+                        Ownership::Copy,
+                    ).unwrap_or(ValueId(0))
+                });
+
+                // Emit __entity_query_begin(world, with_components, without_components)
+                let with_str = query.with.join(",");
+                let without_str = query.without.join(",");
+                let with_idx = self.intern_string(&with_str);
+                let without_idx = self.intern_string(&without_str);
+                let with_vid = self.emit(
+                    IrOp::ConstStr { idx: with_idx },
                     *span,
                     EffectFlags::pure(),
                     Ownership::Copy,
                 );
-                let entity_vid = if let Some(iv) = iter_vid {
-                    self.bind(var.clone(), iv);
-                    Some(iv)
+                let without_vid = self.emit(
+                    IrOp::ConstStr { idx: without_idx },
+                    *span,
+                    EffectFlags::pure(),
+                    Ownership::Copy,
+                );
+
+                let mut begin_args = vec![world_vid];
+                if let Some(wv) = with_vid { begin_args.push(wv); }
+                if let Some(wov) = without_vid { begin_args.push(wov); }
+
+                let query_handle = self.emit(
+                    IrOp::Call {
+                        func: "__entity_query_begin".to_string(),
+                        args: begin_args,
+                    },
+                    *span,
+                    EffectFlags::IO,
+                    Ownership::OWN,
+                );
+
+                // Create loop blocks
+                let header_block = self.create_block();
+                let body_block = self.create_block();
+                let exit_block = self.create_block();
+
+                // Push loop context for break/continue
+                self.loop_stack.push(LoopContext {
+                    break_block: exit_block,
+                    continue_block: header_block,
+                    loop_state_vars: vec![],
+                });
+
+                // Jump to header
+                self.emit_terminator(
+                    IrOp::Jump { target: header_block },
+                    *span,
+                    EffectFlags::TERMINATES,
+                );
+
+                // Header: call __entity_iter to check for next entity
+                self.switch_to_block(header_block);
+                let mut iter_args = vec![];
+                if let Some(qh) = query_handle { iter_args.push(qh); }
+                let entity_vid = self.emit(
+                    IrOp::Call {
+                        func: "__entity_iter".to_string(),
+                        args: iter_args,
+                    },
+                    *span,
+                    EffectFlags::IO,
+                    Ownership::OWN,
+                );
+
+                // Check if entity is valid (non-unit) — for now, always branch to body
+                // A proper implementation would check for a sentinel value
+                if let Some(ev) = entity_vid {
+                    let has_next = self.emit(
+                        IrOp::Call {
+                            func: "__entity_iter_valid".to_string(),
+                            args: vec![ev],
+                        },
+                        *span,
+                        EffectFlags::pure(),
+                        Ownership::Copy,
+                    );
+                    if let Some(hn) = has_next {
+                        self.emit_terminator(
+                            IrOp::CondBr { cond: hn, if_true: body_block, if_false: exit_block },
+                            *span,
+                            EffectFlags::TERMINATES,
+                        );
+                    } else {
+                        self.emit_terminator(
+                            IrOp::Jump { target: body_block },
+                            *span,
+                            EffectFlags::TERMINATES,
+                        );
+                    }
                 } else {
-                    None
-                };
-                let _ = entity_vid;
+                    self.emit_terminator(
+                        IrOp::Jump { target: exit_block },
+                        *span,
+                        EffectFlags::TERMINATES,
+                    );
+                }
+
+                // Body: bind entity variable, lower body
+                self.switch_to_block(body_block);
+                if let Some(ev) = entity_vid {
+                    self.bind(var.clone(), ev);
+                }
                 self.lower_block(body);
+                if !self.is_terminated() {
+                    self.emit_terminator(
+                        IrOp::Jump { target: header_block },
+                        body.span,
+                        EffectFlags::TERMINATES,
+                    );
+                }
+
+                // Exit: call __entity_query_end
+                self.switch_to_block(exit_block);
+                let mut end_args = vec![];
+                if let Some(qh) = query_handle { end_args.push(qh); }
+                self.emit(
+                    IrOp::Call {
+                        func: "__entity_query_end".to_string(),
+                        args: end_args,
+                    },
+                    *span,
+                    EffectFlags::IO,
+                    Ownership::Copy,
+                );
+
+                // Pop loop context
+                self.loop_stack.pop();
                 self.pop_scope();
             }
 
@@ -573,7 +781,7 @@ impl LowerCtx {
                     IrOp::RegionAlloc { region: region_id, ty: IrType::Unit },
                     *span,
                     EffectFlags::ALLOC,
-                    Ownership::Own,
+                    Ownership::OWN,
                 );
                 for s in &body.stmts {
                     self.lower_stmt(s);
@@ -597,7 +805,7 @@ impl LowerCtx {
                     },
                     *span,
                     EffectFlags::PARALLEL,
-                    Ownership::Own,
+                    Ownership::OWN,
                 );
                 if let Some(tv) = task_vid {
                     self.bind(name.clone(), tv);
@@ -717,7 +925,7 @@ impl LowerCtx {
                     IrOp::ConstStr { idx },
                     *span,
                     EffectFlags::pure(),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
 
@@ -765,7 +973,7 @@ impl LowerCtx {
                     },
                     *span,
                     EffectFlags::pure(),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
 
@@ -783,7 +991,7 @@ impl LowerCtx {
                     },
                     *span,
                     EffectFlags::pure().union(EffectFlags::ALLOC),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
 
@@ -839,7 +1047,7 @@ impl LowerCtx {
                                 IrOp::Move { src: v },
                                 *span,
                                 EffectFlags::WRITE,
-                                Ownership::Own,
+                                Ownership::OWN,
                             ),
                             None => None,
                         }
@@ -852,7 +1060,7 @@ impl LowerCtx {
                                     IrOp::Store { ptr, value: val },
                                     *span,
                                     EffectFlags::WRITE,
-                                    Ownership::MutBorrow,
+                                    Ownership::MUT_BORROW,
                                 );
                                 self.bind(name.clone(), val);
                                 return Some(val);
@@ -893,7 +1101,7 @@ impl LowerCtx {
                                             IrOp::MatMul { lhs: l, rhs: r },
                                             *span,
                                             EffectFlags::pure(),
-                                            Ownership::Own,
+                                            Ownership::OWN,
                                         );
                                         if let Expr::Ident { name, .. } = target.as_ref() {
                                             if let Some(vid) = result {
@@ -985,7 +1193,7 @@ impl LowerCtx {
                     IrOp::Call { func: func_name, args: arg_vids },
                     *span,
                     EffectFlags::pure(), // conservative: caller should annotate
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
 
@@ -1007,7 +1215,7 @@ impl LowerCtx {
                     },
                     *span,
                     EffectFlags::pure(),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
 
@@ -1021,7 +1229,7 @@ impl LowerCtx {
                             IrOp::MatMul { lhs: lv, rhs: rv },
                             *span,
                             EffectFlags::pure(),
-                            Ownership::Own,
+                            Ownership::OWN,
                         )
                     }
                     _ => None,
@@ -1037,7 +1245,7 @@ impl LowerCtx {
                             IrOp::HadamardMul { lhs: lv, rhs: rv },
                             *span,
                             EffectFlags::pure(),
-                            Ownership::Own,
+                            Ownership::OWN,
                         )
                     }
                     _ => None,
@@ -1053,7 +1261,7 @@ impl LowerCtx {
                             IrOp::HadamardDiv { lhs: lv, rhs: rv },
                             *span,
                             EffectFlags::pure(),
-                            Ownership::Own,
+                            Ownership::OWN,
                         )
                     }
                     _ => None,
@@ -1069,7 +1277,7 @@ impl LowerCtx {
                             IrOp::TensorConcat { lhs: lv, rhs: rv },
                             *span,
                             EffectFlags::pure().union(EffectFlags::ALLOC),
-                            Ownership::Own,
+                            Ownership::OWN,
                         )
                     }
                     _ => None,
@@ -1085,7 +1293,7 @@ impl LowerCtx {
                             IrOp::KronProd { lhs: lv, rhs: rv },
                             *span,
                             EffectFlags::pure(),
-                            Ownership::Own,
+                            Ownership::OWN,
                         )
                     }
                     _ => None,
@@ -1101,7 +1309,7 @@ impl LowerCtx {
                             IrOp::OuterProd { lhs: lv, rhs: rv },
                             *span,
                             EffectFlags::pure(),
-                            Ownership::Own,
+                            Ownership::OWN,
                         )
                     }
                     _ => None,
@@ -1119,7 +1327,7 @@ impl LowerCtx {
                             },
                             *span,
                             EffectFlags::pure(),
-                            Ownership::Own,
+                            Ownership::OWN,
                         )
                     }
                     _ => None,
@@ -1163,7 +1371,7 @@ impl LowerCtx {
                     IrOp::Intrinsic { name: name.to_string(), args },
                     *span,
                     EffectFlags::pure(),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
 
@@ -1192,17 +1400,13 @@ impl LowerCtx {
             // ── Closures ────────────────────────────────────────────────────
             Expr::Closure { params, body, span, .. } => {
                 // Lower closure as a function + capture
-                let mut param_types = Vec::new();
-                for p in params {
-                    param_types.push(p.ty.as_ref().map(|t| self.lower_type(t)).unwrap_or(IrType::Unit));
-                }
-                // For now, emit a placeholder
+                let _ = params;
                 let _ = body;
                 self.emit(
                     IrOp::ConstUnit,
                     *span,
                     EffectFlags::pure(),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
 
@@ -1226,7 +1430,7 @@ impl LowerCtx {
                     },
                     *span,
                     EffectFlags::pure(),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
 
@@ -1245,7 +1449,7 @@ impl LowerCtx {
                     },
                     *span,
                     EffectFlags::pure().union(EffectFlags::ALLOC),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
 
@@ -1335,7 +1539,7 @@ impl LowerCtx {
                     IrOp::Call { func: func_name, args: arg_vids },
                     *call_span,
                     EffectFlags::pure(),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
             Expr::MethodCall { receiver: _, method, args, span: call_span } => {
@@ -1356,7 +1560,7 @@ impl LowerCtx {
                     },
                     *call_span,
                     EffectFlags::pure(),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
             Expr::Ident { name, .. } => {
@@ -1369,7 +1573,7 @@ impl LowerCtx {
                     IrOp::Call { func: name.clone(), args },
                     span,
                     EffectFlags::pure(),
-                    Ownership::Own,
+                    Ownership::OWN,
                 )
             }
             _ => {
@@ -1493,6 +1697,13 @@ impl LowerCtx {
         let body_block = self.create_block();
         let exit_block = self.create_block();
 
+        // Push loop context for break/continue
+        self.loop_stack.push(LoopContext {
+            break_block: exit_block,
+            continue_block: header_block,
+            loop_state_vars: vec![],
+        });
+
         // Jump from current block to header
         self.emit_terminator(
             IrOp::Jump { target: header_block },
@@ -1524,11 +1735,21 @@ impl LowerCtx {
 
         // Continue after loop
         self.switch_to_block(exit_block);
+
+        // Pop loop context
+        self.loop_stack.pop();
     }
 
     fn lower_loop(&mut self, body: &Block, span: Span) {
         let header_block = self.create_block();
         let exit_block = self.create_block();
+
+        // Push loop context for break/continue
+        self.loop_stack.push(LoopContext {
+            break_block: exit_block,
+            continue_block: header_block,
+            loop_state_vars: vec![],
+        });
 
         self.emit_terminator(
             IrOp::Jump { target: header_block },
@@ -1547,6 +1768,9 @@ impl LowerCtx {
         }
 
         self.switch_to_block(exit_block);
+
+        // Pop loop context
+        self.loop_stack.pop();
     }
 
     fn lower_for_in(&mut self, pattern: &Pattern, iter: &Expr, body: &Block, span: Span) {
@@ -1556,6 +1780,13 @@ impl LowerCtx {
         let header_block = self.create_block();
         let body_block = self.create_block();
         let exit_block = self.create_block();
+
+        // Push loop context for break/continue
+        self.loop_stack.push(LoopContext {
+            break_block: exit_block,
+            continue_block: header_block,
+            loop_state_vars: vec![],
+        });
 
         // Jump to header
         self.emit_terminator(
@@ -1603,7 +1834,7 @@ impl LowerCtx {
                 },
                 span,
                 EffectFlags::pure(),
-                Ownership::Own,
+                Ownership::OWN,
             ),
             None => None,
         };
@@ -1620,6 +1851,9 @@ impl LowerCtx {
         }
 
         self.switch_to_block(exit_block);
+
+        // Pop loop context
+        self.loop_stack.pop();
     }
 
     fn lower_match(&mut self, expr: &Expr, arms: &[MatchArm], span: Span) {
@@ -1740,8 +1974,8 @@ impl LowerCtx {
 
             Type::Tensor { elem, shape } => {
                 IrType::Tensor {
-                    elem: elem.clone(),
-                    shape: shape.iter().map(|d| self.lower_dim(d)).collect(),
+                    elem: Box::new(self.elem_type_to_ir(elem.clone())),
+                    shape: shape.iter().map(|d| self.lower_dim_to_u64(d)).collect(),
                 }
             }
 
@@ -1751,30 +1985,22 @@ impl LowerCtx {
                     VecFamily::Int => IrType::Int { width: 32, signed: true },
                     VecFamily::UInt => IrType::Int { width: 32, signed: false },
                 };
-                IrType::Vec {
-                    elem: Box::new(elem),
-                    lanes: size.lanes(),
-                }
+                let len = size.lanes() as u64;
+                IrType::Array { elem: Box::new(elem), len: Some(len) }
             }
 
             Type::Mat { size } => {
-                IrType::Vec {
-                    elem: Box::new(IrType::Float { width: 32 }),
-                    lanes: size.lanes() * size.lanes(),
-                }
+                let lanes = (size.lanes() * size.lanes()) as u64;
+                IrType::Array { elem: Box::new(IrType::Float { width: 32 }), len: Some(lanes) }
             }
 
             Type::Quat => {
-                IrType::Vec {
-                    elem: Box::new(IrType::Float { width: 32 }),
-                    lanes: 4,
-                }
+                IrType::Array { elem: Box::new(IrType::Float { width: 32 }), len: Some(4) }
             }
 
-            Type::Named(name) => IrType::Opaque(name.clone()),
+            Type::Named(name) => IrType::Unknown, // opaque named type
 
             Type::Tuple(elems) => {
-                // Represent as a struct with numeric field names
                 IrType::Struct {
                     name: "__tuple".to_string(),
                     fields: elems.iter().enumerate()
@@ -1784,34 +2010,39 @@ impl LowerCtx {
             }
 
             Type::Array { elem, len: _ } => {
-                // Arrays lower to a vec type or opaque
-                IrType::Vec {
-                    elem: Box::new(self.lower_type(elem)),
-                    lanes: 0, // dynamic length
-                }
+                IrType::Array { elem: Box::new(self.lower_type(elem)), len: None }
             }
 
             Type::Slice(elem) => {
-                IrType::Ref {
-                    inner: Box::new(self.lower_type(elem)),
-                    ownership: Ownership::Shared,
-                }
+                IrType::Slice(Box::new(self.lower_type(elem)))
             }
 
-            Type::Ref { mutable, inner } => {
-                let ownership = if *mutable { Ownership::MutBorrow } else { Ownership::Shared };
-                IrType::Ref {
-                    inner: Box::new(self.lower_type(inner)),
-                    ownership,
-                }
+            Type::Ref { mutable: false, inner } => {
+                IrType::Ref(Box::new(self.lower_type(inner)))
+            }
+
+            Type::Ref { mutable: true, inner } => {
+                IrType::MutRef(Box::new(self.lower_type(inner)))
             }
 
             Type::Option(inner) => {
-                IrType::Enum { name: format!("Option_{}", self.type_summary(inner)) }
+                IrType::Enum {
+                    name: format!("Option_{}", self.type_summary(inner)),
+                    variants: vec![
+                        ("None".to_string(), vec![]),
+                        ("Some".to_string(), vec![self.lower_type(inner)]),
+                    ],
+                }
             }
 
             Type::Result { ok, err } => {
-                IrType::Enum { name: format!("Result_{}_{}", self.type_summary(ok), self.type_summary(err)) }
+                IrType::Enum {
+                    name: format!("Result_{}_{}", self.type_summary(ok), self.type_summary(err)),
+                    variants: vec![
+                        ("Ok".to_string(), vec![self.lower_type(ok)]),
+                        ("Err".to_string(), vec![self.lower_type(err)]),
+                    ],
+                }
             }
 
             Type::FnPtr { params, ret } => {
@@ -1826,34 +2057,26 @@ impl LowerCtx {
             Type::Infer => IrType::Unit, // inference placeholder
 
             Type::Own(inner) => {
-                IrType::Ref {
-                    inner: Box::new(self.lower_type(inner)),
-                    ownership: Ownership::Own,
-                }
+                // Owned value — just the value itself in the flat IR
+                self.lower_type(inner)
             }
 
             Type::Unique(inner) => {
-                IrType::Ref {
-                    inner: Box::new(self.lower_type(inner)),
-                    ownership: Ownership::Unique,
-                }
+                // Unique reference — immutable in the flat IR
+                IrType::Ref(Box::new(self.lower_type(inner)))
             }
 
             Type::Shared(inner) => {
-                IrType::Ref {
-                    inner: Box::new(self.lower_type(inner)),
-                    ownership: Ownership::Shared,
-                }
+                IrType::Ref(Box::new(self.lower_type(inner)))
             }
         }
     }
 
-    fn lower_dim(&self, dim: &DimExpr) -> IrDim {
+    /// Lower a DimExpr to a u64 shape dimension for the flat IrType::Tensor.
+    fn lower_dim_to_u64(&self, dim: &DimExpr) -> u64 {
         match dim {
-            DimExpr::Lit(n) => IrDim::Static(*n),
-            DimExpr::Named(name) => IrDim::Symbolic(name.clone()),
-            DimExpr::Dynamic => IrDim::Dynamic,
-            DimExpr::Expr(_) => IrDim::Dynamic, // expression dims are dynamic for now
+            DimExpr::Lit(n) => *n,
+            DimExpr::Named(_) | DimExpr::Dynamic | DimExpr::Expr(_) => 0, // 0 = dynamic/unknown dimension
         }
     }
 
@@ -1966,8 +2189,7 @@ impl LowerCtx {
             Stmt::Region { .. } => EffectFlags::ALLOC,
             Stmt::TaskSpawn { .. } => EffectFlags::PARALLEL,
             Stmt::TaskJoin { .. } => EffectFlags::PARALLEL,
-            Stmt::UnsafeBlock { .. } => EffectFlags::UNSAFE,
-            Stmt::Effect { .. } => EffectFlags::IO,
+            Stmt::UnsafeBlock { .. } => EffectFlags::WRITE,
             _ => EffectFlags::pure(),
         }
     }
@@ -1978,15 +2200,17 @@ impl LowerCtx {
     fn infer_ownership(&self, ty: &IrType) -> Ownership {
         match ty {
             IrType::Int { .. } | IrType::Float { .. } | IrType::Bool | IrType::Unit => Ownership::Copy,
-            IrType::String => Ownership::Own,
-            IrType::Tensor { .. } => Ownership::Own,
-            IrType::Vec { .. } => Ownership::Own,
-            IrType::Ref { ownership, .. } => *ownership,
+            IrType::String => Ownership::OWN,
+            IrType::Tensor { .. } => Ownership::OWN,
+            IrType::Array { .. } => Ownership::OWN,
+            IrType::Slice(_) => Ownership::Shared,
+            IrType::Ref(_) => Ownership::Shared,
+            IrType::MutRef(_) => Ownership::MUT_BORROW,
             IrType::FnPtr { .. } => Ownership::Copy,
-            IrType::Struct { .. } => Ownership::Own,
+            IrType::Struct { .. } => Ownership::OWN,
             IrType::Enum { .. } => Ownership::Copy,
-            IrType::Opaque(_) => Ownership::Own,
             IrType::Never => Ownership::Copy,
+            IrType::Unknown => Ownership::OWN,
         }
     }
 }
@@ -1995,9 +2219,9 @@ impl LowerCtx {
 // IR Display / Debug (for emit_ir flag)
 // =============================================================================
 
-impl fmt::Display for IrModule {
+impl fmt::Display for FlatIrModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "; === Jules Unified IR Module ===")?;
+        writeln!(f, "; === Jules Flat IR Module ===")?;
         for func in &self.functions {
             writeln!(f, "\n{} {{", func.name)?;
             writeln!(f, "  entry: {}", func.entry)?;
@@ -2031,59 +2255,5 @@ impl fmt::Display for IrModule {
                 intr.name, intr.param_types, intr.ret_type, intr.effects)?;
         }
         Ok(())
-    }
-}
-
-impl fmt::Display for IrType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IrType::Int { width, signed } => write!(f, "{}{}", if *signed { 'i' } else { 'u' }, width),
-            IrType::Float { width } => write!(f, "f{}", width),
-            IrType::Bool => write!(f, "bool"),
-            IrType::String => write!(f, "str"),
-            IrType::Unit => write!(f, "()"),
-            IrType::Never => write!(f, "!"),
-            IrType::Tensor { elem, shape } => {
-                write!(f, "tensor<{:?}>[", elem)?;
-                for (i, dim) in shape.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
-                    match dim {
-                        IrDim::Static(n) => write!(f, "{}", n)?,
-                        IrDim::Dynamic => write!(f, "_")?,
-                        IrDim::Symbolic(name) => write!(f, "{}", name)?,
-                    }
-                }
-                write!(f, "]")
-            }
-            IrType::Vec { elem, lanes } => write!(f, "vec<{}>[{}]", elem, lanes),
-            IrType::Ref { inner, ownership } => {
-                let prefix = match ownership {
-                    Ownership::Own => "own ",
-                    Ownership::Unique => "unique ",
-                    Ownership::Shared => "shared ",
-                    Ownership::MutBorrow => "mut ",
-                    Ownership::Copy => "",
-                };
-                write!(f, "&{}{}", prefix, inner)
-            }
-            IrType::FnPtr { params, ret } => {
-                write!(f, "fn(")?;
-                for (i, p) in params.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
-                    write!(f, "{}", p)?;
-                }
-                write!(f, ") -> {}", ret)
-            }
-            IrType::Struct { name, fields } => {
-                write!(f, "{} {{", name)?;
-                for (i, (fname, fty)) in fields.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
-                    write!(f, "{}: {}", fname, fty)?;
-                }
-                write!(f, "}}")
-            }
-            IrType::Enum { name } => write!(f, "enum {}", name),
-            IrType::Opaque(name) => write!(f, "opaque {}", name),
-        }
     }
 }

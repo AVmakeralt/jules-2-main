@@ -44,6 +44,7 @@ pub enum ErrorCodeCategory {
     Effect,
     Ownership,
     IR,
+    ShaderGpuMl,
     Runtime,
 }
 
@@ -58,6 +59,7 @@ impl fmt::Display for ErrorCodeCategory {
             ErrorCodeCategory::Effect => write!(f, "effect system"),
             ErrorCodeCategory::Ownership => write!(f, "ownership/region"),
             ErrorCodeCategory::IR => write!(f, "IR / compilation"),
+            ErrorCodeCategory::ShaderGpuMl => write!(f, "shader / GPU / ML pipeline"),
             ErrorCodeCategory::Runtime => write!(f, "runtime"),
         }
     }
@@ -300,6 +302,44 @@ pub enum ErrorCode {
     E7006,
     /// E7007 — Type annotation missing in IR.
     E7007,
+    /// E7008 — Effect capability violation (operation requires unlisted capability).
+    E7008,
+    /// E7009 — Comptime evaluation failed.
+    E7009,
+    /// E7010 — Trait method not satisfied for this type.
+    E7010,
+    /// E7011 — Module visibility violation (accessing private item).
+    E7011,
+    /// E7012 — ECS system scheduling conflict (race detected).
+    E7012,
+    /// E7013 — IR capability set inconsistency.
+    E7013,
+
+    // ── E8xxx — Shader / GPU / ML Pipeline ───────────────────────────────────
+    /// E8001 — Shader stage missing (shader must have at least one stage).
+    E8001,
+    /// E8002 — Shader resource binding conflict (duplicate group/binding).
+    E8002,
+    /// E8003 — Shader vertex stage missing required output.
+    E8003,
+    /// E8004 — Shader fragment stage missing required output.
+    E8004,
+    /// E8005 — Invalid shader workgroup size.
+    E8005,
+    /// E8006 — GPU dispatch with incompatible tensor layout.
+    E8006,
+    /// E8007 — ML graph mode conflict (eager op in static graph context).
+    E8007,
+    /// E8008 — ML autodiff on non-differentiable operation.
+    E8008,
+    /// E8009 — Tensor layout mismatch for kernel (expected NHWC, got NCHW).
+    E8009,
+    /// E8010 — Kernel fusion boundary violation.
+    E8010,
+    /// E8011 — GPU capability required but not declared in function signature.
+    E8011,
+    /// E8012 — SIMD capability required but not declared in function signature.
+    E8012,
 
     // ── E9xxx — Runtime ─────────────────────────────────────────────────────
     /// E9001 — Type error at runtime (dynamic type check failure).
@@ -441,6 +481,25 @@ impl ErrorCode {
             ErrorCode::E7005 => "E7005",
             ErrorCode::E7006 => "E7006",
             ErrorCode::E7007 => "E7007",
+            ErrorCode::E7008 => "E7008",
+            ErrorCode::E7009 => "E7009",
+            ErrorCode::E7010 => "E7010",
+            ErrorCode::E7011 => "E7011",
+            ErrorCode::E7012 => "E7012",
+            ErrorCode::E7013 => "E7013",
+            // Shader / GPU / ML Pipeline
+            ErrorCode::E8001 => "E8001",
+            ErrorCode::E8002 => "E8002",
+            ErrorCode::E8003 => "E8003",
+            ErrorCode::E8004 => "E8004",
+            ErrorCode::E8005 => "E8005",
+            ErrorCode::E8006 => "E8006",
+            ErrorCode::E8007 => "E8007",
+            ErrorCode::E8008 => "E8008",
+            ErrorCode::E8009 => "E8009",
+            ErrorCode::E8010 => "E8010",
+            ErrorCode::E8011 => "E8011",
+            ErrorCode::E8012 => "E8012",
             // Runtime
             ErrorCode::E9001 => "E9001",
             ErrorCode::E9002 => "E9002",
@@ -568,6 +627,25 @@ impl ErrorCode {
             ErrorCode::E7005 => "block terminator missing",
             ErrorCode::E7006 => "PHI node conflict",
             ErrorCode::E7007 => "type annotation missing in IR",
+            ErrorCode::E7008 => "effect capability violation",
+            ErrorCode::E7009 => "comptime evaluation failed",
+            ErrorCode::E7010 => "trait method not satisfied",
+            ErrorCode::E7011 => "module visibility violation",
+            ErrorCode::E7012 => "ECS system scheduling conflict",
+            ErrorCode::E7013 => "capability set inconsistency",
+            // Shader / GPU / ML Pipeline
+            ErrorCode::E8001 => "shader stage missing",
+            ErrorCode::E8002 => "shader resource binding conflict",
+            ErrorCode::E8003 => "shader vertex output missing",
+            ErrorCode::E8004 => "shader fragment output missing",
+            ErrorCode::E8005 => "invalid shader workgroup size",
+            ErrorCode::E8006 => "GPU dispatch tensor layout mismatch",
+            ErrorCode::E8007 => "ML graph mode conflict",
+            ErrorCode::E8008 => "autodiff on non-differentiable operation",
+            ErrorCode::E8009 => "tensor layout mismatch for kernel",
+            ErrorCode::E8010 => "kernel fusion boundary violation",
+            ErrorCode::E8011 => "GPU capability not declared",
+            ErrorCode::E8012 => "SIMD capability not declared",
             // Runtime
             ErrorCode::E9001 => "type error at runtime",
             ErrorCode::E9002 => "index out of bounds",
@@ -629,7 +707,14 @@ impl ErrorCode {
 
             ErrorCode::E7001 | ErrorCode::E7002 | ErrorCode::E7003
             | ErrorCode::E7004 | ErrorCode::E7005 | ErrorCode::E7006
-            | ErrorCode::E7007 => ErrorCodeCategory::IR,
+            | ErrorCode::E7007 | ErrorCode::E7008 | ErrorCode::E7009
+            | ErrorCode::E7010 | ErrorCode::E7011 | ErrorCode::E7012
+            | ErrorCode::E7013 => ErrorCodeCategory::IR,
+
+            ErrorCode::E8001 | ErrorCode::E8002 | ErrorCode::E8003
+            | ErrorCode::E8004 | ErrorCode::E8005 | ErrorCode::E8006
+            | ErrorCode::E8007 | ErrorCode::E8008 | ErrorCode::E8009
+            | ErrorCode::E8010 | ErrorCode::E8011 | ErrorCode::E8012 => ErrorCodeCategory::ShaderGpuMl,
 
             ErrorCode::E9001 | ErrorCode::E9002 | ErrorCode::E9003
             | ErrorCode::E9004 | ErrorCode::E9005 | ErrorCode::E9006
@@ -725,6 +810,44 @@ pub enum DiagnosticHint {
         name: String,
     },
 
+    /// Suggest adding a capability annotation: `effect(gpu)` or `effect(simd)`.
+    AddCapability {
+        capability: String,
+    },
+
+    /// Suggest adding a shader stage to the shader definition.
+    AddShaderStage {
+        stage: String,
+    },
+
+    /// Suggest declaring the correct graph mode for an ML function.
+    AddGraphMode {
+        mode: String,
+    },
+
+    /// Suggest adding ECS system read/write declarations.
+    AddSystemAccess {
+        component: String,
+        access: String,
+    },
+
+    /// Suggest implementing a trait method.
+    ImplementTraitMethod {
+        trait_name: String,
+        method: String,
+    },
+
+    /// Suggest declaring comptime for a compile-time expression.
+    AddComptime {
+        expression: String,
+    },
+
+    /// Suggest adding a visibility modifier.
+    AddVisibility {
+        item: String,
+        visibility: String,
+    },
+
     /// A free-form hint that doesn't fit any structured variant.
     Custom(String),
 }
@@ -772,6 +895,27 @@ impl DiagnosticHint {
             DiagnosticHint::RemoveMutation { name } => {
                 format!("remove the mutation of `{name}` or use an immutable reference")
             }
+            DiagnosticHint::AddCapability { capability } => {
+                format!("add capability annotation: `effect({capability})` to the function signature")
+            }
+            DiagnosticHint::AddShaderStage { stage } => {
+                format!("add a `{stage}` stage to the shader definition")
+            }
+            DiagnosticHint::AddGraphMode { mode } => {
+                format!("declare the function with `@{mode}` to set the execution mode")
+            }
+            DiagnosticHint::AddSystemAccess { component, access } => {
+                format!("declare `{access}` access to component `{component}` in the system signature")
+            }
+            DiagnosticHint::ImplementTraitMethod { trait_name, method } => {
+                format!("implement `{method}` from trait `{trait_name}` for this type")
+            }
+            DiagnosticHint::AddComptime { expression } => {
+                format!("mark `{expression}` with `comptime` to evaluate at compile time")
+            }
+            DiagnosticHint::AddVisibility { item, visibility } => {
+                format!("add `{visibility}` visibility to `{item}` to make it accessible from this scope")
+            }
             DiagnosticHint::Custom(msg) => msg.clone(),
         }
     }
@@ -816,6 +960,7 @@ pub fn error_code_category(code: &str) -> ErrorCodeCategory {
         5000..=5999 => ErrorCodeCategory::Effect,
         6000..=6999 => ErrorCodeCategory::Ownership,
         7000..=7999 => ErrorCodeCategory::IR,
+        8000..=8999 => ErrorCodeCategory::ShaderGpuMl,
         9000..=9999 => ErrorCodeCategory::Runtime,
         _ => ErrorCodeCategory::Runtime,
     }
