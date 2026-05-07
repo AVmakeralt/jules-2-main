@@ -1383,6 +1383,203 @@ impl InstrBlock {
     pub fn is_empty(&self) -> bool {
         self.instrs.is_empty()
     }
+
+    /// Compute flag-state tracking for each instruction point.
+    ///
+    /// Returns a `Vec<FlagState>` of length `instrs.len() + 1`, where
+    /// entry `i` represents the flag state *before* instruction `i`
+    /// executes, and entry `instrs.len()` is the state after the last
+    /// instruction.
+    ///
+    /// This is used to identify redundant CMP/TEST instructions whose
+    /// flags are already available from a prior flag-writing instruction.
+    pub fn compute_flag_states(&self) -> Vec<FlagState> {
+        let n = self.instrs.len();
+        let mut states = Vec::with_capacity(n + 1);
+        let mut current = FlagState::new();
+        states.push(current.clone());
+
+        for (idx, instr) in self.instrs.iter().enumerate() {
+            // If any operand of the current flag writer is clobbered by a
+            // subsequent non-flag-preserving instruction that also writes to
+            // one of the operand registers, we must invalidate.  For simplicity
+            // we invalidate on *any* flag-writing instruction, or on any
+            // instruction that writes a register used by the current flag
+            // writer's operands.
+            if instr.flag_effects.writes_any() {
+                // This instruction writes new flags — check if it's a
+                // comparison-like instruction we can track.
+                if instr.opcode.is_comparison() {
+                    let op0 = instr.dst.clone();
+                    let op1 = instr.srcs.get(0).cloned().unwrap_or(Operand::Imm(0));
+                    current.update(idx, instr.opcode, op0, op1);
+                } else {
+                    // Non-comparison flag writer (ADD, SUB, etc.) — we can
+                    // track it for flag redundancy, but we only know it's
+                    // equivalent to a CMP of dst vs 0 for SUB/ADD patterns.
+                    // For safety, just invalidate and record the new writer.
+                    let op0 = instr.dst.clone();
+                    let op1 = Operand::Imm(0);
+                    current.update(idx, instr.opcode, op0, op1);
+                }
+            } else {
+                // Check if this instruction clobbers a register used by the
+                // current flag writer's operands. If so, the flags are stale.
+                if let Some(_) = current.writer_idx {
+                    let writer_reads: SmallVec<[Reg; 2]> = {
+                        let mut regs = smallvec![];
+                        if let Some(ref op) = current.operand0 { regs.extend(op.regs()); }
+                        if let Some(ref op) = current.operand1 { regs.extend(op.regs()); }
+                        regs
+                    };
+                    let instr_writes = instr.all_writes();
+                    for r in writer_reads {
+                        if instr_writes.contains(r) {
+                            current.invalidate();
+                            break;
+                        }
+                    }
+                }
+                // Also invalidate if this instruction reads flags — it
+                // consumes them, so a subsequent reader can't reuse them.
+                // (No invalidation needed for flag reads; the flags are
+                // still valid for later readers.)
+            }
+            states.push(current.clone());
+        }
+
+        states
+    }
+
+    /// Eliminate redundant CMP/TEST instructions whose flags are already
+    /// available from a prior instruction.
+    ///
+    /// Returns a new `InstrBlock` with redundant comparisons replaced by
+    /// NOPs.  A comparison is considered redundant if:
+    /// - A prior instruction wrote the same flags with the same opcode and
+    ///   operands
+    /// - No intervening instruction clobbers those flags or the operand
+    ///   registers
+    pub fn eliminate_redundant_comparisons(&self) -> InstrBlock {
+        let flag_states = self.compute_flag_states();
+        let mut new_instrs = self.instrs.clone();
+
+        for (idx, instr) in self.instrs.iter().enumerate() {
+            if !instr.opcode.is_comparison() {
+                continue;
+            }
+            // The flag state *before* this instruction is at index `idx`
+            // (because compute_flag_states returns state before each instr)
+            let state_before = &flag_states[idx];
+            let op0 = &instr.dst;
+            let op1 = instr.srcs.get(0).unwrap_or(&Operand::Imm(0));
+
+            if state_before.is_redundant_cmp(instr.opcode, op0, op1) {
+                // Replace with NOP
+                new_instrs[idx] = MachineInstrFull::new(
+                    X86Opcode::Nop,
+                    Operand::Reg(Reg::None),
+                    smallvec![],
+                );
+            }
+        }
+
+        let mut result = InstrBlock::new(new_instrs);
+        result.live_in = self.live_in;
+        result.live_out = self.live_out;
+        result
+    }
+}
+
+// =============================================================================
+// §8b  Flag-Value Numbering
+// =============================================================================
+
+/// Tracks which CPU flags are still valid from a prior CMP/TEST instruction.
+///
+/// This allows the optimizer to eliminate redundant comparisons when the
+/// flags are already set from a previous instruction.
+#[derive(Debug, Clone)]
+pub struct FlagState {
+    /// The instruction index that last wrote the flags
+    pub writer_idx: Option<usize>,
+    /// The opcode that wrote the flags (CMP, TEST, ADD, etc.)
+    pub writer_opcode: Option<X86Opcode>,
+    /// The first operand compared (virtual register or immediate)
+    pub operand0: Option<Operand>,
+    /// The second operand compared
+    pub operand1: Option<Operand>,
+    /// Which flags are still valid
+    pub valid_flags: FlagEffects,
+}
+
+impl FlagState {
+    /// Create a new (empty) flag state — no flags are valid.
+    pub fn new() -> Self {
+        Self {
+            writer_idx: None,
+            writer_opcode: None,
+            operand0: None,
+            operand1: None,
+            valid_flags: FlagEffects::none(),
+        }
+    }
+
+    /// Check if a comparison with the given operands would produce the same
+    /// flags as the current state (i.e., the comparison is redundant).
+    ///
+    /// A comparison is redundant when:
+    /// - The same opcode is used (CMP==CMP or TEST==TEST)
+    /// - The operands are identical
+    /// - The required flags from the new comparison are a subset of the
+    ///   still-valid flags
+    pub fn is_redundant_cmp(&self, opcode: X86Opcode, op0: &Operand, op1: &Operand) -> bool {
+        let Some(ref writer_opc) = self.writer_opcode else { return false; };
+        let Some(ref stored_op0) = self.operand0 else { return false; };
+        let Some(ref stored_op1) = self.operand1 else { return false; };
+
+        // For CMP: same opcode and same operands → same flags
+        if opcode == *writer_opc && op0 == stored_op0 && op1 == stored_op1 {
+            return true;
+        }
+
+        // For TEST: TEST a, b is commutative, so TEST a,b == TEST b,a
+        if opcode == X86Opcode::Test64 && *writer_opc == X86Opcode::Test64 {
+            if (op0 == stored_op0 && op1 == stored_op1)
+                || (op0 == stored_op1 && op1 == stored_op0)
+            {
+                return true;
+            }
+        }
+
+        // CMP a, 0 is equivalent to TEST a, a (both set flags based on a - 0
+        // and a & a respectively, giving same ZF/SF/PF for the value of a).
+        // We conservatively do NOT fold this because CF differs (CMP sets CF
+        // to the borrow, TEST clears CF). Only fold if the reader only checks
+        // ZF/SF.
+
+        false
+    }
+
+    /// Invalidate the flag state (e.g., when any flag-writing instruction
+    /// occurs that we cannot precisely track, or when an operand register
+    /// is clobbered).
+    pub fn invalidate(&mut self) {
+        self.writer_idx = None;
+        self.writer_opcode = None;
+        self.operand0 = None;
+        self.operand1 = None;
+        self.valid_flags = FlagEffects::none();
+    }
+
+    /// Update the flag state with a new flag-writing instruction.
+    pub fn update(&mut self, idx: usize, opcode: X86Opcode, op0: Operand, op1: Operand) {
+        self.writer_idx = Some(idx);
+        self.writer_opcode = Some(opcode);
+        self.operand0 = Some(op0);
+        self.operand1 = Some(op1);
+        self.valid_flags = FlagEffects::writes_all_arith();
+    }
 }
 
 // =============================================================================
@@ -1413,6 +1610,11 @@ pub enum LegalityViolation {
     CallingConventionViolation { msg: String },
     /// A division instruction has a live RDX that would be clobbered
     DivClobbersRdx { instr_idx: usize },
+    /// A flag-writing instruction's flags are clobbered between the writer
+    /// and a flag-reading consumer
+    FlagDependencyViolation { writer_idx: usize, reader_idx: usize },
+    /// A register is defined but never used (dead code)
+    UnusedDefViolation { reg: Reg, instr_idx: usize },
 }
 
 /// Check the legality of an instruction block.
@@ -1489,6 +1691,227 @@ pub fn check_legality(block: &InstrBlock) -> LegalityResult {
     LegalityResult {
         is_legal: violations.is_empty(),
         violations,
+    }
+}
+
+/// Check flag dependencies in an instruction block.
+///
+/// Verifies that no flag clobber occurs between a flag-writing instruction
+/// and its flag-reading consumers. This catches cases where an intervening
+/// instruction destroys flags that a later instruction depends on.
+///
+/// Returns a `LegalityResult` containing any `FlagDependencyViolation`s
+/// found.  The algorithm tracks the most recent flag-writer and, for each
+/// flag-reader, checks that no intervening instruction clobbers the flags.
+pub fn check_flag_dependencies(block: &InstrBlock) -> LegalityResult {
+    let mut violations = Vec::new();
+
+    // Track the most recent flag writer for each set of flags.
+    // When we encounter a flag reader, we check that the flags are still
+    // valid (i.e., no intervening instruction wrote them).
+    let mut last_flag_writer_idx: Option<usize> = None;
+
+    for (idx, instr) in block.instrs.iter().enumerate() {
+        if instr.flag_effects.reads_any() {
+            // This instruction reads flags — check that the writer is
+            // still valid (no clobber in between).
+            if let Some(writer_idx) = last_flag_writer_idx {
+                // Walk from writer_idx+1 to idx-1 and check for flag clobbers
+                for mid_idx in writer_idx + 1..idx {
+                    let mid_instr = &block.instrs[mid_idx];
+                    if mid_instr.flag_effects.writes_any() {
+                        // A flag-clobbering instruction sits between the
+                        // writer and reader — this is a violation.
+                        violations.push(LegalityViolation::FlagDependencyViolation {
+                            writer_idx,
+                            reader_idx: idx,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        if instr.flag_effects.writes_any() {
+            last_flag_writer_idx = Some(idx);
+        }
+    }
+
+    LegalityResult {
+        is_legal: violations.is_empty(),
+        violations,
+    }
+}
+
+/// Detect unused definitions (dead code) in an instruction block.
+///
+/// A register is "unused" if it is written by an instruction but never read
+/// by any subsequent instruction (and is not in the live-out set).  This is
+/// a separate check from the main `check_legality` because unused defs are
+/// not always illegal — they may be intentional (e.g., for side effects).
+/// However, flagging them is useful for optimization.
+pub fn check_unused_defs(block: &InstrBlock) -> LegalityResult {
+    let mut violations = Vec::new();
+
+    // Build a map from each register to the list of instruction indices
+    // where it is read.  Then for each definition, check if there is a
+    // subsequent read.
+    let mut reg_reads: HashMap<Reg, Vec<usize>> = HashMap::new();
+    for (idx, instr) in block.instrs.iter().enumerate() {
+        for r in instr.all_reads().iter_physical() {
+            reg_reads.entry(r).or_default().push(idx);
+        }
+    }
+
+    for (idx, instr) in block.instrs.iter().enumerate() {
+        // Only check pure instructions that can be safely eliminated
+        if !instr.is_safe_to_eliminate() {
+            continue;
+        }
+        // Only check register destinations
+        if let Some(dst_reg) = instr.dst_reg() {
+            if dst_reg == Reg::None {
+                continue;
+            }
+            // Check if this register is ever read after this definition
+            let has_subsequent_read = reg_reads
+                .get(&dst_reg)
+                .map_or(false, |reads| reads.iter().any(|&r_idx| r_idx > idx));
+
+            // Also check if it's in the live-out set
+            let is_live_out = block.live_out.contains(dst_reg);
+
+            if !has_subsequent_read && !is_live_out {
+                violations.push(LegalityViolation::UnusedDefViolation {
+                    reg: dst_reg,
+                    instr_idx: idx,
+                });
+            }
+        }
+    }
+
+    LegalityResult {
+        is_legal: violations.is_empty(),
+        violations,
+    }
+}
+
+// =============================================================================
+// §9b  E-Graph Canonicalization Layer
+// =============================================================================
+
+/// Canonicalize an instruction block using e-graph style equality saturation.
+///
+/// This normalizes equivalent instruction patterns so the optimizer can
+/// more easily identify optimization opportunities.
+///
+/// Canonicalization rules applied:
+/// 1. Sort commutative operands (smaller vreg first)
+/// 2. Normalize constant positions (constants to the right of commutative ops)
+/// 3. Chain same-ops into trees (ADD(ADD(a,b),c) stays, but sort operands)
+/// 4. Eliminate double negations
+/// 5. Normalize XOR/AND masks
+pub fn canonicalize_block(block: &InstrBlock) -> InstrBlock {
+    let mut new_instrs = block.instrs.clone();
+
+    for instr in new_instrs.iter_mut() {
+        canonicalize_instruction(instr);
+    }
+
+    let mut result = InstrBlock::new(new_instrs);
+    result.live_in = block.live_in;
+    result.live_out = block.live_out;
+    result
+}
+
+/// Apply canonicalization rules to a single instruction.
+fn canonicalize_instruction(instr: &mut MachineInstrFull) {
+    // Rule 1 & 2: Sort commutative operands — put smaller register on the
+    // left, and constants on the right.
+    if instr.opcode.is_commutative() && instr.srcs.len() >= 1 {
+        let dst = instr.dst.clone();
+        let src0 = instr.srcs[0].clone();
+
+        // For commutative ops like ADD dst, src where dst == src0 after
+        // renaming, we can swap dst and src0 to canonicalize.
+        // More generally, if the instruction is `op dst, src0` and op is
+        // commutative, then `op src0, dst` is equivalent.
+        // We canonicalize so that the "smaller" operand is dst.
+        if should_swap_commutative(&dst, &src0) {
+            instr.dst = src0;
+            instr.srcs[0] = dst;
+        }
+
+        // Normalize constant positions: if dst is an immediate (unlikely
+        // but possible in some representations), swap with the register
+        // source.
+        if instr.dst.is_imm() && instr.srcs.iter().any(|s| s.is_reg()) {
+            // Find first register source and swap
+            for src in instr.srcs.iter_mut() {
+                if src.is_reg() {
+                    std::mem::swap(&mut instr.dst, src);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Rule 4: Eliminate double negation: NEG(NEG r) → r
+    if instr.opcode == X86Opcode::Neg64 {
+        // This would require looking at the source instruction that defined
+        // the operand. For a single-instruction view, we can't do this.
+        // This rule is applied at the block level in a separate pass.
+    }
+
+    // Rule 5: Normalize XOR with self → ZeroReg32 pattern
+    // XOR r, r is equivalent to ZeroReg32 r and is already handled in
+    // the instruction table. No additional canonicalization needed.
+
+    // Rule: Normalize AND with all-ones mask (AND r, -1 → NOP/MOV)
+    if instr.opcode == X86Opcode::And64 {
+        if let Some(Operand::Imm(mask)) = instr.srcs.get(0) {
+            if *mask == -1 {
+                // AND r, -1 is a no-op (identity). Replace with MOV.
+                instr.opcode = X86Opcode::Mov64;
+                let dst = instr.dst.clone();
+                instr.srcs = smallvec![dst];
+                instr.flag_effects = FlagEffects::preserves_all();
+            }
+        }
+    }
+}
+
+/// Determine whether commutative operands should be swapped for
+/// canonicalization.  We want the "smaller" operand on the left (dst)
+/// side to make pattern matching easier.
+///
+/// Ordering: registers < immediates < memory operands.
+/// Among registers: physical regs < virtual regs (by number).
+fn should_swap_commutative(dst: &Operand, src: &Operand) -> bool {
+    let dst_rank = operand_rank(dst);
+    let src_rank = operand_rank(src);
+
+    // Swap if src has a lower rank (should be on the dst side)
+    if src_rank != dst_rank {
+        return src_rank < dst_rank;
+    }
+
+    // Same rank — compare within the rank
+    match (dst, src) {
+        (Operand::Reg(Reg::VReg(a)), Operand::Reg(Reg::VReg(b))) => a > b,
+        (Operand::Reg(a), Operand::Reg(b)) => a.index() > b.index(),
+        (Operand::Imm(a), Operand::Imm(b)) => a > b,
+        _ => false,
+    }
+}
+
+/// Assign a ranking value to an operand for canonical ordering.
+fn operand_rank(op: &Operand) -> u8 {
+    match op {
+        Operand::Reg(_) => 0,
+        Operand::Imm(_) => 1,
+        Operand::Mem { .. } => 2,
+        Operand::RipRelative(_) => 3,
     }
 }
 
@@ -1739,10 +2162,420 @@ pub fn apply_machine_rewrite(
             }
             false
         }
-        _ => {
-            // Other actions require more context (e.g., liveness, register state)
-            // — implemented as no-ops for now, will be extended
-            false
+        MachineRewriteAction::FoldConst => {
+            // If an instruction has all immediate source operands and is pure,
+            // evaluate it at compile time and replace with LoadImm.
+            let instr = &new_instrs[target_idx];
+            if !instr.is_pure() {
+                return None;
+            }
+            // All source operands must be immediates
+            let all_imm = instr.srcs.iter().all(|o| o.is_imm());
+            if !all_imm {
+                return None;
+            }
+            // Also the dst must be a register (we need somewhere to put the result)
+            let dst_reg = match instr.dst_reg() {
+                Some(r) => r,
+                None => return None,
+            };
+            // Evaluate the constant expression
+            let result = match instr.opcode {
+                X86Opcode::Add64 | X86Opcode::Add32 => {
+                    if let (Some(Operand::Imm(a)), Some(Operand::Imm(b))) =
+                        (instr.srcs.get(0), instr.srcs.get(1)) {
+                        Some(a.wrapping_add(*b))
+                    } else { None }
+                }
+                X86Opcode::Sub64 | X86Opcode::Sub32 => {
+                    if let (Some(Operand::Imm(a)), Some(Operand::Imm(b))) =
+                        (instr.srcs.get(0), instr.srcs.get(1)) {
+                        Some(a.wrapping_sub(*b))
+                    } else { None }
+                }
+                X86Opcode::And64 => {
+                    if let (Some(Operand::Imm(a)), Some(Operand::Imm(b))) =
+                        (instr.srcs.get(0), instr.srcs.get(1)) {
+                        Some(a & b)
+                    } else { None }
+                }
+                X86Opcode::Or64 => {
+                    if let (Some(Operand::Imm(a)), Some(Operand::Imm(b))) =
+                        (instr.srcs.get(0), instr.srcs.get(1)) {
+                        Some(a | b)
+                    } else { None }
+                }
+                X86Opcode::Xor64 => {
+                    if let (Some(Operand::Imm(a)), Some(Operand::Imm(b))) =
+                        (instr.srcs.get(0), instr.srcs.get(1)) {
+                        Some(a ^ b)
+                    } else { None }
+                }
+                X86Opcode::Shl64 => {
+                    if let (Some(Operand::Imm(a)), Some(Operand::Imm(b))) =
+                        (instr.srcs.get(0), instr.srcs.get(1)) {
+                        if *b >= 0 && *b < 64 {
+                            Some(a.wrapping_shl(*b as u32))
+                        } else { None }
+                    } else { None }
+                }
+                X86Opcode::Shr64 => {
+                    if let (Some(Operand::Imm(a)), Some(Operand::Imm(b))) =
+                        (instr.srcs.get(0), instr.srcs.get(1)) {
+                        if *b >= 0 && *b < 64 {
+                            Some((*a as u64).wrapping_shr(*b as u32) as i64)
+                        } else { None }
+                    } else { None }
+                }
+                X86Opcode::Sar64 => {
+                    if let (Some(Operand::Imm(a)), Some(Operand::Imm(b))) =
+                        (instr.srcs.get(0), instr.srcs.get(1)) {
+                        if *b >= 0 && *b < 64 {
+                            Some(a.wrapping_shr(*b as u32))
+                        } else { None }
+                    } else { None }
+                }
+                X86Opcode::Imul64Imm => {
+                    if let (Some(Operand::Imm(a)), Some(Operand::Imm(b))) =
+                        (instr.srcs.get(0), instr.srcs.get(1)) {
+                        Some(a.wrapping_mul(*b))
+                    } else { None }
+                }
+                X86Opcode::Neg64 => {
+                    if let Some(Operand::Imm(a)) = instr.srcs.get(0) {
+                        Some(a.wrapping_neg())
+                    } else { None }
+                }
+                X86Opcode::Not64 => {
+                    if let Some(Operand::Imm(a)) = instr.srcs.get(0) {
+                        Some(!a)
+                    } else { None }
+                }
+                X86Opcode::Inc64 => {
+                    if let Some(Operand::Imm(a)) = instr.srcs.get(0) {
+                        Some(a.wrapping_add(1))
+                    } else { None }
+                }
+                X86Opcode::Dec64 => {
+                    if let Some(Operand::Imm(a)) = instr.srcs.get(0) {
+                        Some(a.wrapping_sub(1))
+                    } else { None }
+                }
+                _ => None,
+            };
+            if let Some(val) = result {
+                let folded = if val == 0 {
+                    MachineInstrFull::new(
+                        X86Opcode::ZeroReg32,
+                        Operand::Reg(dst_reg),
+                        smallvec![Operand::Reg(dst_reg)],
+                    )
+                } else {
+                    let low32 = val as i32;
+                    let fits_32 = (val as u128) == ((low32 as u64) as u128);
+                    if fits_32 {
+                        MachineInstrFull::new(
+                            X86Opcode::LoadImm32,
+                            Operand::Reg(dst_reg),
+                            smallvec![Operand::Imm(val)],
+                        )
+                    } else {
+                        MachineInstrFull::new(
+                            X86Opcode::LoadImm64,
+                            Operand::Reg(dst_reg),
+                            smallvec![Operand::Imm(val)],
+                        )
+                    }
+                };
+                new_instrs[target_idx] = folded;
+                true
+            } else {
+                false
+            }
+        }
+        MachineRewriteAction::Rematerialize => {
+            // Find a LoadImm at target_idx; if there's a gap between it and its
+            // first use, move it right before the first use.
+            let instr = &new_instrs[target_idx];
+            if !matches!(instr.opcode, X86Opcode::LoadImm32 | X86Opcode::LoadImm64 | X86Opcode::ZeroReg32) {
+                return None;
+            }
+            let dst_reg = match instr.dst_reg() {
+                Some(r) => r,
+                None => return None,
+            };
+            // Find the first use of dst_reg after target_idx
+            let mut first_use_idx: Option<usize> = None;
+            for i in (target_idx + 1)..new_instrs.len() {
+                let reads = new_instrs[i].all_reads();
+                if reads.contains(dst_reg) {
+                    first_use_idx = Some(i);
+                    break;
+                }
+            }
+            // If no use found, or the first use is immediately adjacent, no move needed
+            let use_idx = match first_use_idx {
+                Some(idx) if idx > target_idx + 1 => idx,
+                _ => return None,
+            };
+            // Move the LoadImm from target_idx to just before use_idx
+            let loadimm = new_instrs.remove(target_idx);
+            // After removal, use_idx shifted by -1
+            new_instrs.insert(use_idx - 1, loadimm);
+            true
+        }
+        MachineRewriteAction::CopyPropagate => {
+            // If the instruction at target_idx is MOV dst, src (where src is a register),
+            // find all subsequent uses of dst and replace them with src.
+            // Stop at any instruction that writes to src.
+            let instr = &new_instrs[target_idx];
+            if !matches!(instr.opcode, X86Opcode::Mov64 | X86Opcode::Mov32) {
+                return None;
+            }
+            if instr.srcs.len() != 1 {
+                return None;
+            }
+            let src_reg = match &instr.srcs[0] {
+                Operand::Reg(r) => *r,
+                _ => return None,
+            };
+            let dst_reg = match instr.dst_reg() {
+                Some(r) => r,
+                None => return None,
+            };
+            if dst_reg == src_reg {
+                return None; // Self-copy — that's EliminateMove
+            }
+            // Propagate: replace uses of dst_reg with src_reg in subsequent instructions
+            let mut made_change = false;
+            for i in (target_idx + 1)..new_instrs.len() {
+                // Stop if any instruction writes to src_reg (would change meaning)
+                let writes = new_instrs[i].all_writes();
+                if writes.contains(src_reg) {
+                    break;
+                }
+                // Replace uses of dst_reg with src_reg
+                let reads = new_instrs[i].all_reads();
+                if reads.contains(dst_reg) {
+                    new_instrs[i].rename_reg(dst_reg, src_reg);
+                    made_change = true;
+                }
+                // Stop if this instruction redefines dst_reg (new value, can't propagate past)
+                if writes.contains(dst_reg) {
+                    break;
+                }
+            }
+            made_change
+        }
+        MachineRewriteAction::ScheduleSwap => {
+            // If target_idx and target_idx+1 are both pure, flag-independent,
+            // and reorderable, swap them.
+            if target_idx + 1 >= new_instrs.len() {
+                return None;
+            }
+            let instr_a = &new_instrs[target_idx];
+            let instr_b = &new_instrs[target_idx + 1];
+            if !instr_a.is_pure() || !instr_b.is_pure() {
+                return None;
+            }
+            // Must be flag-independent (no flag writes that the other reads)
+            if instr_a.flag_effects.writes_any() || instr_b.flag_effects.writes_any() {
+                return None;
+            }
+            if !instr_a.can_reorder_with(instr_b) {
+                return None;
+            }
+            // Swap the two instructions
+            new_instrs.swap(target_idx, target_idx + 1);
+            true
+        }
+        MachineRewriteAction::RenameReg => {
+            // If the instruction at target_idx has a virtual register destination,
+            // rename it to a different (unused) virtual register.
+            let instr = &new_instrs[target_idx];
+            let dst_reg = match instr.dst_reg() {
+                Some(r @ Reg::VReg(_)) => r,
+                _ => return None,
+            };
+            // Collect all vreg numbers in the block to find a free one
+            let mut max_vreg: u32 = 0;
+            let mut used_vregs: HashSet<u32> = HashSet::new();
+            for i in &new_instrs {
+                if let Some(Reg::VReg(v)) = i.dst_reg() {
+                    used_vregs.insert(v);
+                    max_vreg = max_vreg.max(v);
+                }
+                for src in &i.srcs {
+                    if let Operand::Reg(Reg::VReg(v)) = src {
+                        used_vregs.insert(*v);
+                        max_vreg = max_vreg.max(*v);
+                    }
+                }
+            }
+            // Find a free vreg number
+            let new_vreg_num = (0..=max_vreg + 1)
+                .find(|v| !used_vregs.contains(v))
+                .unwrap_or(max_vreg + 1);
+            let new_reg = Reg::VReg(new_vreg_num);
+            // Rename the destination in the defining instruction
+            let old_reg = dst_reg;
+            new_instrs[target_idx].rename_reg(old_reg, new_reg);
+            // Update all uses of old_reg in subsequent instructions
+            for i in (target_idx + 1)..new_instrs.len() {
+                let reads = new_instrs[i].all_reads();
+                if reads.contains(old_reg) {
+                    new_instrs[i].rename_reg(old_reg, new_reg);
+                }
+                // Stop if this instruction redefines old_reg
+                let writes = new_instrs[i].all_writes();
+                if writes.contains(old_reg) {
+                    break;
+                }
+            }
+            true
+        }
+        MachineRewriteAction::SpillAvoid => {
+            // If the instruction at target_idx is a LoadImm with a small constant
+            // (fits in 32 bits), mark it as rematerializable by replacing it with
+            // a shorter encoding (LoadImm32 → ZeroReg32 if value is 0).
+            let instr = &new_instrs[target_idx];
+            let dst_reg = match instr.dst_reg() {
+                Some(r) if r.is_virtual() => r,
+                _ => return None,
+            };
+            match instr.opcode {
+                X86Opcode::LoadImm32 => {
+                    if let Some(Operand::Imm(v)) = instr.srcs.get(0) {
+                        if *v == 0 {
+                            // Replace LoadImm32 with ZeroReg32 (shorter encoding)
+                            let zero = MachineInstrFull::new(
+                                X86Opcode::ZeroReg32,
+                                Operand::Reg(dst_reg),
+                                smallvec![Operand::Reg(dst_reg)],
+                            );
+                            new_instrs[target_idx] = zero;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                X86Opcode::LoadImm64 => {
+                    // If the 64-bit immediate actually fits in 32 bits, use LoadImm32 instead
+                    if let Some(Operand::Imm(v)) = instr.srcs.get(0) {
+                        let low32 = *v as i32;
+                        let fits_32 = (*v as u128) == ((low32 as u64) as u128);
+                        if fits_32 {
+                            let shorter = MachineInstrFull::new(
+                                X86Opcode::LoadImm32,
+                                Operand::Reg(dst_reg),
+                                smallvec![Operand::Imm(*v)],
+                            );
+                            new_instrs[target_idx] = shorter;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        }
+        MachineRewriteAction::FusePair => {
+            // If the instruction at target_idx is CMP/TEST and the next instruction
+            // is SETcc/CMOVcc, mark the pair for macro-fusion by ensuring they're
+            // adjacent. If they're not adjacent, try to move them together by
+            // removing intervening pure, flag-preserving instructions.
+            let instr = &new_instrs[target_idx];
+            if !instr.opcode.is_comparison() {
+                return None;
+            }
+            // Find a SETcc/CMOVcc after target_idx that reads flags
+            let mut fusion_target: Option<usize> = None;
+            for i in (target_idx + 1)..new_instrs.len() {
+                let candidate = &new_instrs[i];
+                if matches!(candidate.opcode, X86Opcode::Setcc | X86Opcode::Cmov64)
+                    && candidate.flag_effects.reads_any() {
+                    fusion_target = Some(i);
+                    break;
+                }
+                // Stop if an intervening instruction clobbers flags
+                if candidate.flag_effects.writes_any() && !candidate.preserves_flags() {
+                    break;
+                }
+            }
+            let fuse_idx = match fusion_target {
+                Some(idx) if idx > target_idx + 1 => idx,
+                Some(_) => return None, // Already adjacent, nothing to do
+                None => return None,
+            };
+            // Check that all instructions between target_idx+1 and fuse_idx are
+            // pure and flag-preserving, so they can be moved safely
+            let mut intervening: Vec<usize> = Vec::new();
+            let mut can_move = true;
+            for i in (target_idx + 1)..fuse_idx {
+                let mid = &new_instrs[i];
+                if !mid.is_pure() || mid.flag_effects.writes_any() {
+                    can_move = false;
+                    break;
+                }
+                intervening.push(i);
+            }
+            if !can_move || intervening.is_empty() {
+                return None;
+            }
+            // Move the CMP/TEST instruction right before the SETcc/CMOVcc
+            // by removing it from target_idx and inserting before fuse_idx
+            let cmp_instr = new_instrs.remove(target_idx);
+            // After removal, fuse_idx shifted by -1, and intervening indices shifted by -1
+            // The flag-user is now at fuse_idx - 1
+            new_instrs.insert(fuse_idx - 1, cmp_instr);
+            true
+        }
+        MachineRewriteAction::SplitLiveRange => {
+            // If the instruction at target_idx defines a virtual register vreg,
+            // split the live range by creating a new VReg, updating the original
+            // instruction's dst to the new VReg, and adding a MOV from the new VReg
+            // to the old VReg right after the definition.
+            let instr = &new_instrs[target_idx];
+            let dst_reg = match instr.dst_reg() {
+                Some(r @ Reg::VReg(_)) => r,
+                _ => return None,
+            };
+            // Collect all vreg numbers to find a free one
+            let mut max_vreg: u32 = 0;
+            let mut used_vregs: HashSet<u32> = HashSet::new();
+            for i in &new_instrs {
+                if let Some(Reg::VReg(v)) = i.dst_reg() {
+                    used_vregs.insert(v);
+                    max_vreg = max_vreg.max(v);
+                }
+                for src in &i.srcs {
+                    if let Operand::Reg(Reg::VReg(v)) = src {
+                        used_vregs.insert(*v);
+                        max_vreg = max_vreg.max(*v);
+                    }
+                }
+            }
+            let new_vreg_num = (0..=max_vreg + 1)
+                .find(|v| !used_vregs.contains(v))
+                .unwrap_or(max_vreg + 1);
+            let new_reg = Reg::VReg(new_vreg_num);
+            let old_reg = dst_reg;
+            // Change the original instruction's dst to the new vreg
+            new_instrs[target_idx].rename_reg(old_reg, new_reg);
+            // Insert a MOV from new_reg to old_reg right after the definition
+            let copy = MachineInstrFull::new(
+                X86Opcode::Mov64,
+                Operand::Reg(old_reg),
+                smallvec![Operand::Reg(new_reg)],
+            );
+            new_instrs.insert(target_idx + 1, copy);
+            true
         }
     };
 

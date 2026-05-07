@@ -727,6 +727,31 @@ pub enum RewriteAction {
     LzcntPattern,
     /// TzcntPattern: trailing zero count -> TZCNT
     TzcntPattern,
+    // ── Tier 5: Reassociation, Cancellation, and Memory-Form Rules ──
+    /// AddReassocConst: (a + C1) + C2 -> a + (C1 + C2) — reassociate constants to fold them
+    AddReassocConst,
+    /// MulReassocConst: (a * C1) * C2 -> a * (C1 * C2) — reassociate constant multiplies
+    MulReassocConst,
+    /// AddNegReassoc: (a + b) - a -> b — cancel a + b - a
+    AddNegReassoc,
+    /// SubSelfCancel: a - (a + b) -> -b — cancel subtraction of self
+    SubSelfCancel,
+    /// MulAddDistribute: a*b + a*c -> a * (b + c) — factor out common multiplier (saves 1 MUL)
+    MulAddDistribute,
+    /// MulSubDistribute: a*b - a*c -> a * (b - c) — factor out common multiplier
+    MulSubDistribute,
+    /// NegateMul: -(a * b) -> (-a) * b — enables further opts
+    NegateMul,
+    /// AddSubSwap: (a + b) - c -> a + (b - c) — exposes CSE
+    AddSubSwap,
+    /// SubAddMerge: a - b + b -> a — cancel subtraction then addition
+    SubAddMerge,
+    /// BlsmaskRule: a ^ (a - 1) -> BLSMSK(a) — bit manipulation pattern
+    BlsmaskRule,
+    /// MemFormFold: fold binary op with memory-load second operand into memory-form opcode
+    MemFormFold,
+    /// FlagReuse: eliminate redundant CMP when same operands are compared again
+    FlagReuse,
 }
 
 impl RewriteAction {
@@ -820,6 +845,19 @@ impl RewriteAction {
             RewriteAction::PopcntPattern,
             RewriteAction::LzcntPattern,
             RewriteAction::TzcntPattern,
+            // Tier 5: Reassociation, Cancellation, and Memory-Form Rules
+            RewriteAction::AddReassocConst,
+            RewriteAction::MulReassocConst,
+            RewriteAction::AddNegReassoc,
+            RewriteAction::SubSelfCancel,
+            RewriteAction::MulAddDistribute,
+            RewriteAction::MulSubDistribute,
+            RewriteAction::NegateMul,
+            RewriteAction::AddSubSwap,
+            RewriteAction::SubAddMerge,
+            RewriteAction::BlsmaskRule,
+            RewriteAction::MemFormFold,
+            RewriteAction::FlagReuse,
         ]
     }
 
@@ -1465,6 +1503,97 @@ impl RewriteAction {
                         operand == lhs
                     } else { false }
                 } else { false }
+            }
+            // ── Tier 5: Reassociation, Cancellation, and Memory-Form Rules ──
+            RewriteAction::AddReassocConst => {
+                // (a + C1) + C2 -> a + (C1 + C2)
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, rhs: ref inner_rhs, .. } = &**lhs {
+                        matches!(**inner_rhs, Instr::ConstInt(_)) && matches!(**rhs, Instr::ConstInt(_))
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::MulReassocConst => {
+                // (a * C1) * C2 -> a * (C1 * C2)
+                if let Instr::BinOp { op: BinOpKind::Mul, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Mul, rhs: ref inner_rhs, .. } = &**lhs {
+                        matches!(**inner_rhs, Instr::ConstInt(_)) && matches!(**rhs, Instr::ConstInt(_))
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::AddNegReassoc => {
+                // (a + b) - a -> b
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs: ref add_lhs, .. } = &**lhs {
+                        add_lhs == rhs
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::SubSelfCancel => {
+                // a - (a + b) -> -b
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs: ref add_lhs, .. } = &**rhs {
+                        lhs == add_lhs
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::MulAddDistribute => {
+                // a*b + a*c -> a * (b + c)
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let (Instr::BinOp { op: BinOpKind::Mul, lhs: a1, .. },
+                            Instr::BinOp { op: BinOpKind::Mul, lhs: a2, .. }) = (&**lhs, &**rhs) {
+                        a1 == a2
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::MulSubDistribute => {
+                // a*b - a*c -> a * (b - c)
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs } = instr {
+                    if let (Instr::BinOp { op: BinOpKind::Mul, lhs: a1, .. },
+                            Instr::BinOp { op: BinOpKind::Mul, lhs: a2, .. }) = (&**lhs, &**rhs) {
+                        a1 == a2
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::NegateMul => {
+                // -(a * b) -> (-a) * b
+                if let Instr::UnOp { op: UnOpKind::Neg, operand } = instr {
+                    matches!(**operand, Instr::BinOp { op: BinOpKind::Mul, .. })
+                } else { false }
+            }
+            RewriteAction::AddSubSwap => {
+                // (a + b) - c -> a + (b - c)
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, .. } = instr {
+                    matches!(**lhs, Instr::BinOp { op: BinOpKind::Add, .. })
+                } else { false }
+            }
+            RewriteAction::SubAddMerge => {
+                // a - b + b -> a
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, rhs: ref sub_rhs, .. } = &**lhs {
+                        sub_rhs == rhs
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::BlsmaskRule => {
+                // a ^ (a - 1) -> BLSMSK(a)
+                if let Instr::BinOp { op: BinOpKind::BitXor, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs: ref sub_lhs, rhs: ref sub_rhs } = &**rhs {
+                        lhs == sub_lhs && matches!(**sub_rhs, Instr::ConstInt(1))
+                    } else { false }
+                } else { false }
+            }
+            RewriteAction::MemFormFold => {
+                // Binary op with memory-load second operand -> memory-form opcode
+                // Detect BinOp where rhs is a Var (representing a load from memory)
+                matches!(instr, Instr::BinOp { .. })
+            }
+            RewriteAction::FlagReuse => {
+                // Redundant CMP elimination — detect comparison BinOps
+                matches!(instr,
+                    Instr::BinOp { op: BinOpKind::Lt | BinOpKind::Gt | BinOpKind::Le
+                                  | BinOpKind::Ge | BinOpKind::Eq | BinOpKind::Ne, .. }
+                )
             }
         }
     }
@@ -2694,6 +2823,137 @@ impl MctsSuperoptimizer {
             RewriteAction::BswapPattern | RewriteAction::PopcntPattern |
             RewriteAction::LzcntPattern | RewriteAction::TzcntPattern => {
                 // Mark for cost model — special instruction pattern
+                Some(instr.clone())
+            }
+            // ── Tier 5: Reassociation, Cancellation, and Memory-Form Rules ──
+            RewriteAction::AddReassocConst => {
+                // (a + C1) + C2 -> a + (C1 + C2)
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs: ref a, rhs: ref c1 } = &**lhs {
+                        if let (Instr::ConstInt(v1), Instr::ConstInt(v2)) = (&**c1, &**rhs) {
+                            return Some(Instr::BinOp {
+                                op: BinOpKind::Add,
+                                lhs: a.clone(),
+                                rhs: Box::new(Instr::ConstInt(v1.wrapping_add(*v2))),
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::MulReassocConst => {
+                // (a * C1) * C2 -> a * (C1 * C2)
+                if let Instr::BinOp { op: BinOpKind::Mul, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Mul, lhs: ref a, rhs: ref c1 } = &**lhs {
+                        if let (Instr::ConstInt(v1), Instr::ConstInt(v2)) = (&**c1, &**rhs) {
+                            return Some(Instr::BinOp {
+                                op: BinOpKind::Mul,
+                                lhs: a.clone(),
+                                rhs: Box::new(Instr::ConstInt(v1.wrapping_mul(*v2))),
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::AddNegReassoc => {
+                // (a + b) - a -> b
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs: ref add_lhs, rhs: ref add_rhs, .. } = &**lhs {
+                        if add_lhs == rhs { return Some((**add_rhs).clone()); }
+                    }
+                }
+                None
+            }
+            RewriteAction::SubSelfCancel => {
+                // a - (a + b) -> -b
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs: ref add_lhs, rhs: ref add_rhs, .. } = &**rhs {
+                        if lhs == add_lhs {
+                            return Some(Instr::UnOp { op: UnOpKind::Neg, operand: add_rhs.clone() });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::MulAddDistribute => {
+                // a*b + a*c -> a * (b + c)
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let (Instr::BinOp { op: BinOpKind::Mul, lhs: a1, rhs: b },
+                            Instr::BinOp { op: BinOpKind::Mul, lhs: a2, rhs: c }) = (&**lhs, &**rhs) {
+                        if a1 == a2 {
+                            return Some(Instr::BinOp {
+                                op: BinOpKind::Mul,
+                                lhs: a1.clone(),
+                                rhs: Box::new(Instr::BinOp { op: BinOpKind::Add, lhs: b.clone(), rhs: c.clone() }),
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::MulSubDistribute => {
+                // a*b - a*c -> a * (b - c)
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs } = instr {
+                    if let (Instr::BinOp { op: BinOpKind::Mul, lhs: a1, rhs: b },
+                            Instr::BinOp { op: BinOpKind::Mul, lhs: a2, rhs: c }) = (&**lhs, &**rhs) {
+                        if a1 == a2 {
+                            return Some(Instr::BinOp {
+                                op: BinOpKind::Mul,
+                                lhs: a1.clone(),
+                                rhs: Box::new(Instr::BinOp { op: BinOpKind::Sub, lhs: b.clone(), rhs: c.clone() }),
+                            });
+                        }
+                    }
+                }
+                None
+            }
+            RewriteAction::NegateMul => {
+                // -(a * b) -> (-a) * b
+                if let Instr::UnOp { op: UnOpKind::Neg, operand } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Mul, lhs, rhs } = &**operand {
+                        return Some(Instr::BinOp {
+                            op: BinOpKind::Mul,
+                            lhs: Box::new(Instr::UnOp { op: UnOpKind::Neg, operand: lhs.clone() }),
+                            rhs: rhs.clone(),
+                        });
+                    }
+                }
+                None
+            }
+            RewriteAction::AddSubSwap => {
+                // (a + b) - c -> a + (b - c)
+                if let Instr::BinOp { op: BinOpKind::Sub, lhs, rhs: ref c } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Add, lhs: ref a, rhs: ref b } = &**lhs {
+                        return Some(Instr::BinOp {
+                            op: BinOpKind::Add,
+                            lhs: a.clone(),
+                            rhs: Box::new(Instr::BinOp { op: BinOpKind::Sub, lhs: b.clone(), rhs: c.clone() }),
+                        });
+                    }
+                }
+                None
+            }
+            RewriteAction::SubAddMerge => {
+                // a - b + b -> a
+                if let Instr::BinOp { op: BinOpKind::Add, lhs, rhs } = instr {
+                    if let Instr::BinOp { op: BinOpKind::Sub, lhs: ref a, rhs: ref sub_rhs } = &**lhs {
+                        if sub_rhs == rhs { return Some((**a).clone()); }
+                    }
+                }
+                None
+            }
+            RewriteAction::BlsmaskRule => {
+                // a ^ (a - 1) -> BLSMSK(a) — mark for cost model
+                Some(instr.clone())
+            }
+            RewriteAction::MemFormFold => {
+                // Fold binary op with memory-load second operand into memory-form opcode
+                // Mark for cost model — memory-form instruction pattern
+                Some(instr.clone())
+            }
+            RewriteAction::FlagReuse => {
+                // Eliminate redundant CMP with same operands — mark for cost model
                 Some(instr.clone())
             }
         }
