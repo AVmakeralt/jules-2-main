@@ -27,6 +27,12 @@ use std::time::Instant;
 
 use crate::compiler::ast::{Expr, Item, Program, Stmt, SuperoptMode};
 
+#[cfg(feature = "machine-instr-model")]
+use crate::optimizer::machine_instr_model::{
+    MachineInstrPipeline, MachineCostVector, estimate_machine_cost,
+    lower_instr_to_machine, check_legality, validate_transformation,
+};
+
 // ── Feature-gated imports ──────────────────────────────────────────────────
 
 #[cfg(any(feature = "core-superopt", feature = "gnn-optimizer"))]
@@ -70,6 +76,10 @@ pub struct SuperoptStats {
     pub known_bits_rejections: usize,
     /// Number of candidates rejected because uarch cost was not better (Stage 5).
     pub uarch_rejections: usize,
+    /// Number of candidates processed by the machine-instr pipeline (Stage 6).
+    pub machine_instr_candidates: usize,
+    /// Number of candidates rejected by machine-instr cost model (Stage 6).
+    pub machine_instr_rejections: usize,
     /// Total wall-clock time spent in the pass, in microseconds.
     pub total_time_us: u64,
 }
@@ -559,6 +569,53 @@ impl SuperoptPass {
                     // (Equal cost rewrites are rejected to avoid churn.)
                     if candidate_cost >= original_cost {
                         self.stats.uarch_rejections += 1;
+                        return false;
+                    }
+                }
+            }
+
+            // ── Stage 6: Machine-Instruction-Aware Optimization ────────
+            //
+            // When the machine-instr-model feature is enabled, lower the
+            // candidate to machine instructions and run the instruction-aware
+            // pipeline: legality check → multi-objective cost model →
+            // bounded validation. This catches cases where the expression-level
+            // MCTS found something that looks good algebraically but is worse
+            // at the machine level (e.g., more spills, worse port pressure).
+            #[cfg(feature = "machine-instr-model")]
+            {
+                self.stats.machine_instr_candidates += 1;
+
+                // Lower both original and candidate to machine instruction blocks
+                let orig_block = lower_instr_to_machine(&original_instr);
+                let cand_block = lower_instr_to_machine(&candidate_instr);
+
+                // Run the machine-instr pipeline on the candidate
+                let target = *self.cached_target.get_or_insert_with(TargetConfig::detect);
+                let pipeline = MachineInstrPipeline::new(target);
+
+                // Score both blocks with the multi-objective cost model
+                let orig_cost = estimate_machine_cost(&orig_block, target);
+                let cand_cost = estimate_machine_cost(&cand_block, target);
+
+                // Reject if the machine-level cost is not better
+                if cand_cost.weighted_cost() >= orig_cost.weighted_cost() {
+                    self.stats.machine_instr_rejections += 1;
+                    return false;
+                }
+
+                // Validate the transformation at the machine level
+                let valid = validate_transformation(
+                    &orig_block, &cand_block, pipeline.validation_tests,
+                );
+                match valid {
+                    crate::optimizer::machine_instr_model::ValidationResult::ProvenEquivalent
+                    | crate::optimizer::machine_instr_model::ValidationResult::BoundedTestPassed { .. } => {
+                        // Machine-level validation passed
+                    }
+                    _ => {
+                        // Machine-level validation failed — reject
+                        self.stats.machine_instr_rejections += 1;
                         return false;
                     }
                 }

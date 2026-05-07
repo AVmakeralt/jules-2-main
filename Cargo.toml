@@ -129,8 +129,9 @@ gnn-optimizer = []
 core-superopt = ["egg"]
 legacy-passes = []
 smt-verify = ["z3"]  # Requires libclang + Z3 lib/headers (see README)
+machine-instr-model = ["core-superopt"]  # Machine-instruction-aware optimization layer
 ultra-fast = ["phase3-jit", "phase6-simd", "core-superopt"]
-full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "cranelift-backend", "phase4-llvm", "phase5-cow", "phase6-simd", "gnn-optimizer", "core-superopt", "legacy-passes"]
+full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "cranelift-backend", "phase4-llvm", "phase5-cow", "phase6-simd", "gnn-optimizer", "core-superopt", "machine-instr-model", "legacy-passes"]
 
 [lints.rust]
 dead_code = "warn"

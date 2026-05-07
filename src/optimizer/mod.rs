@@ -39,4 +39,6 @@ pub mod alias_layout;
 pub mod dead_field_elim;
 #[cfg(feature = "core-superopt")]
 pub mod known_bits;
+#[cfg(feature = "core-superopt")]
+pub mod machine_instr_model;
 pub mod superopt_pass;
