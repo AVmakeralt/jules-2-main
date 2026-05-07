@@ -50,7 +50,7 @@ use rustc_hash::FxHashMap;
 
 use crate::compiler::ast::{
     AgentDecl, BinOpKind, Block, ComponentDecl, DimExpr, ElemType, Expr, FnDecl, GenericParam,
-    Item, ModelDecl, ModelLayer, Pattern, Program, Stmt, StructDecl, SystemDecl, TrainDecl, Type,
+    Item, ModelDecl, ModelLayer, Pattern, Program, StructDecl, SystemDecl, TrainDecl, Type,
     UnOpKind, VecFamily, VecSize,
 };
 use crate::compiler::lexer::Span;
@@ -123,14 +123,6 @@ pub enum Ty {
     /// The ECS world handle: `world`.
     World,
 
-    // ── Ownership-qualified types (v2) ──────────────────────────────────────
-    /// `own<T>` — owned type with transfer semantics on assignment.
-    Own(Box<Ty>),
-    /// `unique<T>` — no-alias pointer; at most one mutable reference.
-    Unique(Box<Ty>),
-    /// `shared<T>` — read-only shared reference; multiple readers, no writers.
-    Shared(Box<Ty>),
-
     // ── Inference variable ────────────────────────────────────────────────────
     /// An unresolved `_` slot; ID is unique within the current `InferCtx`.
     Infer(u32),
@@ -184,21 +176,6 @@ impl Ty {
         }
     }
 
-    /// True if this type is `Option<_>` (after resolving inference vars).
-    pub fn is_option(&self) -> bool {
-        matches!(self, Ty::Option(_))
-    }
-
-    /// True if this type is `Result<_, _>` (after resolving inference vars).
-    pub fn is_result(&self) -> bool {
-        matches!(self, Ty::Result { .. })
-    }
-
-    /// True if this type is `Option<_>` or `Result<_, _>`.
-    pub fn is_option_or_result(&self) -> bool {
-        self.is_option() || self.is_result()
-    }
-
     /// A human-readable name for error messages.
     pub fn display(&self) -> String {
         match self {
@@ -243,9 +220,6 @@ impl Ty {
             Ty::Struct(name) => name.clone(),
             Ty::Enum(name) => name.clone(),
             Ty::Component(name) => name.clone(),
-            Ty::Own(inner) => format!("own<{}>", inner.display()),
-            Ty::Unique(inner) => format!("unique<{}>", inner.display()),
-            Ty::Shared(inner) => format!("shared<{}>", inner.display()),
             Ty::World => "world".into(),
             Ty::Infer(id) => format!("_#{}", id),
         }
@@ -272,6 +246,10 @@ pub struct Diagnostic {
     pub message: String,
     /// Optional secondary "note" labels attached to other spans.
     pub notes: Vec<(Span, String)>,
+    /// Error code (e.g. "E2001") from the error_codes module.
+    pub code: Option<&'static str>,
+    /// Suggested fix hint (optional, displayed as `help:` in the renderer).
+    pub hint: Option<String>,
 }
 
 impl Diagnostic {
@@ -281,6 +259,8 @@ impl Diagnostic {
             span,
             message: message.into(),
             notes: vec![],
+            code: None,
+            hint: None,
         }
     }
     pub fn warning(span: Span, message: impl Into<String>) -> Self {
@@ -289,6 +269,8 @@ impl Diagnostic {
             span,
             message: message.into(),
             notes: vec![],
+            code: None,
+            hint: None,
         }
     }
     pub fn note(span: Span, message: impl Into<String>) -> Self {
@@ -297,10 +279,22 @@ impl Diagnostic {
             span,
             message: message.into(),
             notes: vec![],
+            code: None,
+            hint: None,
         }
     }
     pub fn with_note(mut self, span: Span, msg: impl Into<String>) -> Self {
         self.notes.push((span, msg.into()));
+        self
+    }
+    /// Attach an error code (e.g. `"E2001"`).
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+    /// Attach a suggested fix hint.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
         self
     }
 
@@ -314,18 +308,9 @@ impl Diagnostic {
 #[derive(Debug, Default)]
 pub struct Diagnostics {
     pub items: Vec<Diagnostic>,
-    /// Symbols that have already produced "undeclared variable" errors.
-    /// Subsequent errors about the same symbol are suppressed to avoid cascading.
-    suppressed_symbols: std::collections::HashSet<String>,
 }
 
 impl Diagnostics {
-    pub fn new() -> Self {
-        Diagnostics {
-            items: Vec::new(),
-            suppressed_symbols: std::collections::HashSet::new(),
-        }
-    }
     pub fn push(&mut self, d: Diagnostic) {
         self.items.push(d);
     }
@@ -338,28 +323,6 @@ impl Diagnostics {
     pub fn note(&mut self, span: Span, msg: impl Into<String>) {
         self.push(Diagnostic::note(span, msg));
     }
-
-    /// Emit an "undeclared variable" error with cascade suppression.
-    /// After the first error about a given symbol, subsequent errors about
-    /// the same symbol are suppressed to avoid error avalanches.
-    pub fn undeclared_var(&mut self, span: Span, name: &str, extra: impl Into<String>) {
-        if self.suppressed_symbols.contains(name) {
-            // Already reported this undeclared variable — suppress cascade
-            return;
-        }
-        self.suppressed_symbols.insert(name.to_string());
-        let msg = format!(
-            "use of undeclared variable `{}` — {}",
-            name, extra.into()
-        );
-        self.push(Diagnostic::error(span, msg));
-        // Add a note about cascade suppression
-        self.push(Diagnostic::note(
-            span,
-            format!("additional errors about `{}` are suppressed to avoid cascading", name),
-        ));
-    }
-
     pub fn has_errors(&self) -> bool {
         self.items.iter().any(|d| d.is_fatal())
     }
@@ -421,9 +384,6 @@ impl InferCtx {
             }
             Ty::Option(inner) => self.occurs_in(id, inner),
             Ty::Result { ok, err } => self.occurs_in(id, ok) || self.occurs_in(id, err),
-            Ty::Own(inner) | Ty::Unique(inner) | Ty::Shared(inner) => {
-                self.occurs_in(id, inner)
-            }
             Ty::Tuple(ts) => ts.iter().any(|t| self.occurs_in(id, t)),
             Ty::Array { elem, .. } => self.occurs_in(id, elem),
             Ty::Slice(inner) => self.occurs_in(id, inner),
@@ -931,15 +891,19 @@ impl TypeCk {
                             }
                         } else {
                             // Not yet declared — emit an error, return infer.
-                            self.diag.error(
-                                span,
-                                format!(
-                                    "unknown type `{}` — no struct, component, or enum with \
-                                     this name has been declared. Declare it before use with \
-                                     `struct {} {{ ... }}` or `component {} {{ ... }}`, \
-                                     or check for a spelling mistake.",
-                                    name, name, name
-                                ),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    span,
+                                    format!(
+                                        "unknown type `{}` — no struct, component, or enum with \
+                                         this name has been declared. Declare it before use with \
+                                         `struct {} {{ ... }}` or `component {} {{ ... }}`, \
+                                         or check for a spelling mistake.",
+                                        name, name, name
+                                    ),
+                                )
+                                .with_code("E2002")
+                                .with_hint("declare it before use with `struct Name { ... }` or check for a spelling mistake"),
                             );
                             self.infer.fresh()
                         }
@@ -957,13 +921,17 @@ impl TypeCk {
                         len: n,
                     }
                 } else {
-                    self.diag.error(
-                        span,
-                        "array length must be a compile-time constant — use a literal \
-                             integer (e.g. `[f32; 16]`) or a `const` declaration \
-                             (e.g. `const N: usize = 16; let a: [f32; N] = ...`). \
-                             Dynamic lengths are not allowed in array types; \
-                             use a `Slice` or `Vec` if the length is runtime-determined.",
+                    self.diag.push(
+                        Diagnostic::error(
+                            span,
+                            "array length must be a compile-time constant — use a literal \
+                                 integer (e.g. `[f32; 16]`) or a `const` declaration \
+                                 (e.g. `const N: usize = 16; let a: [f32; N] = ...`). \
+                                 Dynamic lengths are not allowed in array types; \
+                                 use a `Slice` or `Vec` if the length is runtime-determined.".to_string(),
+                        )
+                        .with_code("E2018")
+                        .with_hint("use a literal integer or a `const` declaration for the array length"),
                     );
                     self.infer.fresh()
                 }
@@ -995,9 +963,36 @@ impl TypeCk {
             },
 
             // ── Ownership-qualified types (v2) ──────────────────────────
-            Type::Own(inner) => Ty::Own(Box::new(self.lower_ast_type(inner, span))),
-            Type::Unique(inner) => Ty::Unique(Box::new(self.lower_ast_type(inner, span))),
-            Type::Shared(inner) => Ty::Shared(Box::new(self.lower_ast_type(inner, span))),
+            Type::Own(inner) => {
+                self.diag.push(
+                    Diagnostic::warning(span, "`own T` is a new ownership type; treating as mutable reference for now")
+                        .with_code("W2001"),
+                );
+                Ty::Ref {
+                    mutable: true,
+                    inner: Box::new(self.lower_ast_type(inner, span)),
+                }
+            }
+            Type::Unique(inner) => {
+                self.diag.push(
+                    Diagnostic::warning(span, "`unique T` is a new ownership type; treating as mutable reference for now")
+                        .with_code("W2001"),
+                );
+                Ty::Ref {
+                    mutable: true,
+                    inner: Box::new(self.lower_ast_type(inner, span)),
+                }
+            }
+            Type::Shared(inner) => {
+                self.diag.push(
+                    Diagnostic::warning(span, "`shared T` is a new ownership type; treating as shared reference for now")
+                        .with_code("W2001"),
+                );
+                Ty::Ref {
+                    mutable: false,
+                    inner: Box::new(self.lower_ast_type(inner, span)),
+                }
+            }
         }
     }
 
@@ -1078,15 +1073,19 @@ impl TypeCk {
                 Some(t) => self.lower_ast_type(t, param.span),
                 None => {
                     // Unannotated params are allowed for closures; warn for fns.
-                    self.diag.warning(
-                        param.span,
-                        format!(
-                            "parameter `{}` has no type annotation — add an explicit type \
-                             like `{}: f32`, or use `_` as a wildcard placeholder if the \
-                             type is fully inferred from call sites. Unannotated function \
-                             parameters make overload resolution and documentation harder.",
-                            param.name, param.name
-                        ),
+                    self.diag.push(
+                        Diagnostic::warning(
+                            param.span,
+                            format!(
+                                "parameter `{}` has no type annotation — add an explicit type \
+                                 like `{}: f32`, or use `_` as a wildcard placeholder if the \
+                                 type is fully inferred from call sites. Unannotated function \
+                                 parameters make overload resolution and documentation harder.",
+                                param.name, param.name
+                            ),
+                        )
+                        .with_code("E2019")
+                        .with_hint(format!("add an explicit type like `{}: f32`", param.name)),
                     );
                     self.infer.fresh()
                 }
@@ -1094,67 +1093,8 @@ impl TypeCk {
             env.bind(param.name.clone(), ty);
         }
 
-        // ── Type-check requires constraints (must be bool). ────────────────
-        for req in &f.requires {
-            let req_ty = self.check_expr(req, &mut env);
-            if !matches!(self.infer.resolve(&req_ty), Ty::Bool) {
-                self.diag.error(
-                    req.span(),
-                    format!(
-                        "`requires` constraint must be `bool`, got `{}`",
-                        self.infer.resolve(&req_ty).display()
-                    ),
-                );
-            }
-        }
-
-        // ── Type-check ensures constraints (must be bool). ─────────────────
-        // In `ensures` clauses, `result` refers to the function's return value.
-        let ret_ty = f
-            .ret_ty
-            .as_ref()
-            .map(|t| self.lower_ast_type(t, f.span))
-            .unwrap_or(Ty::Unit);
-        // Temporarily bind `result` in the environment for ensures checking.
-        let had_result = env.lookup("result").is_some();
-        // Save the old `result` binding (if any) so we can restore it after.
-        let old_result_ty: Option<Ty> = if had_result {
-            env.lookup("result").cloned()
-        } else {
-            None
-        };
-        env.bind("result", ret_ty.clone());
-        for ens in &f.ensures {
-            let ens_ty = self.check_expr(ens, &mut env);
-            if !matches!(self.infer.resolve(&ens_ty), Ty::Bool) {
-                self.diag.error(
-                    ens.span(),
-                    format!(
-                        "`ensures` constraint must be `bool`, got `{}`",
-                        self.infer.resolve(&ens_ty).display()
-                    ),
-                );
-            }
-        }
-        // Restore the old `result` binding (or remove it if it wasn't there).
-        if had_result {
-            if let Some(old_ty) = old_result_ty {
-                env.bind("result", old_ty);
-            }
-        } else {
-            // Remove the `result` binding by removing from the innermost scope.
-            if let Some(scope) = env.scopes.last_mut() {
-                scope.remove("result");
-            }
-        }
-
         // Check body.
         if let Some(body) = &f.body {
-            // ── Effect checking: pure functions cannot emit effects. ────────
-            if f.effect.as_deref() == Some("pure") {
-                self.check_pure_body(body, f.span, &f.name);
-            }
-
             let body_ty = self.check_block(body, &mut env);
             let ret_ty = f
                 .ret_ty
@@ -1163,22 +1103,25 @@ impl TypeCk {
                 .unwrap_or(Ty::Unit);
 
             if !self.infer.unify(&ret_ty, &body_ty) {
-                self.diag.error(
-                    f.span,
-                    format!(
-                        "function `{}` is declared to return `{}` but its body produces `{}`. \
-                         Fix this by either:\n  \
-                         (a) changing the return type annotation to `-> {}`, or\n  \
-                         (b) ensuring the final expression in the body has type `{}`.\n  \
-                         If the function should not return a value, remove the `-> {}` \
-                         annotation and add a `;` after the last statement.",
-                        f.name,
-                        self.infer.resolve(&ret_ty).display(),
-                        self.infer.resolve(&body_ty).display(),
-                        self.infer.resolve(&body_ty).display(),
-                        self.infer.resolve(&ret_ty).display(),
-                        self.infer.resolve(&ret_ty).display(),
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        f.span,
+                        format!(
+                            "function `{}` is declared to return `{}` but its body produces `{}`. \
+                             Fix this by either:\n  \
+                             (a) changing the return type annotation to `-> {}`, or\n  \
+                             (b) ensuring the final expression in the body has type `{}`.\n  \
+                             If the function should not return a value, remove the `-> {}` \
+                             annotation and add a `;` after the last statement.",
+                            f.name,
+                            self.infer.resolve(&ret_ty).display(),
+                            self.infer.resolve(&body_ty).display(),
+                            self.infer.resolve(&body_ty).display(),
+                            self.infer.resolve(&ret_ty).display(),
+                            self.infer.resolve(&ret_ty).display(),
+                        ),
+                    )
+                    .with_code("E2013"),
                 );
             }
         }
@@ -1200,143 +1143,6 @@ impl TypeCk {
         env.pop_scope();
     }
 
-    /// Recursively check that a `pure` function body contains no `emit`
-    /// expressions or `effect` statements.
-    fn check_pure_body(&mut self, block: &Block, fn_span: Span, fn_name: &str) {
-        for stmt in &block.stmts {
-            self.check_pure_stmt(stmt, fn_span, fn_name);
-        }
-        if let Some(tail) = &block.tail {
-            self.check_pure_expr(tail, fn_span, fn_name);
-        }
-    }
-
-    fn check_pure_stmt(&mut self, stmt: &Stmt, fn_span: Span, fn_name: &str) {
-        match stmt {
-            Stmt::Effect { span, .. } => {
-                self.diag.error(
-                    *span,
-                    format!(
-                        "pure function `{}` cannot emit effects; \
-                         remove `effect pure` or move the effect out",
-                        fn_name
-                    ),
-                );
-            }
-            Stmt::Expr { expr, .. } => self.check_pure_expr(expr, fn_span, fn_name),
-            Stmt::Let { init, .. } => {
-                if let Some(e) = init {
-                    self.check_pure_expr(e, fn_span, fn_name);
-                }
-            }
-            Stmt::If { cond, then, else_, .. } => {
-                self.check_pure_expr(cond, fn_span, fn_name);
-                self.check_pure_body(then, fn_span, fn_name);
-                if let Some(e) = else_ {
-                    match e.as_ref() {
-                        crate::compiler::ast::IfOrBlock::If(s) => {
-                            self.check_pure_stmt(s, fn_span, fn_name)
-                        }
-                        crate::compiler::ast::IfOrBlock::Block(b) => {
-                            self.check_pure_body(b, fn_span, fn_name)
-                        }
-                    }
-                }
-            }
-            Stmt::While { cond, body, .. } => {
-                self.check_pure_expr(cond, fn_span, fn_name);
-                self.check_pure_body(body, fn_span, fn_name);
-            }
-            Stmt::Loop { body, .. } => self.check_pure_body(body, fn_span, fn_name),
-            Stmt::ForIn { iter, body, .. } => {
-                self.check_pure_expr(iter, fn_span, fn_name);
-                self.check_pure_body(body, fn_span, fn_name);
-            }
-            Stmt::Match { expr, arms, .. } => {
-                self.check_pure_expr(expr, fn_span, fn_name);
-                for arm in arms {
-                    self.check_pure_expr(&arm.body, fn_span, fn_name);
-                }
-            }
-            Stmt::Return { value, .. } | Stmt::Break { value, .. } => {
-                if let Some(v) = value {
-                    self.check_pure_expr(v, fn_span, fn_name);
-                }
-            }
-            Stmt::Region { body, .. } => self.check_pure_body(body, fn_span, fn_name),
-            Stmt::UnsafeBlock { body, .. } => self.check_pure_body(body, fn_span, fn_name),
-            Stmt::EntityFor { body, .. } => self.check_pure_body(body, fn_span, fn_name),
-            Stmt::ParallelFor(pf) => self.check_pure_body(&pf.body, fn_span, fn_name),
-            _ => {}
-        }
-    }
-
-    fn check_pure_expr(&mut self, expr: &Expr, fn_span: Span, fn_name: &str) {
-        match expr {
-            Expr::Emit { span, .. } => {
-                self.diag.error(
-                    *span,
-                    format!(
-                        "pure function `{}` cannot emit effects; \
-                         use `match` or `?` to handle the value, \
-                         or remove `effect pure` from the function",
-                        fn_name
-                    ),
-                );
-            }
-            Expr::BinOp { lhs, rhs, .. } => {
-                self.check_pure_expr(lhs, fn_span, fn_name);
-                self.check_pure_expr(rhs, fn_span, fn_name);
-            }
-            Expr::UnOp { expr, .. } => self.check_pure_expr(expr, fn_span, fn_name),
-            Expr::Call { func, args, .. } => {
-                self.check_pure_expr(func, fn_span, fn_name);
-                for a in args {
-                    self.check_pure_expr(a, fn_span, fn_name);
-                }
-            }
-            Expr::MethodCall { receiver, args, .. } => {
-                self.check_pure_expr(receiver, fn_span, fn_name);
-                for a in args {
-                    self.check_pure_expr(a, fn_span, fn_name);
-                }
-            }
-            Expr::IfExpr { cond, then, else_, .. } => {
-                self.check_pure_expr(cond, fn_span, fn_name);
-                self.check_pure_body(then, fn_span, fn_name);
-                if let Some(e) = else_ {
-                    self.check_pure_body(e, fn_span, fn_name);
-                }
-            }
-            Expr::Block(b) => self.check_pure_body(b, fn_span, fn_name),
-            Expr::Tuple { elems, .. } | Expr::ArrayLit { elems, .. } => {
-                for e in elems {
-                    self.check_pure_expr(e, fn_span, fn_name);
-                }
-            }
-            Expr::Assign { target, value, .. } => {
-                self.check_pure_expr(target, fn_span, fn_name);
-                self.check_pure_expr(value, fn_span, fn_name);
-            }
-            Expr::Field { object, .. } => self.check_pure_expr(object, fn_span, fn_name),
-            Expr::Index { object, indices, .. } => {
-                self.check_pure_expr(object, fn_span, fn_name);
-                for i in indices {
-                    self.check_pure_expr(i, fn_span, fn_name);
-                }
-            }
-            Expr::Closure { body, .. } => self.check_pure_expr(body, fn_span, fn_name),
-            Expr::Pipeline { stages, .. } => {
-                for s in stages {
-                    self.check_pure_expr(s, fn_span, fn_name);
-                }
-            }
-            Expr::Copy { inner, .. } => self.check_pure_expr(inner, fn_span, fn_name),
-            _ => {}
-        }
-        let _ = fn_span;
-    }
-
     // =========================================================================
     // SYSTEM CHECKING (Feature 2 — Game Simulation)
     // =========================================================================
@@ -1348,16 +1154,20 @@ impl TypeCk {
         // All system parameters MUST have explicit types (they become uniforms).
         for param in &s.params {
             if param.ty.is_none() {
-                self.diag.error(
-                    param.span,
-                    format!(
-                        "system parameter `{}` must have an explicit type annotation — \
-                         system parameters are lowered to GPU uniforms or push constants \
-                         and must have a concrete type at compile time. \
-                         Add a type annotation: `{}: f32` (or the appropriate type). \
-                         Example: `system update(dt: f32, gravity: vec3) {{ ... }}`",
-                        param.name, param.name
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        param.span,
+                        format!(
+                            "system parameter `{}` must have an explicit type annotation — \
+                             system parameters are lowered to GPU uniforms or push constants \
+                             and must have a concrete type at compile time. \
+                             Add a type annotation: `{}: f32` (or the appropriate type). \
+                             Example: `system update(dt: f32, gravity: vec3) {{ ... }}`",
+                            param.name, param.name
+                        ),
+                    )
+                    .with_code("E2020")
+                    .with_hint("system parameters are lowered to GPU uniforms and must have a concrete type"),
                 );
             }
             let ty = param
@@ -1378,16 +1188,20 @@ impl TypeCk {
         if let Some(q) = &s.explicit_query {
             for comp in q.with.iter().chain(q.without.iter()) {
                 if !self.symbols.structs.contains_key(comp.as_str()) {
-                    self.diag.error(
-                        q.span,
-                        format!(
-                            "query references unknown component `{}` — \
-                             declare it first with `component {} {{ ... }}` \
-                             above the system, or check for a spelling mistake. \
-                             All components used in `with` / `without` clauses \
-                             must be declared at the top level.",
-                            comp, comp
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            q.span,
+                            format!(
+                                "query references unknown component `{}` — \
+                                 declare it first with `component {} {{ ... }}` \
+                                 above the system, or check for a spelling mistake. \
+                                 All components used in `with` / `without` clauses \
+                                 must be declared at the top level.",
+                                comp, comp
+                            ),
+                        )
+                        .with_code("E2002")
+                        .with_hint("declare it before use with `struct Name { ... }` or check for a spelling mistake"),
                     );
                 }
             }
@@ -1418,6 +1232,7 @@ impl TypeCk {
                                         acc_a.component, a.name, acc_a.mode, b.name, acc_b.mode,
                                     ),
                                 )
+                                .with_code("E2026")
                                 .with_note(b.span, "second system here"),
                             );
                         }
@@ -1444,20 +1259,6 @@ impl TypeCk {
             Expr::Ident { span, name } => match env.lookup(name) {
                 Some(ty) => ty.clone(),
                 None => {
-                    // `result` is valid inside ensures clauses; it should be
-                    // bound by the ensures-checking logic. If it's still not
-                    // found here, provide a more specific error.
-                    if name == "result" {
-                        self.diag.error(
-                            *span,
-                            "`result` is only valid inside `ensures` clauses — \
-                             it refers to the function's return value. \
-                             Move this expression into an `ensures` postcondition, \
-                             or use the actual return expression directly."
-                                .to_string(),
-                        );
-                        return self.infer.fresh();
-                    }
                     if let Some(fi) = self.symbols.fns.get(name.as_str()) {
                         return Ty::FnPtr {
                             params: fi.params.iter().map(|(_, t)| t.clone()).collect(),
@@ -1467,12 +1268,19 @@ impl TypeCk {
                     if Self::is_runtime_builtin_ident(name.as_str()) {
                         return self.infer.fresh();
                     }
-                    self.diag.undeclared_var(
-                        *span,
-                        name,
-                        format!("declare it before use with `let {} = ...;`, \
-                         add it as a function parameter, or check for \
-                         a spelling mistake. Variable names are case-sensitive.", name)
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!(
+                                "use of undeclared variable `{}` — \
+                                 declare it before use with `let {} = ...;`, \
+                                 add it as a function parameter, or check for \
+                                 a spelling mistake. Variable names are case-sensitive.",
+                                name, name
+                            ),
+                        )
+                        .with_code("E2003")
+                        .with_hint("check the spelling or declare the variable before this point"),
                     );
                     self.infer.fresh()
                 }
@@ -1497,16 +1305,20 @@ impl TypeCk {
                                 ret: Box::new(fi.ret.clone()),
                             }
                         } else {
-                            self.diag.error(
-                                *span,
-                                format!(
-                                    "unknown path `{}` — check that every segment is declared \
-                                 and that any required `use` imports are present. \
-                                 Built-in runtime paths begin with `game::`, `graphics::`, \
-                                 `audio::`, `input::`, `physics::`, `ml::`, `math::`, \
-                                 `tensor::`, `sim::`, `window::`, etc.",
-                                    name
-                                ),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    *span,
+                                    format!(
+                                        "unknown path `{}` — check that every segment is declared \
+                                     and that any required `use` imports are present. \
+                                     Built-in runtime paths begin with `game::`, `graphics::`, \
+                                     `audio::`, `input::`, `physics::`, `ml::`, `math::`, \
+                                     `tensor::`, `sim::`, `window::`, etc.",
+                                        name
+                                    ),
+                                )
+                                .with_code("E2003")
+                                .with_hint("check the spelling or declare the variable before this point"),
                             );
                             self.infer.fresh()
                         }
@@ -1518,30 +1330,36 @@ impl TypeCk {
             Expr::VecCtor { span, size, elems } => {
                 let n = size.lanes() as usize;
                 if elems.len() != n {
-                    self.diag.error(
-                        *span,
-                        format!(
-                            "vec{n} constructor expects exactly {n} elements but {got} \
-                             were provided — provide exactly {n} f32 values, \
-                             e.g. `vec{n}({args})`",
-                            n = n,
-                            got = elems.len(),
-                            args = (0..n).map(|_| "0.0").collect::<Vec<_>>().join(", ")
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!(
+                                "vec{n} constructor expects exactly {n} elements but {got} \
+                                 were provided — provide exactly {n} f32 values, \
+                                 e.g. `vec{n}({args})`",
+                                n = n,
+                                got = elems.len(),
+                                args = (0..n).map(|_| "0.0").collect::<Vec<_>>().join(", ")
+                            ),
+                        )
+                        .with_code("E2011"),
                     );
                 }
                 for e in elems {
                     let ty = self.check_expr(e, env);
                     if !ty.is_float_scalar() {
-                        self.diag.warning(
-                            e.span(),
-                            format!(
-                                "vec constructor element should be `f32` but got `{}` — \
-                                 cast to f32 with `{} as f32` if needed, or use a float \
-                                 literal (e.g. `1.0` instead of `1`)",
-                                ty.display(),
-                                ty.display()
-                            ),
+                        self.diag.push(
+                            Diagnostic::warning(
+                                e.span(),
+                                format!(
+                                    "vec constructor element should be `f32` but got `{}` — \
+                                     cast to f32 with `{} as f32` if needed, or use a float \
+                                     literal (e.g. `1.0` instead of `1`)",
+                                    ty.display(),
+                                    ty.display()
+                                ),
+                            )
+                            .with_code("E2012"),
                         );
                     }
                 }
@@ -1563,18 +1381,22 @@ impl TypeCk {
                 for e in &elems[1..] {
                     let ty = self.check_expr(e, env);
                     if !self.infer.unify(&first_ty, &ty) {
-                        self.diag.error(
-                            *span,
-                            format!(
-                                "array literal has inconsistent element types: first element \
-                                 is `{}` but a later element is `{}` — all elements of an \
-                                 array literal must share the same type. \
-                                 Use an explicit cast (e.g. `x as {}`) to coerce mismatched \
-                                 elements, or split into separate arrays.",
-                                first_ty.display(),
-                                ty.display(),
-                                first_ty.display()
-                            ),
+                        self.diag.push(
+                            Diagnostic::error(
+                                *span,
+                                format!(
+                                    "array literal has inconsistent element types: first element \
+                                     is `{}` but a later element is `{}` — all elements of an \
+                                     array literal must share the same type. \
+                                     Use an explicit cast (e.g. `x as {}`) to coerce mismatched \
+                                     elements, or split into separate arrays.",
+                                    first_ty.display(),
+                                    ty.display(),
+                                    first_ty.display()
+                                ),
+                            )
+                            .with_code("E2004")
+                            .with_hint(format!("use an explicit cast: `lhs as {}` or ensure both operands have the same type", first_ty.display())),
                         );
                     }
                 }
@@ -1593,24 +1415,30 @@ impl TypeCk {
                 match op {
                     UnOpKind::Neg => {
                         if !ty.is_numeric() && !ty.is_tensor_like() {
-                            self.diag.error(
-                                *span,
-                                format!(
-                                    "unary `-` requires a numeric or tensor type, got `{}`",
-                                    ty.display()
-                                ),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    *span,
+                                    format!(
+                                        "unary `-` requires a numeric or tensor type, got `{}`",
+                                        ty.display()
+                                    ),
+                                )
+                                .with_code("E2005"),
                             );
                         }
                         ty
                     }
                     UnOpKind::Not => {
                         if !matches!(ty, Ty::Bool) && !ty.is_numeric() {
-                            self.diag.error(
-                                *span,
-                                format!(
-                                    "unary `!`/`~` requires `bool` or integer, got `{}`",
-                                    ty.display()
-                                ),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    *span,
+                                    format!(
+                                        "unary `!`/`~` requires `bool` or integer, got `{}`",
+                                        ty.display()
+                                    ),
+                                )
+                                .with_code("E2005"),
                             );
                         }
                         if matches!(ty, Ty::Bool) {
@@ -1622,8 +1450,10 @@ impl TypeCk {
                     UnOpKind::Deref => match ty {
                         Ty::Ref { inner, .. } => *inner,
                         _ => {
-                            self.diag
-                                .error(*span, format!("cannot dereference `{}`", ty.display()));
+                            self.diag.push(
+                                Diagnostic::error(*span, format!("cannot dereference `{}`", ty.display()))
+                                .with_code("E2021"),
+                            );
                             self.infer.fresh()
                         }
                     },
@@ -1641,105 +1471,31 @@ impl TypeCk {
             // ── Assignment ────────────────────────────────────────────────────
             Expr::Assign {
                 span,
-                op,
+                op: _,
                 target,
                 value,
             } => {
-                use crate::compiler::ast::AssignOpKind;
-                match op {
-                    AssignOpKind::Assign => {
-                        // In Jules v2, `x = value` where x is undeclared creates a
-                        // new binding. When x is already declared, it's a rebinding.
-                        if let Expr::Ident { name, .. } = target.as_ref() {
-                            let v_ty = self.check_expr(value, env);
-                            if env.lookup(name).is_none() && !self.symbols.fns.contains_key(name) && !Self::is_runtime_builtin_ident(name) {
-                                // New binding — bind with the value's type.
-                                env.bind(name.clone(), v_ty.clone());
-                            }
-                            // For already-declared vars, unify (rebinding/shadowing handled by sema).
-                            Ty::Unit
-                        } else {
-                            // Non-ident target: check normally.
-                            let t_ty = self.check_expr(target, env);
-                            let v_ty = self.check_expr(value, env);
-                            if !self.can_assign(&t_ty, &v_ty) {
-                                self.diag.error(
-                                    *span,
-                                    format!(
-                                        "type mismatch in assignment: cannot assign `{}` to a \
-                                         binding of type `{}` — use an explicit cast \
-                                         (`value as {}`) or change the binding's declared type.",
-                                        v_ty.display(),
-                                        t_ty.display(),
-                                        t_ty.display()
-                                    ),
-                                );
-                            }
-                            Ty::Unit
-                        }
-                    }
-                    AssignOpKind::MutAssign => {
-                        // `:=` is explicit mutation.
-                        // On undeclared variable: creates new mutable binding (like `let mut`).
-                        // On declared variable: mutates it.
-                        if let Expr::Ident { name, .. } = target.as_ref() {
-                            if env.lookup(name).is_none() {
-                                // Undeclared: create new mutable binding with value's type
-                                let v_ty = self.check_expr(value, env);
-                                env.bind(name, v_ty.clone());
-                                Ty::Unit
-                            } else {
-                                // Declared: type-check mutation
-                                let t_ty = self.check_expr(target, env);
-                                let v_ty = self.check_expr(value, env);
-                                if !self.can_assign(&t_ty, &v_ty) {
-                                    self.diag.error(
-                                        *span,
-                                        format!(
-                                            "type mismatch in mutation assignment: cannot assign `{}` \
-                                             to a variable of type `{}`",
-                                            v_ty.display(),
-                                            t_ty.display()
-                                        ),
-                                    );
-                                }
-                                Ty::Unit
-                            }
-                        } else {
-                            let t_ty = self.check_expr(target, env);
-                            let v_ty = self.check_expr(value, env);
-                            if !self.can_assign(&t_ty, &v_ty) {
-                                self.diag.error(
-                                    *span,
-                                    format!(
-                                        "type mismatch in mutation assignment: cannot assign `{}` \
-                                         to a variable of type `{}`",
-                                        v_ty.display(),
-                                        t_ty.display()
-                                    ),
-                                );
-                            }
-                            Ty::Unit
-                        }
-                    }
-                    _ => {
-                        // Compound assignment (+=, -=, etc.)
-                        let t_ty = self.check_expr(target, env);
-                        let v_ty = self.check_expr(value, env);
-                        if !self.can_assign(&t_ty, &v_ty) {
-                            self.diag.error(
-                                *span,
-                                format!(
-                                    "type mismatch in compound assignment: cannot assign `{}` \
-                                     to a variable of type `{}`",
-                                    v_ty.display(),
-                                    t_ty.display()
-                                ),
-                            );
-                        }
-                        Ty::Unit
-                    }
+                let t_ty = self.check_expr(target, env);
+                let v_ty = self.check_expr(value, env);
+                if !self.infer.unify(&t_ty, &v_ty) {
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!(
+                                "type mismatch in assignment: cannot assign `{}` to a \
+                                 binding of type `{}` — the value type must exactly match \
+                                 the target type. Use an explicit cast (`value as {}`) \
+                                 or change the binding's declared type.",
+                                v_ty.display(),
+                                t_ty.display(),
+                                t_ty.display()
+                            ),
+                        )
+                        .with_code("E2004")
+                        .with_hint(format!("use an explicit cast: `lhs as {}` or ensure both operands have the same type", t_ty.display())),
+                    );
                 }
+                Ty::Unit
             }
 
             // ── Field access ───────────────────────────────────────────────────
@@ -1768,30 +1524,39 @@ impl TypeCk {
                                 | ElemType::Usize
                         )
                     ) {
-                        self.diag.warning(
-                            *span,
-                            format!("index should be an integer type, got `{}`", i_ty.display()),
+                        self.diag.push(
+                            Diagnostic::warning(
+                                *span,
+                                format!("index should be an integer type, got `{}`", i_ty.display()),
+                            )
+                            .with_code("E2007"),
                         );
                     }
                 }
                 match &obj_ty {
                     Ty::Tensor { elem, shape } => {
                         if indices.len() != shape.len() {
-                            self.diag.error(
-                                *span,
-                                format!(
-                                    "tensor has rank {} but {} indices provided",
-                                    shape.len(),
-                                    indices.len()
-                                ),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    *span,
+                                    format!(
+                                        "tensor has rank {} but {} indices provided",
+                                        shape.len(),
+                                        indices.len()
+                                    ),
+                                )
+                                .with_code("E2016"),
                             );
                         }
                         Ty::Scalar(elem.clone())
                     }
                     Ty::Array { elem, .. } | Ty::Slice(elem) => *elem.clone(),
                     _ => {
-                        self.diag
-                            .error(*span, format!("cannot index into `{}`", obj_ty.display()));
+                        self.diag.push(
+                            Diagnostic::error(*span, format!("cannot index into `{}`", obj_ty.display()))
+                            .with_code("E2007")
+                            .with_hint("only tensors, arrays, tuples, and strings support indexing"),
+                        );
                         self.infer.fresh()
                     }
                 }
@@ -1838,12 +1603,16 @@ impl TypeCk {
                 ) = (&l, &r)
                 {
                     if ea != eb {
-                        self.diag
-                            .error(*span, "Kronecker product: element type mismatch");
+                        self.diag.push(
+                            Diagnostic::error(*span, "Kronecker product: element type mismatch")
+                            .with_code("E2015"),
+                        );
                     }
                     if sa.len() != 2 || sb.len() != 2 {
-                        self.diag
-                            .error(*span, "Kronecker product (`@@`) requires 2-D tensors");
+                        self.diag.push(
+                            Diagnostic::error(*span, "Kronecker product (`@@`) requires 2-D tensors")
+                            .with_code("E2016"),
+                        );
                         return self.infer.fresh();
                     }
                     let d0 = match (&sa[0], &sb[0]) {
@@ -1859,13 +1628,17 @@ impl TypeCk {
                         shape: vec![d0, d1],
                     };
                 }
-                self.diag.error(
-                    *span,
-                    format!(
-                        "`@@` (Kronecker product) requires 2-D tensor operands; got `{}` and `{}`",
-                        l.display(),
-                        r.display()
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        *span,
+                        format!(
+                            "`@@` (Kronecker product) requires 2-D tensor operands; got `{}` and `{}`",
+                            l.display(),
+                            r.display()
+                        ),
+                    )
+                    .with_code("E2017")
+                    .with_hint("these operators only work on tensor types"),
                 );
                 self.infer.fresh()
             }
@@ -1910,10 +1683,14 @@ impl TypeCk {
                         };
                     }
                     _ => {
-                        self.diag.error(*span, format!(
-                            "`^*` (outer product) requires 1-D tensor or vector operands; got `{}` and `{}`",
-                            l.display(), r.display()
-                        ));
+                        self.diag.push(
+                            Diagnostic::error(*span, format!(
+                                "`^*` (outer product) requires 1-D tensor or vector operands; got `{}` and `{}`",
+                                l.display(), r.display()
+                            ))
+                            .with_code("E2017")
+                            .with_hint("these operators only work on tensor types"),
+                        );
                         return self.infer.fresh();
                     }
                 };
@@ -1926,12 +1703,16 @@ impl TypeCk {
             Expr::Grad { span, inner } => {
                 let ty = self.check_expr(inner, env);
                 if !ty.supports_grad() {
-                    self.diag.error(
-                        *span,
-                        format!(
-                            "`grad` requires a float tensor or vector type, got `{}`",
-                            ty.display()
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!(
+                                "`grad` requires a float tensor or vector type, got `{}`",
+                                ty.display()
+                            ),
+                        )
+                        .with_code("E2022")
+                        .with_hint("@grad only applies to float, tensor, vec, mat, or quat types"),
                     );
                 }
                 ty
@@ -1941,18 +1722,24 @@ impl TypeCk {
                 let b_ty = self.check_expr(base, env);
                 let e_ty = self.check_expr(exp, env);
                 if !b_ty.is_numeric() && !b_ty.is_tensor_like() {
-                    self.diag.error(
-                        *span,
-                        format!(
-                            "`**` base must be numeric or tensor, got `{}`",
-                            b_ty.display()
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!(
+                                "`**` base must be numeric or tensor, got `{}`",
+                                b_ty.display()
+                            ),
+                        )
+                        .with_code("E2021"),
                     );
                 }
                 if !e_ty.is_numeric() {
-                    self.diag.error(
-                        *span,
-                        format!("`**` exponent must be numeric, got `{}`", e_ty.display()),
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!("`**` exponent must be numeric, got `{}`", e_ty.display()),
+                        )
+                        .with_code("E2004"),
                     );
                 }
                 b_ty
@@ -1966,7 +1753,8 @@ impl TypeCk {
                     if let Some(ref prev) = bound_ty {
                         if !self.infer.unify(prev, &ty) {
                             self.diag
-                                .error(*span, "range bounds have incompatible types");
+                                .push(Diagnostic::error(*span, "range bounds have incompatible types")
+                                .with_code("E2004"));
                         }
                     } else {
                         bound_ty = Some(ty);
@@ -1983,12 +1771,14 @@ impl TypeCk {
                 // Allow numeric widening / narrowing; warn on lossy casts.
                 if let (Ty::Scalar(se), Ty::Scalar(de)) = (&src, &dst) {
                     if se.byte_size() > de.byte_size() {
-                        self.diag.warning(
-                            *span,
-                            format!(
-                                "narrowing cast from `{}` to `{}`; may lose precision",
-                                src.display(),
-                                dst.display()
+                        self.diag.push(
+                            Diagnostic::warning(
+                                *span,
+                                format!(
+                                    "narrowing cast from `{}` to `{}`; may lose precision",
+                                    src.display(),
+                                    dst.display()
+                                ),
                             ),
                         );
                     }
@@ -2005,22 +1795,28 @@ impl TypeCk {
             } => {
                 let cond_ty = self.check_expr(cond, env);
                 if !matches!(cond_ty, Ty::Bool) {
-                    self.diag.error(
-                        *span,
-                        format!("`if` condition must be `bool`, got `{}`", cond_ty.display()),
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!("`if` condition must be `bool`, got `{}`", cond_ty.display()),
+                        )
+                        .with_code("E2004"),
                     );
                 }
                 let then_ty = self.check_block(then, env);
                 if let Some(else_blk) = else_ {
                     let else_ty = self.check_block(else_blk, env);
                     if !self.infer.unify(&then_ty, &else_ty) {
-                        self.diag.error(
-                            *span,
-                            format!(
-                                "`if` branches have incompatible types: `{}` vs `{}`",
-                                then_ty.display(),
-                                else_ty.display()
-                            ),
+                        self.diag.push(
+                            Diagnostic::error(
+                                *span,
+                                format!(
+                                    "`if` branches have incompatible types: `{}` vs `{}`",
+                                    then_ty.display(),
+                                    else_ty.display()
+                                ),
+                            )
+                            .with_code("E2004"),
                         );
                     }
                 }
@@ -2077,31 +1873,38 @@ impl TypeCk {
                         if let Some(expected) = info.field_ty(fname) {
                             let expected = expected.clone();
                             if !self.infer.unify(&expected, &expr_ty) {
-                                self.diag.error(
-                                    fexpr.span(),
-                                    format!(
-                                        "mismatched type for field `{fname}` of `{name}`: \
-                                         expected `{exp}` but the expression has type `{got}`. \
-                                         Either change the field value to produce a `{exp}`, \
-                                         or use an explicit cast (`value as {exp}`) if the \
-                                         types are compatible.",
-                                        fname = fname,
-                                        name = name,
-                                        exp = expected.display(),
-                                        got = expr_ty.display()
-                                    ),
+                                self.diag.push(
+                                    Diagnostic::error(
+                                        fexpr.span(),
+                                        format!(
+                                            "mismatched type for field `{fname}` of `{name}`: \
+                                             expected `{exp}` but the expression has type `{got}`. \
+                                             Either change the field value to produce a `{exp}`, \
+                                             or use an explicit cast (`value as {exp}`) if the \
+                                             types are compatible.",
+                                            fname = fname,
+                                            name = name,
+                                            exp = expected.display(),
+                                            got = expr_ty.display()
+                                        ),
+                                    )
+                                    .with_code("E2012"),
                                 );
                             }
                         } else {
-                            self.diag.error(
-                                *span,
-                                format!(
-                                    "`{name}` has no field named `{fname}`. \
-                                     Check the struct definition for the correct field names, \
-                                     or remove this field from the literal.",
-                                    name = name,
-                                    fname = fname
-                                ),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    *span,
+                                    format!(
+                                        "`{name}` has no field named `{fname}`. \
+                                         Check the struct definition for the correct field names, \
+                                         or remove this field from the literal.",
+                                        name = name,
+                                        fname = fname
+                                    ),
+                                )
+                                .with_code("E2008")
+                                .with_hint(format!("check the available fields on type `{}`", name)),
                             );
                         }
                     }
@@ -2111,164 +1914,45 @@ impl TypeCk {
                         Ty::Struct(name.clone())
                     }
                 } else {
-                    self.diag.error(
-                        *span,
-                        format!(
-                            "cannot construct unknown struct `{name}`. \
-                             Declare it first with `struct {name} {{ ... }}` or \
-                             `component {name} {{ ... }}`, or check for a spelling mistake.",
-                            name = name
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!(
+                                "cannot construct unknown struct `{name}`. \
+                                 Declare it first with `struct {name} {{ ... }}` or \
+                                 `component {name} {{ ... }}`, or check for a spelling mistake.",
+                                name = name
+                            ),
+                        )
+                        .with_code("E2002")
+                        .with_hint("declare it before use with `struct Name { ... }` or check for a spelling mistake"),
                     );
                     self.infer.fresh()
                 }
             }
 
-            // ── Pipeline expression (v2) ───────────────────────────────────
-            Expr::Pipeline { span, stages } => {
-                if stages.is_empty() {
-                    self.diag.error(*span, "pipeline expression must have at least one stage");
-                    return self.infer.fresh();
+            // ── v2: Pipeline / Emit / Copy ──────────────────────────────
+            Expr::Pipeline { stages, span } => {
+                // Type-check each stage; result type is the type of the last stage.
+                let mut last_ty = self.infer.fresh();
+                for stage in stages {
+                    last_ty = self.check_expr(stage, env);
                 }
-                let mut ty = self.check_expr(&stages[0], env);
-                for stage in &stages[1..] {
-                    // Each stage after the first should be a function call.
-                    // `y |> add(5)` means `add(y, 5)` — the pipeline value
-                    // becomes the first argument of the call.
-                    match stage {
-                        Expr::Call { func, args, named, span: call_span } => {
-                            // Type-check the function being called.
-                            let func_ty = self.check_expr(func, env);
-                            // The pipeline value is prepended as the first argument.
-                            // Check if this is consistent with the function signature.
-                            if let Ty::FnPtr { params, ret } = &func_ty {
-                                // Check that the pipeline value type matches the
-                                // first parameter (with widening allowed).
-                                if !params.is_empty() {
-                                    if !self.infer.unify(&params[0], &ty)
-                                        && !self.can_widen_ints(&ty, &params[0])
-                                    {
-                                        self.diag.error(
-                                            *call_span,
-                                            format!(
-                                                "pipeline stage type mismatch: \
-                                                 first parameter expects `{}` but pipeline \
-                                                 provides `{}`",
-                                                params[0].display(),
-                                                ty.display()
-                                            ),
-                                        );
-                                    }
-                                }
-                                ty = ret.as_ref().clone();
-                            } else {
-                                // Function type not resolved; just propagate.
-                                // Still type-check the arguments for cascading errors.
-                                for a in args {
-                                    self.check_expr(a, env);
-                                }
-                                for (_, a) in named {
-                                    self.check_expr(a, env);
-                                }
-                                ty = self.infer.fresh();
-                            }
-                        }
-                        _ => {
-                            // Non-call stage: try to use as a simple function.
-                            let func_ty = self.check_expr(stage, env);
-                            if let Ty::FnPtr { params, ret } = &func_ty {
-                                if !params.is_empty() {
-                                    if !self.infer.unify(&params[0], &ty)
-                                        && !self.can_widen_ints(&ty, &params[0])
-                                    {
-                                        self.diag.error(
-                                            stage.span(),
-                                            format!(
-                                                "pipeline stage type mismatch: expected `{}` but got `{}`",
-                                                params[0].display(),
-                                                ty.display()
-                                            ),
-                                        );
-                                    }
-                                    ty = ret.as_ref().clone();
-                                } else {
-                                    ty = ret.as_ref().clone();
-                                }
-                            } else {
-                                // Not a function pointer; just propagate the type
-                                ty = func_ty;
-                            }
-                        }
-                    }
-                }
-                ty
+                last_ty
             }
-
-            // ── Emit expression (v2) ──────────────────────────────────────
-            Expr::Emit { span, value, .. } => {
-                let _ = self.check_expr(value, env);
-                self.infer.fresh() // emit returns unit
+            Expr::Emit { value, span: _, .. } => {
+                let _val_ty = self.check_expr(value, env);
+                self.infer.fresh()
             }
-
-            // ── Copy expression (v2) ──────────────────────────────────────
-            Expr::Copy { inner, .. } => self.check_expr(inner, env).clone(),
-        }
-    }
-
-    // =========================================================================
-    // INTEGER WIDENING
-    // =========================================================================
-
-    /// Check if two integer scalar types can be implicitly widened.
-    /// Returns true if one type can be widened to the other (e.g. i32 → i64).
-    /// This is symmetric — it returns true if either direction works.
-    fn can_widen_ints(&self, a: &Ty, b: &Ty) -> bool {
-        match (self.infer.resolve(a), self.infer.resolve(b)) {
-            (Ty::Scalar(ea), Ty::Scalar(eb)) => {
-                self.can_widen_elem(ea, eb) || self.can_widen_elem(eb, ea)
+            Expr::Copy { inner, span } => {
+                let inner_ty = self.check_expr(inner, env);
+                self.diag.push(
+                    Diagnostic::warning(*span, "`copy` expression is not yet fully implemented; returning inner type as-is")
+                        .with_code("W2002"),
+                );
+                inner_ty
             }
-            _ => false,
         }
-    }
-
-    /// Check if `from` can be implicitly widened to `to`.
-    fn can_widen_elem(&self, from: &ElemType, to: &ElemType) -> bool {
-        use ElemType::*;
-        match (from, to) {
-            // Same signed family widening
-            (I8, I16 | I32 | I64) => true,
-            (I16, I32 | I64) => true,
-            (I32, I64) => true,
-            // Same unsigned family widening
-            (U8, U16 | U32 | U64) => true,
-            (U16, U32 | U64) => true,
-            (U32, U64) => true,
-            // Unsigned to signed widening (safe when the signed type is larger)
-            (U8, I16 | I32 | I64) => true,
-            (U16, I32 | I64) => true,
-            (U32, I64) => true,
-            // Reverse direction: the wider type is already the target
-            (I16 | I32 | I64, I8) => false,
-            (I32 | I64, I16) => false,
-            (I64, I32) => false,
-            (U16 | U32 | U64, U8) => false,
-            (U32 | U64, U16) => false,
-            (U64, U32) => false,
-            // Usize is 64-bit
-            (Usize, U64) | (U64, Usize) => true,
-            (U8 | U16 | U32, Usize) => true,
-            (I8 | I16 | I32, Usize) => true,
-            _ => false,
-        }
-    }
-
-    /// Check if `value_ty` can be assigned to `target_ty`, considering
-    /// implicit integer widening.
-    fn can_assign(&mut self, target_ty: &Ty, value_ty: &Ty) -> bool {
-        if self.infer.unify(target_ty, value_ty) {
-            return true;
-        }
-        self.can_widen_ints(value_ty, target_ty)
     }
 
     // =========================================================================
@@ -2294,67 +1978,21 @@ impl TypeCk {
             | BinOpKind::Le
             | BinOpKind::Gt
             | BinOpKind::Ge => {
-                // ── Total types: disallow comparing Option<T> with T ──────
-                let l_resolved = self.infer.resolve(&l);
-                let r_resolved = self.infer.resolve(&r);
-                if l_resolved.is_option() && !r_resolved.is_option() {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "cannot compare `{}` with `{}` — \
-                             comparing `Option<T>` with `T` is not allowed; \
-                             use `match` or `?` to extract the value first",
-                            l.display(),
-                            r.display()
-                        ),
-                    );
-                } else if r_resolved.is_option() && !l_resolved.is_option() {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "cannot compare `{}` with `{}` — \
-                             comparing `T` with `Option<T>` is not allowed; \
-                             use `match` or `?` to extract the value first",
-                            l.display(),
-                            r.display()
-                        ),
-                    );
-                } else if l_resolved.is_result() && !r_resolved.is_result() {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "cannot compare `{}` with `{}` — \
-                             comparing `Result<T, E>` with a non-Result type is not allowed; \
-                             use `match` or `?` to extract the value first",
-                            l.display(),
-                            r.display()
-                        ),
-                    );
-                } else if r_resolved.is_result() && !l_resolved.is_result() {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "cannot compare `{}` with `{}` — \
-                             comparing a non-Result type with `Result<T, E>` is not allowed; \
-                             use `match` or `?` to extract the value first",
-                            l.display(),
-                            r.display()
-                        ),
-                    );
-                }
-
-                if !self.infer.unify(&l, &r) && !self.can_widen_ints(&l, &r) {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "cannot compare `{lty}` with `{rty}` — both sides of a \
-                             comparison operator must have the same type (or be \
-                             implicitly widening integer types). \
-                             Cast one side to match the other (e.g. `x as {rty}`) \
-                             or ensure both operands are produced by the same type.",
-                            lty = l.display(),
-                            rty = r.display()
-                        ),
+                if !self.infer.unify(&l, &r) {
+                    self.diag.push(
+                        Diagnostic::error(
+                            span,
+                            format!(
+                                "cannot compare `{lty}` with `{rty}` — both sides of a \
+                                 comparison operator must have the same type. \
+                                 Cast one side to match the other (e.g. `x as {rty}`) \
+                                 or ensure both operands are produced by the same type.",
+                                lty = l.display(),
+                                rty = r.display()
+                            ),
+                        )
+                        .with_code("E2006")
+                        .with_hint("use an explicit cast to a common type before comparing"),
                     );
                 }
                 Ty::Bool
@@ -2364,16 +2002,19 @@ impl TypeCk {
             BinOpKind::And | BinOpKind::Or => {
                 for ty in [&l, &r] {
                     if !matches!(ty, Ty::Bool) {
-                        self.diag.error(
-                            span,
-                            format!(
-                                "logical `&&`/`||` operator requires `bool` on both sides, \
-                                 but found `{got}`. \
-                                 If you intended a bitwise operation use `&` / `|` instead. \
-                                 To convert a numeric value to bool, write an explicit comparison: \
-                                 `{got} != 0`.",
-                                got = ty.display()
-                            ),
+                        self.diag.push(
+                            Diagnostic::error(
+                                span,
+                                format!(
+                                    "logical `&&`/`||` operator requires `bool` on both sides, \
+                                     but found `{got}`. \
+                                     If you intended a bitwise operation use `&` / `|` instead. \
+                                     To convert a numeric value to bool, write an explicit comparison: \
+                                     `{got} != 0`.",
+                                    got = ty.display()
+                                ),
+                            )
+                            .with_code("E2004"),
                         );
                     }
                 }
@@ -2387,32 +2028,6 @@ impl TypeCk {
             | BinOpKind::Div
             | BinOpKind::Rem
             | BinOpKind::FloorDiv => {
-                // ── Total types: Option/Result cannot be used in arithmetic ──
-                let l_resolved = self.infer.resolve(&l);
-                let r_resolved = self.infer.resolve(&r);
-                if l_resolved.is_option_or_result() {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "cannot use Option/Result value in arithmetic without unwrapping; \
-                             use `match` or `?` to extract the value. \
-                             Left operand has type `{}`",
-                            l.display()
-                        ),
-                    );
-                }
-                if r_resolved.is_option_or_result() {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "cannot use Option/Result value in arithmetic without unwrapping; \
-                             use `match` or `?` to extract the value. \
-                             Right operand has type `{}`",
-                            r.display()
-                        ),
-                    );
-                }
-
                 // Vector × scalar or scalar × vector
                 if let (Ty::Vec { size, family }, ref rty) | (ref rty, Ty::Vec { size, family }) =
                     (&l, &r)
@@ -2451,30 +2066,36 @@ impl TypeCk {
                 ) = (&l, &r)
                 {
                     if ea != eb {
-                        self.diag.error(
-                            span,
-                            format!(
-                                "element-type mismatch in tensor arithmetic: \
-                                 left is `{lt}` but right is `{rt}`. \
-                                 Tensor operands must have the same element type. \
-                                 Cast one tensor: `tensor.cast::<{lelem}>()` \
-                                 or ensure both are constructed with matching element types.",
-                                lt = l.display(),
-                                rt = r.display(),
-                                lelem = format!("{:?}", ea).to_lowercase()
-                            ),
+                        self.diag.push(
+                            Diagnostic::error(
+                                span,
+                                format!(
+                                    "element-type mismatch in tensor arithmetic: \
+                                     left is `{lt}` but right is `{rt}`. \
+                                     Tensor operands must have the same element type. \
+                                     Cast one tensor: `tensor.cast::<{lelem}>()` \
+                                     or ensure both are constructed with matching element types.",
+                                    lt = l.display(),
+                                    rt = r.display(),
+                                    lelem = format!("{:?}", ea).to_lowercase()
+                                ),
+                            )
+                            .with_code("E2015"),
                         );
                     } else if sa.len() != sb.len() {
-                        self.diag.error(
-                            span,
-                            format!(
-                                "rank mismatch in tensor arithmetic: \
-                                 left operand is rank-{la} (`{lt}`) but right is rank-{rb} (`{rt}`). \
-                                 Both tensors must have the same number of dimensions. \
-                                 Use `.reshape(...)` or `.unsqueeze(...)` to align ranks.",
-                                la = sa.len(), lt = l.display(),
-                                rb = sb.len(), rt = r.display()
-                            ),
+                        self.diag.push(
+                            Diagnostic::error(
+                                span,
+                                format!(
+                                    "rank mismatch in tensor arithmetic: \
+                                     left operand is rank-{la} (`{lt}`) but right is rank-{rb} (`{rt}`). \
+                                     Both tensors must have the same number of dimensions. \
+                                     Use `.reshape(...)` or `.unsqueeze(...)` to align ranks.",
+                                    la = sa.len(), lt = l.display(),
+                                    rb = sb.len(), rt = r.display()
+                                ),
+                            )
+                            .with_code("E2016"),
                         );
                     }
                     return l;
@@ -2491,19 +2112,22 @@ impl TypeCk {
                     }
                 }
                 // Plain numeric
-                if !self.infer.unify(&l, &r) && !self.can_widen_ints(&l, &r) {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "type mismatch in arithmetic: \
-                             cannot apply `{op}` to `{lt}` and `{rt}`. \
-                             Both operands must have the same numeric type (or \
-                             be implicitly widening integer types). \
-                             Use an explicit cast: `lhs as {rt}` or `rhs as {lt}`.",
-                            op = format!("{:?}", op).to_lowercase(),
-                            lt = l.display(),
-                            rt = r.display()
-                        ),
+                if !self.infer.unify(&l, &r) {
+                    self.diag.push(
+                        Diagnostic::error(
+                            span,
+                            format!(
+                                "type mismatch in arithmetic: \
+                                 cannot apply `{op}` to `{lt}` and `{rt}`. \
+                                 Both operands must have the same numeric type. \
+                                 Use an explicit cast: `lhs as {rt}` or `rhs as {lt}`.",
+                                op = format!("{:?}", op).to_lowercase(),
+                                lt = l.display(),
+                                rt = r.display()
+                            ),
+                        )
+                        .with_code("E2004")
+                        .with_hint(format!("use an explicit cast: `lhs as {}` or ensure both operands have the same type", r.display())),
                     );
                 }
                 l
@@ -2515,30 +2139,22 @@ impl TypeCk {
             | BinOpKind::BitXor
             | BinOpKind::Shl
             | BinOpKind::Shr => {
-                // ── Total types: Option/Result cannot be used in bitwise ops ──
-                let l_resolved = self.infer.resolve(&l);
-                let r_resolved = self.infer.resolve(&r);
-                if l_resolved.is_option_or_result() || r_resolved.is_option_or_result() {
-                    self.diag.error(
-                        span,
-                        "cannot use Option/Result value in bitwise operations without unwrapping; \
-                         use `match` or `?` to extract the value".to_string(),
-                    );
-                }
-
                 if !l.is_numeric() || !r.is_numeric() {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "bitwise operator requires integer operands, \
-                             but got `{lt}` and `{rt}`. \
-                             Bitwise operations (`&`, `|`, `^`, `<<`, `>>`) are only \
-                             defined for integer types such as `i32`, `u32`, `i64`, `u64`. \
-                             If you want element-wise boolean logic, use `&&` / `||` on \
-                             `bool` values instead.",
-                            lt = l.display(),
-                            rt = r.display()
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            span,
+                            format!(
+                                "bitwise operator requires integer operands, \
+                                 but got `{lt}` and `{rt}`. \
+                                 Bitwise operations (`&`, `|`, `^`, `<<`, `>>`) are only \
+                                 defined for integer types such as `i32`, `u32`, `i64`, `u64`. \
+                                 If you want element-wise boolean logic, use `&&` / `||` on \
+                                 `bool` values instead.",
+                                lt = l.display(),
+                                rt = r.display()
+                            ),
+                        )
+                        .with_code("E2004"),
                     );
                 }
                 l
@@ -2562,17 +2178,20 @@ impl TypeCk {
         // mat × mat
         if let (Ty::Mat { size: ls }, Ty::Mat { size: rs }) = (&l, &r) {
             if ls != rs {
-                self.diag.error(
-                    span,
-                    format!(
-                        "matrix multiply: size mismatch — `{lt}` @ `{rt}`. \
-                         Square matrix multiplication requires both matrices to have \
-                         the same size (e.g. `mat3 @ mat3`). \
-                         Did you mean to use a `mat{r}` on the left?",
-                        lt = l.display(),
-                        rt = r.display(),
-                        r = rs.lanes()
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "matrix multiply: size mismatch — `{lt}` @ `{rt}`. \
+                             Square matrix multiplication requires both matrices to have \
+                             the same size (e.g. `mat3 @ mat3`). \
+                             Did you mean to use a `mat{r}` on the left?",
+                            lt = l.display(),
+                            rt = r.display(),
+                            r = rs.lanes()
+                        ),
+                    )
+                    .with_code("E2014"),
                 );
             }
             return Ty::Mat { size: *ls };
@@ -2581,16 +2200,19 @@ impl TypeCk {
         // mat × vec
         if let (Ty::Mat { size: ms }, Ty::Vec { size: vs, .. }) = (&l, &r) {
             if ms != vs {
-                self.diag.error(
-                    span,
-                    format!(
-                        "matrix–vector multiply: size mismatch — `{lt}` @ `{rt}`. \
-                         An N×N matrix can only multiply an N-component vector. \
-                         Use `mat{mv}` with a `vec{mv}` (or vice versa).",
-                        lt = l.display(),
-                        rt = r.display(),
-                        mv = ms.lanes()
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "matrix–vector multiply: size mismatch — `{lt}` @ `{rt}`. \
+                             An N×N matrix can only multiply an N-component vector. \
+                             Use `mat{mv}` with a `vec{mv}` (or vice versa).",
+                            lt = l.display(),
+                            rt = r.display(),
+                            mv = ms.lanes()
+                        ),
+                    )
+                    .with_code("E2014"),
                 );
             }
             return Ty::Vec {
@@ -2612,30 +2234,36 @@ impl TypeCk {
         ) = (&l, &r)
         {
             if ea != eb {
-                self.diag.error(
-                    span,
-                    format!(
-                        "matrix multiply (`@`) requires both tensors to have the same element type, \
-                         but left is `tensor<{lelem}>` and right is `tensor<{relem}>`. \
-                         Cast one operand: e.g. `A.cast::<{relem}>() @ B`.",
-                        lelem = format!("{:?}", ea).to_lowercase(),
-                        relem = format!("{:?}", eb).to_lowercase()
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "matrix multiply (`@`) requires both tensors to have the same element type, \
+                             but left is `tensor<{lelem}>` and right is `tensor<{relem}>`. \
+                             Cast one operand: e.g. `A.cast::<{relem}>() @ B`.",
+                            lelem = format!("{:?}", ea).to_lowercase(),
+                            relem = format!("{:?}", eb).to_lowercase()
+                        ),
+                    )
+                    .with_code("E2015"),
                 );
             }
             // Require at least 2-D tensors.
             if sa.len() < 2 || sb.len() < 2 {
-                self.diag.error(
-                    span,
-                    format!(
-                        "matrix multiply (`@`) requires at least 2-D tensors, \
-                         but got rank-{la} `{lt}` and rank-{rb} `{rt}`. \
-                         Use `.unsqueeze(0)` to promote a 1-D tensor to 2-D before multiplying.",
-                        la = sa.len(),
-                        lt = l.display(),
-                        rb = sb.len(),
-                        rt = r.display()
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "matrix multiply (`@`) requires at least 2-D tensors, \
+                             but got rank-{la} `{lt}` and rank-{rb} `{rt}`. \
+                             Use `.unsqueeze(0)` to promote a 1-D tensor to 2-D before multiplying.",
+                            la = sa.len(),
+                            lt = l.display(),
+                            rb = sb.len(),
+                            rt = r.display()
+                        ),
+                    )
+                    .with_code("E2016"),
                 );
                 return self.infer.fresh();
             }
@@ -2644,17 +2272,20 @@ impl TypeCk {
             let k_r = &sb[sb.len() - 2];
             if let (Dim::Lit(kl), Dim::Lit(kr)) = (k_l, k_r) {
                 if kl != kr {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "matrix multiply shape mismatch: \
-                             the inner (contracting) dimension of the left operand is {kl} \
-                             but the corresponding dimension of the right operand is {kr}. \
-                             For `A[M, K] @ B[K, N]` the K dimensions must be equal. \
-                             Transpose one operand (`.transpose()`) if the shapes are swapped.",
-                            kl = kl,
-                            kr = kr
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            span,
+                            format!(
+                                "matrix multiply shape mismatch: \
+                                 the inner (contracting) dimension of the left operand is {kl} \
+                                 but the corresponding dimension of the right operand is {kr}. \
+                                 For `A[M, K] @ B[K, N]` the K dimensions must be equal. \
+                                 Transpose one operand (`.transpose()`) if the shapes are swapped.",
+                                kl = kl,
+                                kr = kr
+                            ),
+                        )
+                        .with_code("E2014"),
                     );
                 }
             }
@@ -2663,16 +2294,19 @@ impl TypeCk {
             let batch_a = &sa[..sa.len() - 2];
             let batch_b = &sb[..sb.len() - 2];
             if batch_a != batch_b {
-                self.diag.error(
-                    span,
-                    format!(
-                        "matrix multiply batch shape mismatch: `{}` @ `{}`. \
-                         Left batch dims {:?} do not match right batch dims {:?}.",
-                        l.display(),
-                        r.display(),
-                        batch_a,
-                        batch_b
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "matrix multiply batch shape mismatch: `{}` @ `{}`. \
+                             Left batch dims {:?} do not match right batch dims {:?}.",
+                            l.display(),
+                            r.display(),
+                            batch_a,
+                            batch_b
+                        ),
+                    )
+                    .with_code("E2014"),
                 );
             }
 
@@ -2685,16 +2319,20 @@ impl TypeCk {
             };
         }
 
-        self.diag.error(
-            span,
-            format!(
-                "`@` (matrix multiply) requires tensor or matrix operands, \
-                 but got `{lt}` and `{rt}`. \
-                 Valid forms: `tensor<E>[M,K] @ tensor<E>[K,N]`, `mat3 @ mat3`, `mat3 @ vec3`. \
-                 If you want element-wise multiplication use `.*` instead.",
-                lt = l.display(),
-                rt = r.display()
-            ),
+        self.diag.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "`@` (matrix multiply) requires tensor or matrix operands, \
+                     but got `{lt}` and `{rt}`. \
+                     Valid forms: `tensor<E>[M,K] @ tensor<E>[K,N]`, `mat3 @ mat3`, `mat3 @ vec3`. \
+                     If you want element-wise multiplication use `.*` instead.",
+                    lt = l.display(),
+                    rt = r.display()
+                ),
+            )
+            .with_code("E2017")
+            .with_hint("these operators only work on tensor types"),
         );
         self.infer.fresh()
     }
@@ -2706,15 +2344,19 @@ impl TypeCk {
         let r = self.check_expr(rhs, env);
 
         if !l.supports_hadamard() || !r.supports_hadamard() {
-            self.diag.error(
-                span,
-                format!(
-                    "Hadamard operator (`.*` / `./`) requires tensor or vector operands on both sides, \
-                     but got `{lt}` and `{rt}`. \
-                     If you want element-wise scalar arithmetic, use the plain `*` operator. \
-                     Wrap scalars in a tensor or broadcast them explicitly if needed.",
-                    lt = l.display(), rt = r.display()
-                ),
+            self.diag.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "Hadamard operator (`.*` / `./`) requires tensor or vector operands on both sides, \
+                         but got `{lt}` and `{rt}`. \
+                         If you want element-wise scalar arithmetic, use the plain `*` operator. \
+                         Wrap scalars in a tensor or broadcast them explicitly if needed.",
+                        lt = l.display(), rt = r.display()
+                    ),
+                )
+                .with_code("E2017")
+                .with_hint("these operators only work on tensor types"),
             );
             return self.infer.fresh();
         }
@@ -2732,15 +2374,18 @@ impl TypeCk {
         ) = (&l, &r)
         {
             if ea != eb {
-                self.diag.error(
-                    span,
-                    format!(
-                        "Hadamard `.*`/`./` element type mismatch: left is `{lt}` but right is `{rt}`. \
-                         Both tensors must share the same element type. \
-                         Use `.cast::<{lelem}>()` to convert the right operand.",
-                        lt = l.display(), rt = r.display(),
-                        lelem = format!("{:?}", ea).to_lowercase()
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "Hadamard `.*`/`./` element type mismatch: left is `{lt}` but right is `{rt}`. \
+                             Both tensors must share the same element type. \
+                             Use `.cast::<{lelem}>()` to convert the right operand.",
+                            lt = l.display(), rt = r.display(),
+                            lelem = format!("{:?}", ea).to_lowercase()
+                        ),
+                    )
+                    .with_code("E2015"),
                 );
                 return self.infer.fresh();
             }
@@ -2754,18 +2399,21 @@ impl TypeCk {
                     }
                 }
                 None => {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "cannot broadcast tensor shapes `{lt}` and `{rt}` for `.*`/`./`. \
-                             NumPy-style broadcasting requires each dimension pair (aligned from \
-                             the right) to be equal, or one of them to be exactly 1. \
-                             For example, `[3, 1]` broadcasts with `[1, 4]` → `[3, 4]`, \
-                             but `[3, 2]` and `[2, 3]` are incompatible. \
-                             Reshape one operand to make the shapes broadcastable.",
-                            lt = l.display(),
-                            rt = r.display()
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            span,
+                            format!(
+                                "cannot broadcast tensor shapes `{lt}` and `{rt}` for `.*`/`./`. \
+                                 NumPy-style broadcasting requires each dimension pair (aligned from \
+                                 the right) to be equal, or one of them to be exactly 1. \
+                                 For example, `[3, 1]` broadcasts with `[1, 4]` → `[3, 4]`, \
+                                 but `[3, 2]` and `[2, 3]` are incompatible. \
+                                 Reshape one operand to make the shapes broadcastable.",
+                                lt = l.display(),
+                                rt = r.display()
+                            ),
+                        )
+                        .with_code("E2014"),
                     );
                     return self.infer.fresh();
                 }
@@ -2773,14 +2421,17 @@ impl TypeCk {
         }
 
         if !self.infer.unify(&l, &r) {
-            self.diag.error(
-                span,
-                format!(
-                    "Hadamard `.*`/`./` operand mismatch: left is `{lt}` and right is `{rt}`. \
-                     Both operands must be the same type or broadcastable tensor shapes.",
-                    lt = l.display(),
-                    rt = r.display()
-                ),
+            self.diag.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "Hadamard `.*`/`./` operand mismatch: left is `{lt}` and right is `{rt}`. \
+                         Both operands must be the same type or broadcastable tensor shapes.",
+                        lt = l.display(),
+                        rt = r.display()
+                    ),
+                )
+                .with_code("E2004"),
             );
         }
         l
@@ -2805,23 +2456,29 @@ impl TypeCk {
         ) = (&l, &r)
         {
             if ea != eb {
-                self.diag.error(
-                    span,
-                    format!(
-                        "tensor concat `++`: element type mismatch \
-                     (`tensor<{:?}>` ++ `tensor<{:?}>`)",
-                        ea, eb
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "tensor concat `++`: element type mismatch \
+                         (`tensor<{:?}>` ++ `tensor<{:?}>`)",
+                            ea, eb
+                        ),
+                    )
+                    .with_code("E2015"),
                 );
             }
             if sa.len() != sb.len() {
-                self.diag.error(
-                    span,
-                    format!(
-                        "tensor concat `++`: rank mismatch ({} vs {})",
-                        sa.len(),
-                        sb.len()
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "tensor concat `++`: rank mismatch ({} vs {})",
+                            sa.len(),
+                            sb.len()
+                        ),
+                    )
+                    .with_code("E2016"),
                 );
                 return self.infer.fresh();
             }
@@ -2829,14 +2486,17 @@ impl TypeCk {
             for (i, (da, db)) in sa[1..].iter().zip(sb[1..].iter()).enumerate() {
                 if let (Dim::Lit(a), Dim::Lit(b)) = (da, db) {
                     if a != b {
-                        self.diag.error(
-                            span,
-                            format!(
-                                "tensor concat `++`: dimension {} mismatch ({} vs {})",
-                                i + 1,
-                                a,
-                                b
-                            ),
+                        self.diag.push(
+                            Diagnostic::error(
+                                span,
+                                format!(
+                                    "tensor concat `++`: dimension {} mismatch ({} vs {})",
+                                    i + 1,
+                                    a,
+                                    b
+                                ),
+                            )
+                            .with_code("E2014"),
                         );
                     }
                 }
@@ -2854,13 +2514,17 @@ impl TypeCk {
             };
         }
 
-        self.diag.error(
-            span,
-            format!(
-                "`++` (tensor concat) requires tensor operands; got `{}` and `{}`",
-                l.display(),
-                r.display()
-            ),
+        self.diag.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "`++` (tensor concat) requires tensor operands; got `{}` and `{}`",
+                    l.display(),
+                    r.display()
+                ),
+            )
+            .with_code("E2017")
+            .with_hint("these operators only work on tensor types"),
         );
         self.infer.fresh()
     }
@@ -2888,7 +2552,9 @@ impl TypeCk {
                         ty.clone()
                     } else {
                         self.diag
-                            .error(span, format!("`{}` has no field `{}`", name, field));
+                            .push(Diagnostic::error(span, format!("`{}` has no field `{}`", name, field))
+                            .with_code("E2008")
+                            .with_hint(format!("check the available fields on type `{}`", name)));
                         self.infer.fresh()
                     }
                 } else {
@@ -2922,14 +2588,20 @@ impl TypeCk {
                             family: *family,
                         },
                         _ => {
-                            self.diag.error(span, "swizzle exceeds 4 components");
+                            self.diag.push(
+                                Diagnostic::error(span, "swizzle exceeds 4 components")
+                                .with_code("E2023"),
+                            );
                             self.infer.fresh()
                         }
                     }
                 } else {
-                    self.diag.error(
-                        span,
-                        format!("`{}` has no field `{}`", resolved.display(), field),
+                    self.diag.push(
+                        Diagnostic::error(
+                            span,
+                            format!("`{}` has no field `{}`", resolved.display(), field),
+                        )
+                        .with_code("E2023"),
                     );
                     self.infer.fresh()
                 }
@@ -2941,7 +2613,8 @@ impl TypeCk {
                     Ty::Scalar(ElemType::F32)
                 } else {
                     self.diag
-                        .error(span, format!("`quat` has no field `{}`", field));
+                        .push(Diagnostic::error(span, format!("`quat` has no field `{}`", field))
+                        .with_code("E2008"));
                     self.infer.fresh()
                 }
             }
@@ -2952,23 +2625,31 @@ impl TypeCk {
                     if idx < ts.len() {
                         ts[idx].clone()
                     } else {
-                        self.diag.error(
-                            span,
-                            format!("tuple index {} out of range (len {})", idx, ts.len()),
+                        self.diag.push(
+                            Diagnostic::error(
+                                span,
+                                format!("tuple index {} out of range (len {})", idx, ts.len()),
+                            )
+                            .with_code("E2007"),
                         );
                         self.infer.fresh()
                     }
                 } else {
                     self.diag
-                        .error(span, format!("invalid tuple field `{}`", field));
+                        .push(Diagnostic::error(span, format!("invalid tuple field `{}`", field))
+                        .with_code("E2008"));
                     self.infer.fresh()
                 }
             }
 
             _ => {
-                self.diag.error(
-                    span,
-                    format!("type `{}` has no field `{}`", resolved.display(), field),
+                self.diag.push(
+                    Diagnostic::error(
+                        span,
+                        format!("type `{}` has no field `{}`", resolved.display(), field),
+                    )
+                    .with_code("E2008")
+                    .with_hint(format!("check the available fields on type `{}`", resolved.display())),
                 );
                 self.infer.fresh()
             }
@@ -2996,40 +2677,32 @@ impl TypeCk {
         match &func_ty {
             Ty::FnPtr { params, ret } => {
                 if params.len() != arg_tys.len() {
-                    self.diag.error(
-                        span,
-                        format!(
-                            "function expects {} argument(s), {} provided",
-                            params.len(),
-                            arg_tys.len()
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            span,
+                            format!(
+                                "function expects {} argument(s), {} provided",
+                                params.len(),
+                                arg_tys.len()
+                            ),
+                        )
+                        .with_code("E2011"),
                     );
                 }
                 for (i, (expected, actual)) in params.iter().zip(arg_tys.iter()).enumerate() {
-                    // Clone resolved types to avoid borrow conflicts with self.infer
-                    let resolved_expected = self.infer.resolve(expected).clone();
-                    let resolved_actual = self.infer.resolve(actual).clone();
-                    let can_widen = self.can_widen_ints(&resolved_actual, &resolved_expected);
-                    if !self.infer.unify(expected, actual) && !can_widen {
-                        let mut msg = format!(
-                            "argument {} type mismatch: expected `{}`, got `{}`",
-                            i + 1,
-                            resolved_expected.display(),
-                            resolved_actual.display()
+                    if !self.infer.unify(expected, actual) {
+                        self.diag.push(
+                            Diagnostic::error(
+                                span,
+                                format!(
+                                    "argument {} type mismatch: expected `{}`, got `{}`",
+                                    i + 1,
+                                    expected.display(),
+                                    actual.display()
+                                ),
+                            )
+                            .with_code("E2012"),
                         );
-                        // Suggest literal suffix for integer widening
-                        if let (Ty::Scalar(exp_elem), Ty::Scalar(act_elem)) = (&resolved_expected, &resolved_actual) {
-                            if self.can_widen_elem(act_elem, exp_elem) {
-                                msg.push_str(&format!(
-                                    "; try adding a suffix like `5{}`",
-                                    format!("{:?}", exp_elem).to_lowercase()
-                                ));
-                            }
-                        }
-                        self.diag.error(span, msg);
-                    } else if can_widen {
-                        // Widening is possible — unify by substituting the wider type
-                        self.infer.unify(expected, &resolved_expected);
                     }
                 }
                 *ret.clone()
@@ -3039,36 +2712,36 @@ impl TypeCk {
                 if let Expr::Ident { name, .. } = func {
                     if let Some(fi) = self.symbols.fns.get(name.as_str()).cloned() {
                         if fi.params.len() != arg_tys.len() {
-                            self.diag.error(
-                                span,
-                                format!(
-                                    "function `{}` expects {} argument(s), {} provided",
-                                    name,
-                                    fi.params.len(),
-                                    arg_tys.len()
-                                ),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    span,
+                                    format!(
+                                        "function `{}` expects {} argument(s), {} provided",
+                                        name,
+                                        fi.params.len(),
+                                        arg_tys.len()
+                                    ),
+                                )
+                                .with_code("E2011"),
                             );
                         }
                         for (i, ((_, expected), actual)) in
                             fi.params.iter().zip(arg_tys.iter()).enumerate()
                         {
-                            if !self.infer.unify(expected, actual) && !self.can_widen_ints(actual, expected) {
-                                let mut msg = format!(
-                                    "argument {} to `{}`: expected `{}`, got `{}`",
-                                    i + 1,
-                                    name,
-                                    expected.display(),
-                                    actual.display()
+                            if !self.infer.unify(expected, actual) {
+                                self.diag.push(
+                                    Diagnostic::error(
+                                        span,
+                                        format!(
+                                            "argument {} to `{}`: expected `{}`, got `{}`",
+                                            i + 1,
+                                            name,
+                                            expected.display(),
+                                            actual.display()
+                                        ),
+                                    )
+                                    .with_code("E2012"),
                                 );
-                                if let (Ty::Scalar(exp_elem), Ty::Scalar(act_elem)) = (expected, actual) {
-                                    if self.can_widen_elem(act_elem, exp_elem) {
-                                        msg.push_str(&format!(
-                                            "; try a suffix like `5{}`",
-                                            format!("{:?}", exp_elem).to_lowercase()
-                                        ));
-                                    }
-                                }
-                                self.diag.error(span, msg);
                             }
                         }
                         return fi.ret.clone();
@@ -3093,7 +2766,9 @@ impl TypeCk {
                     }
                     // Unknown function — emit error, return fresh var.
                     self.diag
-                        .error(span, format!("call to undeclared function `{}`", name));
+                        .push(Diagnostic::error(span, format!("call to undeclared function `{}`", name))
+                        .with_code("E2010")
+                        .with_hint("make sure you are calling a function, not a value of another type"));
                 } else if let Expr::Path { segments, .. } = func {
                     if Self::is_runtime_builtin_path_segments(segments) {
                         if let Some(ty) =
@@ -3105,11 +2780,17 @@ impl TypeCk {
                     }
                     let fq = segments.join("::");
                     self.diag
-                        .error(span, format!("call to undeclared function `{}`", fq));
+                        .push(Diagnostic::error(span, format!("call to undeclared function `{}`", fq))
+                        .with_code("E2010")
+                        .with_hint("make sure you are calling a function, not a value of another type"));
                 } else {
-                    self.diag.error(
-                        span,
-                        format!("expression of type `{}` is not callable", func_ty.display()),
+                    self.diag.push(
+                        Diagnostic::error(
+                            span,
+                            format!("expression of type `{}` is not callable", func_ty.display()),
+                        )
+                        .with_code("E2010")
+                        .with_hint("make sure you are calling a function, not a value of another type"),
                     );
                 }
                 self.infer.fresh()
@@ -3132,7 +2813,10 @@ impl TypeCk {
         match (&recv_ty, method) {
             (Ty::Tensor { elem, shape }, "transpose") => {
                 if shape.len() < 2 {
-                    self.diag.error(span, "`transpose()` requires a 2-D tensor");
+                    self.diag.push(
+                        Diagnostic::error(span, "`transpose()` requires a 2-D tensor")
+                        .with_code("E2016"),
+                    );
                     return recv_ty;
                 }
                 let mut new_shape = shape.clone();
@@ -3237,19 +2921,21 @@ impl TypeCk {
                     .map(|e| self.check_expr(e, env))
                     .unwrap_or_else(|| self.infer.fresh());
 
-                if !self.infer.unify(&declared, &init_ty) && !self.can_widen_ints(&init_ty, &declared) {
-                    self.diag.error(
-                        *span,
-                        format!(
-                            "type mismatch in `let`: declared `{}`, initialiser is `{}`",
-                            declared.display(),
-                            init_ty.display()
-                        ),
+                if !self.infer.unify(&declared, &init_ty) {
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!(
+                                "type mismatch in `let`: declared `{}`, initialiser is `{}`",
+                                declared.display(),
+                                init_ty.display()
+                            ),
+                        )
+                        .with_code("E2004"),
                     );
                 }
 
                 // Bind pattern names.
-                // When widening applies, use the declared (wider) type.
                 self.bind_pattern(pattern, &declared, env);
             }
 
@@ -3295,9 +2981,13 @@ impl TypeCk {
                 // Validate component names in the query.
                 for comp in query.with.iter().chain(query.without.iter()) {
                     if !self.symbols.structs.contains_key(comp.as_str()) {
-                        self.diag.error(
-                            *span,
-                            format!("entity query references unknown component `{}`", comp),
+                        self.diag.push(
+                            Diagnostic::error(
+                                *span,
+                                format!("entity query references unknown component `{}`", comp),
+                            )
+                            .with_code("E2002")
+                            .with_hint("declare it before use with `struct Name { ... }` or check for a spelling mistake"),
                         );
                     }
                 }
@@ -3305,7 +2995,8 @@ impl TypeCk {
                     let ft = self.check_expr(f, env);
                     if !matches!(ft, Ty::Bool) {
                         self.diag
-                            .error(*span, "entity query filter must be a `bool` expression");
+                            .push(Diagnostic::error(*span, "entity query filter must be a `bool` expression")
+                            .with_code("E2004"));
                     }
                 }
                 env.push_scope();
@@ -3323,9 +3014,12 @@ impl TypeCk {
             } => {
                 let ct = self.check_expr(cond, env);
                 if !matches!(ct, Ty::Bool) {
-                    self.diag.error(
-                        cond.span(),
-                        format!("`while` condition must be `bool`, got `{}`", ct.display()),
+                    self.diag.push(
+                        Diagnostic::error(
+                            cond.span(),
+                            format!("`while` condition must be `bool`, got `{}`", ct.display()),
+                        )
+                        .with_code("E2004"),
                     );
                 }
                 self.check_block(body, env);
@@ -3344,9 +3038,12 @@ impl TypeCk {
             } => {
                 let ct = self.check_expr(cond, env);
                 if !matches!(ct, Ty::Bool) {
-                    self.diag.error(
-                        *span,
-                        format!("`if` condition must be `bool`, got `{}`", ct.display()),
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!("`if` condition must be `bool`, got `{}`", ct.display()),
+                        )
+                        .with_code("E2004"),
                     );
                 }
                 self.check_block(then, env);
@@ -3373,19 +3070,25 @@ impl TypeCk {
                     if let Some(g) = &arm.guard {
                         let gt = self.check_expr(g, env);
                         if !matches!(gt, Ty::Bool) {
-                            self.diag.error(arm.span, "match guard must be `bool`");
+                            self.diag.push(
+                                Diagnostic::error(arm.span, "match guard must be `bool`")
+                                .with_code("E2004"),
+                            );
                         }
                     }
                     let bt = self.check_expr(&arm.body, env);
                     if let Some(ref prev) = arm_ty {
                         if !self.infer.unify(prev, &bt) {
-                            self.diag.error(
-                                arm.span,
-                                format!(
-                                    "match arm type `{}` is incompatible with `{}`",
-                                    bt.display(),
-                                    prev.display()
-                                ),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    arm.span,
+                                    format!(
+                                        "match arm type `{}` is incompatible with `{}`",
+                                        bt.display(),
+                                        prev.display()
+                                    ),
+                                )
+                                .with_code("E2004"),
                             );
                         }
                     } else {
@@ -3426,25 +3129,31 @@ impl TypeCk {
                 self.check_block(&ab.body, env);
             }
 
-            // ── Jules v2 statements ────────────────────────────────────────
-            Stmt::Effect { body, .. } => {
+            // ── v2: effect / region / task / unsafe / intrinsics / constraints ──
+            Stmt::Effect { body, span: _, .. } => {
                 self.check_block(body, env);
             }
-            Stmt::Region { body, .. } => {
+            Stmt::Region { body, span: _, .. } => {
                 self.check_block(body, env);
             }
-            Stmt::TaskSpawn { task_expr, .. } => {
-                self.check_expr(task_expr, env);
+            Stmt::TaskSpawn { name, task_expr, span } => {
+                let task_ty = self.check_expr(task_expr, env);
+                env.bind(name.clone(), task_ty);
             }
-            Stmt::TaskJoin { .. } => {}
+            Stmt::TaskJoin { name, span } => {
+                // `join x` — look up the task binding; no type to produce.
+                let _ = env.lookup(name);
+            }
             Stmt::UnsafeBlock { body, .. } => {
                 self.check_block(body, env);
             }
-            Stmt::IntrinsicsBlock { .. } => {}
-            Stmt::Requires { condition, .. } => {
+            Stmt::IntrinsicsBlock { span: _, .. } => {
+                // Intrinsic declarations don't produce types in the current scope.
+            }
+            Stmt::Requires { condition, span: _ } => {
                 self.check_expr(condition, env);
             }
-            Stmt::Ensures { condition, .. } => {
+            Stmt::Ensures { condition, span: _ } => {
                 self.check_expr(condition, env);
             }
         }
@@ -3461,13 +3170,16 @@ impl TypeCk {
             Pattern::Tuple { elems, span } => {
                 if let Ty::Tuple(ts) = ty {
                     if ts.len() != elems.len() {
-                        self.diag.error(
-                            *span,
-                            format!(
-                                "tuple pattern has {} elements but type has {}",
-                                elems.len(),
-                                ts.len()
-                            ),
+                        self.diag.push(
+                            Diagnostic::error(
+                                *span,
+                                format!(
+                                    "tuple pattern has {} elements but type has {}",
+                                    elems.len(),
+                                    ts.len()
+                                ),
+                            )
+                            .with_code("E2004"),
                         );
                     }
                     for (p, t) in elems.iter().zip(ts.iter()) {
@@ -3512,14 +3224,17 @@ impl TypeCk {
 
     fn expect_ty(&mut self, expected: &Ty, actual: &Ty, span: Span, ctx: &str) {
         if !self.infer.unify(expected, actual) {
-            self.diag.error(
-                span,
-                format!(
-                    "type mismatch in {}: expected `{}`, got `{}`",
-                    ctx,
-                    expected.display(),
-                    actual.display()
-                ),
+            self.diag.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "type mismatch in {}: expected `{}`, got `{}`",
+                        ctx,
+                        expected.display(),
+                        actual.display()
+                    ),
+                )
+                .with_code("E2004"),
             );
         }
     }
@@ -3533,9 +3248,12 @@ impl TypeCk {
         for layer in &m.layers {
             if let ModelLayer::Dropout { span, rate } = layer {
                 if *rate < 0.0 || *rate >= 1.0 {
-                    self.diag.error(
-                        *span,
-                        format!("dropout rate {} is out of range [0.0, 1.0)", rate),
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            format!("dropout rate {} is out of range [0.0, 1.0)", rate),
+                        )
+                        .with_code("E2024"),
                     );
                 }
             }
@@ -3546,9 +3264,12 @@ impl TypeCk {
             } = layer
             {
                 if *num_heads == 0 || *head_dim == 0 {
-                    self.diag.error(
-                        *span,
-                        "attention layer must have num_heads > 0 and head_dim > 0",
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            "attention layer must have num_heads > 0 and head_dim > 0",
+                        )
+                        .with_code("E2024"),
                     );
                 }
             }
@@ -3559,9 +3280,12 @@ impl TypeCk {
             } = layer
             {
                 if *vocab_size == 0 || *embed_dim == 0 {
-                    self.diag.error(
-                        *span,
-                        "embed layer must have vocab_size > 0 and embed_dim > 0",
+                    self.diag.push(
+                        Diagnostic::error(
+                            *span,
+                            "embed layer must have vocab_size > 0 and embed_dim > 0",
+                        )
+                        .with_code("E2024"),
                     );
                 }
             }
@@ -3577,12 +3301,18 @@ impl TypeCk {
                 ModelLayer::Dense { span, units, .. } => {
                     current_width = Some(*units);
                     if *units == 0 {
-                        self.diag.error(*span, "dense layer must have units > 0");
+                        self.diag.push(
+                            Diagnostic::error(*span, "dense layer must have units > 0")
+                            .with_code("E2024"),
+                        );
                     }
                 }
                 ModelLayer::Output { span, units, .. } => {
                     if *units == 0 {
-                        self.diag.error(*span, "output layer must have units > 0");
+                        self.diag.push(
+                            Diagnostic::error(*span, "output layer must have units > 0")
+                            .with_code("E2024"),
+                        );
                     }
                     current_width = Some(*units);
                 }
@@ -3593,7 +3323,10 @@ impl TypeCk {
                     ..
                 } => {
                     if *size_h == 0 || *size_w == 0 {
-                        self.diag.error(*span, "pool size must be > 0");
+                        self.diag.push(
+                            Diagnostic::error(*span, "pool size must be > 0")
+                            .with_code("E2024"),
+                        );
                     }
                 }
                 ModelLayer::Conv2d {
@@ -3604,17 +3337,23 @@ impl TypeCk {
                     ..
                 } => {
                     if *filters == 0 || *kernel_h == 0 || *kernel_w == 0 {
-                        self.diag.error(
-                            *span,
-                            "conv layer must have filters > 0 and kernel size > 0",
+                        self.diag.push(
+                            Diagnostic::error(
+                                *span,
+                                "conv layer must have filters > 0 and kernel size > 0",
+                            )
+                            .with_code("E2024"),
                         );
                     }
                 }
                 ModelLayer::SubModel { span, name } => {
                     if !self.symbols.models.contains_key(name.as_str()) {
-                        self.diag.error(
-                            *span,
-                            format!("model layer references unknown model `{}`", name),
+                        self.diag.push(
+                            Diagnostic::error(
+                                *span,
+                                format!("model layer references unknown model `{}`", name),
+                            )
+                            .with_code("E2024"),
                         );
                     }
                 }
@@ -3625,10 +3364,13 @@ impl TypeCk {
 
         // Warn if trainable model has no @grad attribute.
         if !m.is_trainable() && m.optimizer.is_some() {
-            self.diag.warning(
-                m.span,
-                "model has an optimizer but no `@grad` attribute; \
-                 gradients will not be tracked",
+            self.diag.push(
+                Diagnostic::warning(
+                    m.span,
+                    "model has an optimizer but no `@grad` attribute; \
+                     gradients will not be tracked",
+                )
+                .with_code("E2024"),
             );
         }
     }
@@ -3640,18 +3382,24 @@ impl TypeCk {
     fn check_train(&mut self, t: &TrainDecl) {
         // Verify the agent exists.
         if !self.symbols.agents.contains_key(&t.agent) {
-            self.diag.error(
-                t.span,
-                format!("`train` references unknown agent `{}`", t.agent),
+            self.diag.push(
+                Diagnostic::error(
+                    t.span,
+                    format!("`train` references unknown agent `{}`", t.agent),
+                )
+                .with_code("E2025"),
             );
         }
 
         // Verify the model exists (if specified).
         if let Some(model_name) = &t.model {
             if !self.symbols.models.contains_key(model_name.as_str()) {
-                self.diag.error(
-                    t.span,
-                    format!("`train` references unknown model `{}`", model_name),
+                self.diag.push(
+                    Diagnostic::error(
+                        t.span,
+                        format!("`train` references unknown model `{}`", model_name),
+                    )
+                    .with_code("E2025"),
                 );
             }
         }
@@ -3659,15 +3407,18 @@ impl TypeCk {
         // Signal weights should be non-negative.
         for sig in &t.signals {
             if sig.weight < 0.0 {
-                self.diag.error(
-                    sig.span,
-                    format!(
-                        "{} signal `{}` has negative weight {}; \
-                     use a `penalty` with a positive weight for negative reinforcement",
-                        if sig.is_reward { "reward" } else { "penalty" },
-                        sig.name,
-                        sig.weight
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        sig.span,
+                        format!(
+                            "{} signal `{}` has negative weight {}; \
+                         use a `penalty` with a positive weight for negative reinforcement",
+                            if sig.is_reward { "reward" } else { "penalty" },
+                            sig.name,
+                            sig.weight
+                        ),
+                    )
+                    .with_code("E2025"),
                 );
             }
             // Check expression if present.
@@ -3675,14 +3426,17 @@ impl TypeCk {
                 let mut env = TyEnv::new();
                 let ty = self.check_expr(e, &mut env);
                 if !ty.is_float_scalar() {
-                    self.diag.warning(
-                        e.span(),
-                        format!(
-                            "signal expression for `{}` should produce a scalar float; \
-                         got `{}`",
-                            sig.name,
-                            ty.display()
-                        ),
+                    self.diag.push(
+                        Diagnostic::warning(
+                            e.span(),
+                            format!(
+                                "signal expression for `{}` should produce a scalar float; \
+                                 got `{}`",
+                                sig.name,
+                                ty.display()
+                            ),
+                        )
+                        .with_code("E2025"),
                     );
                 }
             }
@@ -3694,12 +3448,15 @@ impl TypeCk {
                 let mut env = TyEnv::new();
                 let ty = self.check_expr(cond, &mut env);
                 if !matches!(ty, Ty::Bool) {
-                    self.diag.error(
-                        cond.span(),
-                        format!(
-                            "episode `done_condition` must be `bool`, got `{}`",
-                            ty.display()
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            cond.span(),
+                            format!(
+                                "episode `done_condition` must be `bool`, got `{}`",
+                                ty.display()
+                            ),
+                        )
+                        .with_code("E2025"),
                     );
                 }
             }
@@ -3710,13 +3467,16 @@ impl TypeCk {
         for (name, expr) in &t.hyper {
             let ty = self.check_expr(expr, &mut env);
             if !ty.is_float_scalar() && !matches!(ty, Ty::Scalar(_)) {
-                self.diag.warning(
-                    expr.span(),
-                    format!(
-                        "hyper-parameter `{}` value should be a scalar; got `{}`",
-                        name,
-                        ty.display()
-                    ),
+                self.diag.push(
+                    Diagnostic::warning(
+                        expr.span(),
+                        format!(
+                            "hyper-parameter `{}` value should be a scalar; got `{}`",
+                            name,
+                            ty.display()
+                        ),
+                    )
+                    .with_code("E2025"),
                 );
             }
         }
@@ -3741,36 +3501,46 @@ impl TypeCk {
             match &ls.kind {
                 crate::compiler::ast::LearningKind::Reinforcement | crate::compiler::ast::LearningKind::Imitation => {
                     if ls.policy_model.is_none() {
-                        self.diag.warning(
-                            ls.span,
-                            format!(
-                                "agent `{}` uses {:?} learning but has no `policy_model`; \
-                             a model must be referenced in a `train` block",
-                                a.name, ls.kind
-                            ),
+                        self.diag.push(
+                            Diagnostic::warning(
+                                ls.span,
+                                format!(
+                                    "agent `{}` uses {:?} learning but has no `policy_model`; \
+                                     a model must be referenced in a `train` block",
+                                    a.name, ls.kind
+                                ),
+                            )
+                            .with_code("E2025"),
                         );
                     } else if let Some(pm) = &ls.policy_model {
                         if !self.symbols.models.contains_key(pm.as_str()) {
-                            self.diag.error(
-                                ls.span,
-                                format!(
-                                    "agent `{}` references unknown policy model `{}`",
-                                    a.name, pm
-                                ),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    ls.span,
+                                    format!(
+                                        "agent `{}` references unknown policy model `{}`",
+                                        a.name, pm
+                                    ),
+                                )
+                                .with_code("E2024"),
                             );
                         }
                     }
                     if let Some(lr) = ls.learning_rate {
                         if lr <= 0.0 {
                             self.diag
-                                .error(ls.span, format!("learning rate must be > 0, got {}", lr));
+                                .push(Diagnostic::error(ls.span, format!("learning rate must be > 0, got {}", lr))
+                                .with_code("E2024"));
                         }
                     }
                     if let Some(g) = ls.gamma {
                         if !(0.0..=1.0).contains(&g) {
-                            self.diag.error(
-                                ls.span,
-                                format!("discount factor γ must be in [0, 1], got {}", g),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    ls.span,
+                                    format!("discount factor γ must be in [0, 1], got {}", g),
+                                )
+                                .with_code("E2024"),
                             );
                         }
                     }
@@ -3803,14 +3573,17 @@ impl TypeCk {
             env.bind("self", Ty::Struct(a.name.clone()));
             let ty = self.check_expr(&goal.utility, &mut env);
             if !ty.is_float_scalar() {
-                self.diag.error(
-                    goal.utility.span(),
-                    format!(
-                        "goal `{}` utility expression should return a float scalar \
-                     (representing priority in [0, 1]); got `{}`",
-                        goal.name,
-                        ty.display()
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        goal.utility.span(),
+                        format!(
+                            "goal `{}` utility expression should return a float scalar \
+                             (representing priority in [0, 1]); got `{}`",
+                            goal.name,
+                            ty.display()
+                        ),
+                    )
+                    .with_code("E2024"),
                 );
             }
         }
@@ -3818,7 +3591,8 @@ impl TypeCk {
         // Warn if there are no behaviours.
         if a.behaviors.is_empty() {
             self.diag
-                .warning(a.span, format!("agent `{}` declares no behaviours", a.name));
+                .push(Diagnostic::warning(a.span, format!("agent `{}` declares no behaviours", a.name))
+                .with_code("E2024"));
         }
     }
 
@@ -3838,16 +3612,20 @@ impl TypeCk {
             if let Some(crate::compiler::ast::Expr::StrLit { value, span }) = args.first() {
                 if let Err(e) = self.validate_architecture_string(value) {
                     self.diag
-                        .error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e));
+                        .push(Diagnostic::error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e))
+                        .with_code("E2024"));
                     return None;
                 }
                 // Basic validation succeeded.
                 return Some(());
             } else {
-                self.diag.error(a.span, format!(
-                    "@{} decorator requires a string literal argument (e.g., @{}(\"256->512->10\"))",
-                    decorator_name.to_uppercase(), decorator_name.to_uppercase()
-                ));
+                self.diag.push(
+                    Diagnostic::error(a.span, format!(
+                        "@{} decorator requires a string literal argument (e.g., @{}(\"256->512->10\"))",
+                        decorator_name.to_uppercase(), decorator_name.to_uppercase()
+                    ))
+                    .with_code("E2024"),
+                );
                 return None;
             }
         }
@@ -3884,7 +3662,10 @@ impl TypeCk {
         if let Some(first) = args.first() {
             if let crate::compiler::ast::Expr::StrLit { value, span } = first {
                 if let Err(e) = self.validate_architecture_string(value) {
-                    self.diag.error(*span, format!("@{}: {}", dec, e));
+                    self.diag.push(
+                        Diagnostic::error(*span, format!("@{}: {}", dec, e))
+                        .with_code("E2024"),
+                    );
                 }
             }
         }
@@ -3900,12 +3681,18 @@ impl TypeCk {
                     "network" => {
                         if let crate::compiler::ast::Expr::StrLit { value: arch, span } = &**value {
                             if let Err(e) = self.validate_architecture_string(arch) {
-                                self.diag.error(*span, format!("@{} network: {}", dec, e));
+                                self.diag.push(
+                                    Diagnostic::error(*span, format!("@{} network: {}", dec, e))
+                                    .with_code("E2024"),
+                                );
                             }
                         } else {
-                            self.diag.error(
-                                value.span(),
-                                format!("@{} `network` must be a string architecture", dec),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    value.span(),
+                                    format!("@{} `network` must be a string architecture", dec),
+                                )
+                                .with_code("E2024"),
                             );
                         }
                     }
@@ -3913,54 +3700,72 @@ impl TypeCk {
                         has_learning_rate = true;
                         if let Some(v) = self.ai_number_literal(value) {
                             if v <= 0.0 {
-                                self.diag.error(
-                                    value.span(),
-                                    format!("@{} learning rate must be > 0", dec),
+                                self.diag.push(
+                                    Diagnostic::error(
+                                        value.span(),
+                                        format!("@{} learning rate must be > 0", dec),
+                                    )
+                                    .with_code("E2024"),
                                 );
                             }
                         } else {
-                            self.diag.error(
-                                value.span(),
-                                format!("@{} learning rate must be numeric", dec),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    value.span(),
+                                    format!("@{} learning rate must be numeric", dec),
+                                )
+                                .with_code("E2024"),
                             );
                         }
                     }
                     "gamma" => {
                         if let Some(v) = self.ai_number_literal(value) {
                             if !(0.0..=1.0).contains(&v) {
-                                self.diag.error(
-                                    value.span(),
-                                    format!("@{} gamma must be in [0, 1]", dec),
+                                self.diag.push(
+                                    Diagnostic::error(
+                                        value.span(),
+                                        format!("@{} gamma must be in [0, 1]", dec),
+                                    )
+                                    .with_code("E2024"),
                                 );
                             }
                         } else {
                             self.diag
-                                .error(value.span(), format!("@{} gamma must be numeric", dec));
+                                .push(Diagnostic::error(value.span(), format!("@{} gamma must be numeric", dec))
+                                .with_code("E2024"));
                         }
                     }
                     "lambda" => {
                         if let Some(v) = self.ai_number_literal(value) {
                             if !(0.0..=1.0).contains(&v) {
-                                self.diag.error(
-                                    value.span(),
-                                    format!("@{} lambda must be in [0, 1]", dec),
+                                self.diag.push(
+                                    Diagnostic::error(
+                                        value.span(),
+                                        format!("@{} lambda must be in [0, 1]", dec),
+                                    )
+                                    .with_code("E2024"),
                                 );
                             }
                         } else {
                             self.diag
-                                .error(value.span(), format!("@{} lambda must be numeric", dec));
+                                .push(Diagnostic::error(value.span(), format!("@{} lambda must be numeric", dec))
+                                .with_code("E2024"));
                         }
                     }
                     "input" | "output" => {
                         if let Some(v) = self.ai_u64_literal(value) {
                             if v == 0 {
                                 self.diag
-                                    .error(value.span(), format!("@{} `{}` must be > 0", dec, key));
+                                    .push(Diagnostic::error(value.span(), format!("@{} `{}` must be > 0", dec, key))
+                                    .with_code("E2024"));
                             }
                         } else {
-                            self.diag.error(
-                                value.span(),
-                                format!("@{} `{}` must be an integer", dec, key),
+                            self.diag.push(
+                                Diagnostic::error(
+                                    value.span(),
+                                    format!("@{} `{}` must be an integer", dec, key),
+                                )
+                                .with_code("E2024"),
                             );
                         }
                     }
@@ -3970,9 +3775,12 @@ impl TypeCk {
         }
 
         if dec == "PPO" && !has_learning_rate {
-            self.diag.error(
-                a.span,
-                "@PPO requires `learning_rate` (or `lr`)".to_string(),
+            self.diag.push(
+                Diagnostic::error(
+                    a.span,
+                    "@PPO requires `learning_rate` (or `lr`)".to_string(),
+                )
+                .with_code("E2024"),
             );
         }
 
@@ -4267,7 +4075,6 @@ mod tests {
         Expr::IntLit {
             span: dummy(),
             value: v,
-            ty: None,
         }
     }
     fn bool_lit(v: bool) -> Expr {
@@ -4821,7 +4628,6 @@ mod tests {
                     value: Box::new(Expr::IntLit {
                         span: dummy(),
                         value: 128,
-                        ty: None,
                     }),
                 },
                 Expr::Assign {
@@ -4834,7 +4640,6 @@ mod tests {
                     value: Box::new(Expr::IntLit {
                         span: dummy(),
                         value: 32,
-                        ty: None,
                     }),
                 },
             ],
@@ -5076,7 +4881,6 @@ mod tests {
                     Expr::IntLit {
                         span: dummy(),
                         value: 4,
-                        ty: None,
                     },
                 ),
                 assign_kv(
@@ -5084,7 +4888,6 @@ mod tests {
                     Expr::IntLit {
                         span: dummy(),
                         value: 64,
-                        ty: None,
                     },
                 ),
                 assign_kv(
@@ -5153,9 +4956,6 @@ mod tests {
                 tail: None,
             }),
             is_async: false,
-            requires: vec![],
-            ensures: vec![],
-            effect: None,
         };
 
         let program = Program {
@@ -5173,7 +4973,7 @@ mod tests {
                 span,
                 name: "clamp".into(),
             }),
-            args: vec![Expr::IntLit { span, value: 42, ty: None }],
+            args: vec![Expr::IntLit { span, value: 42 }],
             named: vec![],
         };
 
@@ -5201,7 +5001,7 @@ mod tests {
                 span,
                 segments: vec!["window".into(), "open".into()],
             }),
-            args: vec![Expr::IntLit { span, value: 1, ty: None }],
+            args: vec![Expr::IntLit { span, value: 1 }],
             named: vec![],
         };
 
@@ -5274,308 +5074,5 @@ mod tests {
                 ..
             }
         ));
-    }
-}
-
-// =============================================================================
-// POST-TYPECK ANNOTATION PASS
-// =============================================================================
-
-/// Walk a `Program` and annotate every `Expr::IntLit` with its resolved
-/// `ElemType`.  This runs **after** type checking so the interpreter and
-/// bytecode VM know the correct integer width without guessing.
-///
-/// Rules:
-/// - Default to `I64` as the safe default (matches the `Int` prelude type).
-///   This eliminates the `u128 → i32` truncation bug that caused Collatz-200 → 0.
-/// - If a context-specific type can be inferred from a type annotation or
-///   variable declaration, that takes precedence.
-///
-/// This pass must run after the type checker has validated the program.
-pub fn annotate_int_widths(program: &mut Program) {
-    for item in &mut program.items {
-        annotate_item(item);
-    }
-}
-
-fn annotate_item(item: &mut Item) {
-    match item {
-        Item::Fn(f) => {
-            for param in &mut f.params {
-                if let Some(d) = &mut param.default {
-                    annotate_expr_with_hint(d, param.ty.as_ref().and_then(ty_to_elem));
-                }
-            }
-            if let Some(body) = &mut f.body {
-                annotate_block(body);
-            }
-        }
-        Item::System(s) => {
-            annotate_block(&mut s.body);
-        }
-        Item::Const(c) => {
-            annotate_expr_with_hint(&mut c.value, ty_to_elem(&c.ty));
-        }
-        Item::Mod {
-            items: Some(inner), ..
-        } => {
-            for i in inner {
-                annotate_item(i);
-            }
-        }
-        Item::Agent(a) => {
-            for rule in &mut a.behaviors {
-                for param in &mut rule.params {
-                    if let Some(d) = &mut param.default {
-                        annotate_expr_with_hint(d, param.ty.as_ref().and_then(ty_to_elem));
-                    }
-                }
-                annotate_block(&mut rule.body);
-            }
-            for goal in &mut a.goals {
-                // GoalDecl may contain expressions; walk them if present.
-                let _ = goal;
-            }
-        }
-        Item::Train(t) => {
-            for (_key, expr) in &mut t.hyper {
-                annotate_expr_with_default(expr, ElemType::I64);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn annotate_block(block: &mut Block) {
-    for stmt in &mut block.stmts {
-        annotate_stmt(stmt);
-    }
-    if let Some(tail) = &mut block.tail {
-        annotate_expr_with_default(tail, ElemType::I64);
-    }
-}
-
-fn annotate_stmt(stmt: &mut Stmt) {
-    match stmt {
-        Stmt::Let { init, .. } => {
-            if let Some(e) = init {
-                annotate_expr_with_default(e, ElemType::I64);
-            }
-        }
-        Stmt::Expr { expr, .. } => annotate_expr_with_default(expr, ElemType::I64),
-        Stmt::Return { value, .. } => {
-            if let Some(e) = value {
-                annotate_expr_with_default(e, ElemType::I64);
-            }
-        }
-        Stmt::Break { value, .. } => {
-            if let Some(e) = value {
-                annotate_expr_with_default(e, ElemType::I64);
-            }
-        }
-        Stmt::Continue { .. } => {}
-        Stmt::ForIn { iter, body, .. } => {
-            annotate_expr_with_default(iter, ElemType::I64);
-            annotate_block(body);
-        }
-        Stmt::EntityFor { query, body, .. } => {
-            if let Some(filter) = &mut query.filter {
-                annotate_expr_with_default(filter, ElemType::I64);
-            }
-            annotate_block(body);
-        }
-        Stmt::While { cond, body, .. } => {
-            annotate_expr_with_default(cond, ElemType::I64);
-            annotate_block(body);
-        }
-        Stmt::Loop { body, .. } => annotate_block(body),
-        Stmt::If {
-            cond, then, else_, ..
-        } => {
-            annotate_expr_with_default(cond, ElemType::I64);
-            annotate_block(then);
-            if let Some(e) = else_ {
-                match &mut **e {
-                    crate::compiler::ast::IfOrBlock::If(s) => annotate_stmt(s),
-                    crate::compiler::ast::IfOrBlock::Block(b) => annotate_block(b),
-                }
-            }
-        }
-        Stmt::Match { expr, arms, .. } => {
-            annotate_expr_with_default(expr, ElemType::I64);
-            for arm in arms {
-                if let Some(g) = &mut arm.guard {
-                    annotate_expr_with_default(g, ElemType::I64);
-                }
-                annotate_expr_with_default(&mut arm.body, ElemType::I64);
-            }
-        }
-        Stmt::Item(inner) => annotate_item(inner),
-        Stmt::ParallelFor(pf) => {
-            annotate_expr_with_default(&mut pf.iter, ElemType::I64);
-            annotate_block(&mut pf.body);
-        }
-        Stmt::Spawn(sb) => {
-            annotate_block(&mut sb.body);
-        }
-        Stmt::Sync(sb) => {
-            annotate_block(&mut sb.body);
-        }
-        Stmt::Atomic(ab) => {
-            annotate_block(&mut ab.body);
-        }
-        Stmt::Effect { body, .. } => annotate_block(body),
-        Stmt::Region { body, .. } => annotate_block(body),
-        Stmt::TaskSpawn { task_expr, .. } => {
-            annotate_expr_with_default(task_expr, ElemType::I64);
-        }
-        Stmt::TaskJoin { .. } => {}
-        Stmt::UnsafeBlock { body, .. } => annotate_block(body),
-        Stmt::IntrinsicsBlock { .. } => {}
-        Stmt::Requires { condition, .. } => {
-            annotate_expr_with_default(condition, ElemType::I64);
-        }
-        Stmt::Ensures { condition, .. } => {
-            annotate_expr_with_default(condition, ElemType::I64);
-        }
-    }
-}
-
-/// Annotate an expression with its default integer width.
-/// Only touches `Expr::IntLit` nodes that don't already have a type annotation.
-fn annotate_expr_with_default(expr: &mut Expr, default: ElemType) {
-    match expr {
-        Expr::IntLit { ty, .. } => {
-            if ty.is_none() {
-                *ty = Some(default);
-            }
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            annotate_expr_with_default(lhs, default.clone());
-            annotate_expr_with_default(rhs, default);
-        }
-        Expr::UnOp { expr: inner, .. } => annotate_expr_with_default(inner, default),
-        Expr::Assign { target, value, .. } => {
-            annotate_expr_with_default(target, default.clone());
-            annotate_expr_with_default(value, default);
-        }
-        Expr::Field { object, .. } => annotate_expr_with_default(object, default),
-        Expr::Index {
-            object, indices, ..
-        } => {
-            annotate_expr_with_default(object, default.clone());
-            for idx in indices {
-                annotate_expr_with_default(idx, default.clone());
-            }
-        }
-        Expr::Call {
-            func, args, named, ..
-        } => {
-            annotate_expr_with_default(func, default.clone());
-            for a in args {
-                annotate_expr_with_default(a, default.clone());
-            }
-            for (_name, val) in named {
-                annotate_expr_with_default(val, default.clone());
-            }
-        }
-        Expr::MethodCall {
-            receiver, args, ..
-        } => {
-            annotate_expr_with_default(receiver, default.clone());
-            for a in args {
-                annotate_expr_with_default(a, default.clone());
-            }
-        }
-        Expr::MatMul { lhs, rhs, .. }
-        | Expr::HadamardMul { lhs, rhs, .. }
-        | Expr::HadamardDiv { lhs, rhs, .. }
-        | Expr::TensorConcat { lhs, rhs, .. }
-        | Expr::KronProd { lhs, rhs, .. }
-        | Expr::OuterProd { lhs, rhs, .. } => {
-            annotate_expr_with_default(lhs, default.clone());
-            annotate_expr_with_default(rhs, default);
-        }
-        Expr::Grad { inner, .. } => annotate_expr_with_default(inner, default),
-        Expr::Pow { base, exp, .. } => {
-            annotate_expr_with_default(base, default.clone());
-            annotate_expr_with_default(exp, default);
-        }
-        Expr::Range { lo, hi, .. } => {
-            if let Some(l) = lo {
-                annotate_expr_with_default(l, default.clone());
-            }
-            if let Some(h) = hi {
-                annotate_expr_with_default(h, default);
-            }
-        }
-        Expr::Cast { expr: inner, .. } => annotate_expr_with_default(inner, default),
-        Expr::IfExpr {
-            cond, then, else_, ..
-        } => {
-            annotate_expr_with_default(cond, default.clone());
-            annotate_block(then);
-            if let Some(b) = else_ {
-                annotate_block(b);
-            }
-        }
-        Expr::Closure {
-            params, body, ..
-        } => {
-            for param in params {
-                if let Some(d) = &mut param.default {
-                    annotate_expr_with_default(d, default.clone());
-                }
-            }
-            annotate_expr_with_default(body, default);
-        }
-        Expr::Block(b) => {
-            annotate_block(b);
-        }
-        Expr::Tuple { elems, .. } => {
-            for e in elems {
-                annotate_expr_with_default(e, default.clone());
-            }
-        }
-        Expr::StructLit { fields, .. } => {
-            for (_name, val) in fields {
-                annotate_expr_with_default(val, default.clone());
-            }
-        }
-        Expr::ArrayLit { elems, .. } | Expr::VecCtor { elems, .. } => {
-            for e in elems {
-                annotate_expr_with_default(e, default.clone());
-            }
-        }
-        Expr::Pipeline { stages, .. } => {
-            for s in stages {
-                annotate_expr_with_default(s, default.clone());
-            }
-        }
-        Expr::Emit { value, .. } => annotate_expr_with_default(value, default),
-        Expr::Copy { inner, .. } => annotate_expr_with_default(inner, default),
-        // Leaf expressions with no sub-expressions to walk.
-        Expr::FloatLit { .. }
-        | Expr::BoolLit { .. }
-        | Expr::StrLit { .. }
-        | Expr::Ident { .. }
-        | Expr::Path { .. } => {}
-    }
-}
-
-/// Annotate with a specific type hint from a type annotation (e.g. `let x: i32 = 42`).
-fn annotate_expr_with_hint(expr: &mut Expr, hint: Option<ElemType>) {
-    if let Some(elem) = hint {
-        annotate_expr_with_default(expr, elem);
-    } else {
-        annotate_expr_with_default(expr, ElemType::I64);
-    }
-}
-
-/// Try to extract an `ElemType` from an AST `Type`.
-fn ty_to_elem(ty: &Type) -> Option<ElemType> {
-    match ty {
-        Type::Scalar(e) => Some(e.clone()),
-        _ => None,
     }
 }

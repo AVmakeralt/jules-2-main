@@ -31,6 +31,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 return Some(Err(RuntimeError {
                     span: Some(Span::dummy()),
                     message: "sieve_210::prime_count(limit): limit must be >= 0".into(),
+                    code: "E9999",
                 }));
             }
             let count = sieve_210_wheel(limit as u64);
@@ -42,6 +43,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 return Some(Err(RuntimeError {
                     span: Some(Span::dummy()),
                     message: "sieve_210::naive_prime_count(limit): limit must be >= 0".into(),
+                    code: "E9999",
                 }));
             }
             let count = naive_sieve(limit as u64);

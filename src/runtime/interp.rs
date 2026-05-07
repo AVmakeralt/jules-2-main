@@ -3885,6 +3885,7 @@ pub fn vm_exec_i32(
             return Some(Err(RuntimeError {
                 message: format!($($arg)*),
                 span: None,
+                code: "E9999",
             }));
         }};
     }
@@ -3933,6 +3934,7 @@ pub fn vm_exec_i32(
                             return Some(Err(RuntimeError {
                                 message: "division by zero".into(),
                                 span: None,
+                                code: "E9999",
                             }));
                         }
                         a.wrapping_div(b)
@@ -3942,6 +3944,7 @@ pub fn vm_exec_i32(
                             return Some(Err(RuntimeError {
                                 message: "modulo by zero".into(),
                                 span: None,
+                                code: "E9999",
                             }));
                         }
                         a.wrapping_rem(b)
@@ -4080,6 +4083,9 @@ fn vm_unop(op: UnOpKind, v: Value) -> Result<Value, RuntimeError> {
 pub struct RuntimeError {
     pub message: String,
     pub span: Option<Span>,
+    /// Error code (e.g. "E9001") from the error_codes module.
+    /// Defaults to "E9999" (unknown runtime error) if not explicitly set.
+    pub code: &'static str,
 }
 
 impl RuntimeError {
@@ -4088,12 +4094,40 @@ impl RuntimeError {
         RuntimeError {
             message: msg.into(),
             span: None,
+            code: "E9999",
         }
     }
+
+    /// Create a runtime error with a specific error code.
+    pub fn with_code(msg: impl Into<String>, code: &'static str) -> Self {
+        RuntimeError {
+            message: msg.into(),
+            span: None,
+            code,
+        }
+    }
+
+    /// Set the error code on this runtime error.
+    pub fn code(mut self, code: &'static str) -> Self {
+        self.code = code;
+        self
+    }
+
     pub fn at(mut self, span: Span) -> Self {
         self.span = Some(span);
         self
     }
+}
+
+/// Helper macro for creating a RuntimeError with a specific code.
+#[macro_export]
+macro_rules! runtime_error {
+    ($code:expr, $fmt:literal $(, $arg:expr)*) => {
+        $crate::interp::RuntimeError::with_code(format!($fmt $(, $arg)*), $code)
+    };
+    ($fmt:literal $(, $arg:expr)*) => {
+        $crate::interp::RuntimeError::new(format!($fmt $(, $arg)*))
+    };
 }
 
 impl fmt::Display for RuntimeError {
@@ -8224,6 +8258,7 @@ impl Interpreter {
                     Err(RuntimeError {
                         message: format!("unknown std function: {}", name),
                         span: None,
+                        code: "E9999",
                     })
                 })
             }
@@ -8237,6 +8272,7 @@ impl Interpreter {
                 args.into_iter().next().ok_or_else(|| RuntimeError {
                     message: "fused_elementwise() requires exactly 1 argument".into(),
                     span: None,
+                    code: "E9999",
                 })
             }
             "exact_div_restore" => {
@@ -8244,6 +8280,7 @@ impl Interpreter {
                 args.into_iter().next().ok_or_else(|| RuntimeError {
                     message: "exact_div_restore() requires exactly 1 argument".into(),
                     span: None,
+                    code: "E9999",
                 })
             }
             "matmul_elemwise" => {
@@ -8252,6 +8289,7 @@ impl Interpreter {
                 args.into_iter().next().ok_or_else(|| RuntimeError {
                     message: "matmul_elemwise() requires at least 1 argument".into(),
                     span: None,
+                    code: "E9999",
                 })
             }
             "scaled_matmul" => {
@@ -8259,6 +8297,7 @@ impl Interpreter {
                 args.into_iter().next().ok_or_else(|| RuntimeError {
                     message: "scaled_matmul() requires at least 1 argument".into(),
                     span: None,
+                    code: "E9999",
                 })
             }
 
@@ -8266,6 +8305,7 @@ impl Interpreter {
             _ => Err(RuntimeError {
                 message: format!("unknown function: {}", name),
                 span: None,
+                code: "E9999",
             }),
         }
     }

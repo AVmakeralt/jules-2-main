@@ -102,6 +102,10 @@ pub struct Diagnostic {
     pub message: String,
     /// Secondary labels pointing at related source locations.
     pub labels: Vec<(Span, String)>,
+    /// Error code (e.g. "E3001") from the error_codes module.
+    pub code: Option<&'static str>,
+    /// Suggested fix hint (optional, displayed as `help:` in the renderer).
+    pub hint: Option<String>,
 }
 
 impl Diagnostic {
@@ -111,6 +115,8 @@ impl Diagnostic {
             span,
             message: msg.into(),
             labels: vec![],
+            code: None,
+            hint: None,
         }
     }
     pub fn warning(span: Span, msg: impl Into<String>) -> Self {
@@ -119,6 +125,8 @@ impl Diagnostic {
             span,
             message: msg.into(),
             labels: vec![],
+            code: None,
+            hint: None,
         }
     }
     pub fn note(span: Span, msg: impl Into<String>) -> Self {
@@ -127,11 +135,23 @@ impl Diagnostic {
             span,
             message: msg.into(),
             labels: vec![],
+            code: None,
+            hint: None,
         }
     }
     /// Attach a secondary label to a different source location.
     pub fn with_label(mut self, span: Span, msg: impl Into<String>) -> Self {
         self.labels.push((span, msg.into()));
+        self
+    }
+    /// Attach an error code (e.g. `"E3001"`).
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+    /// Attach a suggested fix hint.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
         self
     }
     pub fn is_fatal(&self) -> bool {
@@ -555,18 +575,26 @@ impl SemaCtx {
 
     fn pop_scope(&mut self) {
         for (name, binding) in self.scopes.pop() {
-            self.warn(
-                binding.span,
-                format!("unused variable `{}`; prefix with `_` to suppress", name),
+            self.diag.push(
+                Diagnostic::warning(
+                    binding.span,
+                    format!("unused variable `{}`; prefix with `_` to suppress", name),
+                )
+                .with_code("E3001")
+                .with_hint(format!("prefix `{}` with `_` (e.g. `let _{} = …`) or use it", name, name)),
             );
         }
     }
 
     fn declare_var(&mut self, name: &str, span: Span, mutable: bool) {
         if self.warn_shadow && self.scopes.is_outer_name(name) {
-            self.warn(
-                span,
-                format!("binding `{}` shadows an outer variable", name),
+            self.diag.push(
+                Diagnostic::warning(
+                    span,
+                    format!("binding `{}` shadows an outer variable", name),
+                )
+                .with_code("E3002")
+                .with_hint(format!("rename this binding to avoid confusion, or use the outer `{}` directly", name)),
             );
         }
         let wildcard = name == "_" || name.starts_with('_');
@@ -740,14 +768,18 @@ impl SemaCtx {
         if has_parallel_attr {
             if let Some(q) = &s.explicit_query {
                 if q.with.is_empty() {
-                    self.warn(
-                        s.span,
-                        format!(
-                            "system `{}` is annotated for parallel execution but has \
-                         an unconstrained query (`with` is empty); \
-                         this may process more entities than intended",
-                            s.name
-                        ),
+                    self.diag.push(
+                        Diagnostic::warning(
+                            s.span,
+                            format!(
+                                "system `{}` is annotated for parallel execution but has \
+                             an unconstrained query (`with` is empty); \
+                             this may process more entities than intended",
+                                s.name
+                            ),
+                        )
+                        .with_code("E3006")
+                        .with_hint("add at least one component to `with(…)` to constrain the query"),
                     );
                 }
             }
@@ -785,13 +817,17 @@ impl SemaCtx {
         // All component names must be declared.
         for comp in q.with.iter().chain(q.without.iter()) {
             if !self.components.contains(comp.as_str()) {
-                self.err(
-                    q.span,
-                    format!(
-                        "query references component `{}` which has not been declared \
-                     with the `component` keyword",
-                        comp
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        q.span,
+                        format!(
+                            "query references component `{}` which has not been declared \
+                         with the `component` keyword",
+                            comp
+                        ),
+                    )
+                    .with_code("E3003")
+                    .with_hint(format!("declare `component {} {{ … }}` or check the spelling", comp)),
                 );
             }
             // Mark it used so the unused-decl check doesn't fire.
@@ -804,23 +840,31 @@ impl SemaCtx {
 
         for comp in &q.with {
             if !seen_with.insert(comp.as_str()) {
-                self.err(
-                    q.span,
-                    format!(
-                        "component `{}` appears more than once in `with(…)` clause",
-                        comp
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        q.span,
+                        format!(
+                            "component `{}` appears more than once in `with(…)` clause",
+                            comp
+                        ),
+                    )
+                    .with_code("E3004")
+                    .with_hint("remove the duplicate component from the `with` clause"),
                 );
             }
         }
         for comp in &q.without {
             if !seen_without.insert(comp.as_str()) {
-                self.err(
-                    q.span,
-                    format!(
-                        "component `{}` appears more than once in `without(…)` clause",
-                        comp
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        q.span,
+                        format!(
+                            "component `{}` appears more than once in `without(…)` clause",
+                            comp
+                        ),
+                    )
+                    .with_code("E3004")
+                    .with_hint("remove the duplicate component from the `without` clause"),
                 );
             }
         }
@@ -828,12 +872,16 @@ impl SemaCtx {
         // A component cannot be in both `with` and `without`.
         for comp in &q.with {
             if q.without.contains(comp) {
-                self.err(
-                    q.span,
-                    format!(
-                        "component `{}` appears in both `with(…)` and `without(…)`",
-                        comp
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        q.span,
+                        format!(
+                            "component `{}` appears in both `with(…)` and `without(…)`",
+                            comp
+                        ),
+                    )
+                    .with_code("E3005")
+                    .with_hint("a component cannot be both required and excluded; remove it from one clause"),
                 );
             }
         }
@@ -862,7 +910,9 @@ impl SemaCtx {
                         .with_label(
                             *span_b,
                             format!("system `{}` also accesses `{}`", name_b, comp),
-                        ),
+                        )
+                        .with_code("E3007")
+                        .with_hint("add `@seq` to one system or restructure to avoid concurrent access to the same component"),
                     );
                 }
             }
@@ -878,12 +928,16 @@ impl SemaCtx {
         let mut seen: FxHashSet<&str> = FxHashSet::default();
         for field in &c.fields {
             if !seen.insert(field.name.as_str()) {
-                self.err(
-                    field.span,
-                    format!(
-                        "field `{}` is declared more than once in component `{}`",
-                        field.name, c.name
-                    ),
+                self.diag.push(
+                    Diagnostic::error(
+                        field.span,
+                        format!(
+                            "field `{}` is declared more than once in component `{}`",
+                            field.name, c.name
+                        ),
+                    )
+                    .with_code("E3008")
+                    .with_hint("rename or remove the duplicate field"),
                 );
             }
         }
@@ -899,12 +953,16 @@ impl SemaCtx {
 
         // §4a  At least one behaviour.
         if a.behaviors.is_empty() {
-            self.warn(
-                a.span,
-                format!(
-                    "agent `{}` declares no behaviours; it will never act",
-                    a.name
-                ),
+            self.diag.push(
+                Diagnostic::warning(
+                    a.span,
+                    format!(
+                        "agent `{}` declares no behaviours; it will never act",
+                        a.name
+                    ),
+                )
+                .with_code("E3009")
+                .with_hint("add at least one `behavior` block to the agent"),
             );
         }
 
@@ -914,13 +972,17 @@ impl SemaCtx {
             for rule in &a.behaviors {
                 let prio = rule.priority.0;
                 if let Some(prev) = seen_prio.insert(prio, rule.name.as_str()) {
-                    self.err(
-                        rule.span,
-                        format!(
-                            "behaviour `{}` and `{}` share the same priority {} \
-                         in agent `{}`; priorities must be unique",
-                            rule.name, prev, prio, a.name
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            rule.span,
+                            format!(
+                                "behaviour `{}` and `{}` share the same priority {} \
+                             in agent `{}`; priorities must be unique",
+                                rule.name, prev, prio, a.name
+                            ),
+                        )
+                        .with_code("E3010")
+                        .with_hint("assign a unique priority to each behaviour"),
                     );
                 }
             }
@@ -932,12 +994,16 @@ impl SemaCtx {
             for perc in &a.perceptions {
                 let duplicate = seen_kinds.iter().any(|k| perception_kind_eq(k, &perc.kind));
                 if duplicate {
-                    self.err(
-                        perc.span,
-                        format!(
-                            "agent `{}` declares the same perception kind more than once",
-                            a.name
-                        ),
+                    self.diag.push(
+                        Diagnostic::error(
+                            perc.span,
+                            format!(
+                                "agent `{}` declares the same perception kind more than once",
+                                a.name
+                            ),
+                        )
+                        .with_code("E3011")
+                        .with_hint("remove the duplicate perception declaration or change its kind"),
                     );
                 } else {
                     seen_kinds.push(&perc.kind);
@@ -950,10 +1016,18 @@ impl SemaCtx {
             use crate::compiler::ast::MemoryCapacity;
             match &mem.capacity {
                 Some(MemoryCapacity::Slots(0)) => {
-                    self.err(mem.span, "memory `slots` capacity must be greater than 0");
+                    self.diag.push(
+                        Diagnostic::error(mem.span, "memory `slots` capacity must be greater than 0")
+                            .with_code("E3012")
+                            .with_hint("set `slots` to a positive integer"),
+                    );
                 }
                 Some(MemoryCapacity::Duration { seconds }) if *seconds <= 0.0 => {
-                    self.err(mem.span, "memory retention duration must be > 0 seconds");
+                    self.diag.push(
+                        Diagnostic::error(mem.span, "memory retention duration must be > 0 seconds")
+                            .with_code("E3012")
+                            .with_hint("set `duration` to a positive number of seconds"),
+                    );
                 }
                 _ => {}
             }
@@ -963,17 +1037,25 @@ impl SemaCtx {
         if let Some(ls) = &a.learning {
             if let Some(lr) = ls.learning_rate {
                 if lr <= 0.0 || lr.is_nan() {
-                    self.err(
-                        ls.span,
-                        format!("learning_rate must be a positive finite number; got {}", lr),
+                    self.diag.push(
+                        Diagnostic::error(
+                            ls.span,
+                            format!("learning_rate must be a positive finite number; got {}", lr),
+                        )
+                        .with_code("E3013")
+                        .with_hint("use a value such as 0.001 or 0.01"),
                     );
                 }
             }
             if let Some(g) = ls.gamma {
                 if !(0.0..=1.0).contains(&g) {
-                    self.err(
-                        ls.span,
-                        format!("discount factor γ must be in [0, 1]; got {}", g),
+                    self.diag.push(
+                        Diagnostic::error(
+                            ls.span,
+                            format!("discount factor γ must be in [0, 1]; got {}", g),
+                        )
+                        .with_code("E3014")
+                        .with_hint("use a value between 0.0 and 1.0, typically 0.99 or 0.95"),
                     );
                 }
             }
@@ -1015,14 +1097,18 @@ impl SemaCtx {
         // Goal utility expressions must not produce side effects.
         // We approximate this by checking for assignments and calls.
         if expr_has_side_effects(&goal.utility) {
-            self.warn(
-                goal.utility.span(),
-                format!(
-                    "goal `{}` utility expression in agent `{}` appears to have \
-                 side effects (contains assignment or call); \
-                 utility expressions should be pure",
-                    goal.name, agent.name
-                ),
+            self.diag.push(
+                Diagnostic::warning(
+                    goal.utility.span(),
+                    format!(
+                        "goal `{}` utility expression in agent `{}` appears to have \
+                     side effects (contains assignment or call); \
+                     utility expressions should be pure",
+                        goal.name, agent.name
+                    ),
+                )
+                .with_code("E3015")
+                .with_hint("remove assignments and calls from the utility expression; use pure arithmetic only"),
             );
         }
 
@@ -1051,59 +1137,83 @@ impl SemaCtx {
             .count();
 
         if input_count == 0 {
-            self.err(
-                m.span,
-                format!(
-                    "model `{}` has no `input` layer; every model must declare an input shape",
-                    m.name
-                ),
+            self.diag.push(
+                Diagnostic::error(
+                    m.span,
+                    format!(
+                        "model `{}` has no `input` layer; every model must declare an input shape",
+                        m.name
+                    ),
+                )
+                .with_code("E3016")
+                .with_hint("add an `input` layer as the first layer of the model"),
             );
         } else if input_count > 1 {
-            self.err(
-                m.span,
-                format!(
-                    "model `{}` declares {} `input` layers; only one is allowed",
-                    m.name, input_count
-                ),
+            self.diag.push(
+                Diagnostic::error(
+                    m.span,
+                    format!(
+                        "model `{}` declares {} `input` layers; only one is allowed",
+                        m.name, input_count
+                    ),
+                )
+                .with_code("E3016")
+                .with_hint("remove the extra `input` layers; a model must have exactly one"),
             );
         }
 
         if output_count == 0 {
-            self.err(
-                m.span,
-                format!(
-                    "model `{}` has no `output` layer; every model must declare an output shape",
-                    m.name
-                ),
+            self.diag.push(
+                Diagnostic::error(
+                    m.span,
+                    format!(
+                        "model `{}` has no `output` layer; every model must declare an output shape",
+                        m.name
+                    ),
+                )
+                .with_code("E3016")
+                .with_hint("add an `output` layer as the last layer of the model"),
             );
         } else if output_count > 1 {
-            self.err(
-                m.span,
-                format!(
-                    "model `{}` declares {} `output` layers; only one is allowed",
-                    m.name, output_count
-                ),
+            self.diag.push(
+                Diagnostic::error(
+                    m.span,
+                    format!(
+                        "model `{}` declares {} `output` layers; only one is allowed",
+                        m.name, output_count
+                    ),
+                )
+                .with_code("E3016")
+                .with_hint("remove the extra `output` layers; a model must have exactly one"),
             );
         }
 
         // §5b  `input` must be the first layer, `output` the last.
         if let Some(first) = m.layers.first() {
             if !matches!(first, ModelLayer::Input { .. }) {
-                self.err(
-                    first.span(),
-                    format!("first layer of model `{}` should be `input`", m.name),
+                self.diag.push(
+                    Diagnostic::error(
+                        first.span(),
+                        format!("first layer of model `{}` should be `input`", m.name),
+                    )
+                    .with_code("E3016")
+                    .with_hint("move the `input` layer to the beginning of the model"),
                 );
             }
         }
         if let Some(last) = m.layers.last() {
             if !matches!(last, ModelLayer::Output { .. }) {
-                self.warn(
-                    last.span(),
-                    format!(
-                        "last layer of model `{}` is not an `output` layer; \
-                     the model output shape will be implicit",
-                        m.name
-                    ),
+                self.diag.push(
+                    Diagnostic::warning(
+                        last.span(),
+                        format!(
+                            "last layer of model `{}` is not an `output` layer; \
+                         the model output shape will be implicit",
+                            m.name
+                        ),
+                    )
+                    .with_code("E3016")
+                    .with_hint("add an `output` layer at the end of the model"),
                 );
             }
         }
@@ -1115,13 +1225,17 @@ impl SemaCtx {
             if Some(kind) == prev_kind
                 && !matches!(layer, ModelLayer::Dense { .. } | ModelLayer::Conv2d { .. })
             {
-                self.warn(
-                    layer.span(),
-                    format!(
-                        "model `{}` has adjacent duplicate `{}` layers; \
-                     is this intentional?",
-                        m.name, kind
-                    ),
+                self.diag.push(
+                    Diagnostic::warning(
+                        layer.span(),
+                        format!(
+                            "model `{}` has adjacent duplicate `{}` layers; \
+                         is this intentional?",
+                            m.name, kind
+                        ),
+                    )
+                    .with_code("E3016")
+                    .with_hint("if intentional, add a comment; otherwise remove the duplicate layer"),
                 );
             }
             prev_kind = Some(kind);
@@ -1236,13 +1350,17 @@ impl SemaCtx {
     fn check_untrained_learnable_agents(&mut self, program: &Program) {
         for agent in program.agents() {
             if agent.is_learnable() && !self.trained_agents.contains(&agent.name) {
-                self.warn(
-                    agent.span,
-                    format!(
-                        "agent `{}` has a `learning` configuration but is never referenced \
-                     in a `train` block; the agent will not improve at runtime",
-                        agent.name
-                    ),
+                self.diag.push(
+                    Diagnostic::warning(
+                        agent.span,
+                        format!(
+                            "agent `{}` has a `learning` configuration but is never referenced \
+                         in a `train` block; the agent will not improve at runtime",
+                            agent.name
+                        ),
+                    )
+                    .with_code("E3017")
+                    .with_hint("add a `train` block that references this agent"),
                 );
             }
         }
@@ -1326,7 +1444,11 @@ impl SemaCtx {
             // ── return ────────────────────────────────────────────────────────
             Stmt::Return { span, value } => {
                 if !self.cf.in_function() {
-                    self.err(*span, "`return` outside of a function");
+                    self.diag.push(
+                        Diagnostic::error(*span, "`return` outside of a function")
+                            .with_code("E3020")
+                            .with_hint("move this `return` inside a function body"),
+                    );
                 }
                 if let Some(e) = value {
                     self.analyse_expr(e);
@@ -1336,12 +1458,20 @@ impl SemaCtx {
             // ── break / continue ──────────────────────────────────────────────
             Stmt::Break { span, value, label } => {
                 if !self.cf.in_loop() {
-                    self.err(*span, "`break` outside of a loop");
+                    self.diag.push(
+                        Diagnostic::error(*span, "`break` outside of a loop")
+                            .with_code("E3018")
+                            .with_hint("move this `break` inside a `loop`, `while`, or `for` body"),
+                    );
                 } else if let Some(lbl) = label {
                     if !self.cf.has_label(lbl) {
-                        self.err(
-                            *span,
-                            format!("`break '{lbl}` does not correspond to any enclosing loop"),
+                        self.diag.push(
+                            Diagnostic::error(
+                                *span,
+                                format!("`break '{lbl}` does not correspond to any enclosing loop"),
+                            )
+                            .with_code("E3018")
+                            .with_hint("check the label spelling or add it to an enclosing loop"),
                         );
                     }
                 }
@@ -1352,12 +1482,20 @@ impl SemaCtx {
 
             Stmt::Continue { span, label } => {
                 if !self.cf.in_loop() {
-                    self.err(*span, "`continue` outside of a loop");
+                    self.diag.push(
+                        Diagnostic::error(*span, "`continue` outside of a loop")
+                            .with_code("E3019")
+                            .with_hint("move this `continue` inside a `loop`, `while`, or `for` body"),
+                    );
                 } else if let Some(lbl) = label {
                     if !self.cf.has_label(lbl) {
-                        self.err(
-                            *span,
-                            format!("`continue '{lbl}` does not correspond to any enclosing loop"),
+                        self.diag.push(
+                            Diagnostic::error(
+                                *span,
+                                format!("`continue '{lbl}` does not correspond to any enclosing loop"),
+                            )
+                            .with_code("E3019")
+                            .with_hint("check the label spelling or add it to an enclosing loop"),
                         );
                     }
                 }
@@ -1550,6 +1688,14 @@ impl SemaCtx {
             }
 
             Stmt::Spawn(sb) => {
+                // Nested `spawn` is not allowed.
+                if matches!(self.cf.frames.last(), Some(CfFrame::Spawn)) {
+                    self.diag.push(
+                        Diagnostic::error(sb.span, "nested `spawn { }` blocks are not allowed")
+                            .with_code("E3022")
+                            .with_hint("move the inner spawn into a separate function or use `sync` to coordinate"),
+                    );
+                }
                 // Captures should be used inside the block; check for
                 // accidentally-captured mutable variables.
                 self.cf.push(CfFrame::Spawn);
@@ -1560,6 +1706,14 @@ impl SemaCtx {
             }
 
             Stmt::Sync(sb) => {
+                // Nested `sync` is not allowed.
+                if matches!(self.cf.frames.last(), Some(CfFrame::Sync)) {
+                    self.diag.push(
+                        Diagnostic::error(sb.span, "nested `sync { }` blocks are not allowed")
+                            .with_code("E3023")
+                            .with_hint("merge the nested `sync` into the outer one or restructure the code"),
+                    );
+                }
                 self.cf.push(CfFrame::Sync);
                 self.push_scope();
                 self.analyse_block(&sb.body);
@@ -1570,7 +1724,11 @@ impl SemaCtx {
             Stmt::Atomic(ab) => {
                 // Nested `atomic` is not allowed.
                 if matches!(self.cf.frames.last(), Some(CfFrame::Atomic)) {
-                    self.err(ab.span, "nested `atomic { }` blocks are not allowed");
+                    self.diag.push(
+                        Diagnostic::error(ab.span, "nested `atomic { }` blocks are not allowed")
+                            .with_code("E3024")
+                            .with_hint("merge the nested `atomic` into the outer one or restructure the code"),
+                    );
                 }
                 self.cf.push(CfFrame::Atomic);
                 self.push_scope();

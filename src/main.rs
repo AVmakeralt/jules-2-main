@@ -479,8 +479,6 @@ pub struct CompileUnit {
     pub filename: String,
     pub source: String,
     pub diags: Vec<Diag>,
-    /// Structured diagnostic collector with cascade suppression.
-    pub structured_diags: crate::compiler::diagnostic::DiagCollector,
 }
 
 impl CompileUnit {
@@ -489,7 +487,6 @@ impl CompileUnit {
             filename: filename.into(),
             source: source.into(),
             diags: vec![],
-            structured_diags: crate::compiler::diagnostic::DiagCollector::new(),
         }
     }
 
@@ -577,31 +574,17 @@ impl Pipeline {
         let mut typeck = crate::compiler::typeck::TypeCk::new();
         typeck.check_program(&program);
         for d in typeck.diag.items {
-            let adapted = adapt_typeck_diag(&d);
-            // Also feed into structured diagnostic collector with cascade suppression
-            let structured = adapt_typeck_to_structured(&d);
-            unit.structured_diags.emit(structured);
-            unit.diags.push(adapted);
+            unit.diags.push(adapt_typeck_diag(d));
         }
         if unit.has_errors() {
             return PipelineResult::HaltedAt(PassName::TypeCheck);
         }
 
-        // ── Pass 3b: Annotate integer widths ─────────────────────────────────
-        // After type checking succeeds, walk the AST and fill in the `ty` field
-        // on every `Expr::IntLit` so the interpreter/VM uses the correct width.
-        // Without this, IntLit always truncates to i32, causing silent wrong
-        // answers (e.g. Collatz-200 → 0).
-        crate::compiler::typeck::annotate_int_widths(&mut program);
-
         // ── Pass 4: Semantic analysis ─────────────────────────────────────────
         let mut sema = crate::compiler::sema::SemaCtx::new();
         sema.analyse(&program);
         for d in sema.diag.items {
-            let adapted = adapt_sema_diag(&d);
-            let structured = adapt_sema_to_structured(&d);
-            unit.structured_diags.emit(structured);
-            unit.diags.push(adapted);
+            unit.diags.push(adapt_sema_diag(d));
         }
         if unit.has_errors() {
             return PipelineResult::HaltedAt(PassName::Sema);
@@ -610,23 +593,10 @@ impl Pipeline {
         // ── Pass 5: Borrow-check (lexical aliasing safety) ───────────────────
         let borrow_diags = crate::compiler::borrowck::jules_borrowck(&program);
         for d in borrow_diags.items {
-            let adapted = adapt_borrowck_diag(&d);
-            let structured = adapt_borrowck_to_structured(&d);
-            unit.structured_diags.emit(structured);
-            unit.diags.push(adapted);
+            unit.diags.push(adapt_borrowck_diag(d));
         }
         if unit.has_errors() {
             return PipelineResult::HaltedAt(PassName::BorrowCheck);
-        }
-
-        // ── Pass 5b: AST → Unified IR Lowering ──────────────────────────────
-        // Lower the validated AST into the unified SSA IR. This IR is used
-        // by backends (JIT, AOT, bytecode VM) and the superoptimizer.
-        let ir_module = crate::compiler::lower::lower_program(&program);
-
-        // If emit_ir flag is set, print the unified IR to stderr
-        if self.emit_ir {
-            eprintln!("{}", ir_module);
         }
 
         // ── Pass 6: Superoptimizer ──────────────────────────────────────────
@@ -804,30 +774,6 @@ impl Pipeline {
             }
         }
 
-        // ── Pass 13: Post-Optimization Validity Check ──────────────────────────
-        // The optimizer mutates the AST after type checking and borrow checking.
-        // Without this pass, the optimizer could introduce type mismatches or
-        // borrow-unsafe code that the earlier passes already validated.
-        // This is a lightweight structural check — it re-runs the borrow checker
-        // and annotates any new IntLit nodes.
-        {
-            // Re-annotate integer widths (optimizer may have introduced new IntLits).
-            crate::compiler::typeck::annotate_int_widths(&mut program);
-
-            // Re-run borrow check to verify the optimizer hasn't broken aliasing.
-            let post_borrow_diags = crate::compiler::borrowck::jules_borrowck(&program);
-            for d in post_borrow_diags.items {
-                // Only promote to warning — don't block compilation on post-opt
-                // borrow issues (they're often false positives from inlining).
-                if matches!(d.severity, crate::compiler::borrowck::Severity::Error) {
-                    unit.diags.push(Diag::warning(
-                        d.span,
-                        format!("[post-opt] borrow check: {}", d.message),
-                    ));
-                }
-            }
-        }
-
         // ── Promote warnings to errors if requested ───────────────────────────
         if self.warn_as_error {
             for d in &mut unit.diags {
@@ -890,7 +836,7 @@ fn parse_error_to_diag(e: crate::compiler::parser::ParseError) -> Diag {
     d
 }
 
-fn adapt_typeck_diag(d: &crate::compiler::typeck::Diagnostic) -> Diag {
+fn adapt_typeck_diag(d: crate::compiler::typeck::Diagnostic) -> Diag {
     let sev = match d.severity {
         crate::compiler::typeck::Severity::Error => DiagSeverity::Error,
         crate::compiler::typeck::Severity::Warning => DiagSeverity::Warning,
@@ -899,18 +845,18 @@ fn adapt_typeck_diag(d: &crate::compiler::typeck::Diagnostic) -> Diag {
     let mut out = Diag {
         severity: sev,
         span: Some(d.span),
-        code: None,
-        message: d.message.clone(),
+        code: d.code,
+        message: d.message,
         labels: vec![],
-        hint: None,
+        hint: d.hint,
     };
-    for (s, m) in &d.notes {
-        out.labels.push((*s, m.clone()));
+    for (s, m) in d.notes {
+        out.labels.push((s, m));
     }
     out
 }
 
-fn adapt_sema_diag(d: &crate::compiler::sema::Diagnostic) -> Diag {
+fn adapt_sema_diag(d: crate::compiler::sema::Diagnostic) -> Diag {
     let sev = match d.severity {
         crate::compiler::sema::Severity::Error => DiagSeverity::Error,
         crate::compiler::sema::Severity::Warning => DiagSeverity::Warning,
@@ -919,18 +865,18 @@ fn adapt_sema_diag(d: &crate::compiler::sema::Diagnostic) -> Diag {
     let mut out = Diag {
         severity: sev,
         span: Some(d.span),
-        code: None,
-        message: d.message.clone(),
+        code: d.code,
+        message: d.message,
         labels: vec![],
-        hint: None,
+        hint: d.hint,
     };
-    for (s, m) in &d.labels {
-        out.labels.push((*s, m.clone()));
+    for (s, m) in d.labels {
+        out.labels.push((s, m));
     }
     out
 }
 
-fn adapt_borrowck_diag(d: &crate::compiler::borrowck::Diagnostic) -> Diag {
+fn adapt_borrowck_diag(d: crate::compiler::borrowck::Diagnostic) -> Diag {
     let sev = match d.severity {
         crate::compiler::borrowck::Severity::Error => DiagSeverity::Error,
         crate::compiler::borrowck::Severity::Warning => DiagSeverity::Warning,
@@ -939,13 +885,13 @@ fn adapt_borrowck_diag(d: &crate::compiler::borrowck::Diagnostic) -> Diag {
     let mut out = Diag {
         severity: sev,
         span: Some(d.span),
-        code: None,
-        message: d.message.clone(),
+        code: d.code,
+        message: d.message,
         labels: vec![],
-        hint: None,
+        hint: d.hint,
     };
-    for (s, m) in &d.labels {
-        out.labels.push((*s, m.clone()));
+    for (s, m) in d.labels {
+        out.labels.push((s, m));
     }
     out
 }
@@ -954,223 +900,11 @@ fn adapt_runtime_error(e: crate::interp::RuntimeError) -> Diag {
     Diag {
         severity: DiagSeverity::Error,
         span: e.span,
-        code: Some("E9000"),
+        code: Some(e.code),
         message: e.message,
         labels: vec![],
         hint: None,
     }
-}
-
-// ── Structured Diagnostic Adapters ─────────────────────────────────────────
-
-use crate::compiler::diagnostic::{StructuredDiag, Severity as StructSeverity, Phase, DiagCode, codes};
-
-/// Convert typeck diagnostics to structured diagnostics with cascade suppression.
-fn adapt_typeck_to_structured(d: &crate::compiler::typeck::Diagnostic) -> StructuredDiag {
-    let sev = match d.severity {
-        crate::compiler::typeck::Severity::Error => StructSeverity::Error,
-        crate::compiler::typeck::Severity::Warning => StructSeverity::Warning,
-        crate::compiler::typeck::Severity::Note => StructSeverity::Note,
-    };
-
-    // Determine structured error code and cascade suppression from message content
-    let (code, suppress_cascade, suppressed_symbol) = if d.message.contains("undeclared variable") {
-        // Extract variable name from message like "use of undeclared variable `x`"
-        let name = extract_backtick_name(&d.message).unwrap_or_default();
-        (codes::NAME_UNDECLARED, true, Some(name))
-    } else if d.message.contains("integer width") || d.message.contains("mismatched type") {
-        (codes::TYPE_MISMATCH, false, None)
-    } else if d.message.contains("call to undeclared function") {
-        let name = extract_backtick_name(&d.message).unwrap_or_default();
-        (codes::NAME_UNDECLARED, true, Some(name))
-    } else if d.message.contains("type mismatch") || d.message.contains("expected") && d.message.contains("got") {
-        (codes::TYPE_MISMATCH, false, None)
-    } else {
-        (codes::TYPE_MISMATCH, false, None)
-    };
-
-    let severity_code = match sev {
-        StructSeverity::Error => 'E',
-        StructSeverity::Warning => 'W',
-        _ => 'N',
-    };
-
-    let mut diag = StructuredDiag {
-        severity: sev,
-        code: DiagCode { category: severity_code, number: code },
-        phase: Phase::TypeCheck,
-        message: d.message.clone(),
-        span: d.span,
-        labels: vec![],
-        cause: vec![],
-        fixits: vec![],
-        suppress_cascade,
-        suppressed_symbol,
-    };
-
-    for (s, m) in &d.notes {
-        diag.labels.push(crate::compiler::diagnostic::SecondaryLabel {
-            span: *s,
-            message: m.clone(),
-        });
-    }
-
-    // Add literal suffix fix-it for integer width mismatches
-    // Detect patterns like "cannot assign `i32` to a binding of type `i64`"
-    // or "cannot apply `add` to `i32` and `i64`"
-    if let Some((from_type, to_type)) = extract_int_width_mismatch(&d.message) {
-        let suffix = match to_type.as_str() {
-            "i8" => "i8",
-            "i16" => "i16",
-            "i32" => "i32",
-            "i64" => "i64",
-            "u8" => "u8",
-            "u16" => "u16",
-            "u32" => "u32",
-            "u64" => "u64",
-            _ => "",
-        };
-        if !suffix.is_empty() {
-            diag.fixits.push(crate::compiler::diagnostic::FixIt {
-                span: d.span,
-                replacement: format!("<value>{}", suffix),
-                description: format!("try adding the literal suffix `{}` to match the expected type `{}`", suffix, to_type),
-            });
-        }
-        let _ = from_type; // used for context but not in the suggestion
-    }
-
-    diag
-}
-
-/// Convert sema diagnostics to structured diagnostics.
-fn adapt_sema_to_structured(d: &crate::compiler::sema::Diagnostic) -> StructuredDiag {
-    let sev = match d.severity {
-        crate::compiler::sema::Severity::Error => StructSeverity::Error,
-        crate::compiler::sema::Severity::Warning => StructSeverity::Warning,
-        crate::compiler::sema::Severity::Note => StructSeverity::Note,
-    };
-
-    let (code, suppress_cascade, suppressed_symbol) = if d.message.contains("undeclared") {
-        let name = extract_backtick_name(&d.message).unwrap_or_default();
-        (codes::NAME_UNDECLARED, true, Some(name))
-    } else {
-        (codes::TYPE_MISMATCH, false, None)
-    };
-
-    let severity_code = match sev {
-        StructSeverity::Error => 'E',
-        StructSeverity::Warning => 'W',
-        _ => 'N',
-    };
-
-    let mut diag = StructuredDiag {
-        severity: sev,
-        code: DiagCode { category: severity_code, number: code },
-        phase: Phase::SemanticAnalysis,
-        message: d.message.clone(),
-        span: d.span,
-        labels: vec![],
-        cause: vec![],
-        fixits: vec![],
-        suppress_cascade,
-        suppressed_symbol,
-    };
-
-    for (s, m) in &d.labels {
-        diag.labels.push(crate::compiler::diagnostic::SecondaryLabel {
-            span: *s,
-            message: m.clone(),
-        });
-    }
-
-    diag
-}
-
-/// Convert borrowck diagnostics to structured diagnostics.
-fn adapt_borrowck_to_structured(d: &crate::compiler::borrowck::Diagnostic) -> StructuredDiag {
-    let sev = match d.severity {
-        crate::compiler::borrowck::Severity::Error => StructSeverity::Error,
-        crate::compiler::borrowck::Severity::Warning => StructSeverity::Warning,
-        crate::compiler::borrowck::Severity::Note => StructSeverity::Note,
-    };
-
-    let code = if d.message.contains("borrow") || d.message.contains("alias") {
-        codes::BORROW_MUT_CONFLICT
-    } else {
-        codes::OWN_BORROW_CONFLICT
-    };
-
-    let severity_code = match sev {
-        StructSeverity::Error => 'E',
-        StructSeverity::Warning => 'W',
-        _ => 'N',
-    };
-
-    let mut diag = StructuredDiag {
-        severity: sev,
-        code: DiagCode { category: severity_code, number: code },
-        phase: Phase::BorrowCheck,
-        message: d.message.clone(),
-        span: d.span,
-        labels: vec![],
-        cause: vec![],
-        fixits: vec![],
-        suppress_cascade: false,
-        suppressed_symbol: None,
-    };
-
-    for (s, m) in &d.labels {
-        diag.labels.push(crate::compiler::diagnostic::SecondaryLabel {
-            span: *s,
-            message: m.clone(),
-        });
-    }
-
-    diag
-}
-
-/// Extract the name inside backticks from a diagnostic message.
-/// e.g., "use of undeclared variable `x`" → Some("x")
-fn extract_backtick_name(msg: &str) -> Option<String> {
-    let start = msg.find('`')?;
-    let rest = &msg[start + 1..];
-    let end = rest.find('`')?;
-    Some(rest[..end].to_string())
-}
-
-/// Detect integer width mismatches in type error messages.
-/// Returns (from_type, to_type) if the message describes a mismatch between
-/// two integer types (e.g., "cannot assign `i32` to a binding of type `i64`").
-fn extract_int_width_mismatch(msg: &str) -> Option<(String, String)> {
-    // Collect all backtick-enclosed names
-    let names: Vec<&str> = msg.split('`')
-        .enumerate()
-        .filter(|(i, _)| i % 2 == 1)  // odd indices are between backticks
-        .map(|(_, s)| s)
-        .collect();
-
-    let int_types = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize"];
-
-    // Look for a pair of different integer types
-    let int_names: Vec<&str> = names.iter()
-        .filter(|n| int_types.contains(&n.to_lowercase().as_str()))
-        .copied()
-        .collect();
-
-    if int_names.len() >= 2 {
-        // Find the first pair that differs
-        for i in 0..int_names.len() {
-            for j in (i+1)..int_names.len() {
-                if int_names[i] != int_names[j] {
-                    // The "from" type is the narrower one (appears as value type)
-                    // The "to" type is the wider one (appears as target type)
-                    return Some((int_names[i].to_string(), int_names[j].to_string()));
-                }
-            }
-        }
-    }
-    None
 }
 
 // =============================================================================

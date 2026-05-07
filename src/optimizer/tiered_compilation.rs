@@ -444,6 +444,7 @@ impl TieredExecutionManager {
         Err(RuntimeError {
             message: "interpreter not initialized".to_string(),
             span: None,
+            code: "E9999",
         })
     }
 

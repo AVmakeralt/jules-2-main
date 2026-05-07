@@ -22,6 +22,7 @@ pub fn dispatch(
             Some(Err(crate::interp::RuntimeError {
                 span: Some(crate::compiler::lexer::Span::dummy()),
                 message: $msg.to_string(),
+                code: "E9999",
             }))
         };
     }
@@ -637,6 +638,7 @@ fn dispatch_scalar(
             Some(Err(crate::interp::RuntimeError {
                 span: Some(crate::compiler::lexer::Span::dummy()),
                 message: $msg.to_string(),
+                code: "E9999",
             }))
         };
     }

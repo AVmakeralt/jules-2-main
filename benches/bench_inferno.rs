@@ -779,7 +779,7 @@ fn run_bench_vm_compare(name: &'static str, iterations: usize, src: &str) -> (&'
         }
         (vm_start.elapsed().as_secs_f64(), v)
     } else {
-        (0.0, Err(jules::interp::RuntimeError { span: None, message: "VM load failed".into() }))
+        (0.0, Err(jules::interp::RuntimeError { span: None, message: "VM load failed".into(), code: "E9999" }))
     };
 
     // Compare results
