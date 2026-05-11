@@ -15,6 +15,7 @@ use crate::compiler::ast::*;
 use crate::compiler::ir::TaskOwnership as IrTaskOwnership;
 use crate::compiler::ir::*;
 use crate::compiler::lexer::Span;
+use std::collections::HashMap;
 use std::fmt;
 
 /// Loop context for break/continue lowering.
@@ -58,6 +59,8 @@ struct LowerCtx {
     scope_stack: Vec<usize>,
     /// String constant table.
     strings: Vec<String>,
+    /// String → index lookup for O(1) interning.
+    string_map: HashMap<String, u32>,
     /// Region counter for region-alloc instructions.
     next_region: u32,
     /// Currently-building function name (for diagnostics).
@@ -78,6 +81,7 @@ impl LowerCtx {
             env: vec![],
             scope_stack: vec![],
             strings: vec![],
+            string_map: HashMap::new(),
             next_region: 0,
             current_fn: String::new(),
             loop_stack: vec![],
@@ -121,14 +125,25 @@ impl LowerCtx {
         self.env.iter().rev().find(|(n, _)| n == name).map(|&(_, v)| v)
     }
 
+    /// Check if the current block already has a terminator (O(1) via cached index).
+    fn is_terminated_fast(&self) -> bool {
+        let idx = self.current_block_id.0 as usize;
+        if idx < self.current_blocks.len() && self.current_blocks[idx].id == self.current_block_id {
+            self.current_blocks[idx].is_terminated()
+        } else {
+            self.is_terminated()
+        }
+    }
+
     // ── String Table ────────────────────────────────────────────────────────
 
     fn intern_string(&mut self, s: &str) -> u32 {
-        if let Some(idx) = self.strings.iter().position(|x| x == s) {
-            idx as u32
+        if let Some(&idx) = self.string_map.get(s) {
+            idx
         } else {
             let idx = self.strings.len() as u32;
             self.strings.push(s.to_string());
+            self.string_map.insert(s.to_string(), idx);
             idx
         }
     }
@@ -171,10 +186,16 @@ impl LowerCtx {
         self.current_block_mut().instrs.push(instr);
     }
 
-    /// Get a mutable reference to the current flat block.
+    /// Get a mutable reference to the current flat block (O(1) via direct index).
     fn current_block_mut(&mut self) -> &mut FlatBlock {
-        let id = self.current_block_id;
-        self.current_blocks.iter_mut().find(|b| b.id == id).expect("current block must exist")
+        let idx = self.current_block_id.0 as usize;
+        if idx < self.current_blocks.len() && self.current_blocks[idx].id == self.current_block_id {
+            &mut self.current_blocks[idx]
+        } else {
+            // Fallback: linear scan (blocks may not be densely packed)
+            let id = self.current_block_id;
+            self.current_blocks.iter_mut().find(|b| b.id == id).expect("current block must exist")
+        }
     }
 
     /// Create a new flat block and return its ID.
@@ -189,12 +210,18 @@ impl LowerCtx {
         self.current_block_id = id;
     }
 
-    /// Check if the current block already has a terminator.
+    /// Check if the current block already has a terminator (O(1) via direct index).
     fn is_terminated(&self) -> bool {
-        self.current_blocks
-            .iter()
-            .find(|b| b.id == self.current_block_id)
-            .map_or(false, |b| b.is_terminated())
+        let idx = self.current_block_id.0 as usize;
+        if idx < self.current_blocks.len() && self.current_blocks[idx].id == self.current_block_id {
+            self.current_blocks[idx].is_terminated()
+        } else {
+            // Fallback: linear scan (blocks may not be densely packed)
+            self.current_blocks
+                .iter()
+                .find(|b| b.id == self.current_block_id)
+                .map_or(false, |b| b.is_terminated())
+        }
     }
 
     // ── Top-Level Lowering ──────────────────────────────────────────────────
@@ -266,6 +293,7 @@ impl LowerCtx {
         self.current_blocks.clear();
         self.next_value = 0;
         self.next_block = 0;
+        self.loop_stack.clear();
 
         // Create entry block
         let entry = self.fresh_block();
@@ -352,6 +380,7 @@ impl LowerCtx {
         self.current_blocks.clear();
         self.next_value = 0;
         self.next_block = 0;
+        self.loop_stack.clear();
 
         let entry = self.fresh_block();
         self.current_blocks.push(FlatBlock::new(entry));

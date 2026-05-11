@@ -47,6 +47,7 @@
 // =============================================================================
 
 use rustc_hash::FxHashMap;
+use std::fmt;
 
 use crate::compiler::ast::{
     AgentDecl, BinOpKind, Block, ComponentDecl, DimExpr, ElemType, Expr, FnDecl, GenericParam,
@@ -222,6 +223,22 @@ impl Ty {
             Ty::Component(name) => name.clone(),
             Ty::World => "world".into(),
             Ty::Infer(id) => format!("_#{}", id),
+        }
+    }
+}
+
+impl fmt::Display for Ty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display())
+    }
+}
+
+impl fmt::Display for Dim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Dim::Lit(n) => write!(f, "{}", n),
+            Dim::Named(s) => write!(f, "{}", s),
+            Dim::Dynamic => write!(f, "_"),
         }
     }
 }

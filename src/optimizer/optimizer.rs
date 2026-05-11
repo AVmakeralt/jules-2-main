@@ -220,6 +220,9 @@ pub struct CosineAnnealingWarmRestarts {
 impl LrSchedule for CosineAnnealingWarmRestarts {
     fn multiplier(&self, step: u64, base_lr: f32) -> f32 {
         // Find which cycle we're in and the position within it.
+        // Guard against t_mult=0 which would cause period to become 0
+        // and create an infinite loop.
+        let t_mult = self.t_mult.max(1);
         let mut t_cur = step;
         let mut period = self.t_0;
         loop {
@@ -227,7 +230,7 @@ impl LrSchedule for CosineAnnealingWarmRestarts {
                 break;
             }
             t_cur -= period;
-            period *= self.t_mult;
+            period *= t_mult;
         }
         let frac = t_cur as f32 / period as f32;
         self.lr_min + 0.5 * (base_lr - self.lr_min) * (1.0 + (PI * frac).cos())
@@ -336,11 +339,6 @@ impl LrSchedule for ReduceOnPlateau {
         if self.best.is_infinite() {
             self.best = metric;
             self.bad_epochs = 0;
-            if self.bad_epochs >= self.patience {
-                self.current_mul *= self.factor;
-                self.bad_epochs = 0;
-                self.cooldown_left = self.cooldown;
-            }
             return;
         }
 
@@ -697,7 +695,7 @@ impl Optimizer for Sgd {
                 for (j, (&g, w)) in p.grads.iter().zip(p.weights.iter_mut()).enumerate() {
                     let g = clip_grad(g, self.hp.grad_clip) + eff_wd * *w;
                     v[j] = self.momentum * v[j] - eff_lr * g;
-                    *w += self.momentum * v[j] - eff_lr * g;
+                    *w += self.momentum * v[j];
                 }
             } else {
                 for (j, (&g, w)) in p.grads.iter().zip(p.weights.iter_mut()).enumerate() {
@@ -1000,6 +998,10 @@ impl AdamW {
         self.inner = self.inner.with_schedule(s);
         self
     }
+    pub fn with_amsgrad(mut self) -> Self {
+        self.inner = self.inner.with_amsgrad();
+        self
+    }
 }
 
 impl Optimizer for AdamW {
@@ -1041,7 +1043,13 @@ impl Optimizer for AdamW {
                 m2[j] = self.inner.beta2 * m2[j] + (1.0 - self.inner.beta2) * g * g;
 
                 let m_hat = m1[j] / bc1;
-                let v_hat = m2[j] / bc2;
+                let v_hat = if self.inner.amsgrad {
+                    let vmax = &mut self.inner.v_max[i][j];
+                    *vmax = vmax.max(m2[j] / bc2);
+                    *vmax
+                } else {
+                    m2[j] / bc2
+                };
 
                 *w -= eff_lr * m_hat / (v_hat.sqrt() + self.inner.eps);
             }

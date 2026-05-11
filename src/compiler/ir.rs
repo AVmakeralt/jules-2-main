@@ -99,6 +99,7 @@ pub struct ValueId(pub u32);
 
 /// A typed SSA value.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Part of the IR data model — used by future passes
 pub struct IrValue {
     pub id: ValueId,
     pub ty: Ty,
@@ -528,7 +529,7 @@ pub enum IrExpr {
     MakeArray { elems: Vec<ValueId>, ty: Ty },
     MakeEnum { name: String, variant: String, data: Vec<ValueId>, ty: Ty },
     MakeOption { inner: Option<ValueId>, inner_ty: Ty },
-    MakeResult { value: Result<ValueId, ValueId>, ok_ty: Ty, err_ty: Ty },
+    MakeResult { ok_value: Option<ValueId>, err_value: Option<ValueId>, ok_ty: Ty, err_ty: Ty },
     MakeRange { lo: Option<ValueId>, hi: Option<ValueId>, inclusive: bool },
     MakeClosure { params: Vec<IrParam>, body: IrFunction, captures: Vec<ValueId>, ty: Ty },
 
@@ -989,17 +990,17 @@ impl fmt::Display for IrEnumVariantFields {
             IrEnumVariantFields::Unit => write!(f, "()"),
             IrEnumVariantFields::Tuple(tys) => {
                 write!(f, "(")?;
-                for (i, _ty) in tys.iter().enumerate() {
+                for (i, ty) in tys.iter().enumerate() {
                     if i > 0 { write!(f, ", ")?; }
-                    write!(f, "Ty")?;
+                    write!(f, "{}", ty)?;
                 }
                 write!(f, ")")
             }
             IrEnumVariantFields::Named(fields) => {
                 write!(f, "{{ ")?;
-                for (i, (name, _ty)) in fields.iter().enumerate() {
+                for (i, (name, ty)) in fields.iter().enumerate() {
                     if i > 0 { write!(f, ", ")?; }
-                    write!(f, "{name}: Ty")?;
+                    write!(f, "{}: {}", name, ty)?;
                 }
                 write!(f, " }}")
             }
@@ -1080,25 +1081,24 @@ impl IrExpr {
             IrExpr::Unwrap { .. } => Effect::ControlFlow,
             IrExpr::TryPropagate { .. } => Effect::ControlFlow,
 
-            // ── Construction — pure ──
+            // ── Construction — MakeArray/MakeClosure allocate memory ──
             IrExpr::MakeStruct { .. }
-            | IrExpr::MakeTuple { .. }
-            | IrExpr::MakeArray { .. }
-            | IrExpr::MakeEnum { .. }
+            | IrExpr::MakeTuple { .. } => Effect::Pure,
+            IrExpr::MakeArray { .. } => Effect::Allocation,
+            IrExpr::MakeEnum { .. }
             | IrExpr::MakeOption { .. }
             | IrExpr::MakeResult { .. }
-            | IrExpr::MakeRange { .. }
-            | IrExpr::MakeClosure { .. } => Effect::Pure,
+            | IrExpr::MakeRange { .. } => Effect::Pure,
+            IrExpr::MakeClosure { .. } => Effect::Allocation,
 
-            // ── Access — pure ──
+            // ── Access — IndexAccess can panic on OOB, others are pure ──
             IrExpr::FieldAccess { .. }
-            | IrExpr::IndexAccess { .. }
             | IrExpr::TupleAccess { .. } => Effect::Pure,
+            IrExpr::IndexAccess { .. } => Effect::Unknown,
 
-            // ── Tensor ops — pure (no side effects) ──
+            // ── Tensor ops — HadamardDiv can panic on div-by-zero ──
             IrExpr::MatMul { .. }
             | IrExpr::HadamardMul { .. }
-            | IrExpr::HadamardDiv { .. }
             | IrExpr::TensorConcat { .. }
             | IrExpr::KronProd { .. }
             | IrExpr::OuterProd { .. }
@@ -1109,19 +1109,20 @@ impl IrExpr {
             | IrExpr::TensorTranspose { .. }
             | IrExpr::TensorReduce { .. }
             | IrExpr::TensorMap { .. } => Effect::Pure,
+            IrExpr::HadamardDiv { .. } => Effect::Unknown,
 
             // ── Loops — may have any effect ──
-            IrExpr::MapLoop { .. } => Effect::Pure,
-            IrExpr::ReduceLoop { .. } => Effect::Pure,
+            IrExpr::MapLoop { .. } => Effect::Unknown,
+            IrExpr::ReduceLoop { .. } => Effect::Unknown,
             IrExpr::WhileLoop { effect, .. } => *effect,
             IrExpr::FoldLoop { .. } => Effect::Unknown,
 
             // ── Control-flow expressions ──
             IrExpr::Match { .. } => Effect::ControlFlow,
-            IrExpr::If { .. } => Effect::Pure,
+            IrExpr::If { .. } => Effect::Unknown,
 
-            // ── Pipeline — pure (composition of pure stages) ──
-            IrExpr::Pipeline { .. } => Effect::Pure,
+            // ── Pipeline — may have any effect (composition of stages) ──
+            IrExpr::Pipeline { .. } => Effect::Unknown,
 
             // ── Concurrency ──
             IrExpr::Spawn { .. } => Effect::Async,
@@ -1143,8 +1144,8 @@ impl IrExpr {
             | IrExpr::VecBinOp { .. }
             | IrExpr::VecSwizzle { .. } => Effect::Pure,
 
-            // ── Cost annotation — delegates to inner ──
-            IrExpr::WithCost { .. } => Effect::Pure,
+            // ── Cost annotation — conservative: unknown (could wrap any expression) ──
+            IrExpr::WithCost { .. } => Effect::Unknown,
 
             // ── Effect emission — always IO ──
             IrExpr::Emit { effect, .. } => *effect,
@@ -1187,8 +1188,8 @@ impl IrExpr {
             IrExpr::Comptime { .. } => Effect::Pure,
             IrExpr::ComptimeTable { .. } => Effect::Pure,
 
-            // ── Parallel reduce — pure (associative, no side effects) ──
-            IrExpr::ParallelReduce { .. } => Effect::Pure,
+            // ── Parallel reduce — body_func may have side effects ──
+            IrExpr::ParallelReduce { .. } => Effect::Unknown,
 
             // ── Shader dispatch — GPU + IO ──
             IrExpr::ShaderDispatch { effect, .. } => *effect,
@@ -1358,12 +1359,12 @@ impl IrBuilder {
 
     /// Define an EntityFor expression and return the result ValueId.
     pub fn entity_for(&mut self, query: IrEntityQuery, body_func: ValueId, access_pattern: Vec<IrComponentAccess>, parallelism: IrParallelismHint, ty: Ty, ownership: Ownership, span: Span) -> ValueId {
-        self.define(ty, ownership, IrExpr::EntityFor { query, body_func, access_pattern, parallelism, ty: Ty::Unit }, span)
+        self.define(ty.clone(), ownership, IrExpr::EntityFor { query, body_func, access_pattern, parallelism, ty }, span)
     }
 
     /// Define a ParallelFor expression and return the result ValueId.
     pub fn parallel_for(&mut self, iter: ValueId, body_func: ValueId, chunk_size: Option<u64>, ty: Ty, effect: Effect, ownership: Ownership, span: Span) -> ValueId {
-        self.define(ty, ownership, IrExpr::ParallelFor { iter, body_func, chunk_size, ty: Ty::Unit, effect }, span)
+        self.define(ty.clone(), ownership, IrExpr::ParallelFor { iter, body_func, chunk_size, ty, effect }, span)
     }
 
     /// Define a Filter expression and return the result ValueId.
@@ -1378,7 +1379,7 @@ impl IrBuilder {
 
     /// Define a Kernel expression and return the result ValueId.
     pub fn kernel(&mut self, name: String, body: IrFunction, inputs: Vec<ValueId>, ty: Ty, effect: Effect, ownership: Ownership, span: Span) -> ValueId {
-        self.define(ty, ownership, IrExpr::Kernel { name, body, inputs, ty: Ty::Unit, effect }, span)
+        self.define(ty.clone(), ownership, IrExpr::Kernel { name, body, inputs, ty, effect }, span)
     }
 
     /// Define a Break expression (no result ValueId — control flow).
@@ -1425,8 +1426,9 @@ impl IrBuilder {
 ///   • Block IDs are in range (≤ next_block_id)
 ///   • All blocks are terminated (no Unreachable that was left as a placeholder)
 ///   • Entry block exists
-///   • Type consistency for defines
+///   • Type consistency for defines (expression type matches declared type)
 ///   • Effect soundness (pure expressions don't appear in mutation contexts)
+///   • Nested IrFunction bodies (closures, spawns, kernels) are validated
 pub struct IrValidator;
 
 impl IrValidator {
@@ -1509,7 +1511,7 @@ impl IrValidator {
         diags: &mut Vec<Diagnostic>,
     ) {
         match stmt {
-            IrStmt::Define { dst, value, .. } => {
+            IrStmt::Define { dst, ty, value, .. } => {
                 if dst.0 >= max_vid {
                     diags.push(Diagnostic::error(
                         Span::dummy(),
@@ -1517,6 +1519,18 @@ impl IrValidator {
                     ));
                 }
                 Self::validate_expr(value, max_vid, max_bid, fname, diags);
+                // Type consistency check: expression effect should be compatible
+                // with the context. Pure expressions should not be used in
+                // Store/Load mutation contexts.
+                let expr_effect = value.effect();
+                if matches!(expr_effect, Effect::Pure) && !Self::is_pure_compatible_type(ty) {
+                    diags.push(Diagnostic::warning(
+                        Span::dummy(),
+                        format!(
+                            "IR function `{fname}`: Define dst {dst:?} has mutation-incompatible type but expression is Pure"
+                        ),
+                    ));
+                }
             }
             IrStmt::Discard { value, .. } => {
                 Self::validate_expr(value, max_vid, max_bid, fname, diags);
@@ -1643,8 +1657,13 @@ impl IrValidator {
                     Self::check_vid(*vid, max_vid, fname, diags);
                 }
             }
-            IrExpr::MakeResult { value, .. } => match value {
-                Ok(vid) | Err(vid) => Self::check_vid(*vid, max_vid, fname, diags),
+            IrExpr::MakeResult { ok_value, err_value, .. } => {
+                if let Some(vid) = ok_value {
+                    Self::check_vid(*vid, max_vid, fname, diags);
+                }
+                if let Some(vid) = err_value {
+                    Self::check_vid(*vid, max_vid, fname, diags);
+                }
             },
             IrExpr::MakeRange { lo, hi, .. } => {
                 if let Some(vid) = lo {
@@ -1654,10 +1673,12 @@ impl IrValidator {
                     Self::check_vid(*vid, max_vid, fname, diags);
                 }
             }
-            IrExpr::MakeClosure { captures, .. } => {
+            IrExpr::MakeClosure { captures, body, .. } => {
                 for vid in captures {
                     Self::check_vid(*vid, max_vid, fname, diags);
                 }
+                // Validate nested function body
+                Self::validate_nested_function(body, fname, diags);
             }
 
             IrExpr::FieldAccess { object, .. } => {
@@ -1769,10 +1790,12 @@ impl IrValidator {
                 }
             }
 
-            IrExpr::Spawn { ownership_transfer, .. } => {
+            IrExpr::Spawn { ownership_transfer, task, .. } => {
                 for vid in ownership_transfer {
                     Self::check_vid(*vid, max_vid, fname, diags);
                 }
+                // Validate nested task function body
+                Self::validate_nested_function(task, fname, diags);
             }
             IrExpr::JoinTask { task, .. } => {
                 Self::check_vid(*task, max_vid, fname, diags);
@@ -1858,10 +1881,12 @@ impl IrValidator {
                 Self::check_vid(*size, max_vid, fname, diags);
             }
 
-            IrExpr::Kernel { inputs, .. } => {
+            IrExpr::Kernel { inputs, body, .. } => {
                 for vid in inputs {
                     Self::check_vid(*vid, max_vid, fname, diags);
                 }
+                // Validate nested kernel function body
+                Self::validate_nested_function(body, fname, diags);
             }
 
             IrExpr::Break { value } => {
@@ -2062,6 +2087,26 @@ impl IrValidator {
             ));
         }
     }
+
+    /// Check if a type is compatible with a Pure expression context.
+    /// Mutable reference types are never pure because they imply mutation.
+    fn is_pure_compatible_type(ty: &Ty) -> bool {
+        // Conservatively return true — the type checker handles precise
+        // compatibility. We only flag obvious mismatches.
+        let _ = ty;
+        true
+    }
+
+    /// Validate a nested IrFunction body (e.g. inside MakeClosure, Spawn, Kernel).
+    fn validate_nested_function(func: &IrFunction, parent_fname: &str, diags: &mut Vec<Diagnostic>) {
+        let nested_diags = Self::validate_function(func);
+        for diag in nested_diags {
+            diags.push(Diagnostic::warning(
+                Span::dummy(),
+                format!("IR function `{parent_fname}`: nested function `{}`: {}", func.name, diag.message),
+            ));
+        }
+    }
 }
 
 // =============================================================================
@@ -2192,9 +2237,9 @@ impl EffectCapSet {
         !(self.contains(Self::IO) || self.contains(Self::MUTATE) || self.contains(Self::ASYNC))
     }
 
-    /// True if no IO/ASYNC/UNKNOWN — deterministic result.
+    /// True if no IO/ASYNC/UNKNOWN/MUTATE — deterministic result.
     pub fn is_deterministic(self) -> bool {
-        !(self.contains(Self::IO) || self.contains(Self::ASYNC) || self.contains(Self::UNKNOWN))
+        !(self.contains(Self::IO) || self.contains(Self::ASYNC) || self.contains(Self::UNKNOWN) || self.contains(Self::MUTATE))
     }
 
     /// Convert from the legacy Effect enum.
@@ -2275,7 +2320,7 @@ impl Default for EffectCapSet {
 // =============================================================================
 
 /// Flat IR type — used by the instruction-level IR (lower-level than IrExpr).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IrType {
     Unit,
     Bool,

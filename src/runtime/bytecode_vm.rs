@@ -285,7 +285,16 @@ impl InlineCache {
             self.offsets[idx] = offset;
             self.state += 1;
         } else {
-            // Megamorphic - just update fallback
+            // Megamorphic - replace least-recently-used entry (LRU) using
+            // a simple ring eviction strategy. The fallback_offset tracks
+            // the most recent shape's offset for the common case of repeated
+            // access to the same shape, but we also keep it in the cache
+            // slots so lookups still work.
+            // Evict the oldest entry (slot 0) by shifting and replacing.
+            self.shape_ids.copy_within(0..3, 1);
+            self.offsets.copy_within(0..3, 1);
+            self.shape_ids[0] = shape_id;
+            self.offsets[0] = offset;
             self.fallback_offset = offset;
         }
     }
