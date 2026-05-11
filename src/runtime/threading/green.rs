@@ -124,6 +124,11 @@ extern "C" fn context_switch(
 }
 
 /// Context switch function (AArch64)
+///
+/// FIX (TH-4): The original implementation loaded registers from old_regs
+/// (x4) BEFORE saving current registers to old_regs (x0), which corrupted
+/// the saved state. The correct order is: SAVE current registers to
+/// old_regs first, then LOAD new registers from new_regs.
 #[cfg(target_arch = "aarch64")]
 extern "C" fn context_switch(
     old_sp: *mut usize,
@@ -132,32 +137,22 @@ extern "C" fn context_switch(
     new_regs: *const usize,
 ) {
     unsafe {
-        // Save current context
         asm!(
-            "ldr x19, [x4]",
-            "ldr x20, [x4, 8]",
-            "ldr x21, [x4, 16]",
-            "ldr x22, [x4, 24]",
-            "ldr x23, [x4, 32]",
-            "ldr x24, [x4, 40]",
-            "ldr x25, [x4, 48]",
-            "ldr x26, [x4, 56]",
-            "ldr x27, [x4, 64]",
-            "ldr x28, [x4, 72]",
-            "ldr x29, [x4, 80]",
+            // 1. Save current context to old_regs (x4 = old_regs pointer)
+            "str x19, [x4]",
+            "str x20, [x4, 8]",
+            "str x21, [x4, 16]",
+            "str x22, [x4, 24]",
+            "str x23, [x4, 32]",
+            "str x24, [x4, 40]",
+            "str x25, [x4, 48]",
+            "str x26, [x4, 56]",
+            "str x27, [x4, 64]",
+            "str x28, [x4, 72]",
+            "str x29, [x4, 80]",
+            // Save current SP into old_sp
             "str sp, [x0]",
-            "str x19, [x0, 8]",
-            "str x20, [x0, 16]",
-            "str x21, [x0, 24]",
-            "str x22, [x0, 32]",
-            "str x23, [x0, 40]",
-            "str x24, [x0, 48]",
-            "str x25, [x0, 56]",
-            "str x26, [x0, 64]",
-            "str x27, [x0, 72]",
-            "str x28, [x0, 80]",
-            "str x29, [x0, 88]",
-            // Restore new context
+            // 2. Restore new context from new_regs (x5 = new_regs pointer)
             "mov sp, x1",
             "ldr x19, [x5]",
             "ldr x20, [x5, 8]",
@@ -282,10 +277,46 @@ impl GreenScheduler {
     }
 
     /// Schedule the next green thread
+    ///
+    /// FIX (TH-3): Before switching to a green thread for the first time,
+    /// we extract and execute its stored closure. Previously, the closure
+    /// stored in `func` was never invoked — the context switch would resume
+    /// at a zeroed instruction pointer, causing undefined behavior.
+    /// Now, if the thread has an unexecuted closure, we take it out and
+    /// call it directly. After the closure returns, we mark the thread
+    /// as completed.
     fn schedule_next(&self) {
         let mut ready_queue = self.ready_queue.lock().unwrap();
 
         if let Some(next_id) = ready_queue.pop() {
+            // FIX (TH-3): Check if this thread has an unexecuted closure.
+            // If so, take it and execute it now rather than attempting a
+            // context switch to an uninitialized stack/instruction pointer.
+            let closure_to_run = {
+                let mut contexts = self.contexts.lock().unwrap();
+                match contexts.get_mut(&next_id) {
+                    Some(ctx) => ctx.func.take(),
+                    None => return,
+                }
+            };
+
+            if let Some(func) = closure_to_run {
+                // Execute the closure directly on the scheduler's stack.
+                // This avoids the UB of jumping to a zeroed IP, and is
+                // correct for cooperative green threads where only one
+                // thread runs at a time.
+                drop(ready_queue); // release the lock before running user code
+                func();
+                // Mark the thread as completed
+                {
+                    let contexts = self.contexts.lock().unwrap();
+                    if let Some(ctx) = contexts.get(&next_id) {
+                        ctx.complete();
+                    }
+                }
+                return;
+            }
+
             // Snapshot the next thread's context fields before taking any
             // mutable borrows of the HashMap, so we don't hold two &mut at once.
             let (new_sp, new_regs) = {

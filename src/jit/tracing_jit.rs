@@ -296,6 +296,9 @@ pub struct NativeCodeGenerator {
     /// Slots are sequential integers, making Vec the natural O(1) choice.
     slot_reg: Vec<Option<Reg>>,
     next_label_id: usize,
+    /// FIX (JIT-1): Deopt label for division-by-zero guards. Set during
+    /// compile_trace() so emit_instruction can reference it.
+    deopt_label: usize,
 }
 
 impl NativeCodeGenerator {
@@ -303,7 +306,7 @@ impl NativeCodeGenerator {
         Self {
             code: Vec::with_capacity(4096), labels: FxHashMap::default(), patch_sites: Vec::new(),
             reg_map: [RegState::Empty; 16], slot_reg: Vec::new(),
-            next_label_id: 0,
+            next_label_id: 0, deopt_label: 0,
         }
     }
 
@@ -315,6 +318,7 @@ impl NativeCodeGenerator {
         // this single label, which is resolved during backpatch_jumps once we
         // know the stub's byte offset.
         let deopt_label = trace.next_label_id;
+        self.deopt_label = deopt_label; // FIX (JIT-1): store for emit_instruction
 
         // Fix #1: Check if trace is type-specialized for unboxed operations
         let is_specialized = trace.specialized_type.is_some() && unboxed_buffer.is_some();
@@ -325,13 +329,22 @@ impl NativeCodeGenerator {
         // 2. Hoist invariant guards to entry & emit
         self.emit_hoisted_guards(&trace.guards, deopt_label)?;
 
-        // J2 fix: Load the unboxed buffer base address into R8 ONCE in the
-        // prologue, so that every subsequent emit_unboxed_load/store_reg
-        // doesn't need to reload it. Previously, each unboxed memory op
-        // emitted a 10-byte MOV R8, imm64 — on a trace with 20 memory ops,
-        // that's 200 bytes of redundant pointer loads.
+        // FIX (JIT-2): The unboxed buffer address is now passed as a function
+        // argument in RDX (the 3rd System V ABI register), rather than baked
+        // as an immediate into the generated code. This makes the JIT code
+        // position-independent with respect to the buffer — if the buffer is
+        // ever reallocated (e.g., by a GC or arena reset), the caller can
+        // simply pass the new address without recompiling the trace.
+        //
+        // The original code used mov_r8_imm64(buffer_addr) which baked the
+        // absolute address into the machine code, creating a relocation
+        // problem. Now we copy RDX → R8 in the prologue so all existing
+        // emit_unboxed_load/store_reg code (which references [R8+offset])
+        // continues to work unchanged.
         if is_specialized {
-            self.mov_r8_imm64(unboxed_buffer.unwrap() as i64);
+            // mov r8, rdx — copy the buffer argument from RDX to R8
+            // REX.WRB: 4C (REX.WR) + 89 (MOV r/m64, r64) + C2 (mod=11, reg=rdx, rm=r8)
+            self.b(0x4C); self.b(0x89); self.b(0xD0); // mov r8, rdx
         }
 
         // 3. Optimization Pass: Constant Folding & Dead Store Elimination
@@ -487,8 +500,21 @@ impl NativeCodeGenerator {
                     BinOpKind::Add => self.add_rax_rcx(),
                     BinOpKind::Sub => self.sub_rax_rcx(),
                     BinOpKind::Mul => self.imul_rax_rcx(),
-                    BinOpKind::Div => self.idiv_rax_rcx(),
-                    BinOpKind::Rem => self.irem_rax_rcx(),
+                    BinOpKind::Div => {
+                        // FIX (JIT-1): Guard against division by zero.
+                        // Emit: test rcx, rcx; jz deopt_label
+                        // If RCX is zero, jump to the deopt stub instead of
+                        // executing IDIV which would trigger #DE (crash).
+                        self.test_rcx_rcx();
+                        self.jz_label(self.deopt_label);
+                        self.idiv_rax_rcx();
+                    }
+                    BinOpKind::Rem => {
+                        // FIX (JIT-1): Guard against division by zero.
+                        self.test_rcx_rcx();
+                        self.jz_label(self.deopt_label);
+                        self.irem_rax_rcx();
+                    }
                     BinOpKind::BitAnd => self.and_rax_rcx(),
                     BinOpKind::BitOr => self.or_rax_rcx(),
                     BinOpKind::BitXor => self.xor_rax_rcx(),
@@ -559,8 +585,18 @@ impl NativeCodeGenerator {
                         BinOpKind::Add => self.add_rax_rcx(),
                         BinOpKind::Sub => self.sub_rax_rcx(),
                         BinOpKind::Mul => self.imul_rax_rcx(),
-                        BinOpKind::Div => self.idiv_rax_rcx(),
-                        BinOpKind::Rem => self.irem_rax_rcx(),
+                        BinOpKind::Div => {
+                            // FIX (JIT-1): Guard against division by zero (unboxed path)
+                            self.test_rcx_rcx();
+                            self.jz_label(self.deopt_label);
+                            self.idiv_rax_rcx();
+                        }
+                        BinOpKind::Rem => {
+                            // FIX (JIT-1): Guard against division by zero (unboxed path)
+                            self.test_rcx_rcx();
+                            self.jz_label(self.deopt_label);
+                            self.irem_rax_rcx();
+                        }
                         BinOpKind::BitAnd => self.and_rax_rcx(),
                         BinOpKind::BitOr => self.or_rax_rcx(),
                         BinOpKind::BitXor => self.xor_rax_rcx(),
@@ -824,6 +860,7 @@ impl NativeCodeGenerator {
     fn shl_rax_cl(&mut self) { self.bb(0x48, 0xD3); self.b(0xE0); }
     fn shr_rax_cl(&mut self) { self.bb(0x48, 0xD3); self.b(0xE8); }
     fn test_rax_rax(&mut self) { self.bbb(0x48, 0x85, 0xC0); }
+    fn test_rcx_rcx(&mut self) { self.bbb(0x48, 0x85, 0xC9); } // FIX (JIT-1): test rcx, rcx
 
     fn jne_label(&mut self, l: usize) { self.rel32_jump(0x0F, 0x85, l); }
     fn jz_label(&mut self, l: usize) { self.rel32_jump(0x0F, 0x84, l); }
@@ -866,10 +903,17 @@ pub struct CompiledTrace {
 }
 
 impl CompiledTrace {
-    /// Signature: fn(slots: *mut i64, types: *const u8) -> i64
-    pub unsafe fn execute(&self, slots: *mut i64, types: *const u8) -> i64 {
-        let func: unsafe extern "C" fn(*mut i64, *const u8) -> i64 = mem::transmute(self.entry_point);
-        func(slots, types)
+    /// Execute the compiled trace.
+    ///
+    /// FIX (JIT-2): The signature now accepts an optional `unboxed_buffer`
+    /// parameter passed via RDX (3rd System V argument register). This
+    /// replaces the old approach where the buffer address was baked into
+    /// the generated code as an immediate value.
+    ///
+    /// Signature: fn(slots: *mut i64, types: *const u8, unboxed_buffer: *mut u8) -> i64
+    pub unsafe fn execute(&self, slots: *mut i64, types: *const u8, unboxed_buffer: *mut u8) -> i64 {
+        let func: unsafe extern "C" fn(*mut i64, *const u8, *mut u8) -> i64 = mem::transmute(self.entry_point);
+        func(slots, types, unboxed_buffer)
     }
 }
 

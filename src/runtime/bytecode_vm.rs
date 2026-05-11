@@ -239,6 +239,9 @@ pub struct InlineCache {
     offsets: [i32; 4],
     /// Fallback when cache miss
     fallback_offset: i32,
+    /// FIX (PERF-7): Ring buffer head pointer for megamorphic eviction.
+    /// Tracks the next slot to overwrite in the ring buffer.
+    head: u8,
 }
 
 impl InlineCache {
@@ -248,6 +251,7 @@ impl InlineCache {
             shape_ids: [0; 4],
             offsets: [0; 4],
             fallback_offset: -1,
+            head: 0,
         }
     }
     
@@ -276,6 +280,13 @@ impl InlineCache {
     }
     
     /// Update cache with new shape ID and offset
+    ///
+    /// FIX (PERF-7): Replaced the O(4) shift-and-insert eviction strategy with
+    /// a ring buffer using a head pointer. The original code shifted all entries
+    /// down by one slot and inserted at position 0, requiring 4 memory moves per
+    /// eviction. The ring buffer achieves the same effect with a single write
+    /// and a head pointer increment, which is significantly faster for this
+    /// hot-path operation.
     #[inline(never)]
     pub fn update(&mut self, shape_id: u64, offset: i32) {
         let idx = self.state as usize;
@@ -285,16 +296,14 @@ impl InlineCache {
             self.offsets[idx] = offset;
             self.state += 1;
         } else {
-            // Megamorphic - replace least-recently-used entry (LRU) using
-            // a simple ring eviction strategy. The fallback_offset tracks
-            // the most recent shape's offset for the common case of repeated
-            // access to the same shape, but we also keep it in the cache
-            // slots so lookups still work.
-            // Evict the oldest entry (slot 0) by shifting and replacing.
-            self.shape_ids.copy_within(0..3, 1);
-            self.offsets.copy_within(0..3, 1);
-            self.shape_ids[0] = shape_id;
-            self.offsets[0] = offset;
+            // Megamorphic - ring buffer eviction strategy.
+            // The `head` field tracks the insertion position. Each new entry
+            // overwrites the oldest slot (the one about to be evicted), and
+            // the head advances. This is O(1) per eviction instead of O(N).
+            let head = self.head as usize;
+            self.shape_ids[head] = shape_id;
+            self.offsets[head] = offset;
+            self.head = ((head + 1) % 4) as u8;
             self.fallback_offset = offset;
         }
     }

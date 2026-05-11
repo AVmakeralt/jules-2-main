@@ -1078,12 +1078,28 @@ impl IrExpr {
             | IrExpr::IsErr { .. } => Effect::Pure,
 
             // ── Unwrap / try — may panic ──
-            IrExpr::Unwrap { .. } => Effect::ControlFlow,
-            IrExpr::TryPropagate { .. } => Effect::ControlFlow,
+            // FIX (IR-2): Changed from ControlFlow to Unknown. While Unwrap
+            // and TryPropagate can affect control flow (propagating errors),
+            // the primary concern is that they can PANIC, which is semantically
+            // closer to Effect::Unknown than Effect::ControlFlow. Classifying
+            // them as ControlFlow prevented the optimizer from performing dead
+            // code elimination and common subexpression elimination on paths
+            // that contain unwraps. With Unknown, the optimizer is still
+            // conservative but can optimize pure paths that happen to contain
+            // unwraps of known-good values.
+            IrExpr::Unwrap { .. } => Effect::Unknown,
+            IrExpr::TryPropagate { .. } => Effect::Unknown,
 
             // ── Construction — MakeArray/MakeClosure allocate memory ──
+            // FIX (IR-3): MakeStruct and MakeTuple changed from Pure to Unknown.
+            // The field values they reference may carry side effects (e.g., a
+            // field that is the result of a function call with IO effects).
+            // Marking the entire construction as Pure would allow the optimizer
+            // to incorrectly reorder or eliminate it. The conservative Unknown
+            // classification ensures the optimizer does not move or eliminate
+            // struct/tuple construction across effect boundaries.
             IrExpr::MakeStruct { .. }
-            | IrExpr::MakeTuple { .. } => Effect::Pure,
+            | IrExpr::MakeTuple { .. } => Effect::Unknown,
             IrExpr::MakeArray { .. } => Effect::Allocation,
             IrExpr::MakeEnum { .. }
             | IrExpr::MakeOption { .. }

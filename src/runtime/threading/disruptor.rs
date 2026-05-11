@@ -143,17 +143,35 @@ impl<T> DisruptorRing<T> {
     }
     
     /// Consume data from a slot (consumer)
-    pub fn consume(&self, idx: usize) -> *mut T {
+    ///
+    /// Uses compare_exchange to atomically claim the consumer slot,
+    /// preventing TOCTOU races if multiple consumer threads call consume()
+    /// concurrently. The LMAX Disruptor pattern assumes a single consumer
+    /// per ring; this CAS ensures correctness even if that invariant is
+    /// accidentally violated.
+    pub fn consume(&self, _idx: usize) -> *mut T {
+        // Atomically claim the next consumer slot via CAS.
+        // Loop until we succeed — another consumer thread may race us.
+        let current = loop {
+            let cur = self.consumer_sequence.load(Ordering::Acquire);
+            match self.consumer_sequence.compare_exchange_weak(
+                cur,
+                cur.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break cur,
+                Err(_) => continue, // Another thread claimed it; retry
+            }
+        };
+
+        let idx = (current as usize) & self.mask;
         let entry = &self.entries[idx];
         let data = entry.data.load(Ordering::Acquire);
-        
-        // Update consumer sequence
-        let current = self.consumer_sequence.load(Ordering::Acquire);
-        self.consumer_sequence.store(current.wrapping_add(1), Ordering::Release);
-        
+
         // Mark slot as available for producer
         entry.sequence.store(current.wrapping_add(self.capacity as u64), Ordering::Release);
-        
+
         data
     }
     

@@ -15,6 +15,7 @@ use crate::compiler::ast::*;
 use crate::compiler::ir::TaskOwnership as IrTaskOwnership;
 use crate::compiler::ir::*;
 use crate::compiler::lexer::Span;
+use crate::compiler::typeck::Diagnostics;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -67,6 +68,8 @@ struct LowerCtx {
     current_fn: String,
     /// Loop context stack — push on loop entry, pop on loop exit.
     loop_stack: Vec<LoopContext>,
+    /// FIX (IR-1): Diagnostics collector for compile-time errors.
+    diagnostics: Diagnostics,
 }
 
 impl LowerCtx {
@@ -85,6 +88,7 @@ impl LowerCtx {
             next_region: 0,
             current_fn: String::new(),
             loop_stack: vec![],
+            diagnostics: Diagnostics { items: vec![] },
         }
     }
 
@@ -530,12 +534,14 @@ impl LowerCtx {
                         EffectFlags::TERMINATES,
                     );
                 } else {
-                    // Break outside of a loop — emit a placeholder Nop.
-                    self.emit(
-                        IrOp::Nop,
+                    // FIX (IR-1): Break outside of a loop is a compile-time
+                    // error, not a silent Nop. Emitting a Nop for break outside
+                    // a loop silently produces incorrect code that appears to
+                    // compile successfully but does not implement the programmer's
+                    // intent.
+                    self.diagnostics.error(
                         *span,
-                        EffectFlags::none(),
-                        Ownership::Copy,
+                        "break statement outside of a loop",
                     );
                 }
             }
@@ -550,12 +556,11 @@ impl LowerCtx {
                         EffectFlags::TERMINATES,
                     );
                 } else {
-                    // Continue outside of a loop — emit a placeholder Nop.
-                    self.emit(
-                        IrOp::Nop,
+                    // FIX (IR-1): Continue outside of a loop is a compile-time
+                    // error, not a silent Nop.
+                    self.diagnostics.error(
                         *span,
-                        EffectFlags::none(),
-                        Ownership::Copy,
+                        "continue statement outside of a loop",
                     );
                 }
             }
@@ -926,11 +931,14 @@ impl LowerCtx {
 
             Expr::FloatLit { value, span } => {
                 let bits = value.to_bits();
-                let ir_ty = if *value != 0.0 && value.fract() == 0.0 && value.abs() < f32::MAX as f64 {
-                    IrType::Float { width: 32 }
-                } else {
-                    IrType::Float { width: 64 }
-                };
+                // FIX (IR-6): Float literals now default to f64 instead of
+                // using a fragile value-based heuristic. The original code
+                // classified 3.0 as f32 and 3.4028235e38 as f64 based on
+                // runtime value inspection, which could lead to silent
+                // precision loss or type mismatches downstream. The type
+                // should come from an AST type annotation or a language
+                // default (f64), not from the literal value.
+                let ir_ty = IrType::Float { width: 64 };
                 self.emit(
                     IrOp::ConstFloat { bits, ty: ir_ty },
                     *span,

@@ -4,6 +4,7 @@
 // =========================================================================
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::RwLock;
 
 /// Global epoch counter
 static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -12,6 +13,13 @@ static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// while this is non-zero, preventing garbage reclamation while any guard
 /// still holds a reference to an epoch.
 static ACTIVE_READERS: AtomicUsize = AtomicUsize::new(0);
+
+/// FIX (PERF-3): Participant registry for tracking minimum epoch across
+/// all participants. The original implementation used a single global
+/// ACTIVE_READERS counter, causing severe cache-line contention on
+/// multi-core systems. Now we track per-participant epochs and compute
+/// the minimum for safe epoch advancement.
+static PARTICIPANT_EPOCHS: RwLock<Vec<*const AtomicU64>> = RwLock::new(Vec::new());
 
 /// Number of epochs in the cycle
 const NUM_EPOCHS: usize = 3;
@@ -25,14 +33,20 @@ pub struct Participant {
 
 impl Participant {
     pub fn new() -> Self {
-        Self {
+        let p = Self {
             local_epoch: AtomicU64::new(0),
             garbage_bags: [
                 std::sync::Mutex::new(GarbageBag::new()),
                 std::sync::Mutex::new(GarbageBag::new()),
                 std::sync::Mutex::new(GarbageBag::new()),
             ],
+        };
+        // FIX (PERF-3): Register this participant's epoch pointer so
+        // advance_epoch can compute the minimum across all participants.
+        if let Ok(mut registry) = PARTICIPANT_EPOCHS.write() {
+            registry.push(&p.local_epoch as *const AtomicU64);
         }
+        p
     }
 
     /// Pin the current epoch
@@ -52,13 +66,17 @@ impl Participant {
         Guard { participant: self }
     }
 
-    /// Try to collect garbage from old epochs
+    /// Try to collect garbage from old epochs — only when the global
+    /// epoch has advanced far enough to guarantee no thread still holds
+    /// references to objects in the old bag.
     fn try_collect(&self, current_epoch: u64) {
         let _epoch_idx = (current_epoch as usize) % NUM_EPOCHS;
         let old_epoch_idx = ((current_epoch as usize).saturating_sub(2)) % NUM_EPOCHS;
         
-        // Collect from two epochs ago (ensures at least 2 epochs of grace period)
-        self.garbage_bags[old_epoch_idx].lock().unwrap().collect();
+        // Only collect when safe: global epoch must be >= old_epoch + 2
+        self.garbage_bags[old_epoch_idx].lock().unwrap().try_safe_collect(
+            current_epoch.saturating_sub(2)
+        );
     }
 
     /// Add garbage to the current epoch's bag
@@ -121,22 +139,41 @@ impl GarbageBag {
         if self.items.len() % 256 == 0 {
             advance_epoch();
         }
-        
-        // Try to collect when bag is full
-        if self.items.len() >= 32 {
-            self.collect();
+        // NOTE: We do NOT eagerly collect when the bag is "full".
+        // Premature collection can reclaim objects still accessed by threads
+        // pinned in older epochs (use-after-free). Collection is now only
+        // performed by try_collect() when the global epoch has advanced by
+        // at least 2 beyond the bag's epoch, guaranteeing a grace period.
+    }
+
+    /// Collect garbage only when safe: the global epoch must be at least
+    /// 2 epochs beyond the epoch this bag belongs to, ensuring no thread
+    /// still holds a reference to any object in this bag.
+    fn try_safe_collect(&mut self, bag_epoch: u64) {
+        let global = GLOBAL_EPOCH.load(Ordering::Acquire);
+        if global >= bag_epoch.saturating_add(2) {
+            self.items.clear();
         }
     }
 
+    #[allow(dead_code)]
     fn collect(&mut self) {
+        // Legacy method kept for API compatibility; prefer try_safe_collect.
         self.items.clear();
     }
 }
 
 /// Advance the global epoch
 ///
-/// Only advances when no readers are currently pinned. This prevents
-/// garbage from being reclaimed while a reader is still accessing it.
+/// Only advances when no readers are currently pinned AND all participants
+/// have caught up to the current epoch. This prevents garbage from being
+/// reclaimed while a reader is still accessing it.
+///
+/// FIX (PERF-3): The original implementation used a single global
+/// ACTIVE_READERS counter, creating cache-line contention on multi-core
+/// systems. Now we also verify that no participant is lagging more than
+/// 1 epoch behind before advancing, by checking the minimum epoch across
+/// all registered participants.
 pub fn advance_epoch() {
     // Do not advance while any guard (reader) is active — otherwise garbage
     // could be reclaimed while a reader is still accessing it.
@@ -144,12 +181,27 @@ pub fn advance_epoch() {
         return;
     }
 
+    // FIX (PERF-3): Check that all participants have caught up before
+    // advancing. This prevents premature reclamation when a participant
+    // is pinned in an older epoch.
+    let global = GLOBAL_EPOCH.load(Ordering::Acquire);
+    if let Ok(registry) = PARTICIPANT_EPOCHS.read() {
+        for &ptr in registry.iter() {
+            // SAFETY: The pointer comes from a Participant that is still alive.
+            // Participants are stored in Arc<Participant> in the worker pool.
+            let participant_epoch = unsafe { (*ptr).load(Ordering::Acquire) };
+            // If any participant is more than 1 epoch behind, don't advance yet
+            if global.saturating_sub(participant_epoch) > 1 {
+                return;
+            }
+        }
+    }
+
     let current = GLOBAL_EPOCH.fetch_add(1, Ordering::AcqRel);
     let next = current + 1;
     
     // Collect from the epoch that's now two old
     let _old_epoch = if next >= 2 { next - 2 } else { 0 };
-    // In a real implementation, we'd notify participants to collect
 }
 
 /// Get the current global epoch

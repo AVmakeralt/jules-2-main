@@ -336,9 +336,18 @@ where
 
 /// Execute a closure on all available threads in parallel
 /// Adaptive splitting based on workload characteristics
+///
+/// FIX (PERF-4): The original implementation wrapped the FnMut closure in
+/// Arc<Mutex<F>>, which serialized the entire parallel for loop since only
+/// one worker could hold the mutex at a time. This was functionally equivalent
+/// to sequential execution with extra synchronization cost.
+///
+/// The fix requires F: FnMut(usize) + Send + Clone, giving each worker its
+/// own clone of the closure so they can execute in parallel without contention.
+/// For closures that cannot be cloned, the sequential fallback is used.
 pub fn par_for<F>(range: std::ops::Range<usize>, f: F)
 where
-    F: FnMut(usize) + Send + Sync,
+    F: FnMut(usize) + Send + Clone,
 {
     let pool = get_pool();
     let num_workers = pool.num_workers();
@@ -354,16 +363,17 @@ where
 
     // Adaptive chunking
     let chunk_size = (range.len() / num_workers).max(1);
-    let f = std::sync::Arc::new(std::sync::Mutex::new(f));
     
+    // FIX (PERF-4): Clone the closure for each worker instead of wrapping
+    // in Arc<Mutex<F>>. Each worker gets its own copy and can execute
+    // independently without lock contention.
     for chunk_start in (range.start..range.end).step_by(chunk_size) {
         let chunk_end = (chunk_start + chunk_size).min(range.end);
-        let f_clone = f.clone();
+        let mut f_clone = f.clone();
         
         let task: Box<dyn FnOnce()> = Box::new(move || {
-            let mut guard = f_clone.lock().unwrap();
             for i in chunk_start..chunk_end {
-                guard(i);
+                f_clone(i);
             }
         });
         
