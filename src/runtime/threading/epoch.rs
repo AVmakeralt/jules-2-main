@@ -6,6 +6,18 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::RwLock;
 
+/// Wrapper around `*const AtomicU64` that implements `Send` + `Sync`.
+///
+/// # Safety
+/// The caller must ensure that the pointed-to `AtomicU64` outlives
+/// any access through this pointer and that all access is through
+/// atomic operations (which are thread-safe by definition).
+#[repr(transparent)]
+struct EpochPtr(*const AtomicU64);
+
+unsafe impl Send for EpochPtr {}
+unsafe impl Sync for EpochPtr {}
+
 /// Global epoch counter
 static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(0);
 
@@ -19,7 +31,7 @@ static ACTIVE_READERS: AtomicUsize = AtomicUsize::new(0);
 /// ACTIVE_READERS counter, causing severe cache-line contention on
 /// multi-core systems. Now we track per-participant epochs and compute
 /// the minimum for safe epoch advancement.
-static PARTICIPANT_EPOCHS: RwLock<Vec<*const AtomicU64>> = RwLock::new(Vec::new());
+static PARTICIPANT_EPOCHS: RwLock<Vec<EpochPtr>> = RwLock::new(Vec::new());
 
 /// Number of epochs in the cycle
 const NUM_EPOCHS: usize = 3;
@@ -44,7 +56,7 @@ impl Participant {
         // FIX (PERF-3): Register this participant's epoch pointer so
         // advance_epoch can compute the minimum across all participants.
         if let Ok(mut registry) = PARTICIPANT_EPOCHS.write() {
-            registry.push(&p.local_epoch as *const AtomicU64);
+            registry.push(EpochPtr(&p.local_epoch as *const AtomicU64));
         }
         p
     }
@@ -186,10 +198,10 @@ pub fn advance_epoch() {
     // is pinned in an older epoch.
     let global = GLOBAL_EPOCH.load(Ordering::Acquire);
     if let Ok(registry) = PARTICIPANT_EPOCHS.read() {
-        for &ptr in registry.iter() {
+        for ep in registry.iter() {
             // SAFETY: The pointer comes from a Participant that is still alive.
             // Participants are stored in Arc<Participant> in the worker pool.
-            let participant_epoch = unsafe { (*ptr).load(Ordering::Acquire) };
+            let participant_epoch = unsafe { (*ep.0).load(Ordering::Acquire) };
             // If any participant is more than 1 epoch behind, don't advance yet
             if global.saturating_sub(participant_epoch) > 1 {
                 return;

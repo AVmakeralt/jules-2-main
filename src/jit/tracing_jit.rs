@@ -961,7 +961,7 @@ impl TracingJIT {
             // This made the JIT catastrophically slow — compile overhead per call
             // far exceeded any speedup from native code.
             if let Some(ct) = self.compiled_cache.get(&tid) {
-                let res = unsafe { ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr()) };
+                let res = unsafe { ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr(), std::ptr::null_mut() as *mut u8) };
                 if res >= 0 { return Ok(Value::I64(res)); }
                 self.deoptimizations += 1;
             } else if let Some(trace) = self.recorder.get_trace(tid) {
@@ -969,7 +969,7 @@ impl TracingJIT {
                     match self.codegen.compile_trace(trace, None) {
                         Ok(ct) => {
                             self.traces_compiled += 1;
-                            let res = unsafe { ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr()) };
+                            let res = unsafe { ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr(), std::ptr::null_mut() as *mut u8) };
                             if res >= 0 {
                                 // Cache the compiled trace for future calls
                                 self.compiled_cache.insert(tid, ct);
