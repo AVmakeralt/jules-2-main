@@ -71,6 +71,26 @@ name = "quick-inferno"
 path = "benches/quick_inferno.rs"
 
 [[bin]]
+name = "vm-debug"
+path = "src/tools/vm_debug.rs"
+
+[[bin]]
+name = "pipeline-debug"
+path = "src/tools/pipeline_debug.rs"
+
+[[bin]]
+name = "ast-dump"
+path = "src/tools/ast_dump.rs"
+
+[[bin]]
+name = "fib-debug"
+path = "src/tools/fib_debug.rs"
+
+[[bin]]
+name = "superopt-debug"
+path = "src/tools/superopt_debug.rs"
+
+[[bin]]
 name = "bench-adversarial"
 path = "src/tools/bench_adversarial.rs"
 

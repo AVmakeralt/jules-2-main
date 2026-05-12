@@ -893,29 +893,31 @@ impl PartialEvaluator {
             }
 
             Stmt::While { span, cond, body, label } => {
-                // CRITICAL: Do NOT fold the condition if any variable read in the
-                // condition is written in the loop body. The loop body executes
-                // after the condition check, so on subsequent iterations the
-                // condition's value depends on the mutated variables.
-                // Invalidate any environment entries for variables written in the
-                // body BEFORE evaluating the condition, to prevent the condition
-                // from being folded to a constant (which would cause an infinite loop).
+                // CRITICAL: Variables written in the loop body must be treated
+                // as Dynamic throughout the entire loop — including the body
+                // itself.  If we leave a pre-loop Static value in the env,
+                // the body's specialize_block will fold `let tmp = a + b`
+                // using the stale constant values of a and b, producing wrong
+                // code.  The saved/restore pattern below is intentionally NOT
+                // used for the body specialization — only for the condition,
+                // where the first-iteration values are still valid.
                 let mut body_writes = std::collections::HashSet::<String>::default();
                 Self::collect_writes_block(&body, &mut body_writes);
-                // Save and invalidate env entries for written variables
+                // Save and invalidate env entries for written variables so
+                // the condition is specialized with correct Dynamic bindings.
                 let saved: Vec<(String, Option<BindingTime>, Option<PartialValue>)> = body_writes.iter().filter_map(|v| {
                     env.bindings.remove(v).map(|(bt, pv)| (v.clone(), Some(bt), Some(pv)))
                 }).collect();
                 let cond = self.specialize_expr(cond, env, depth);
-                // Restore env entries (they'll be invalidated after the body anyway)
-                for (v, bt, pv) in saved {
-                    if let (Some(bt), Some(pv)) = (bt, pv) {
-                        env.bindings.insert(v, (bt, pv));
-                    }
-                }
+                // Do NOT restore the saved env entries before specializing
+                // the body.  The body must see all body-written variables as
+                // Dynamic because their values change across iterations.
+                // (Restoring was the root cause of the fibonacci bug: the body
+                // saw a=Static(0), b=Static(1) and folded tmp = 0+1 = 1, then
+                // a = b = 1, b = tmp = 1 — losing the iterative computation.)
                 let mut body = body;
                 self.specialize_block(&mut body, env, depth + 1);
-                // Evict written variables from the environment
+                // Evict written variables from the environment after the loop.
                 for v in &body_writes {
                     env.bindings.remove(v);
                 }

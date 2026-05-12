@@ -217,18 +217,27 @@ impl ConstantFolder {
     fn try_fold_binop(span: Span, op: BinOpKind, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
         match (lhs, rhs) {
             (Expr::IntLit { value: l, .. }, Expr::IntLit { value: r, .. }) => {
+                // Comparison operators produce BoolLit (not IntLit).
+                // This is critical: folding `1 != 0` to `BoolLit(true)` allows
+                // downstream passes (BranchOptimizer, PartialEvaluator) to
+                // correctly recognize and eliminate constant branches.  The old
+                // code produced `IntLit(u128::MAX)` which broke every pass that
+                // checked for `BoolLit` conditions.
+                match op {
+                    BinOpKind::Eq => return Some(Expr::BoolLit { span, value: *l == *r }),
+                    BinOpKind::Ne => return Some(Expr::BoolLit { span, value: *l != *r }),
+                    BinOpKind::Lt => return Some(Expr::BoolLit { span, value: *l < *r }),
+                    BinOpKind::Le => return Some(Expr::BoolLit { span, value: *l <= *r }),
+                    BinOpKind::Gt => return Some(Expr::BoolLit { span, value: *l > *r }),
+                    BinOpKind::Ge => return Some(Expr::BoolLit { span, value: *l >= *r }),
+                    _ => {}
+                }
                 let result = match op {
                     BinOpKind::Add => Some(l.wrapping_add(*r)),
                     BinOpKind::Sub => Some(l.wrapping_sub(*r)),
                     BinOpKind::Mul => Some(l.wrapping_mul(*r)),
                     BinOpKind::Div if *r != 0 => Some(l / *r),
                     BinOpKind::Rem if *r != 0 => Some(l % *r),
-                    BinOpKind::Eq => Some(if *l == *r { u128::MAX } else { 0 }),
-                    BinOpKind::Ne => Some(if *l != *r { u128::MAX } else { 0 }),
-                    BinOpKind::Lt => Some(if *l < *r { u128::MAX } else { 0 }),
-                    BinOpKind::Le => Some(if *l <= *r { u128::MAX } else { 0 }),
-                    BinOpKind::Gt => Some(if *l > *r { u128::MAX } else { 0 }),
-                    BinOpKind::Ge => Some(if *l >= *r { u128::MAX } else { 0 }),
                     BinOpKind::BitAnd => Some(*l & *r),
                     BinOpKind::BitOr => Some(*l | *r),
                     BinOpKind::BitXor => Some(*l ^ *r),
@@ -239,17 +248,21 @@ impl ConstantFolder {
                 result.map(|v| Expr::IntLit { span, value: v, ty: None })
             }
             (Expr::FloatLit { value: l, .. }, Expr::FloatLit { value: r, .. }) => {
+                // Comparison operators on floats also produce BoolLit.
+                match op {
+                    BinOpKind::Eq => return Some(Expr::BoolLit { span, value: *l == *r }),
+                    BinOpKind::Ne => return Some(Expr::BoolLit { span, value: *l != *r }),
+                    BinOpKind::Lt => return Some(Expr::BoolLit { span, value: *l < *r }),
+                    BinOpKind::Le => return Some(Expr::BoolLit { span, value: *l <= *r }),
+                    BinOpKind::Gt => return Some(Expr::BoolLit { span, value: *l > *r }),
+                    BinOpKind::Ge => return Some(Expr::BoolLit { span, value: *l >= *r }),
+                    _ => {}
+                }
                 let result = match op {
                     BinOpKind::Add => Some(l + r),
                     BinOpKind::Sub => Some(l - r),
                     BinOpKind::Mul => Some(l * r),
                     BinOpKind::Div if *r != 0.0 => Some(l / *r),
-                    BinOpKind::Eq => Some(if *l == *r { 1.0 } else { 0.0 }),
-                    BinOpKind::Ne => Some(if *l != *r { 1.0 } else { 0.0 }),
-                    BinOpKind::Lt => Some(if *l < *r { 1.0 } else { 0.0 }),
-                    BinOpKind::Le => Some(if *l <= *r { 1.0 } else { 0.0 }),
-                    BinOpKind::Gt => Some(if *l > *r { 1.0 } else { 0.0 }),
-                    BinOpKind::Ge => Some(if *l >= *r { 1.0 } else { 0.0 }),
                     _ => None,
                 };
                 result.map(|v| Expr::FloatLit { span, value: v })
@@ -1913,13 +1926,27 @@ impl DeadStoreEliminator {
             match stmt {
                 Stmt::While { cond, body, .. } => {
                     // Variables read in the condition are live across iterations.
+                    // Additionally, variables read ANYWHERE in the loop body are
+                    // also live: a store to `b` at the end of the body may be
+                    // read by `let tmp = a + b` at the start of the next
+                    // iteration.  Without including body reads in external_reads,
+                    // the DSE would consider `b = tmp` dead (nothing reads `b`
+                    // after it in the same iteration) and eliminate it, breaking
+                    // loop-carried dependencies (e.g. fibonacci).
                     let mut all_reads = post_reads.clone();
                     DeadCodeEliminator::collect_reads_expr(cond, &mut all_reads);
+                    for s in &body.stmts { DeadCodeEliminator::collect_reads_stmt(s, &mut all_reads); }
+                    if let Some(t) = &body.tail { DeadCodeEliminator::collect_reads_expr(t, &mut all_reads); }
                     self.eliminate_block(body, &all_reads);
                 }
                 Stmt::ForIn { body, .. }
                 | Stmt::EntityFor { body, .. } => {
-                    self.eliminate_block(body, post_reads);
+                    // Same as while: include body reads as external_reads
+                    // for loop-carried dependencies.
+                    let mut all_reads = post_reads.clone();
+                    for s in &body.stmts { DeadCodeEliminator::collect_reads_stmt(s, &mut all_reads); }
+                    if let Some(t) = &body.tail { DeadCodeEliminator::collect_reads_expr(t, &mut all_reads); }
+                    self.eliminate_block(body, &all_reads);
                 }
                 Stmt::If { then, else_, .. } => {
                     self.eliminate_block(then, post_reads);
@@ -1930,7 +1957,11 @@ impl DeadStoreEliminator {
                     }
                 }
                 Stmt::Loop { body, .. } => {
-                    self.eliminate_block(body, post_reads);
+                    // Same as while: include body reads for loop-carried deps.
+                    let mut all_reads = post_reads.clone();
+                    for s in &body.stmts { DeadCodeEliminator::collect_reads_stmt(s, &mut all_reads); }
+                    if let Some(t) = &body.tail { DeadCodeEliminator::collect_reads_expr(t, &mut all_reads); }
+                    self.eliminate_block(body, &all_reads);
                 }
                 _ => {}
             }
