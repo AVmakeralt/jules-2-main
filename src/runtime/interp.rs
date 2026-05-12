@@ -9577,6 +9577,9 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Unit, Value::Unit) => true,
+        // Cross-type integer comparison (Bug #4 fix)
+        (Value::I64(x), Value::I32(y)) => *x == *y as i64,
+        (Value::I32(x), Value::I64(y)) => *x as i64 == *y,
         _ => false,
     }
 }

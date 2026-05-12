@@ -1689,39 +1689,9 @@ impl SemanticSuperoptimizer {
         None
     }
 
-    fn rule_mul_div_cancel(&self, expr: &Expr) -> Option<Expr> {
-        // (x * y) / y → x  (y ≠ 0, and y is a non-zero literal)
-        if let Expr::BinOp { op: BinOpKind::Div, lhs, rhs: y_outer, .. } = expr {
-            if let Expr::BinOp { op: BinOpKind::Mul, lhs: x, rhs: y_inner, .. } = lhs.as_ref() {
-                if Self::exprs_equal(y_inner, y_outer) && !Self::is_int_lit(y_outer, 0) {
-                    return Some(*x.clone());
-                }
-                if Self::exprs_equal(x, y_outer) && !Self::is_int_lit(y_outer, 0) {
-                    return Some(*y_inner.clone());
-                }
-            }
-        }
-        None
-    }
-
-    fn rule_div_mul_cancel(&self, expr: &Expr) -> Option<Expr> {
-        // (x / y) * y → x  (annotated as "exact division assumed")
-        if let Expr::BinOp { op: BinOpKind::Mul, lhs, rhs: y_outer, span } = expr {
-            if let Expr::BinOp { op: BinOpKind::Div, lhs: x, rhs: y_inner, .. } = lhs.as_ref() {
-                if Self::exprs_equal(y_inner, y_outer) && !Self::is_int_lit(y_outer, 0) {
-                    let span = *span;
-                    // Wrap in an annotation call so the backend knows it assumed exactness.
-                    return Some(Expr::Call {
-                        span,
-                        func: Box::new(Expr::Ident { span, name: "exact_div_restore".to_string() }),
-                        args: vec![*x.clone()],
-                        named: vec![],
-                    });
-                }
-            }
-        }
-        None
-    }
+    // NOTE: rule_mul_div_cancel and rule_div_mul_cancel were removed because they
+    // incorrectly assume real-number division semantics.
+    // For integers: (x * y) / y ≠ x (overflow) and (x / y) * y ≠ x (truncation)
 
     fn rule_shl_shr_cancel(&self, expr: &Expr) -> Option<Expr> {
         // (x << k) >> k → x & mask  where mask = ((1 << (bit_width - k)) - 1)

@@ -654,10 +654,12 @@ impl AlgebraicSimplifier {
                 if Self::is_float_zero(rhs) { return Some(lhs.clone()); }
                 if Self::expr_eq(lhs, rhs) {
                     let span = lhs.span();
-                    if matches!(lhs, Expr::IntLit { .. }) {
-                        return Some(Expr::IntLit { span, value: 0, ty: None });
+                    // Bug #5 fix: Default to IntLit for x - x when type is unknown.
+                    // FloatLit should only be returned for explicitly float-typed operands.
+                    if matches!(lhs, Expr::FloatLit { .. }) {
+                        return Some(Expr::FloatLit { span, value: 0.0 });
                     }
-                    return Some(Expr::FloatLit { span, value: 0.0 });
+                    return Some(Expr::IntLit { span, value: 0, ty: None });
                 }
             }
 
@@ -687,10 +689,12 @@ impl AlgebraicSimplifier {
                 if Self::is_float_one(rhs) { return Some(lhs.clone()); }
                 if Self::expr_eq(lhs, rhs) {
                     let span = lhs.span();
-                    if matches!(lhs, Expr::IntLit { .. }) {
-                        return Some(Expr::IntLit { span, value: 1, ty: None });
+                    // Bug #5 fix: Default to IntLit for x / x when type is unknown.
+                    // FloatLit should only be returned for explicitly float-typed operands.
+                    if matches!(lhs, Expr::FloatLit { .. }) {
+                        return Some(Expr::FloatLit { span, value: 1.0 });
                     }
-                    return Some(Expr::FloatLit { span, value: 1.0 });
+                    return Some(Expr::IntLit { span, value: 1, ty: None });
                 }
                 if Self::is_int_zero(lhs) { return Some(lhs.clone()); }
                 if Self::is_float_zero(lhs) { return Some(lhs.clone()); }
@@ -4408,12 +4412,9 @@ impl EGraph {
                 binop(BinOpKind::Sub, var("x"), var("x")),
                 int_lit(0),
             ),
-            // x / x = 1
-            PatternRewrite::new(
-                "div_self",
-                binop(BinOpKind::Div, var("x"), var("x")),
-                int_lit(1),
-            ),
+            // NOTE: div_self rule was removed because 0/0 should be a runtime error, not 1.
+            // The e-graph cannot prove x ≠ 0 for arbitrary variables.
+
             // x ^ x = 0
             PatternRewrite::new(
                 "xor_self",

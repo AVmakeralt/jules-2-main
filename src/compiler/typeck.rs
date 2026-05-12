@@ -1048,6 +1048,135 @@ impl TypeCk {
             })
             .collect();
         self.check_system_data_races(&systems);
+
+        // Post-pass: annotate literal nodes with their inferred types
+        self.annotate_literal_types(program);
+    }
+
+    /// Write back inferred types to literal nodes in the AST.
+    /// This ensures the runtime sees consistent I32/I64 types.
+    fn annotate_literal_types(&self, program: &Program) {
+        for item in &program.items {
+            self.annotate_item_literal_types(item);
+        }
+    }
+
+    fn annotate_item_literal_types(&self, item: &Item) {
+        match item {
+            Item::Fn(f) => self.annotate_fn_literal_types(f),
+            Item::Const(c) => {
+                self.annotate_expr_literal_types(&c.value);
+            }
+            Item::Mod { items: Some(inner), .. } => {
+                for i in inner {
+                    self.annotate_item_literal_types(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn annotate_fn_literal_types(&self, f: &FnDecl) {
+        for stmt in &f.body.stmts {
+            self.annotate_stmt_literal_types(stmt);
+        }
+    }
+
+    fn annotate_stmt_literal_types(&self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let(l) => self.annotate_expr_literal_types(&l.value),
+            Stmt::Expr(e) => self.annotate_expr_literal_types(e),
+            Stmt::If(if_s) => {
+                self.annotate_expr_literal_types(&if_s.cond);
+                self.annotate_block_literal_types(&if_s.then_block);
+                if let Some(else_block) = &if_s.else_block {
+                    self.annotate_block_literal_types(else_block);
+                }
+            }
+            Stmt::While(w) => {
+                self.annotate_expr_literal_types(&w.cond);
+                self.annotate_block_literal_types(&w.body);
+            }
+            Stmt::For(f) => {
+                self.annotate_expr_literal_types(&f.start);
+                self.annotate_expr_literal_types(&f.end);
+                self.annotate_block_literal_types(&f.body);
+            }
+            Stmt::Return(r) => {
+                if let Some(v) = &r.value {
+                    self.annotate_expr_literal_types(v);
+                }
+            }
+            Stmt::Break | Stmt::Continue => {}
+        }
+    }
+
+    fn annotate_block_literal_types(&self, block: &Block) {
+        for stmt in &block.stmts {
+            self.annotate_stmt_literal_types(stmt);
+        }
+    }
+
+    fn annotate_expr_literal_types(&self, expr: &Expr) {
+        match expr {
+            Expr::IntLit { ty, .. } => {
+                if ty.is_none() {
+                    *ty = Some(ElemType::I32);
+                }
+            }
+            Expr::FloatLit { ty, .. } => {
+                if ty.is_none() {
+                    *ty = Some(ElemType::F32);
+                }
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                self.annotate_expr_literal_types(lhs);
+                self.annotate_expr_literal_types(rhs);
+            }
+            Expr::UnOp { expr: inner, .. } => {
+                self.annotate_expr_literal_types(inner);
+            }
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    self.annotate_expr_literal_types(arg);
+                }
+            }
+            Expr::ArrayLit { elems, .. } => {
+                for elem in elems {
+                    self.annotate_expr_literal_types(elem);
+                }
+            }
+            Expr::VecCtor { elems, .. } => {
+                for elem in elems {
+                    self.annotate_expr_literal_types(elem);
+                }
+            }
+            Expr::Index { object, index, .. } => {
+                self.annotate_expr_literal_types(object);
+                self.annotate_expr_literal_types(index);
+            }
+            Expr::Field { object, .. } => {
+                self.annotate_expr_literal_types(object);
+            }
+            Expr::IfElse { cond, then_body, else_body, .. } => {
+                self.annotate_expr_literal_types(cond);
+                self.annotate_block_literal_types(then_body);
+                self.annotate_expr_literal_types(else_body);
+            }
+            Expr::Block(b) => {
+                self.annotate_block_literal_types(b);
+            }
+            Expr::ForLoop(f) => {
+                self.annotate_expr_literal_types(&f.start);
+                self.annotate_expr_literal_types(&f.end);
+                self.annotate_block_literal_types(&f.body);
+            }
+            Expr::WhileLoop(w) => {
+                self.annotate_expr_literal_types(&w.cond);
+                self.annotate_block_literal_types(&w.body);
+            }
+            _ => {}
+        }
     }
 
     fn check_item(&mut self, item: &Item) {
