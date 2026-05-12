@@ -587,6 +587,73 @@ impl PartialEvaluator {
 
     /// Specialize a block: evaluate static parts, build residual for dynamic
     /// parts.
+    /// Collect all variable names written (assigned or declared) in a block.
+    fn collect_writes_block(block: &crate::compiler::ast::Block, out: &mut std::collections::HashSet<String>) {
+        for stmt in &block.stmts {
+            Self::collect_writes_stmt(stmt, out);
+        }
+        if let Some(tail) = &block.tail {
+            Self::collect_writes_expr(tail, out);
+        }
+    }
+
+    fn collect_writes_stmt(stmt: &crate::compiler::ast::Stmt, out: &mut std::collections::HashSet<String>) {
+        use crate::compiler::ast::Stmt;
+        match stmt {
+            Stmt::Let { pattern, .. } => {
+                if let crate::compiler::ast::Pattern::Ident { name, .. } = pattern {
+                    out.insert(name.clone());
+                }
+            }
+            Stmt::Expr { expr, .. } => Self::collect_writes_expr(expr, out),
+            Stmt::If { then, else_, .. } => {
+                Self::collect_writes_block(then, out);
+                if let Some(eb) = else_ {
+                    match eb.as_ref() {
+                        crate::compiler::ast::IfOrBlock::Block(b) => Self::collect_writes_block(b, out),
+                        crate::compiler::ast::IfOrBlock::If(s) => Self::collect_writes_stmt(s, out),
+                    }
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Loop { body, .. } => {
+                Self::collect_writes_block(body, out);
+            }
+            Stmt::ForIn { pattern, body, .. } => {
+                if let crate::compiler::ast::Pattern::Ident { name, .. } = pattern {
+                    out.insert(name.clone());
+                }
+                Self::collect_writes_block(body, out);
+            }
+            Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+            _ => {}
+        }
+    }
+
+    fn collect_writes_expr(expr: &crate::compiler::ast::Expr, out: &mut std::collections::HashSet<String>) {
+        use crate::compiler::ast::Expr;
+        match expr {
+            Expr::Assign { target, value, .. } => {
+                if let Expr::Ident { name, .. } = target.as_ref() {
+                    out.insert(name.clone());
+                }
+                Self::collect_writes_expr(value, out);
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::collect_writes_expr(lhs, out);
+                Self::collect_writes_expr(rhs, out);
+            }
+            Expr::Block(b) => Self::collect_writes_block(b, out),
+            Expr::IfExpr { cond, then, else_, .. } => {
+                Self::collect_writes_expr(cond, out);
+                Self::collect_writes_block(then, out);
+                if let Some(e) = else_ {
+                    Self::collect_writes_block(e, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn specialize_block(&mut self, block: &mut Block, env: &mut BtaEnv, depth: usize) {
         if depth >= self.config.max_depth {
             return;
@@ -826,9 +893,32 @@ impl PartialEvaluator {
             }
 
             Stmt::While { span, cond, body, label } => {
+                // CRITICAL: Do NOT fold the condition if any variable read in the
+                // condition is written in the loop body. The loop body executes
+                // after the condition check, so on subsequent iterations the
+                // condition's value depends on the mutated variables.
+                // Invalidate any environment entries for variables written in the
+                // body BEFORE evaluating the condition, to prevent the condition
+                // from being folded to a constant (which would cause an infinite loop).
+                let mut body_writes = std::collections::HashSet::<String>::default();
+                Self::collect_writes_block(&body, &mut body_writes);
+                // Save and invalidate env entries for written variables
+                let saved: Vec<(String, Option<BindingTime>, Option<PartialValue>)> = body_writes.iter().filter_map(|v| {
+                    env.bindings.remove(v).map(|(bt, pv)| (v.clone(), Some(bt), Some(pv)))
+                }).collect();
                 let cond = self.specialize_expr(cond, env, depth);
+                // Restore env entries (they'll be invalidated after the body anyway)
+                for (v, bt, pv) in saved {
+                    if let (Some(bt), Some(pv)) = (bt, pv) {
+                        env.bindings.insert(v, (bt, pv));
+                    }
+                }
                 let mut body = body;
                 self.specialize_block(&mut body, env, depth + 1);
+                // Evict written variables from the environment
+                for v in &body_writes {
+                    env.bindings.remove(v);
+                }
                 Some(Stmt::While { span, cond, body, label })
             }
 

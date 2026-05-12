@@ -1058,6 +1058,16 @@ impl BytecodeCompiler {
                 // Continue target for while loops is the condition check
                 self.loop_continue_starts.push(loop_start);
 
+                // CRITICAL: Invalidate all known constants before compiling the
+                // while condition. The loop body may mutate variables that the
+                // condition depends on, so the condition must be re-evaluated
+                // at runtime rather than folded to a constant. For example:
+                //   let mut i = 0;   // known_constants[i] = 0
+                //   while i < 3 {    // would fold to `true` if we don't clear!
+                //     i = i + 1;
+                //   }
+                self.known_constants.clear();
+
                 let cond_slot = self.alloc_slot();
                 self.compile_expr(cond, cond_slot)?;
                 let jump_end_pos = self.emit_jump_false(cond_slot);
@@ -1083,6 +1093,9 @@ impl BytecodeCompiler {
                 // Continue target for `loop` is the body start
                 self.loop_continue_starts.push(loop_start);
 
+                // Invalidate known constants — loop body may mutate variables.
+                self.known_constants.clear();
+
                 self.compile_block(body, 0)?;
 
                 self.emit_backward_jump(loop_start);
@@ -1094,6 +1107,9 @@ impl BytecodeCompiler {
                 self.loop_continue_starts.pop();
             }
             Stmt::ForIn { pattern, iter, body, .. } => {
+                // Invalidate known constants — loop body may mutate variables.
+                self.known_constants.clear();
+
                 // Compile the iterable into a temp slot
                 let iter_slot = self.alloc_slot();
                 self.compile_expr(iter, iter_slot)?;
@@ -1793,6 +1809,11 @@ impl BytecodeVM {
         if self.memory_pool.slots.len() < num_slots {
             self.memory_pool.slots.resize(num_slots, Value::Unit);
         }
+        // Clear all slots to Unit before setting arguments — stale values from
+        // a previous call must not leak into the new invocation.
+        for slot in self.memory_pool.slots.iter_mut().take(num_slots) {
+            *slot = Value::Unit;
+        }
         self.memory_pool.max_slot_used = num_slots.saturating_sub(1);
         for (i, arg) in args.iter().enumerate() {
             if i < num_slots {
@@ -1988,19 +2009,12 @@ impl BytecodeVM {
                     let d = *dst as usize;
                     let s = *src as usize;
                     if d != s {
-                        // SAFETY: d and s are distinct valid indices into the
-                        // pre-allocated slots vec. ptr::read moves ownership out
-                        // of src without running its destructor; ptr::write drops
-                        // the old dst value and installs the moved value.
-                        unsafe {
-                            let v = std::ptr::read(slots.as_ptr().add(s));
-                            std::ptr::write(slots.as_mut_ptr().add(d), v);
-                            // Zero the source slot to prevent double-free:
-                            // ptr::read moves ownership out of src without running
-                            // its destructor, so we must overwrite src with a
-                            // non-owning value before the Vec drops it.
-                            std::ptr::write(slots.as_mut_ptr().add(s), Value::None);
-                        }
+                        // Copy (not move): in a register-based VM, the source slot
+                        // remains valid after the copy. ptr::read + None is WRONG
+                        // because subsequent instructions may read the source slot
+                        // (e.g. Move temp=slot2 followed by Add slot2=a+slot2).
+                        // Clone is safe and correct for all Value variants.
+                        slots[d] = slots[s].clone();
                     }
                     pc += 1;
                 }
@@ -3922,16 +3936,12 @@ mod tests {
         vm.load_functions(vec![f]);
         let result = vm.execute(0, &[]).unwrap();
         match result {
-            Value::Tuple(v) => {
-                assert_eq!(v.len(), 3);
-                assert_i64(&v[0], 0);
-                assert_i64(&v[1], 10);
-                match &v[2] {
-                    Value::Bool(b) => assert!(!b), // exclusive
-                    other => panic!("expected Bool, got {}", other.type_name()),
-                }
+            Value::Range { start, end, inclusive } => {
+                assert_eq!(start, 0);
+                assert_eq!(end, 10);
+                assert!(!inclusive); // exclusive
             }
-            other => panic!("expected Tuple (range), got {:?}", other.type_name()),
+            other => panic!("expected Range, got {:?}", other.type_name()),
         }
     }
 
@@ -3984,5 +3994,42 @@ mod tests {
         let jit = vm.data_dependent_jit();
         // At minimum, the JIT should have been created and not crashed
         let _ = jit;
+    }
+
+    #[test]
+    fn test_vm_while_loop_bytecode() {
+        use crate::compiler::ast::Program;
+        // Parse a simple while loop program
+        let src = "fn bench() -> i32 { let mut i: i32 = 0; while i < 3 { i = i + 1; } i }";
+        let mut unit = crate::CompileUnit::new("<test>".to_string(), src);
+        let result = crate::Pipeline::new().run(&mut unit);
+        if unit.has_errors() {
+            for d in &unit.diags {
+                if d.is_error() {
+                    eprintln!("COMPILE ERROR: {}", d.message);
+                }
+            }
+            panic!("compile errors");
+        }
+        let prog = match result {
+            crate::PipelineResult::Ok(p) => p,
+            _ => panic!("pipeline failed"),
+        };
+
+        let mut compiler = BytecodeCompiler::new();
+        let functions = compiler.compile_program(&prog).unwrap();
+        
+        // Dump bytecode
+        for f in &functions {
+            eprintln!("Function {}: num_params={}, num_locals={}", f.name, f.num_params, f.num_locals);
+            for (j, instr) in f.instructions.iter().enumerate() {
+                eprintln!("  [{:3}] {:?}", j, instr);
+            }
+        }
+
+        let mut vm = BytecodeVM::new();
+        vm.load_functions(functions);
+        let result = vm.call_fn("bench", vec![]).unwrap();
+        assert_i64(&result, 3);
     }
 }

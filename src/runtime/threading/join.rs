@@ -395,11 +395,12 @@ mod tests {
 
     #[test]
     fn test_par_for_sequential() {
-        let mut sum = 0;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sum = AtomicUsize::new(0);
         par_for(0..10, |i| {
-            sum += i;
+            sum.fetch_add(i, Ordering::Relaxed);
         });
-        assert_eq!(sum, 45);
+        assert_eq!(sum.load(Ordering::Relaxed), 45);
     }
 
     #[test]

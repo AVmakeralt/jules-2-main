@@ -1060,6 +1060,7 @@ pub enum TileClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimizer::mcts_superoptimizer::StringInterner;
     
     #[test]
     fn test_micro_sequence_detector() {
@@ -1080,17 +1081,19 @@ mod tests {
     #[test]
     fn test_microop_cost_estimation() {
         let model = MicroarchitectureModel::for_cpu(CpuType::Generic);
+        let load_idx = StringInterner::intern("load");
+        let add_idx = StringInterner::intern("add");
         let ops = vec![
             MicroOp {
-                opcode: "load".to_string(),
-                read_regs: HashSet::new(),
-                write_regs: HashSet::new(),
+                opcode: load_idx,
+                read_regs: smallvec![],
+                write_regs: smallvec![],
                 has_memory: true,
             },
             MicroOp {
-                opcode: "add".to_string(),
-                read_regs: HashSet::new(),
-                write_regs: HashSet::new(),
+                opcode: add_idx,
+                read_regs: smallvec![],
+                write_regs: smallvec![],
                 has_memory: false,
             },
         ];
@@ -1102,19 +1105,23 @@ mod tests {
     #[test]
     fn test_macro_op_emitter() {
         let mut emitter = MacroOpEmitter::new(CpuType::Generic);
+        let load_idx = StringInterner::intern("load");
+        let add_idx = StringInterner::intern("add");
+        let rax_idx = StringInterner::intern("rax");
+        let rcx_idx = StringInterner::intern("rcx");
         
         let candidate = SequenceCandidate {
             instructions: vec![
                 MicroOp {
-                    opcode: "load".to_string(),
-                    read_regs: HashSet::new(),
-                    write_regs: ["rax".to_string()].into_iter().collect(),
+                    opcode: load_idx,
+                    read_regs: smallvec![],
+                    write_regs: smallvec![rax_idx],
                     has_memory: true,
                 },
                 MicroOp {
-                    opcode: "add".to_string(),
-                    read_regs: ["rax".to_string(), "rcx".to_string()].into_iter().collect(),
-                    write_regs: ["rax".to_string()].into_iter().collect(),
+                    opcode: add_idx,
+                    read_regs: smallvec![rax_idx, rcx_idx],
+                    write_regs: smallvec![rax_idx],
                     has_memory: false,
                 },
             ],

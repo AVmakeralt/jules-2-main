@@ -4092,6 +4092,7 @@ mod tests {
         Expr::IntLit {
             span: dummy(),
             value: v,
+            ty: None,
         }
     }
     fn bool_lit(v: bool) -> Expr {
@@ -4645,6 +4646,7 @@ mod tests {
                     value: Box::new(Expr::IntLit {
                         span: dummy(),
                         value: 128,
+                        ty: None,
                     }),
                 },
                 Expr::Assign {
@@ -4657,6 +4659,7 @@ mod tests {
                     value: Box::new(Expr::IntLit {
                         span: dummy(),
                         value: 32,
+                        ty: None,
                     }),
                 },
             ],
@@ -4898,6 +4901,7 @@ mod tests {
                     Expr::IntLit {
                         span: dummy(),
                         value: 4,
+                        ty: None,
                     },
                 ),
                 assign_kv(
@@ -4905,6 +4909,7 @@ mod tests {
                     Expr::IntLit {
                         span: dummy(),
                         value: 64,
+                        ty: None,
                     },
                 ),
                 assign_kv(
@@ -4973,6 +4978,9 @@ mod tests {
                 tail: None,
             }),
             is_async: false,
+            requires: vec![],
+            ensures: vec![],
+            effect: None,
         };
 
         let program = Program {
@@ -4990,7 +4998,7 @@ mod tests {
                 span,
                 name: "clamp".into(),
             }),
-            args: vec![Expr::IntLit { span, value: 42 }],
+            args: vec![Expr::IntLit { span, value: 42, ty: None }],
             named: vec![],
         };
 
@@ -5018,7 +5026,7 @@ mod tests {
                 span,
                 segments: vec!["window".into(), "open".into()],
             }),
-            args: vec![Expr::IntLit { span, value: 1 }],
+            args: vec![Expr::IntLit { span, value: 1, ty: None }],
             named: vec![],
         };
 

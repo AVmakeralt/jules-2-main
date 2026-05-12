@@ -758,19 +758,20 @@ mod tests {
     fn test_may_be_equivalent_x2_vs_xshl1() {
         let mut env: FxHashMap<String, KnownBits> = FxHashMap::default();
         // x is fully unknown
+        let x_idx = crate::optimizer::mcts_superoptimizer::StringInterner::intern("x");
         env.insert("x".to_string(), KnownBits::unknown());
 
         // x * 2
         let x_mul_2 = Instr::BinOp {
             op: BinOpKind::Mul,
-            lhs: Box::new(Instr::Var("x".to_string())),
+            lhs: Box::new(Instr::Var(x_idx)),
             rhs: Box::new(Instr::ConstInt(2)),
         };
 
         // x << 1
         let x_shl_1 = Instr::BinOp {
             op: BinOpKind::Shl,
-            lhs: Box::new(Instr::Var("x".to_string())),
+            lhs: Box::new(Instr::Var(x_idx)),
             rhs: Box::new(Instr::ConstInt(1)),
         };
 
