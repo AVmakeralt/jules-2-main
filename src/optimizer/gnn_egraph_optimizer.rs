@@ -1880,7 +1880,20 @@ fn apply_rewrite(instr: &Instr, action: &RewriteAction) -> Option<Instr> {
         | RewriteAction::BswapPattern
         | RewriteAction::PopcntPattern
         | RewriteAction::LzcntPattern
-        | RewriteAction::TzcntPattern => None,
+        | RewriteAction::TzcntPattern
+        // Tier 5: Reassociation, Cancellation, and Memory-Form Rules
+        | RewriteAction::AddReassocConst
+        | RewriteAction::MulReassocConst
+        | RewriteAction::AddNegReassoc
+        | RewriteAction::SubSelfCancel
+        | RewriteAction::MulAddDistribute
+        | RewriteAction::MulSubDistribute
+        | RewriteAction::NegateMul
+        | RewriteAction::AddSubSwap
+        | RewriteAction::SubAddMerge
+        | RewriteAction::BlsmaskRule
+        | RewriteAction::MemFormFold
+        | RewriteAction::FlagReuse => None,
     }
 }
 

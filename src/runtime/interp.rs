@@ -9570,16 +9570,49 @@ fn arith_i32(op: BinOpKind, a: i32, b: i32) -> Result<i32, RuntimeError> {
 #[inline(always)]
 fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::I32(x), Value::I32(y)) => x == y,
-        (Value::I64(x), Value::I64(y)) => x == y,
-        (Value::F32(x), Value::F32(y)) => x == y,
-        (Value::F64(x), Value::F64(y)) => x == y,
+        // Same-type comparisons
+        (Value::I8(x),   Value::I8(y))   => x == y,
+        (Value::I16(x),  Value::I16(y))  => x == y,
+        (Value::I32(x),  Value::I32(y))  => x == y,
+        (Value::I64(x),  Value::I64(y))  => x == y,
+        (Value::U8(x),   Value::U8(y))   => x == y,
+        (Value::U16(x),  Value::U16(y))  => x == y,
+        (Value::U32(x),  Value::U32(y))  => x == y,
+        (Value::U64(x),  Value::U64(y))  => x == y,
+        (Value::F32(x),  Value::F32(y))  => x == y,
+        (Value::F64(x),  Value::F64(y))  => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::Unit, Value::Unit) => true,
-        // Cross-type integer comparison (Bug #4 fix)
-        (Value::I64(x), Value::I32(y)) => *x == *y as i64,
-        (Value::I32(x), Value::I64(y)) => *x as i64 == *y,
+        (Value::Str(x),  Value::Str(y))  => x == y,
+        (Value::Unit,    Value::Unit)    => true,
+        // Cross-type signed integer comparisons (promote to i64)
+        (Value::I8(x),   Value::I16(y))  => *x as i64 == *y as i64,
+        (Value::I16(x),  Value::I8(y))   => *x as i64 == *y as i64,
+        (Value::I8(x),   Value::I32(y))  => *x as i64 == *y as i64,
+        (Value::I32(x),  Value::I8(y))   => *x as i64 == *y as i64,
+        (Value::I8(x),   Value::I64(y))  => *x as i64 == *y,
+        (Value::I64(x),  Value::I8(y))   => *x == *y as i64,
+        (Value::I16(x),  Value::I32(y))  => *x as i64 == *y as i64,
+        (Value::I32(x),  Value::I16(y))  => *x as i64 == *y as i64,
+        (Value::I16(x),  Value::I64(y))  => *x as i64 == *y,
+        (Value::I64(x),  Value::I16(y))  => *x == *y as i64,
+        (Value::I32(x),  Value::I64(y))  => *x as i64 == *y,
+        (Value::I64(x),  Value::I32(y))  => *x == *y as i64,
+        // Cross-type unsigned integer comparisons (promote to u64)
+        (Value::U8(x),   Value::U16(y))  => *x as u64 == *y as u64,
+        (Value::U16(x),  Value::U8(y))   => *x as u64 == *y as u64,
+        (Value::U8(x),   Value::U32(y))  => *x as u64 == *y as u64,
+        (Value::U32(x),  Value::U8(y))   => *x as u64 == *y as u64,
+        (Value::U8(x),   Value::U64(y))  => *x as u64 == *y,
+        (Value::U64(x),  Value::U8(y))   => *x == *y as u64,
+        (Value::U16(x),  Value::U32(y))  => *x as u64 == *y as u64,
+        (Value::U32(x),  Value::U16(y))  => *x as u64 == *y as u64,
+        (Value::U16(x),  Value::U64(y))  => *x as u64 == *y,
+        (Value::U64(x),  Value::U16(y))  => *x == *y as u64,
+        (Value::U32(x),  Value::U64(y))  => *x as u64 == *y,
+        (Value::U64(x),  Value::U32(y))  => *x == *y as u64,
+        // Cross-type float comparisons (promote to f64)
+        (Value::F32(x),  Value::F64(y))  => *x as f64 == *y,
+        (Value::F64(x),  Value::F32(y))  => *x == *y as f64,
         _ => false,
     }
 }
@@ -10585,7 +10618,7 @@ mod tests {
                 value: 5.0,
             }),
         };
-        assert!(matches!(eval(&e), Value::F32(v) if (v + 5.0).abs() < 1e-6));
+        assert!(matches!(eval(&e), Value::F64(v) if (v + 5.0).abs() < 1e-6));
     }
 
     #[test]
@@ -10617,7 +10650,7 @@ mod tests {
                 &mut env,
             )
             .unwrap();
-        assert!(matches!(v, Value::I32(99)));
+        assert!(matches!(v, Value::I64(99)));
     }
 
     #[test]
@@ -10649,7 +10682,7 @@ mod tests {
                 })),
             })),
         };
-        assert!(matches!(i.eval_expr(&e, &mut env).unwrap(), Value::I32(1)));
+        assert!(matches!(i.eval_expr(&e, &mut env).unwrap(), Value::I64(1)));
     }
 
     #[test]
@@ -11564,7 +11597,7 @@ mod tests {
             tail: None,
         };
         let r = i.eval_block(&block, &mut env).unwrap();
-        assert!(matches!(r, Value::Return(v) if matches!(*v, Value::I32(42))));
+        assert!(matches!(r, Value::Return(v) if matches!(*v, Value::I64(42))));
     }
 
     #[test]
@@ -11587,8 +11620,8 @@ mod tests {
             }),
         };
         let result = i.eval_expr(&e, &mut env).unwrap();
-        if let Value::Tensor(t) = result {
-            assert_eq!(t.read().unwrap().shape, vec![2, 2]);
+        if let Value::TensorFast(t) = result {
+            assert_eq!(t.borrow().shape, vec![2, 2]);
         } else {
             panic!("expected tensor");
         }
@@ -11668,7 +11701,7 @@ mod tests {
         };
         let result = i.eval_block(&block, &mut env).unwrap();
         assert!(
-            matches!(result, Value::I32(10)),
+            matches!(result, Value::I64(10)),
             "0+1+2+3+4 = 10, got {result}"
         );
     }
@@ -11737,7 +11770,7 @@ mod tests {
         };
         let result = i.eval_block(&block, &mut env).unwrap();
         assert!(
-            matches!(result, Value::I32(3)),
+            matches!(result, Value::I64(3)),
             "expected 3 chars, got {result}"
         );
     }

@@ -386,10 +386,8 @@ impl SemanticSuperoptimizer {
             rule!("add_sub_cancel",    1.0, |s, e| s.rule_add_sub_cancel(e)),
             // R111  (x - y) + y  →  x
             rule!("sub_add_cancel",    1.0, |s, e| s.rule_sub_add_cancel(e)),
-            // R112  (x * y) / y  →  x  (y ≠ 0)
-            rule!("mul_div_cancel",    1.0, |s, e| s.rule_mul_div_cancel(e)),
-            // R113  (x / y) * y  →  x  (only exact, flagged as annotation)
-            rule!("div_mul_cancel",    1.0, |s, e| s.rule_div_mul_cancel(e)),
+            // R112  (x * y) / y  →  x  — REMOVED: unsound for integer overflow
+            // R113  (x / y) * y  →  x  — REMOVED: unsound for integer truncation
             // R114  (x << k) >> k  →  x & ((1<<k)-1)^MAX  (mask, unsigned)
             rule!("shl_shr_cancel",    1.1, |s, e| s.rule_shl_shr_cancel(e)),
             // R115  if true { e1 } else { e2 }  →  e1
@@ -3392,18 +3390,8 @@ mod tests {
         assert!(matches!(&r, Expr::Ident { name, .. } if name == "x"));
     }
 
-    #[test]
-    fn test_mul_div_cancel() {
-        let opt = SemanticSuperoptimizer::new();
-        // (x * y) / y → x  (y is a literal)
-        let e = binop(
-            BinOpKind::Div,
-            binop(BinOpKind::Mul, ident("x"), int(5)),
-            int(5),
-        );
-        let r = opt.rule_mul_div_cancel(&e).unwrap();
-        assert!(matches!(&r, Expr::Ident { name, .. } if name == "x"));
-    }
+    // NOTE: test_mul_div_cancel removed — the rule was unsound for integer arithmetic.
+    // (x * y) / y ≠ x when x * y overflows; (x / y) * y ≠ x due to truncation.
 
     // ── §10 pow-by-squaring annotation ──────────────────────────────────────
 

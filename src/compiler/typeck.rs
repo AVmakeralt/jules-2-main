@@ -51,8 +51,8 @@ use std::fmt;
 
 use crate::compiler::ast::{
     AgentDecl, BinOpKind, Block, ComponentDecl, DimExpr, ElemType, Expr, FnDecl, GenericParam,
-    Item, ModelDecl, ModelLayer, Pattern, Program, StructDecl, SystemDecl, TrainDecl, Type,
-    UnOpKind, VecFamily, VecSize,
+    IfOrBlock, Item, ModelDecl, ModelLayer, Pattern, Program, Stmt, StructDecl, SystemDecl,
+    TrainDecl, Type, UnOpKind, VecFamily, VecSize,
 };
 use crate::compiler::lexer::Span;
 
@@ -1026,7 +1026,7 @@ impl TypeCk {
     // PASS 2 — Check all items
     // =========================================================================
 
-    pub fn check_program(&mut self, program: &Program) {
+    pub fn check_program(&mut self, program: &mut Program) {
         // First pass: collect all declarations so forward references work.
         self.collect_items(program);
 
@@ -1055,17 +1055,17 @@ impl TypeCk {
 
     /// Write back inferred types to literal nodes in the AST.
     /// This ensures the runtime sees consistent I32/I64 types.
-    fn annotate_literal_types(&self, program: &Program) {
-        for item in &program.items {
+    fn annotate_literal_types(&self, program: &mut Program) {
+        for item in &mut program.items {
             self.annotate_item_literal_types(item);
         }
     }
 
-    fn annotate_item_literal_types(&self, item: &Item) {
+    fn annotate_item_literal_types(&self, item: &mut Item) {
         match item {
             Item::Fn(f) => self.annotate_fn_literal_types(f),
             Item::Const(c) => {
-                self.annotate_expr_literal_types(&c.value);
+                self.annotate_expr_literal_types(&mut c.value);
             }
             Item::Mod { items: Some(inner), .. } => {
                 for i in inner {
@@ -1076,58 +1076,103 @@ impl TypeCk {
         }
     }
 
-    fn annotate_fn_literal_types(&self, f: &FnDecl) {
-        for stmt in &f.body.stmts {
-            self.annotate_stmt_literal_types(stmt);
+    fn annotate_fn_literal_types(&self, f: &mut FnDecl) {
+        if let Some(body) = &mut f.body {
+            self.annotate_block_literal_types(body);
         }
     }
 
-    fn annotate_stmt_literal_types(&self, stmt: &Stmt) {
+    fn annotate_block_literal_types(&self, block: &mut Block) {
+        for stmt in &mut block.stmts {
+            self.annotate_stmt_literal_types(stmt);
+        }
+        if let Some(tail) = &mut block.tail {
+            self.annotate_expr_literal_types(tail);
+        }
+    }
+
+    fn annotate_stmt_literal_types(&self, stmt: &mut Stmt) {
         match stmt {
-            Stmt::Let(l) => self.annotate_expr_literal_types(&l.value),
-            Stmt::Expr(e) => self.annotate_expr_literal_types(e),
-            Stmt::If(if_s) => {
-                self.annotate_expr_literal_types(&if_s.cond);
-                self.annotate_block_literal_types(&if_s.then_block);
-                if let Some(else_block) = &if_s.else_block {
-                    self.annotate_block_literal_types(else_block);
+            Stmt::Let { init, .. } => {
+                if let Some(e) = init {
+                    self.annotate_expr_literal_types(e);
                 }
             }
-            Stmt::While(w) => {
-                self.annotate_expr_literal_types(&w.cond);
-                self.annotate_block_literal_types(&w.body);
+            Stmt::Expr { expr, .. } => {
+                self.annotate_expr_literal_types(expr);
             }
-            Stmt::For(f) => {
-                self.annotate_expr_literal_types(&f.start);
-                self.annotate_expr_literal_types(&f.end);
-                self.annotate_block_literal_types(&f.body);
+            Stmt::If { cond, then, else_, .. } => {
+                self.annotate_expr_literal_types(cond);
+                self.annotate_block_literal_types(then);
+                if let Some(else_branch) = else_ {
+                    match else_branch.as_mut() {
+                        IfOrBlock::If(s) => self.annotate_stmt_literal_types(s),
+                        IfOrBlock::Block(b) => self.annotate_block_literal_types(b),
+                    }
+                }
             }
-            Stmt::Return(r) => {
-                if let Some(v) = &r.value {
+            Stmt::While { cond, body, .. } => {
+                self.annotate_expr_literal_types(cond);
+                self.annotate_block_literal_types(body);
+            }
+            Stmt::ForIn { iter, body, .. } => {
+                self.annotate_expr_literal_types(iter);
+                self.annotate_block_literal_types(body);
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(v) = value {
                     self.annotate_expr_literal_types(v);
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break { value, .. } => {
+                if let Some(v) = value {
+                    self.annotate_expr_literal_types(v);
+                }
+            }
+            Stmt::Loop { body, .. } => {
+                self.annotate_block_literal_types(body);
+            }
+            Stmt::Match { expr, arms, .. } => {
+                self.annotate_expr_literal_types(expr);
+                for arm in arms {
+                    if let Some(guard) = &mut arm.guard {
+                        self.annotate_expr_literal_types(guard);
+                    }
+                    self.annotate_expr_literal_types(&mut arm.body);
+                }
+            }
+            Stmt::Effect { body, .. } |
+            Stmt::Region { body, .. } |
+            Stmt::UnsafeBlock { body, .. } => {
+                self.annotate_block_literal_types(body);
+            }
+            Stmt::EntityFor { body, .. } => {
+                self.annotate_block_literal_types(body);
+            }
+            Stmt::Continue { .. } |
+            Stmt::Item(_) |
+            Stmt::ParallelFor(_) |
+            Stmt::Spawn(_) |
+            Stmt::Sync(_) |
+            Stmt::Atomic(_) |
+            Stmt::TaskSpawn { .. } |
+            Stmt::TaskJoin { .. } |
+            Stmt::IntrinsicsBlock { .. } |
+            Stmt::Requires { .. } |
+            Stmt::Ensures { .. } => {}
         }
     }
 
-    fn annotate_block_literal_types(&self, block: &Block) {
-        for stmt in &block.stmts {
-            self.annotate_stmt_literal_types(stmt);
-        }
-    }
-
-    fn annotate_expr_literal_types(&self, expr: &Expr) {
+    fn annotate_expr_literal_types(&self, expr: &mut Expr) {
         match expr {
             Expr::IntLit { ty, .. } => {
                 if ty.is_none() {
                     *ty = Some(ElemType::I32);
                 }
             }
-            Expr::FloatLit { ty, .. } => {
-                if ty.is_none() {
-                    *ty = Some(ElemType::F32);
-                }
+            Expr::FloatLit { .. } => {
+                // FloatLit has no ty field in the AST; the runtime
+                // always defaults to F64, which is correct.
             }
             Expr::BinOp { lhs, rhs, .. } => {
                 self.annotate_expr_literal_types(lhs);
@@ -1136,7 +1181,17 @@ impl TypeCk {
             Expr::UnOp { expr: inner, .. } => {
                 self.annotate_expr_literal_types(inner);
             }
-            Expr::Call { args, .. } => {
+            Expr::Call { func, args, named, .. } => {
+                self.annotate_expr_literal_types(func);
+                for arg in args {
+                    self.annotate_expr_literal_types(arg);
+                }
+                for (_name, val) in named {
+                    self.annotate_expr_literal_types(val);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                self.annotate_expr_literal_types(receiver);
                 for arg in args {
                     self.annotate_expr_literal_types(arg);
                 }
@@ -1151,31 +1206,78 @@ impl TypeCk {
                     self.annotate_expr_literal_types(elem);
                 }
             }
-            Expr::Index { object, index, .. } => {
+            Expr::Index { object, indices, .. } => {
                 self.annotate_expr_literal_types(object);
-                self.annotate_expr_literal_types(index);
+                for idx in indices {
+                    self.annotate_expr_literal_types(idx);
+                }
             }
             Expr::Field { object, .. } => {
                 self.annotate_expr_literal_types(object);
             }
-            Expr::IfElse { cond, then_body, else_body, .. } => {
+            Expr::IfExpr { cond, then, else_, .. } => {
                 self.annotate_expr_literal_types(cond);
-                self.annotate_block_literal_types(then_body);
-                self.annotate_expr_literal_types(else_body);
+                self.annotate_block_literal_types(then);
+                if let Some(eb) = else_ {
+                    self.annotate_block_literal_types(eb);
+                }
             }
             Expr::Block(b) => {
                 self.annotate_block_literal_types(b);
             }
-            Expr::ForLoop(f) => {
-                self.annotate_expr_literal_types(&f.start);
-                self.annotate_expr_literal_types(&f.end);
-                self.annotate_block_literal_types(&f.body);
+            Expr::Assign { target, value, .. } => {
+                self.annotate_expr_literal_types(target);
+                self.annotate_expr_literal_types(value);
             }
-            Expr::WhileLoop(w) => {
-                self.annotate_expr_literal_types(&w.cond);
-                self.annotate_block_literal_types(&w.body);
+            Expr::Cast { expr: inner, .. } => {
+                self.annotate_expr_literal_types(inner);
             }
-            _ => {}
+            Expr::Closure { body, .. } => {
+                self.annotate_expr_literal_types(body);
+            }
+            Expr::Tuple { elems, .. } => {
+                for elem in elems {
+                    self.annotate_expr_literal_types(elem);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_name, val) in fields {
+                    self.annotate_expr_literal_types(val);
+                }
+            }
+            Expr::MatMul { lhs, rhs, .. } |
+            Expr::HadamardMul { lhs, rhs, .. } |
+            Expr::HadamardDiv { lhs, rhs, .. } |
+            Expr::TensorConcat { lhs, rhs, .. } |
+            Expr::KronProd { lhs, rhs, .. } |
+            Expr::OuterProd { lhs, rhs, .. } => {
+                self.annotate_expr_literal_types(lhs);
+                self.annotate_expr_literal_types(rhs);
+            }
+            Expr::Grad { inner, .. } |
+            Expr::Copy { inner, .. } => {
+                self.annotate_expr_literal_types(inner);
+            }
+            Expr::Pow { base, exp, .. } => {
+                self.annotate_expr_literal_types(base);
+                self.annotate_expr_literal_types(exp);
+            }
+            Expr::Range { lo, hi, .. } => {
+                if let Some(l) = lo { self.annotate_expr_literal_types(l); }
+                if let Some(h) = hi { self.annotate_expr_literal_types(h); }
+            }
+            Expr::Pipeline { stages, .. } => {
+                for s in stages {
+                    self.annotate_expr_literal_types(s);
+                }
+            }
+            Expr::Emit { value, .. } => {
+                self.annotate_expr_literal_types(value);
+            }
+            Expr::BoolLit { .. } |
+            Expr::StrLit { .. } |
+            Expr::Ident { .. } |
+            Expr::Path { .. } => {}
         }
     }
 
@@ -3047,8 +3149,7 @@ impl TypeCk {
         ty
     }
 
-    fn check_stmt(&mut self, stmt: &crate::compiler::ast::Stmt, env: &mut TyEnv) {
-        use crate::compiler::ast::Stmt;
+    fn check_stmt(&mut self, stmt: &Stmt, env: &mut TyEnv) {
         match stmt {
             Stmt::Let {
                 span,
@@ -3195,8 +3296,8 @@ impl TypeCk {
                 self.check_block(then, env);
                 if let Some(e) = else_ {
                     match e.as_ref() {
-                        crate::compiler::ast::IfOrBlock::If(s) => self.check_stmt(s, env),
-                        crate::compiler::ast::IfOrBlock::Block(b) => {
+                        IfOrBlock::If(s) => self.check_stmt(s, env),
+                        IfOrBlock::Block(b) => {
                             self.check_block(b, env);
                         }
                     }
@@ -4170,7 +4271,7 @@ fn broadcast_shapes(a: &[Dim], b: &[Dim]) -> Option<Vec<Dim>> {
 ///     eprintln!("[{}] {}: {}", format!("{:?}", d.severity), d.span, d.message);
 /// }
 /// ```
-pub fn jules_check(program: &Program) -> Diagnostics {
+pub fn jules_check(program: &mut Program) -> Diagnostics {
     let mut ck = TypeCk::new();
     ck.check_program(program);
     ck.diag
@@ -4794,14 +4895,14 @@ mod tests {
             ],
         };
 
-        let program = Program {
+        let mut program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
             superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
-        ck.check_program(&program);
+        ck.check_program(&mut program);
         assert!(
             !ck.diag.has_errors(),
             "unexpected errors for valid @ai options: {:?}",
@@ -4833,14 +4934,14 @@ mod tests {
             ],
         };
 
-        let program = Program {
+        let mut program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
             superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
-        ck.check_program(&program);
+        ck.check_program(&mut program);
         assert!(ck.diag.has_errors());
     }
 
@@ -4868,14 +4969,14 @@ mod tests {
             ],
         };
 
-        let program = Program {
+        let mut program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ppo_attr]))],
             superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
-        ck.check_program(&program);
+        ck.check_program(&mut program);
         assert!(
             !ck.diag.has_errors(),
             "unexpected errors for valid @ppo options: {:?}",
@@ -4901,14 +5002,14 @@ mod tests {
             }],
         };
 
-        let program = Program {
+        let mut program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
             superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
-        ck.check_program(&program);
+        ck.check_program(&mut program);
         assert!(
             !ck.diag.has_errors(),
             "unexpected errors for custom architecture prefix: {:?}",
@@ -4948,14 +5049,14 @@ mod tests {
                 }],
             };
 
-            let program = Program {
+            let mut program = Program {
                 span: dummy(),
                 items: vec![Item::Agent(mk_agent_with_attrs(vec![ai_attr]))],
             superopt_mode: SuperoptMode::All,
             };
 
             let mut ck = make_checker();
-            ck.check_program(&program);
+            ck.check_program(&mut program);
             assert!(
                 !ck.diag.has_errors(),
                 "expected @ai network `{arch}` to be accepted, got diagnostics: {:?}",
@@ -4974,14 +5075,14 @@ mod tests {
             }],
         };
 
-        let program = Program {
+        let mut program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ppo_attr]))],
             superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
-        ck.check_program(&program);
+        ck.check_program(&mut program);
         assert!(
             ck.diag.has_errors(),
             "expected missing required PPO args to produce errors"
@@ -5058,14 +5159,14 @@ mod tests {
             ],
         };
 
-        let program = Program {
+        let mut program = Program {
             span: dummy(),
             items: vec![Item::Agent(mk_agent_with_attrs(vec![ppo_attr]))],
             superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
-        ck.check_program(&program);
+        ck.check_program(&mut program);
         assert!(
             !ck.diag.has_errors(),
             "expected valid PPO config to pass, got: {:?}",
@@ -5112,14 +5213,14 @@ mod tests {
             effect: None,
         };
 
-        let program = Program {
+        let mut program = Program {
             span,
             items: vec![Item::Fn(fn_decl)],
             superopt_mode: SuperoptMode::All,
         };
 
         let mut ck = make_checker();
-        ck.check_program(&program);
+        ck.check_program(&mut program);
 
         let call = Expr::Call {
             span,

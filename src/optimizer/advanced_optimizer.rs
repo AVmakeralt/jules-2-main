@@ -688,13 +688,21 @@ impl AlgebraicSimplifier {
                 if Self::is_int_one(rhs) { return Some(lhs.clone()); }
                 if Self::is_float_one(rhs) { return Some(lhs.clone()); }
                 if Self::expr_eq(lhs, rhs) {
-                    let span = lhs.span();
-                    // Bug #5 fix: Default to IntLit for x / x when type is unknown.
-                    // FloatLit should only be returned for explicitly float-typed operands.
-                    if matches!(lhs, Expr::FloatLit { .. }) {
-                        return Some(Expr::FloatLit { span, value: 1.0 });
+                    // Guard: x / x is only safe when x is provably non-zero.
+                    // Skip this simplification for arbitrary variables (0/0 is
+                    // a runtime error, not 1).  Only simplify when the operand
+                    // is a known non-zero literal.
+                    if let Expr::IntLit { value, span, .. } = lhs {
+                        if *value != 0 {
+                            return Some(Expr::IntLit { span: *span, value: 1, ty: None });
+                        }
+                    } else if let Expr::FloatLit { value, span, .. } = lhs {
+                        if *value != 0.0 {
+                            return Some(Expr::FloatLit { span: *span, value: 1.0 });
+                        }
                     }
-                    return Some(Expr::IntLit { span, value: 1, ty: None });
+                    // For arbitrary expressions, do NOT simplify x / x → 1
+                    // because we cannot prove x ≠ 0 at compile time.
                 }
                 if Self::is_int_zero(lhs) { return Some(lhs.clone()); }
                 if Self::is_float_zero(lhs) { return Some(lhs.clone()); }

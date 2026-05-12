@@ -579,7 +579,7 @@ impl Pipeline {
 
         // ── Pass 3: Type-check ────────────────────────────────────────────────
         let mut typeck = crate::compiler::typeck::TypeCk::new();
-        typeck.check_program(&program);
+        typeck.check_program(&mut program);
         for d in typeck.diag.items {
             unit.diags.push(adapt_typeck_diag(d));
         }
