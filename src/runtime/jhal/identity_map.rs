@@ -252,7 +252,7 @@ impl HugePageAllocator {
 
     pub fn allocate(&mut self) -> Option<u64> {
         let size = self.page_size.size_bytes();
-        if self.next_addr + size > self.end_addr {
+        if self.next_addr > self.end_addr {
             return None;
         }
         let addr = self.next_addr;
@@ -427,22 +427,44 @@ mod tests {
 
     #[test]
     fn test_identity_map_new() {
-        let map = IdentityMap::new(true);
-        assert_eq!(map.mapped_bytes(), 0);
+        // IdentityMap is ~2MB due to inline PDPT arrays; use larger stack
+        let child = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let map = IdentityMap::new(true);
+                assert_eq!(map.mapped_bytes(), 0);
+            })
+            .expect("thread spawn failed");
+        child.join().expect("test thread panicked");
     }
 
     #[test]
     fn test_identity_map_1gb() {
-        let mut map = IdentityMap::new(true);
-        map.map_1gb(0, PTE_PRESENT | PTE_WRITABLE);
-        assert_eq!(map.mapped_bytes(), 1024 * 1024 * 1024);
+        // IdentityMap is ~2MB due to inline PDPT arrays; use spawn_with_stack
+        // to get enough stack space for the test
+        let child = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut map = IdentityMap::new(true);
+                map.map_1gb(0, PTE_PRESENT | PTE_WRITABLE);
+                assert_eq!(map.mapped_bytes(), 1024 * 1024 * 1024);
+            })
+            .expect("thread spawn failed");
+        child.join().expect("test thread panicked");
     }
 
     #[test]
     fn test_identity_map_2mb() {
-        let mut map = IdentityMap::new(false);
-        map.map_2mb(0, PTE_PRESENT | PTE_WRITABLE);
-        assert_eq!(map.mapped_bytes(), 2 * 1024 * 1024);
+        // IdentityMap is ~2MB due to inline PDPT arrays; use larger stack
+        let child = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut map = IdentityMap::new(false);
+                map.map_2mb(0, PTE_PRESENT | PTE_WRITABLE);
+                assert_eq!(map.mapped_bytes(), 2 * 1024 * 1024);
+            })
+            .expect("thread spawn failed");
+        child.join().expect("test thread panicked");
     }
 
     #[test]

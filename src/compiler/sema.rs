@@ -1915,23 +1915,24 @@ impl SemaCtx {
                     AssignOpKind::Assign => {
                         // In Jules v2, `x = value` on an undeclared variable
                         // creates a new binding (equivalent to `let x = value`).
-                        // When the variable is already declared, it's a rebinding/shadowing.
+                        // When the variable is already declared, check mutability.
                         if let Expr::Ident { span, name } = target.as_ref() {
-                            if self.scopes.lookup(name).is_none() {
-                                // Undeclared: treat as a new immutable binding.
-                                self.declare_var(name, *span, false);
-                            } else {
-                                // Already declared: this is a rebinding/shadowing.
-                                // Emit a shadowing warning if applicable, then declare
-                                // a new binding in the current scope.
-                                if self.warn_shadow && self.scopes.is_outer_name(name) {
-                                    self.warn(
+                            if let Some(b) = self.scopes.lookup(name) {
+                                if !b.mutable {
+                                    // Already declared and immutable: this is an error.
+                                    self.err(
                                         *span,
-                                        format!("binding `{}` shadows an outer variable", name),
+                                        format!(
+                                            "cannot assign to immutable variable `{}`; \
+                                             declare it with `let mut {}`",
+                                            name, name
+                                        ),
                                     );
                                 }
-                                let wildcard = name == "_" || name.starts_with('_');
-                                self.scopes.declare(name, Binding::new(*span, false, wildcard));
+                                // Mutable: assignment is allowed.
+                            } else {
+                                // Undeclared: treat as a new immutable binding.
+                                self.declare_var(name, *span, false);
                             }
                         } else {
                             // Non-ident target (e.g. field, index): check mutability normally.

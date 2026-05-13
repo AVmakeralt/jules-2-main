@@ -70,7 +70,9 @@ impl FieldProfile {
 
     /// Whether this field has dead writes — some writes are never read.
     pub fn has_dead_writes(&self) -> bool {
-        self.dead_write_count > 0 && self.write_count > 0
+        // A field has dead writes if it was written but never read (is_dead),
+        // or if some subset of writes were tracked as dead.
+        self.is_dead() || (self.dead_write_count > 0 && self.write_count > 0)
     }
 
     /// Dead write ratio (0.0–1.0).

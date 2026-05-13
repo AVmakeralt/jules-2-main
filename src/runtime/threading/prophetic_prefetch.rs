@@ -365,7 +365,7 @@ fn classify_access_pattern(
             if abs_stride == CACHE_LINE_SIZE || abs_stride < CACHE_LINE_SIZE {
                 // Unit or near-unit stride: CPU L2 stream prefetcher handles this
                 AccessPattern::Linear
-            } else if abs_stride <= 4 * CACHE_LINE_SIZE && stability > 5 {
+            } else if abs_stride <= 4 * CACHE_LINE_SIZE && stability >= 5 {
                 // Small fixed stride that hardware may partially handle,
                 // but software prefetch can still help
                 AccessPattern::FixedStride(s)
@@ -1172,10 +1172,11 @@ mod tests {
         assert!(addr.is_some());
         assert_eq!(addr.unwrap() as usize, 0x1000 + 128);
 
-        // Negative offset
-        let addr = PrefetchEmitter::compute_prefetch_address(base, -64, 1, true, false);
+        // Negative offset — use a base that won't cross a page boundary
+        let base_mid_page = 0x1400 as *const u8;
+        let addr = PrefetchEmitter::compute_prefetch_address(base_mid_page, -64, 1, true, false);
         assert!(addr.is_some());
-        assert_eq!(addr.unwrap() as usize, 0x1000 - 64);
+        assert_eq!(addr.unwrap() as usize, 0x1400 - 64);
 
         // Cross page boundary — returns None
         let near_boundary = 0x0FC0 as *const u8;

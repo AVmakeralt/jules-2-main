@@ -884,7 +884,8 @@ mod tests {
             | (5u32 << 11)
             | (1u32 << 8)
             | (0x10u32 & 0xFC);
-        assert_eq!(addr, 0x800A_5110);
+        // 0x80000000 | 0x20000 | 0x2800 | 0x100 | 0x10 = 0x80022910
+        assert_eq!(addr, 0x8002_2910);
     }
 
     #[test]
@@ -915,7 +916,8 @@ mod tests {
             + (1usize << 20)
             + (2usize << 15)
             + (3usize << 12);
-        assert_eq!(addr2, 0xE010_6000);
+        // 0xE0000000 + 0x100000 + 0x10000 + 0x3000 = 0xE0113000
+        assert_eq!(addr2, 0xE011_3000);
     }
 
     #[test]

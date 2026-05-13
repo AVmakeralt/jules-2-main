@@ -754,7 +754,7 @@ impl EntropyWatchdog {
         if let Some(max_iter) = self.sensitivity.max_iterations_scaled(self.complexity_factor) {
             // Trigger if total iterations exceed the threshold AND
             // no entropy has been detected recently.
-            let stagnant_threshold = (max_iter / 100).max(1000); // 1% of max, min 1000
+            let stagnant_threshold = (max_iter / 10000).max(1000); // 0.01% of max, min 1000
             if self.stagnant_count > stagnant_threshold {
                 return true; // Infinite loop detected!
             }

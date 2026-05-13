@@ -153,24 +153,77 @@ impl fmt::Display for Reg {
 }
 
 /// A compact bitset of registers for fast liveness/clobber tracking.
-/// Uses a u32 where each bit corresponds to Reg::index().
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RegSet(u32);
+/// Uses a u32 for physical registers (17 physical regs, one bit each).
+/// Virtual registers are tracked separately in a HashSet since their
+/// index space (200+) doesn't fit in u32 bit positions.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RegSet {
+    physical: u32,
+    virtuals: HashSet<u32>,
+}
+
+impl Clone for RegSet {
+    fn clone(&self) -> Self {
+        RegSet {
+            physical: self.physical,
+            virtuals: self.virtuals.clone(),
+        }
+    }
+}
 
 impl RegSet {
-    pub fn empty() -> Self { Self(0) }
-    pub fn all() -> Self { Self(0x0001FFFF) } // All 17 physical regs
+    pub fn empty() -> Self { Self::default() }
+    pub fn all() -> Self { Self { physical: 0x0001FFFF, virtuals: HashSet::new() } } // All 17 physical regs
 
-    pub fn insert(&mut self, r: Reg) { self.0 |= 1 << r.index(); }
-    pub fn remove(&mut self, r: Reg) { self.0 &= !(1 << r.index()); }
-    pub fn contains(&self, r: Reg) -> bool { self.0 & (1 << r.index()) != 0 }
+    pub fn insert(&mut self, r: Reg) {
+        match r {
+            Reg::VReg(v) => { self.virtuals.insert(v); }
+            _ => {
+                let idx = r.index();
+                if idx < 32 { self.physical |= 1 << idx; }
+            }
+        }
+    }
+    pub fn remove(&mut self, r: Reg) {
+        match r {
+            Reg::VReg(v) => { self.virtuals.remove(&v); }
+            _ => {
+                let idx = r.index();
+                if idx < 32 { self.physical &= !(1 << idx); }
+            }
+        }
+    }
+    pub fn contains(&self, r: Reg) -> bool {
+        match r {
+            Reg::VReg(v) => self.virtuals.contains(&v),
+            _ => {
+                let idx = r.index();
+                if idx < 32 { self.physical & (1 << idx) != 0 } else { false }
+            }
+        }
+    }
 
-    pub fn union(&self, other: &RegSet) -> RegSet { RegSet(self.0 | other.0) }
-    pub fn intersect(&self, other: &RegSet) -> RegSet { RegSet(self.0 & other.0) }
-    pub fn difference(&self, other: &RegSet) -> RegSet { RegSet(self.0 & !other.0) }
+    pub fn union(&self, other: &RegSet) -> RegSet {
+        RegSet {
+            physical: self.physical | other.physical,
+            virtuals: self.virtuals.union(&other.virtuals).copied().collect(),
+        }
+    }
+    pub fn intersect(&self, other: &RegSet) -> RegSet {
+        RegSet {
+            physical: self.physical & other.physical,
+            virtuals: self.virtuals.intersection(&other.virtuals).copied().collect(),
+        }
+    }
+    pub fn difference(&self, other: &RegSet) -> RegSet {
+        RegSet {
+            physical: self.physical & !other.physical,
+            virtuals: self.virtuals.difference(&other.virtuals).copied().collect(),
+        }
+    }
 
-    pub fn count(&self) -> u32 { self.0.count_ones() }
-    pub fn is_empty(&self) -> bool { self.0 == 0 }
+    pub fn count(&self) -> u32 { self.physical.count_ones() + self.virtuals.len() as u32 }
+    pub fn is_empty(&self) -> bool { self.physical == 0 && self.virtuals.is_empty() }
 
     /// Iterate over the physical registers in this set
     pub fn iter_physical(&self) -> impl Iterator<Item = Reg> + '_ {
@@ -182,6 +235,13 @@ impl RegSet {
             Reg::Rflags,
         ];
         PHYSICAL_REGS.iter().copied().filter(move |r| self.contains(*r))
+    }
+
+    /// Iterate over the virtual registers in this set
+    pub fn iter_virtuals(&self) -> impl Iterator<Item = Reg> + '_ {
+        let mut vregs: Vec<u32> = self.virtuals.iter().copied().collect();
+        vregs.sort();
+        vregs.into_iter().map(Reg::VReg)
     }
 }
 
@@ -676,7 +736,7 @@ impl MachineInstrFull {
 
     /// All registers read by this instruction (explicit + implicit)
     pub fn all_reads(&self) -> RegSet {
-        let mut reads = self.implicit_reads;
+        let mut reads = self.implicit_reads.clone();
         if let Some(r) = self.dst_reg() {
             // For read-modify-write ops, dst is also read
             if self.flag_effects.writes_any() && !self.is_comparison() {
@@ -693,7 +753,7 @@ impl MachineInstrFull {
 
     /// All registers written by this instruction (explicit + implicit)
     pub fn all_writes(&self) -> RegSet {
-        let mut writes = self.implicit_writes;
+        let mut writes = self.implicit_writes.clone();
         if let Some(r) = self.dst_reg() {
             writes.insert(r);
         }
@@ -839,7 +899,7 @@ impl MachineInstrFull {
 // =============================================================================
 
 /// Metadata for an x86-64 instruction, looked up from the instruction table.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct InstrMeta {
     pub implicit_reads: RegSet,
     pub implicit_writes: RegSet,
@@ -1136,7 +1196,7 @@ impl X86InstrTable {
             X86Opcode::Cmov64 => InstrMeta {
                 implicit_reads: { let mut s = RegSet::empty(); s.insert(Reg::Rflags); s },
                 implicit_writes: RegSet::empty(),
-                flag_effects: FlagEffects::preserves_all(),
+                flag_effects: FlagEffects::reads_all_arith(),
                 mem_effects: MemEffects::pure(),
                 encoding_length: 4,
                 latency: 2, throughput: 0.5, uop_count: 2,
@@ -1145,7 +1205,7 @@ impl X86InstrTable {
             X86Opcode::Setcc => InstrMeta {
                 implicit_reads: { let mut s = RegSet::empty(); s.insert(Reg::Rflags); s },
                 implicit_writes: RegSet::empty(),
-                flag_effects: FlagEffects::preserves_all(),
+                flag_effects: FlagEffects::reads_all_arith(),
                 mem_effects: MemEffects::pure(),
                 encoding_length: 3,
                 latency: 1, throughput: 0.5, uop_count: 1,
@@ -1356,7 +1416,7 @@ impl InstrBlock {
     /// Compute liveness information for this block.
     pub fn compute_liveness(&mut self) {
         // Backward analysis: live = uses ∪ (live_out - defs)
-        let mut live: RegSet = self.live_out;
+        let mut live: RegSet = self.live_out.clone();
         // We'll store per-instruction liveness in a separate pass
         for instr in self.instrs.iter().rev() {
             // Remove defs from live set
@@ -1485,8 +1545,8 @@ impl InstrBlock {
         }
 
         let mut result = InstrBlock::new(new_instrs);
-        result.live_in = self.live_in;
-        result.live_out = self.live_out;
+        result.live_in = self.live_in.clone();
+        result.live_out = self.live_out.clone();
         result
     }
 }
@@ -1627,11 +1687,11 @@ pub enum LegalityViolation {
 /// 5. Calling convention constraints hold
 pub fn check_legality(block: &InstrBlock) -> LegalityResult {
     let mut violations = Vec::new();
-    let mut live: RegSet = block.live_in;
+    let mut live: RegSet = block.live_in.clone();
 
     for (idx, instr) in block.instrs.iter().enumerate() {
         // 1. Check implicit clobbers don't conflict with live registers
-        let clobbers = instr.clobbers;
+        let clobbers = instr.clobbers.clone();
         let conflict = live.intersect(&clobbers);
         for reg in conflict.iter_physical() {
             // Only flag if the clobbered register is not the destination
@@ -1819,8 +1879,8 @@ pub fn canonicalize_block(block: &InstrBlock) -> InstrBlock {
     }
 
     let mut result = InstrBlock::new(new_instrs);
-    result.live_in = block.live_in;
-    result.live_out = block.live_out;
+    result.live_in = block.live_in.clone();
+    result.live_out = block.live_out.clone();
     result
 }
 

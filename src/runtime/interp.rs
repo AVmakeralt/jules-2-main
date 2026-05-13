@@ -11226,8 +11226,8 @@ mod tests {
         let state = interp
             .eval_builtin("sim::state_tensor", vec![Value::I64(world_id)])
             .unwrap();
-        if let Value::Tensor(t) = state {
-            let tt = t.read().unwrap();
+        if let Value::TensorFast(t) = state {
+            let tt = t.borrow();
             assert_eq!(tt.shape, vec![128, 4]);
             assert_eq!(tt.numel(), 512);
         } else {

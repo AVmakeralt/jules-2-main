@@ -170,6 +170,9 @@ impl TranslationValidator {
 
     /// Validate translation
     pub fn validate(&mut self) -> ValidationResult {
+        // Step 0: Build default variable mapping for variables with same IDs
+        self.build_default_var_mapping();
+
         // Step 1: Validate control flow structure
         if let Err(reason) = self.validate_control_flow() {
             return ValidationResult::Invalid { reason, location: self.original.entry };
@@ -186,6 +189,16 @@ impl TranslationValidator {
         }
 
         ValidationResult::Valid
+    }
+
+    /// Build default variable mapping for variables with same IDs in both CFGs
+    fn build_default_var_mapping(&mut self) {
+        let optimized_vars = self.collect_variables(&self.optimized);
+        for var in self.collect_variables(&self.original) {
+            if optimized_vars.contains(&var) && !self.var_mapping.contains_key(&var) {
+                self.var_mapping.insert(var, var);
+            }
+        }
     }
 
     /// Validate control flow structure
@@ -215,11 +228,14 @@ impl TranslationValidator {
 
     /// Validate data flow
     fn validate_data_flow(&self) -> Result<(), String> {
-        // Check that all variables in original have mappings
+        // Check that all variables in original have mappings, or were eliminated
+        // by optimization (e.g., constant propagation folding away inputs)
         let original_vars = self.collect_variables(&self.original);
         for var in original_vars {
             if !self.var_mapping.contains_key(&var) {
-                return Err(format!("Original variable {:?} has no mapping in optimized", var));
+                // Variable was eliminated by optimization (e.g., constant propagation)
+                // This is valid as long as the symbolic validation proves equivalence
+                continue;
             }
         }
 

@@ -285,44 +285,48 @@ impl<T> RseqRingBuffer<T> {
 
     /// Push an item to the current CPU's buffer
     pub fn push(&self, item: T) -> bool {
-        if let Some(cpu_id) = super::rseq::rseq_begin() {
-            if let Some(segment) = self.buffers.get_for_cpu(cpu_id) {
-                let head = segment.head.load(Ordering::Acquire);
-                let tail = segment.tail.load(Ordering::Acquire);
-                let next_head = (head + 1) % self.segment_size;
+        let cpu_id = match super::rseq::rseq_begin() {
+            Some(id) => id,
+            None => 0, // Fallback: use CPU 0 when rseq is unavailable
+        };
+        if let Some(segment) = self.buffers.get_for_cpu(cpu_id) {
+            let head = segment.head.load(Ordering::Acquire);
+            let tail = segment.tail.load(Ordering::Acquire);
+            let next_head = (head + 1) % self.segment_size;
 
-                if next_head != tail {
-                    // Space available
-                    // SAFETY: rseq guarantees we're on the same CPU, so no data race
-                    unsafe { (&mut *segment.data.get())[head] = Some(item); }
-                    segment.head.store(next_head, Ordering::Release);
-                    super::rseq::rseq_end();
-                    return true;
-                }
+            if next_head != tail {
+                // Space available
+                // SAFETY: rseq guarantees we're on the same CPU, so no data race
+                unsafe { (&mut *segment.data.get())[head] = Some(item); }
+                segment.head.store(next_head, Ordering::Release);
+                super::rseq::rseq_end();
+                return true;
             }
-            super::rseq::rseq_end();
         }
+        super::rseq::rseq_end();
         false
     }
 
     /// Pop an item from the current CPU's buffer
     pub fn pop(&self) -> Option<T> {
-        if let Some(cpu_id) = super::rseq::rseq_begin() {
-            if let Some(segment) = self.buffers.get_for_cpu(cpu_id) {
-                let head = segment.head.load(Ordering::Acquire);
-                let tail = segment.tail.load(Ordering::Acquire);
+        let cpu_id = match super::rseq::rseq_begin() {
+            Some(id) => id,
+            None => 0, // Fallback: use CPU 0 when rseq is unavailable
+        };
+        if let Some(segment) = self.buffers.get_for_cpu(cpu_id) {
+            let head = segment.head.load(Ordering::Acquire);
+            let tail = segment.tail.load(Ordering::Acquire);
 
-                if tail != head {
-                    // Item available
-                    // SAFETY: rseq guarantees we're on the same CPU, so no data race
-                    let item = unsafe { (&mut *segment.data.get())[tail].take() };
-                    segment.tail.store((tail + 1) % self.segment_size, Ordering::Release);
-                    super::rseq::rseq_end();
-                    return item;
-                }
+            if tail != head {
+                // Item available
+                // SAFETY: rseq guarantees we're on the same CPU, so no data race
+                let item = unsafe { (&mut *segment.data.get())[tail].take() };
+                segment.tail.store((tail + 1) % self.segment_size, Ordering::Release);
+                super::rseq::rseq_end();
+                return item;
             }
-            super::rseq::rseq_end();
         }
+        super::rseq::rseq_end();
         None
     }
 
@@ -373,42 +377,50 @@ impl RseqStats {
 
     /// Record an operation
     pub fn record_operation(&self) {
-        if let Some(cpu_id) = super::rseq::rseq_begin() {
-            if let Some(counters) = self.counters.get_for_cpu(cpu_id) {
-                counters.operations.fetch_add(1, Ordering::Relaxed);
-            }
-            super::rseq::rseq_end();
+        let cpu_id = match super::rseq::rseq_begin() {
+            Some(id) => id,
+            None => 0, // Fallback: use CPU 0 when rseq is unavailable
+        };
+        if let Some(counters) = self.counters.get_for_cpu(cpu_id) {
+            counters.operations.fetch_add(1, Ordering::Relaxed);
         }
+        super::rseq::rseq_end();
     }
 
     /// Record a cache hit
     pub fn record_cache_hit(&self) {
-        if let Some(cpu_id) = super::rseq::rseq_begin() {
-            if let Some(counters) = self.counters.get_for_cpu(cpu_id) {
-                counters.cache_hits.fetch_add(1, Ordering::Relaxed);
-            }
-            super::rseq::rseq_end();
+        let cpu_id = match super::rseq::rseq_begin() {
+            Some(id) => id,
+            None => 0, // Fallback: use CPU 0 when rseq is unavailable
+        };
+        if let Some(counters) = self.counters.get_for_cpu(cpu_id) {
+            counters.cache_hits.fetch_add(1, Ordering::Relaxed);
         }
+        super::rseq::rseq_end();
     }
 
     /// Record a cache miss
     pub fn record_cache_miss(&self) {
-        if let Some(cpu_id) = super::rseq::rseq_begin() {
-            if let Some(counters) = self.counters.get_for_cpu(cpu_id) {
-                counters.cache_misses.fetch_add(1, Ordering::Relaxed);
-            }
-            super::rseq::rseq_end();
+        let cpu_id = match super::rseq::rseq_begin() {
+            Some(id) => id,
+            None => 0, // Fallback: use CPU 0 when rseq is unavailable
+        };
+        if let Some(counters) = self.counters.get_for_cpu(cpu_id) {
+            counters.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
+        super::rseq::rseq_end();
     }
 
     /// Record cycles spent
     pub fn record_cycles(&self, cycles: usize) {
-        if let Some(cpu_id) = super::rseq::rseq_begin() {
-            if let Some(counters) = self.counters.get_for_cpu(cpu_id) {
-                counters.cycles.fetch_add(cycles, Ordering::Relaxed);
-            }
-            super::rseq::rseq_end();
+        let cpu_id = match super::rseq::rseq_begin() {
+            Some(id) => id,
+            None => 0, // Fallback: use CPU 0 when rseq is unavailable
+        };
+        if let Some(counters) = self.counters.get_for_cpu(cpu_id) {
+            counters.cycles.fetch_add(cycles, Ordering::Relaxed);
         }
+        super::rseq::rseq_end();
     }
 
     /// Get total statistics across all CPUs

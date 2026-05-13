@@ -192,9 +192,11 @@ impl LoomModelChecker {
     /// Check if an operation is enabled in current state
     fn is_operation_enabled(&self, state: &MemoryState, op: &ThreadOp) -> bool {
         match op {
-            ThreadOp::LockAcquire { lock_id, .. } => {
-                // Can acquire if lock is free
-                state.locks.get(lock_id).map_or(true, |owner| owner.is_none())
+            ThreadOp::LockAcquire { lock_id, thread_id } => {
+                // Can attempt acquire unless this thread already holds the lock.
+                // If the lock is held by another thread the thread will block,
+                // which is essential for deadlock detection.
+                state.locks.get(lock_id).map_or(true, |owner| *owner != Some(*thread_id))
             }
             ThreadOp::LockRelease { lock_id, thread_id, .. } => {
                 // Can release if this thread holds the lock
@@ -413,8 +415,8 @@ impl LoomModelChecker {
 
     /// Check if state is terminal (no more operations possible)
     fn is_terminal_state(&self, state: &MemoryState) -> bool {
-        // Terminal if all threads are completed
-        state.thread_states.values().all(|s| *s == ThreadState::Completed)
+        // Terminal if no threads are running (all blocked or completed)
+        !state.thread_states.values().any(|s| *s == ThreadState::Running)
     }
 
     /// Get number of interleavings explored

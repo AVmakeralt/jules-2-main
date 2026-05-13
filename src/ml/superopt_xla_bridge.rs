@@ -132,7 +132,7 @@ impl SuperoptXlaBridge {
     fn parse_hlo_line(&self, line: &str) -> Option<HloOperation> {
         // Simple parser for HLO operations
         // Format: name = opcode(shape) operands=...
-        let parts: Vec<&str> = line.split('=').collect();
+        let parts: Vec<&str> = line.splitn(2, '=').collect();
         if parts.len() < 2 {
             return None;
         }
@@ -186,22 +186,18 @@ impl SuperoptXlaBridge {
                 match op.opcode.as_str() {
                     "multiply" => {
                         // x * 1 -> x, x * 0 -> 0
-                        if let Some(operand) = op.operands.first() {
-                            if operand == "1" || operand == "1.0" {
-                                op.opcode = "identity".to_string();
-                                self.stats.algebraic_simplifications.fetch_add(1, Ordering::Relaxed);
-                                self.stats.rewrites_performed.fetch_add(1, Ordering::Relaxed);
-                            }
+                        if op.operands.iter().any(|o| o == "1" || o == "1.0") {
+                            op.opcode = "identity".to_string();
+                            self.stats.algebraic_simplifications.fetch_add(1, Ordering::Relaxed);
+                            self.stats.rewrites_performed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     "add" => {
                         // x + 0 -> x
-                        if let Some(operand) = op.operands.first() {
-                            if operand == "0" || operand == "0.0" {
-                                op.opcode = "identity".to_string();
-                                self.stats.algebraic_simplifications.fetch_add(1, Ordering::Relaxed);
-                                self.stats.rewrites_performed.fetch_add(1, Ordering::Relaxed);
-                            }
+                        if op.operands.iter().any(|o| o == "0" || o == "0.0") {
+                            op.opcode = "identity".to_string();
+                            self.stats.algebraic_simplifications.fetch_add(1, Ordering::Relaxed);
+                            self.stats.rewrites_performed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     _ => {}

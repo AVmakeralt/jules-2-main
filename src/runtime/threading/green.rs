@@ -235,7 +235,7 @@ impl GreenScheduler {
         Self {
             ready_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             contexts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            next_id: AtomicUsize::new(0),
+            next_id: AtomicUsize::new(1),
             current: AtomicUsize::new(usize::MAX),
             main_sp: AtomicUsize::new(0),
             main_regs: AtomicUsize::new(0),

@@ -1057,7 +1057,7 @@ mod tests {
 
         // Base is 0, so the OR instruction should show 0x...0000
         assert!(asm.contains("or  rdi, 0x"));
-        assert!(asm.contains("00000000000010000")); // offset mask for 0x10000
+        assert!(asm.contains("000000000000FFFF")); // offset mask = size - 1 = 0xFFFF
     }
 
     // ─── apply_mask_asm Tests ──────────────────────────────────────

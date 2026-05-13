@@ -349,12 +349,12 @@ pub struct MemoryAccessEstimate {
 pub struct Fp32ScalarKernel;
 
 impl MatmulKernel for Fp32ScalarKernel {
-    fn gemm(&self, a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize, _lda: usize, _ldb: usize, ldc: usize) {
+    fn gemm(&self, a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize, lda: usize, ldb: usize, ldc: usize) {
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f32;
                 for p in 0..k {
-                    sum += a[i * k + p] * b[p * n + j];
+                    sum += a[p * lda + i] * b[p * ldb + j];
                 }
                 c[i * ldc + j] = sum;
             }

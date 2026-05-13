@@ -396,7 +396,7 @@ impl PartialEvaluator {
                     false
                 };
 
-                if is_pure && func_bt == BindingTime::Static && args_bt == BindingTime::Static {
+                if is_pure && args_bt == BindingTime::Static {
                     BindingTime::Static
                 } else {
                     func_bt.max(args_bt)

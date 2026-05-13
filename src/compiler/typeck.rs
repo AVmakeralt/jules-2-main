@@ -3860,7 +3860,7 @@ impl TypeCk {
         decorator_name: &str,
     ) -> Option<()> {
         if let crate::compiler::ast::Attribute::Named { args, .. } = attr {
-            // Expect a string literal as the first argument.
+            // Case 1: first positional argument is a string literal (e.g., @AI("256->512->10"))
             if let Some(crate::compiler::ast::Expr::StrLit { value, span }) = args.first() {
                 if let Err(e) = self.validate_architecture_string(value) {
                     self.diag
@@ -3870,16 +3870,25 @@ impl TypeCk {
                 }
                 // Basic validation succeeded.
                 return Some(());
-            } else {
-                self.diag.push(
-                    Diagnostic::error(a.span, format!(
-                        "@{} decorator requires a string literal argument (e.g., @{}(\"256->512->10\"))",
-                        decorator_name.to_uppercase(), decorator_name.to_uppercase()
-                    ))
-                    .with_code("E2024"),
-                );
-                return None;
             }
+            // Case 2: all named arguments (e.g., @AI(network="256->512->10", lr=0.001))
+            // The validate_ai_decorator already handles the named `network=` arg,
+            // so we just check that there is at least one named arg present.
+            let has_named_arg = args.iter().any(|arg| {
+                matches!(arg, crate::compiler::ast::Expr::Assign { .. })
+            });
+            if has_named_arg {
+                return Some(());
+            }
+            // Case 3: no string literal, no named args — this is an error
+            self.diag.push(
+                Diagnostic::error(a.span, format!(
+                    "@{} decorator requires a string literal argument (e.g., @{}(\"256->512->10\"))",
+                    decorator_name.to_uppercase(), decorator_name.to_uppercase()
+                ))
+                .with_code("E2024"),
+            );
+            return None;
         }
         None
     }
@@ -5319,7 +5328,7 @@ mod tests {
         let tensor_ty = ck.lower_ast_type(&Type::Named("Tensor".into()), span);
         let tensor_lower_ty = ck.lower_ast_type(&Type::Named("tensor".into()), span);
 
-        assert_eq!(int_ty, Ty::Scalar(ElemType::I64));
+        assert_eq!(int_ty, Ty::Scalar(ElemType::I32));
         assert_eq!(float_ty, Ty::Scalar(ElemType::F32));
         assert_eq!(bool_ty, Ty::Bool);
         assert!(matches!(

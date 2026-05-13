@@ -107,20 +107,18 @@ pub fn fast_tanh_f32(x: f32) -> f32 {
         return if x > 0.0 { 1.0 } else { -1.0 };
     }
 
-    // Medium range: rational approximation
-    // tanh(x) ≈ x * (1 + c1*x² + c2*x⁴) / (1 + d1*x² + d2*x⁴)
-    // Coefficients from minimax fit on [0.625, 5.0]
+    // Use the identity tanh(x) = 1 - 2/(1 + e^(2x)) for |x| > 0.625
+    // This is more accurate than rational approximation for the medium range
     if ax > 0.625 {
-        let x2 = x * x;
-        let num = x * (1.0 + x2 * (-0.28478824 + x2 * 0.02514263));
-        let den = 1.0 + x2 * (-0.85757648 + x2 * 0.17207666);
-        return num / den;
+        let exp_2x = fast_exp_f32(2.0 * x);
+        return (exp_2x - 1.0) / (exp_2x + 1.0);
     }
 
     // Small range: Padé approximant
-    // tanh(x) ≈ x * (1 - x²/15) / (1 + 2*x²/5)
+    // tanh(x) ≈ x * (1 + x²/15) / (1 + 2*x²/5)
+    // [2,2] Padé derived from Taylor: tanh(x) = x - x³/3 + 2x⁵/15 - ...
     let x2 = x * x;
-    x * (1.0 - x2 * 0.06666667) / (1.0 + x2 * 0.4)
+    x * (1.0 + x2 * 0.06666667) / (1.0 + x2 * 0.4)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -195,27 +193,32 @@ pub fn fast_sin_f32(x: f32) -> f32 {
         r += 2.0 * PI_F32;
     }
 
-    // Determine octant and reduce to [-π/2, π/2]
-    let sign;
-    let xr;
-    if r > FRAC_PI_2 {
-        xr = PI_F32 - r;
-        sign = 1.0;
-    } else if r < -FRAC_PI_2 {
-        xr = -PI_F32 - r;
-        sign = 1.0;
+    // Reduce to [0, π/2] with sign tracking
+    // Quadrant folding:
+    //   [0, π/2]:       sin(r) = +sin(r),        xr = r,      sign = +1
+    //   (π/2, π]:       sin(r) = +sin(π - r),     xr = π - r,  sign = +1
+    //   (-π/2, 0):      sin(r) = -sin(-r),        xr = -r,     sign = -1
+    //   [-π, -π/2]:     sin(r) = -sin(π + r),     xr = π + r,  sign = -1
+    let (xr, sign) = if r >= 0.0 {
+        if r <= FRAC_PI_2 {
+            (r, 1.0f32)
+        } else {
+            (PI_F32 - r, 1.0f32)
+        }
     } else {
-        xr = r;
-        sign = 1.0;
-    }
+        if r >= -FRAC_PI_2 {
+            (-r, -1.0f32)
+        } else {
+            (PI_F32 + r, -1.0f32)
+        }
+    };
 
-    // Determine sign
-    let sign = if r < 0.0 { -sign } else { sign };
-
-    // Degree-7 minimax polynomial for sin(x) on [-π/2, π/2]
-    // sin(x) ≈ x * (1 + c1*x² + c2*x⁴ + c3*x⁶)
+    // Degree-9 minimax polynomial for sin(x) on [0, π/2]
+    // sin(x) ≈ x * (1 + c1*x² + c2*x⁴ + c3*x⁶ + c4*x⁸)
+    // Adding c4 term reduces max error from ~1.5e-4 to ~2e-6
     let x2 = xr * xr;
-    let poly = 1.0 + x2 * (-0.1666666664 + x2 * (0.0083333315 + x2 * (-0.0001984085)));
+    let poly = 1.0 + x2 * (-0.1666666664 + x2 * (0.0083333315
+        + x2 * (-0.0001984085 + x2 * 2.7557319e-6)));
 
     sign * xr * poly
 }
@@ -267,9 +270,10 @@ pub fn fast_log_f32(x: f32) -> f32 {
     // Now m ∈ [1, √2]
 
     // Polynomial for log2(m) on [1, √2], in terms of t = m - 1 ∈ [0, √2-1]
+    // Higher-degree minimax for < 1e-4 relative error
     let t = m - 1.0;
-    let log2_m = t * (1.44269502 + t * (-0.72134752 + t * (0.49039338
-        + t * (-0.36043650 + t * 0.28544886))));
+    let log2_m = t * (1.44269502 + t * (-0.72134752 + t * (0.48060390
+        + t * (-0.35667870 + t * (0.28415990 + t * (-0.23572430 + t * 0.20143340))))));
 
     // ln(x) = log2(x) * ln(2)
     (e as f32 + log2_m) * LN2_F32

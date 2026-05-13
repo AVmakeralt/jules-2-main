@@ -1708,7 +1708,7 @@ impl ErrorExplanationDatabase {
                     Use `&data` to borrow instead, or `.clone()` to make a copy before the move.".into(),
             }];
             e.fixes = vec![
-                "Borrow with `&name` instead of moving".into(),
+                "borrow with `&name` instead of moving".into(),
                 "Use `.clone()` to create a copy before the move".into(),
                 "Mark the type as `copy` if it should be implicitly copyable".into(),
             ];

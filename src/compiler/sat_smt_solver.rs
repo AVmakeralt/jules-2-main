@@ -346,6 +346,49 @@ impl SatSmtSolver {
             }
         }
 
+        // Var-Var comparison: narrow both sides based on each other's ranges
+        if let (ArithExpr::Var(left_var), ArithExpr::Var(right_var)) = (left, right) {
+            let left_range = self.get_range(*left_var);
+            let right_range = self.get_range(*right_var);
+            if left_range.known && right_range.known {
+                match op {
+                    ComparisonOp::Lt => {
+                        // left < right => left.max <= right.max - 1
+                        // left < right => right.min >= left.min + 1
+                        let new_left_max = left_range.max.min(right_range.max - 1);
+                        let new_right_min = right_range.min.max(left_range.min + 1);
+                        new_ranges.insert(*left_var, ValueRange::new(left_range.min, new_left_max));
+                        new_ranges.insert(*right_var, ValueRange::new(new_right_min, right_range.max));
+                    }
+                    ComparisonOp::Le => {
+                        // left <= right => left.max <= right.max
+                        // left <= right => right.min >= left.min
+                        let new_left_max = left_range.max.min(right_range.max);
+                        let new_right_min = right_range.min.max(left_range.min);
+                        new_ranges.insert(*left_var, ValueRange::new(left_range.min, new_left_max));
+                        new_ranges.insert(*right_var, ValueRange::new(new_right_min, right_range.max));
+                    }
+                    ComparisonOp::Gt => {
+                        // left > right => left.min >= right.min + 1
+                        // left > right => right.max <= left.max - 1
+                        let new_left_min = left_range.min.max(right_range.min + 1);
+                        let new_right_max = right_range.max.min(left_range.max - 1);
+                        new_ranges.insert(*left_var, ValueRange::new(new_left_min, left_range.max));
+                        new_ranges.insert(*right_var, ValueRange::new(right_range.min, new_right_max));
+                    }
+                    ComparisonOp::Ge => {
+                        // left >= right => left.min >= right.min
+                        // left >= right => right.max <= left.max
+                        let new_left_min = left_range.min.max(right_range.min);
+                        let new_right_max = right_range.max.min(left_range.max);
+                        new_ranges.insert(*left_var, ValueRange::new(new_left_min, left_range.max));
+                        new_ranges.insert(*right_var, ValueRange::new(right_range.min, new_right_max));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         if new_ranges.is_empty() {
             None
         } else {
@@ -902,7 +945,11 @@ mod tests {
 
         solver.add_constraint(Constraint::Lt(
             Box::new(ArithExpr::Var(x)),
+            Box::new(ArithExpr::Const(5)),
+        ));
+        solver.add_constraint(Constraint::Gt(
             Box::new(ArithExpr::Var(y)),
+            Box::new(ArithExpr::Const(10)),
         ));
 
         let ranges = solver.range_analysis();

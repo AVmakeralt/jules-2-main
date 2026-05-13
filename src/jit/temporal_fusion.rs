@@ -247,7 +247,7 @@ fn get_interned(idx: u32) -> String {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 struct MicroOp {
     /// Interned opcode index (u32 instead of String, ~24 bytes total)
     opcode: u32,
@@ -257,12 +257,16 @@ struct MicroOp {
     has_memory: bool,
 }
 
+impl PartialEq for MicroOp {
+    fn eq(&self, other: &Self) -> bool {
+        self.opcode == other.opcode && self.has_memory == other.has_memory
+    }
+}
+
 impl std::hash::Hash for MicroOp {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.opcode.hash(state);
         self.has_memory.hash(state);
-        for r in &self.read_regs { r.hash(state); }
-        for r in &self.write_regs { r.hash(state); }
     }
 }
 
@@ -1127,13 +1131,17 @@ mod tests {
     fn test_micro_sequence_detector() {
         let config = TemporalFusionConfig::default();
         let mut detector = MicroSequenceDetector::new(&config);
-        
-        let instructions = vec![
+
+        // Repeat the load-add-store pattern enough times to exceed min_frequency
+        let base = vec![
             IrInstruction::Load { dst: "rax".to_string(), src: "rbx".to_string(), offset: 0 },
             IrInstruction::Add { dst: "rax".to_string(), lhs: "rax".to_string(), rhs: "rcx".to_string() },
             IrInstruction::Store { dst: "rbx".to_string(), src: "rax".to_string(), offset: 0 },
         ];
-        
+        let instructions: Vec<IrInstruction> = (0..12)
+            .flat_map(|_| base.clone())
+            .collect();
+
         let detected = detector.analyze(&instructions);
         // Should detect sequences like "load", "add", "store"
         assert!(detected.len() > 0);

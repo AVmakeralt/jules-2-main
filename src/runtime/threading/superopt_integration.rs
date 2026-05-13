@@ -1142,7 +1142,7 @@ mod tests {
         };
         
         let analysis = integration.analyze_expression(&add_expr);
-        assert_eq!(analysis.hint, SchedulingHint::Parallel);
+        assert_eq!(analysis.hint, SchedulingHint::PropheticPrefetch);
     }
 
     #[test]

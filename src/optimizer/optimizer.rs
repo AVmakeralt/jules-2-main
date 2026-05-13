@@ -3485,7 +3485,8 @@ mod tests {
     fn test_reduce_on_plateau_cooldown_delays_reduction() {
         let mut sched = ReduceOnPlateau::new(0.5, 2, 1e-8).with_cooldown(3);
         let base = 0.1_f32;
-        // Trigger a reduction (2 bad epochs).
+        // First call establishes baseline; next 2 are bad epochs that trigger reduction.
+        sched.on_metric(1.0);
         sched.on_metric(1.0);
         sched.on_metric(1.0);
         let lr_after_first_reduce = sched.multiplier(0, base);
