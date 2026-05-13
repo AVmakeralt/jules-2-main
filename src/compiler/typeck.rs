@@ -889,7 +889,11 @@ impl TypeCk {
                     "bool" | "Bool" => Ty::Bool,
                     "str" | "String" => Ty::Str,
                     // Prelude aliases for ergonomic startup in .jules files.
-                    "Int" | "int" => Ty::Scalar(ElemType::I64),
+                    // FIX: "Int"/"int" defaults to I32 (not I64) to be consistent
+                    // with annotate_literal_types which defaults unannotated IntLit
+                    // to I32. This ensures `fn foo() -> Int` and `fn foo() -> i32`
+                    // produce the same IR type, and integer literals are type-compatible.
+                    "Int" | "int" => Ty::Scalar(ElemType::I32),
                     "Float" | "float" => Ty::Scalar(ElemType::F32),
                     "Tensor" | "tensor" => Ty::Tensor {
                         elem: ElemType::F32,

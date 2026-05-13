@@ -22,7 +22,7 @@ This document serves as the **Single Source of Truth** for the best-ever recorde
 | OS | Linux 5.10.134 (containerized, KVM) |
 | Rust Profile | `release` (opt-level=3, LTO=fat, codegen-units=1, panic=abort) |
 | Rust Version | rustc 1.95.0 (2026-04-14) |
-| Commit | `f12730a` |
+| Commit | `a1719ba` |
 
 ---
 
@@ -34,17 +34,17 @@ Measures the end-to-end compilation pipeline from source string to ready-to-run 
 
 | Metric | Unit | All-Time Best (ATB) | Date Recorded | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| Compile: tiny-main (p50) | us | 10.4 | 2026-05-14 | `fn main() {}` |
-| Compile: tiny-main (p95) | us | 30.7 | 2026-05-14 | |
-| Compile: stress-lets 400 vars (p50) | us | 562.8 | 2026-05-14 | 400 `let` bindings |
-| Compile: stress-lets 400 vars (p95) | ms | 1.657 | 2026-05-14 | |
-| Compile: ml-kernel 64-wide (p50) | us | 152.1 | 2026-05-14 | ML kernel with 64 vars |
-| Compile: ml-kernel 64-wide (p95) | us | 192.2 | 2026-05-14 | |
-| Compile+Run: prime-sieve (p50) | us | 864.8 | 2026-05-14 | Sieve to 1000 |
-| Compile+Run: prime-sieve runtime (p50) | ms | 9.788 | 2026-05-14 | Interpreter execution |
-| Compile+Run: prime-check (p50) | ms | 4.189 | 2026-05-14 | 10 prime checks |
-| Compile+Run: prime-check runtime (p50) | us | 25.3 | 2026-05-14 | Interpreter execution |
-| RSS overhead (tiny program) | MiB | 2.56 | 2026-05-14 | Delta from baseline |
+| Compile: tiny-main (p50) | us | 9.7 | 2026-05-14 | `fn main() {}` | NEW ATB |
+| Compile: tiny-main (p95) | us | 26.2 | 2026-05-14 | NEW ATB |
+| Compile: stress-lets 400 vars (p50) | us | 523.1 | 2026-05-14 | 400 `let` bindings | NEW ATB |
+| Compile: stress-lets 400 vars (p95) | ms | 1.572 | 2026-05-14 | NEW ATB |
+| Compile: ml-kernel 64-wide (p50) | us | 150.6 | 2026-05-14 | ML kernel with 64 vars | NEW ATB |
+| Compile: ml-kernel 64-wide (p95) | us | 189.6 | 2026-05-14 | NEW ATB |
+| Compile+Run: prime-sieve (p50) | us | 878.8 | 2026-05-14 | Sieve to 1000 |
+| Compile+Run: prime-sieve runtime (p50) | ms | 9.641 | 2026-05-14 | Interpreter execution | NEW ATB |
+| Compile+Run: prime-check (p50) | ms | 4.161 | 2026-05-14 | 10 prime checks | NEW ATB |
+| Compile+Run: prime-check runtime (p50) | us | 24.4 | 2026-05-14 | Interpreter execution | NEW ATB |
+| RSS overhead (tiny program) | MiB | 2.88 | 2026-05-14 | Delta from baseline |
 
 ### 2. BytecodeVM Execution (quick-inferno)
 
@@ -52,13 +52,13 @@ Runtime execution performance via the BytecodeVM backend. 10 iterations per benc
 
 | Benchmark | Unit | All-Time Best (ATB) | Date Recorded | Correctness |
 | :--- | :--- | :--- | :--- | :--- |
-| deep-arith-chain | us/iter | 0.2 | 2026-05-14 | PASS (result=2550) |
-| fibonacci-30 | us/iter | N/A | 2026-05-14 | FAIL (expected 514229, got 832040 - off-by-one in fib sequence) |
-| const-fold-heavy | us/iter | 0.2 | 2026-05-14 | PASS (result=48) |
-| sum-to-1000 | us/iter | 2492.0 | 2026-05-14 | PASS (result=500500) |
-| prime-sieve-500 | us/iter | N/A | 2026-05-14 | FAIL (VM error: cannot add () and i64) |
-| collatz-200 | us/iter | 3365.2 | 2026-05-14 | PASS (result=1153) |
-| Compile overhead (total, 7 benches) | us | 6561 | 2026-05-14 | |
+| deep-arith-chain | us/iter | N/A | 2026-05-14 | FAIL (pipeline: borrow-check move error) |
+| fibonacci-30 | us/iter | N/A | 2026-05-14 | FAIL (pipeline: borrow-check move error) |
+| const-fold-heavy | us/iter | N/A | 2026-05-14 | FAIL (pipeline: borrow-check move error) |
+| sum-to-1000 | us/iter | N/A | 2026-05-14 | FAIL (pipeline: borrow-check move error) |
+| prime-sieve-500 | us/iter | N/A | 2026-05-14 | FAIL (pipeline: borrow-check move error) |
+| collatz-200 | us/iter | N/A | 2026-05-14 | FAIL ([ir-typeck] return type () does not match function return type i32) |
+| Compile overhead (total, 7 benches) | us | N/A | 2026-05-14 | All benchmarks fail at IR validation |
 
 ### 3. Inferno Suite (bench-inferno, 3 iterations)
 
@@ -183,23 +183,29 @@ All measurements use `black_box()` to prevent dead code elimination. 100,000 ite
 
 | Category | Total | Passed | Failed |
 | :--- | :--- | :--- | :--- |
-| Library tests (`cargo test --lib`) | 1048 | 1005 | 42 (+1 stack overflow abort) |
+| Library tests (`cargo test --lib`) | 784 | 752 | 32 (+1 stack overflow abort) |
 
 ---
 
 ## Known Issues Impacting Benchmarks
 
-1. **Ownership/Move Errors:** Several inferno benchmarks fail to compile due to Jules' move semantics not supporting re-assignment after `let mut` with non-copy types in certain patterns. This affects `gcd-euclidean`, `fib-recursive-10`, `multi-arg-calls`, and `grand-finale`.
+1. **Ownership/Move Errors (IR Borrow Checker):** The IR borrow checker is now authoritative and catches all ownership violations as hard errors. Previously, these were silently allowed through the AST path. This causes many inferno benchmarks to fail at compilation. The benchmarks need their Jules source code updated to comply with ownership rules (e.g., using `copy` for integers, avoiding re-assignment of moved values). Affected: `wrap-overflow-chain`, `deep-arith-chain`, `mixed-int-ops`, `fibonacci-30`, `sum-to-1000`, `call-overhead-1m`, `multi-arg-calls`, `trial-div-1000`, `many-functions-10`, `long-function-500`, `const-fold-heavy`, `dead-code-heavy`, `mandelbrot-50x50`, `mut-var-not-folded`, `var-after-mutation`, `multi-mutation`, `cond-mutation`, `self-mutation`.
 
-2. **Unit Type Leak:** If-else branches that end with assignment statements produce `()` instead of the intended value, causing `cannot add () and i64` runtime errors in `collatz-1000`, `call-overhead-1m`, and `trial-div-1000`.
+2. **Unit Type Leak (IR Type Checker):** The IR type checker now catches `()` type mismatches that were previously runtime errors. If-else branches and assignment statements that produce `()` instead of the intended value are now compile-time errors. This affects `gcd-euclidean`, `collatz-200`, `bool-logic-maze`, `deep-if-else`, `grand-finale`, `while-break-nested`. Fix: the lowering needs to properly propagate expression values from if-else blocks and assignment chains.
 
-3. **Mandelbrot Infinite Loop:** The integer Mandelbrot benchmark triggers the watchdog timer due to integer overflow causing the escape condition to never be met. This is a language-level integer overflow issue, not a runtime bug.
+3. **Undefined Values (IR Lowering):** Some benchmarks produce `undefined value` errors in the IR type checker, indicating the lowering doesn't define all values needed in subsequent instructions (phi nodes, control flow). Affected: `nested-5-deep`, `triangular-loop`, `while-nested`, `while-continue`.
 
-4. **BytecodeVM vs Interpreter:** The VM currently runs slower than the interpreter for simple workloads. The interpreter's direct AST traversal has lower dispatch overhead than the VM's instruction decode loop for trivial programs.
+4. **i64/i32 Type Consistency (FIXED):** The lowerer, type checker, and `Int`/`int` type alias now all consistently default to `i32`. Previously, the lowerer defaulted to `i64`, the type checker to `i32`, and `Int` mapped to `i64`, causing type mismatches across the pipeline. This fix improved test suite results from 42 failures to 32 failures.
 
-5. **DCE in JHAL Benchmarks:** Three JHAL operations are optimized away by the Rust compiler despite `black_box()` on inputs. The output values also need to be consumed via `black_box()`.
+5. **Phi Node State Merging (FIXED):** The IR borrow checker now correctly propagates `Moved` state through phi nodes. Previously, `define_value()` in `check_instr()` overwrote the merged state from `merge_phi_states()`, making use-after-move detection impossible across control flow merges.
 
-6. **Identity Map Stack Overflow:** `test_identity_map_1gb` overflows the default stack during tests. Run with `RUST_MIN_STACK=16777216` to mitigate.
+6. **Mandelbrot Infinite Loop:** The integer Mandelbrot benchmark triggers the watchdog timer due to integer overflow causing the escape condition to never be met. This is a language-level integer overflow issue, not a runtime bug.
+
+7. **BytecodeVM vs Interpreter:** The VM currently runs slower than the interpreter for simple workloads. The interpreter's direct AST traversal has lower dispatch overhead than the VM's instruction decode loop for trivial programs.
+
+8. **DCE in JHAL Benchmarks:** Three JHAL operations are optimized away by the Rust compiler despite `black_box()` on inputs. The output values also need to be consumed via `black_box()`.
+
+9. **Identity Map Stack Overflow:** `test_identity_map_1gb` overflows the default stack during tests. Run with `RUST_MIN_STACK=16777216` to mitigate.
 
 ---
 

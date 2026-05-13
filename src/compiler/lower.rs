@@ -947,7 +947,11 @@ impl LowerCtx {
             Expr::IntLit { value, ty, span } => {
                 let ir_ty = ty.as_ref()
                     .map(|et| self.elem_type_to_ir(et.clone()))
-                    .unwrap_or(IrType::Int { width: 64, signed: true });
+                    // FIX: Default to i32 (not i64) to match annotate_literal_types
+                    // in typeck.rs, which sets unannotated IntLit to I32.
+                    // Optimizers create IntLit nodes with ty=None, so this fallback
+                    // must be consistent with the type checker's default.
+                    .unwrap_or(IrType::Int { width: 32, signed: true });
 
                 // Truncate to i128 for the IR representation
                 let truncated = (*value & 0xFFFFFFFFFFFFFFFF) as i128;
