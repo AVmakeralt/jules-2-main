@@ -83,6 +83,7 @@ fn bench() -> i32 {{
             if i + 1 == iters && sample + 1 == samples {
                 match result {
                     PipelineResult::Ok(p) => program = Some(p),
+                    PipelineResult::OkWithIr { program: p, .. } => program = Some(p),
                     _ => {
                         eprintln!("pipeline failed to produce executable program");
                         std::process::exit(1);
@@ -311,6 +312,7 @@ fn bench() -> i32 {
     let mut unit = CompileUnit::new("<native-probe>", src);
     let program = match pipeline.run(&mut unit) {
         PipelineResult::Ok(p) if !unit.has_errors() => p,
+        PipelineResult::OkWithIr { program, .. } if !unit.has_errors() => program,
         _ => return 2,
     };
     let mut interp = jules::interp::Interpreter::new();

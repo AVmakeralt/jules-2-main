@@ -32,7 +32,7 @@ fn bench() -> i32 {
     pipeline.print_opt_stats = true;
     let result = pipeline.run(&mut unit);
     
-    if let PipelineResult::Ok(prog) = result {
+    if let Some(prog) = result.program() {
         for item in &prog.items {
             if let jules::compiler::ast::Item::Fn(fn_decl) = item {
                 println!("Function: {}", fn_decl.name);
@@ -50,7 +50,7 @@ fn bench() -> i32 {
     pipeline2.print_opt_stats = true;
     let result2 = pipeline2.run(&mut unit2);
     
-    if let PipelineResult::Ok(prog) = result2 {
+    if let Some(prog) = result2.program() {
         for item in &prog.items {
             if let jules::compiler::ast::Item::Fn(fn_decl) = item {
                 println!("Function: {}", fn_decl.name);
@@ -124,6 +124,7 @@ fn test_with_opt_level(src: &str, opt_level: u8, expected: Option<i32>) {
 
     let prog = match result {
         PipelineResult::Ok(p) => p,
+        PipelineResult::OkWithIr { program, .. } => program,
         _ => { println!("  PIPELINE FAILED"); return; }
     };
 

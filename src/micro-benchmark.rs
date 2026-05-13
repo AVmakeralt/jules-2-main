@@ -118,7 +118,7 @@ fn run_sample(sample: &Sample, iterations: usize) -> Result<SampleReport, String
             ));
         }
 
-        let PipelineResult::Ok(program) = result else {
+        let Some(program) = result.program() else {
             return Err(format!(
                 "pipeline halted before codegen/runtime in sample `{}` at iteration {}",
                 sample.name, i

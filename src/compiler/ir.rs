@@ -2613,6 +2613,11 @@ pub struct FlatIrModule {
     pub functions: Vec<FlatIrFunction>,
     pub intrinsics: Vec<IrIntrinsic>,
     pub span: Span,
+    /// Errors encountered during AST → IR lowering (e.g., break outside loop).
+    /// These are HARD ERRORS — if non-empty, the IR module must not be
+    /// executed. The pipeline should report these before running IR type
+    /// checking or borrow checking.
+    pub lowering_errors: Vec<(crate::compiler::lexer::Span, String)>,
 }
 
 // =============================================================================

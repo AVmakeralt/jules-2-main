@@ -24,6 +24,7 @@ fn bench() -> i32 {
     pipeline.opt_level = 0;
     let prog = match pipeline.run(&mut unit) {
         PipelineResult::Ok(p) => p,
+        PipelineResult::OkWithIr { program, .. } => program,
         _ => { println!("PIPELINE FAILED"); return; }
     };
 

@@ -30,15 +30,34 @@ struct LoopContext {
 }
 
 /// Lower an AST Program into a Flat IR Module.
+///
+/// # ONE TRUTH RULE
+///
+/// After this function runs, the returned `FlatIrModule` is the SOLE source of
+/// truth for all subsequent compiler passes. The AST must NEVER be semantically
+/// analyzed again — all type checking, borrow checking, and code generation
+/// MUST operate on the IR.
+///
+/// If lowering encounters errors (e.g., break outside a loop), they are
+/// collected in the module's diagnostics and should be treated as hard errors
+/// by the caller.
 pub fn lower_program(program: &Program) -> FlatIrModule {
     let mut ctx = LowerCtx::new();
     for item in &program.items {
         ctx.lower_item(item);
     }
+
+    // Propagate any lowering diagnostics (e.g., break outside loop) into
+    // the IR module so the pipeline can report them as hard errors.
+    // The lowerer's Diagnostics use the same Severity::Error as the
+    // borrow checker — these are compile-time errors, not warnings.
+    let lowering_errors = ctx.diagnostics();
+
     FlatIrModule {
         functions: ctx.functions,
         intrinsics: ctx.intrinsics,
         span: program.span,
+        lowering_errors,
     }
 }
 
@@ -89,6 +108,17 @@ impl LowerCtx {
             loop_stack: vec![],
             diagnostics: Diagnostics { items: vec![] },
         }
+    }
+
+    /// Return a vector of (Span, message) pairs for all errors encountered
+    /// during lowering. These should be treated as HARD ERRORS by the pipeline.
+    fn diagnostics(&self) -> Vec<(crate::compiler::lexer::Span, String)> {
+        self.diagnostics
+            .items
+            .iter()
+            .filter(|d| matches!(d.severity, crate::compiler::typeck::Severity::Error))
+            .map(|d| (d.span, d.message.clone()))
+            .collect()
     }
 
     // ── SSA Helpers ─────────────────────────────────────────────────────────

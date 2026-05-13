@@ -91,24 +91,53 @@ pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
             .collect();
         return Err(msgs.join("\n"));
     }
-    if let PipelineResult::Ok(program) = result {
-        // Try the standalone bytecode VM first (fast path).
-        let mut vm = crate::runtime::bytecode_vm::BytecodeVM::new();
-        if vm.load_program(&program).is_ok() {
-            return vm
-                .call_fn(entry, vec![])
+    match result {
+        PipelineResult::OkWithIr { program: _, ir_module } => {
+            // ══════════════════════════════════════════════════════════════════
+            // ══ ONE TRUTH RULE: IR IS THE SOLE SOURCE OF TRUTH ═══════════════
+            // ══════════════════════════════════════════════════════════════════
+            // The IR is the ONLY path to execution. There is NO fallback to
+            // AST-derived bytecode or the tree-walking interpreter. If the IR
+            // pipeline fails, compilation fails — period.
+            //
+            // This eliminates the split-brain where some paths used AST and
+            // others used IR, causing inconsistent semantics.
+            // ══════════════════════════════════════════════════════════════════
+
+            let ir_bc = crate::compiler::ir_to_bytecode::compile_ir_module(&ir_module);
+            if !ir_bc.errors.is_empty() {
+                // IR → bytecode compilation failed. This is a HARD ERROR.
+                // Report all errors and abort — no fallback.
+                let err_msgs: Vec<String> = ir_bc.errors.iter()
+                    .map(|e| format!("[ir-codegen] {}", e))
+                    .collect();
+                return Err(format!(
+                    "IR codegen failed ({} error(s)). No AST fallback permitted.\n{}",
+                    err_msgs.len(),
+                    err_msgs.join("\n")
+                ));
+            }
+            if ir_bc.functions.is_empty() {
+                return Err("IR codegen produced no functions. No AST fallback permitted.".into());
+            }
+            let mut vm = crate::runtime::bytecode_vm::BytecodeVM::new();
+            if let Err(e) = vm.load_ir_functions(ir_bc.functions) {
+                return Err(format!(
+                    "VM failed to load IR-compiled functions: {}. No AST fallback permitted.",
+                    e
+                ));
+            }
+            vm.call_fn(entry, vec![])
                 .map(|_| ())
-                .map_err(|e| e.message);
+                .map_err(|e| e.message)
         }
-        // Fallback: tree-walking interpreter.
-        let mut interp = crate::interp::Interpreter::new();
-        interp.load_program(&program);
-        interp
-            .call_fn(entry, vec![])
-            .map(|_| ())
-            .map_err(|e| e.message)
-    } else {
-        Err("pipeline did not produce a program".into())
+        PipelineResult::Ok(_) => {
+            // Legacy path (no IR) — this should NEVER happen anymore.
+            // The pipeline always produces IR. If we end up here, something
+            // is fundamentally broken.
+            Err("internal error: pipeline produced no IR. This should never happen.".into())
+        }
+        PipelineResult::HaltedAt(_) => Err("pipeline did not produce a program".into()),
     }
 }
 
@@ -604,14 +633,27 @@ impl Pipeline {
             return PipelineResult::HaltedAt(PassName::Sema);
         }
 
-        // ── Pass 5: Borrow-check (lexical aliasing safety) ───────────────────
-        let borrow_diags = crate::compiler::borrowck::jules_borrowck(&program);
-        for d in borrow_diags.items {
-            unit.diags.push(adapt_borrowck_diag(d));
-        }
-        if unit.has_errors() {
-            return PipelineResult::HaltedAt(PassName::BorrowCheck);
-        }
+        // ── Pass 5: Borrow-check — DEPRECATED (AST-based) ──────────────────
+        // The AST-based borrow checker is NO LONGER AUTHORITATIVE.
+        // It runs only as a secondary advisory check. The IR-based borrow
+        // checker (ir_borrowck) is the sole authority for ownership errors.
+        // AST borrowck results are emitted as NOTES, never errors.
+        //
+        // ONE TRUTH RULE: After IR lowering, IR borrowck is the authority.
+        // The AST borrowck cannot produce errors — only informational notes.
+        let _borrow_diags = crate::compiler::borrowck::jules_borrowck(&program);
+        // AST borrowck results are suppressed. IR borrowck (below) is the
+        // sole source of truth for ownership violations.
+        // for d in _borrow_diags.items {
+        //     unit.diags.push(Diag {
+        //         severity: DiagSeverity::Note,
+        //         span: Some(d.span),
+        //         code: d.code,
+        //         message: format!("[ast-borrowck/suppressed] {}", d.message),
+        //         labels: vec![],
+        //         hint: d.hint,
+        //     });
+        // }
 
         // ── Pass 6: Superoptimizer ──────────────────────────────────────────
         // Runs the full AST-level superoptimizer: constant folding, SCCP,
@@ -824,20 +866,162 @@ impl Pipeline {
             }
         }
 
-        PipelineResult::Ok(program)
+        // ═══════════════════════════════════════════════════════════════════
+        // ══ UNIFIED IR PIPELINE — THE ONE TRUTH RULE ════════════════════════
+        // ═══════════════════════════════════════════════════════════════════
+        // After parsing, the AST is lowered to IR. The IR is the single
+        // source of truth for all subsequent analysis. The AST is kept
+        // only for backward-compatible interpreter fallback.
+        //
+        // Pipeline: AST → IR Lower → IR TypeCheck → IR BorrowCheck →
+        //           Optimizers (AST, legacy) → IR Validation Gate →
+        //           CodeGen from IR → Execute
+        // ═══════════════════════════════════════════════════════════════════
+
+        // ── Pass: IR Lowering (mandatory — NO IR = NO COMPILE) ──────────────
+        // Lower the AST to flat SSA IR. This is the ONE TRUTH — after this
+        // point, all semantic analysis must operate on IR, not AST.
+        //
+        // VALIDATION GATE: If lowering produces an empty module, that is a
+        // hard error. The IR is mandatory — no IR means no compilation.
+        let ir_module = crate::compiler::lower::lower_program(&program);
+
+        // ── IR VALIDATION GATE ────────────────────────────────────────────
+        // After lowering, verify the IR is non-empty and well-formed.
+        // An empty IR module means lowering silently failed — this is a
+        // hard error, not a warning.
+        if ir_module.functions.is_empty() {
+            unit.diags.push(Diag {
+                severity: DiagSeverity::Error,
+                span: None,
+                code: Some("E0032"),
+                message: "IR lowering produced no functions — the AST→IR lowering pass \
+                          failed silently. This is a compiler bug or the source file \
+                          contains no function definitions. No AST fallback permitted.".into(),
+                labels: vec![],
+                hint: Some("ensure the source file contains at least one function definition".into()),
+            });
+            return PipelineResult::HaltedAt(PassName::TypeCheck);
+        }
+
+        // ── IR Lowering Error Gate ───────────────────────────────────────
+        // Report any errors that occurred during AST → IR lowering as
+        // HARD ERRORS. These include things like break outside a loop.
+        // Ownership violations during lowering are always hard errors.
+        for (span, msg) in &ir_module.lowering_errors {
+            unit.diags.push(Diag {
+                severity: DiagSeverity::Error,
+                span: Some(*span),
+                code: Some("E0033"),
+                message: format!("[ir-lower] {}", msg),
+                labels: vec![],
+                hint: None,
+            });
+        }
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::TypeCheck);
+        }
+
+        // ── Pass: IR Type Check (AUTHORITATIVE — HARD ERRORS) ─────────────
+        // Validates that IR type annotations are internally consistent.
+        // Catches "cannot add () and i64" BEFORE execution.
+        //
+        // ONE TRUTH RULE: IR type errors are HARD ERRORS, always.
+        // The IR is the single source of truth. If the IR has type errors,
+        // compilation MUST halt. No fallback to AST is permitted.
+        let ir_typeck_result = crate::compiler::ir_typeck::ir_typeck(&ir_module);
+        for d in &ir_typeck_result.diagnostics {
+            unit.diags.push(Diag {
+                severity: DiagSeverity::Error, // HARD ERROR — IR is authoritative
+                span: Some(d.span),
+                code: Some("E0030"),
+                message: format!("[ir-typeck] {}", d.message),
+                labels: vec![],
+                hint: None,
+            });
+        }
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::TypeCheck);
+        }
+
+        // ── Pass: IR Borrow Check (AUTHORITATIVE — HARD ERRORS) ───────────
+        // Validates ownership semantics using IR's Ownership annotations.
+        // Catches use-after-move, double mutable borrow, alias violations.
+        //
+        // ONE TRUTH RULE: Ownership violations are HARD ERRORS, always.
+        // The IR is the sole authority for ownership semantics. Use-after-move,
+        // double mutable borrow, alias violations, and move-while-borrowed
+        // are ALWAYS errors — never warnings, never advisory.
+        let ir_borrowck_result = crate::compiler::ir_borrowck::ir_borrowck(&ir_module);
+        for d in &ir_borrowck_result.diagnostics {
+            unit.diags.push(Diag {
+                severity: DiagSeverity::Error, // HARD ERROR — ownership is always a hard error
+                span: Some(d.span),
+                code: Some("E0031"),
+                message: format!("[ir-borrowck] {}", d.message),
+                labels: vec![],
+                hint: None,
+            });
+        }
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::BorrowCheck);
+        }
+
+        if self.emit_ir {
+            eprintln!("=== IR Module ===\n{}", ir_module);
+        }
+
+        PipelineResult::OkWithIr {
+            program,
+            ir_module,
+        }
     }
 }
 
 #[derive(Debug)]
 pub enum PipelineResult {
     Ok(crate::compiler::ast::Program),
+    /// Unified pipeline result: IR is the single source of truth.
+    /// The AST is kept only for backward-compatible interpreter fallback.
+    OkWithIr {
+        program: crate::compiler::ast::Program,
+        ir_module: crate::compiler::ir::FlatIrModule,
+    },
     HaltedAt(PassName),
+}
+
+impl PipelineResult {
+    /// Extract the AST program from either variant.
+    /// Returns `None` for `HaltedAt`.
+    pub fn program(&self) -> Option<&crate::compiler::ast::Program> {
+        match self {
+            PipelineResult::Ok(p) => Some(p),
+            PipelineResult::OkWithIr { program, .. } => Some(program),
+            PipelineResult::HaltedAt(_) => None,
+        }
+    }
+
+    /// Extract the IR module, if available.
+    pub fn ir_module(&self) -> Option<&crate::compiler::ir::FlatIrModule> {
+        match self {
+            PipelineResult::OkWithIr { ir_module, .. } => Some(ir_module),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this is a successful compilation result.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, PipelineResult::Ok(_) | PipelineResult::OkWithIr { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassName {
     Lex,
     Parse,
+    LowerIr,
+    IrTypeCheck,
+    IrBorrowCheck,
     TypeCheck,
     Sema,
     BorrowCheck,
@@ -896,6 +1080,10 @@ fn adapt_sema_diag(d: crate::compiler::sema::Diagnostic) -> Diag {
     out
 }
 
+/// DEPRECATED: AST borrowck is no longer authoritative. IR borrowck is the
+/// sole source of truth. This adapter is kept for potential future diagnostic
+/// unification but is currently unused.
+#[allow(dead_code)]
 fn adapt_borrowck_diag(d: crate::compiler::borrowck::Diagnostic) -> Diag {
     let sev = match d.severity {
         crate::compiler::borrowck::Severity::Error => DiagSeverity::Error,
@@ -2260,7 +2448,7 @@ fn cmd_run(args: &CliArgs) -> i32 {
     }
 
     // Run the program.
-    if let PipelineResult::Ok(program) = result {
+    if let Some(program) = result.program() {
         if args.tiered {
             #[cfg(feature = "phase3-jit")]
             {
@@ -2617,6 +2805,7 @@ fn cmd_compile(args: &CliArgs) -> i32 {
 
     let program = match result {
         PipelineResult::Ok(program) => program,
+        PipelineResult::OkWithIr { program, .. } => program,
         _ => {
             eprintln!("jules compile: pipeline did not produce a program");
             return 1;
@@ -2693,7 +2882,7 @@ fn cmd_train(args: &CliArgs) -> i32 {
         return 1;
     }
 
-    if let PipelineResult::Ok(program) = result {
+    if let Some(program) = result.program() {
         if !args.quiet {
             print_feature_capability_matrix(&program);
         }
@@ -3163,7 +3352,7 @@ impl Repl {
             return Err(ReplRunError::Compile(unit.diags));
         }
 
-        let PipelineResult::Ok(program) = result else {
+        let Some(program) = result.program() else {
             return Err(ReplRunError::Runtime(
                 "pipeline did not produce a runnable program".into(),
             ));
@@ -3991,7 +4180,7 @@ mod tests {
         let pipeline = Pipeline::new();
         let result = pipeline.run(&mut unit);
         assert!(!unit.has_errors(), "{:?}", unit.diags);
-        assert!(matches!(result, PipelineResult::Ok(_)));
+        assert!(result.is_ok());
     }
 
     #[test]

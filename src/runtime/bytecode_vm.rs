@@ -216,7 +216,7 @@ impl BytecodeFunction {
     }
     
     #[inline(always)]
-    fn add_constant(&mut self, value: Value) -> u32 {
+    pub fn add_constant(&mut self, value: Value) -> u32 {
         let idx = self.constants.len() as u32;
         self.constants.push(value);
         idx
@@ -1794,6 +1794,17 @@ impl BytecodeVM {
             self.function_index.insert(f.name.clone(), i);
         }
         self.functions = functions;
+    }
+
+    /// Load functions compiled from the IR-to-bytecode pipeline.
+    /// This is the ONE TRUTH path — functions compiled from the unified IR
+    /// rather than from raw AST.
+    pub fn load_ir_functions(&mut self, functions: Vec<BytecodeFunction>) -> Result<(), String> {
+        if functions.is_empty() {
+            return Err("IR compilation produced no functions".into());
+        }
+        self.load_functions(functions);
+        Ok(())
     }
     
     /// Execute a function by index
@@ -4013,6 +4024,7 @@ mod tests {
         }
         let prog = match result {
             crate::PipelineResult::Ok(p) => p,
+            crate::PipelineResult::OkWithIr { program, .. } => program,
             _ => panic!("pipeline failed"),
         };
 
