@@ -550,7 +550,14 @@ impl IrBorrowChecker {
         }
 
         // ── Step 3: Register the destination value ───────────────────
-        if let Some(dst) = instr.dst {
+        // Phi nodes are already handled by merge_phi_states — their
+        // destination state reflects the merged predecessor states.
+        // Overwriting with define_value would erase the merged Moved
+        // state, which would make phi-node use-after-move detection
+        // impossible.  Skip define_value for Phi instructions.
+        if let IrOp::Phi { .. } = &instr.op {
+            // Already defined in merge_phi_states — nothing to do.
+        } else if let Some(dst) = instr.dst {
             self.define_value(dst, ownership);
 
             // Track borrow relationships.
@@ -1342,5 +1349,1125 @@ mod tests {
         let result = ir_borrowck(&module);
         assert_eq!(result.errors, 0);
         assert_eq!(result.diagnostics.len(), 0);
+    }
+}
+
+// =============================================================================
+// §6  STRESS TESTS — OWNERSHIP IS ALWAYS A HARD ERROR
+// =============================================================================
+//
+// These tests verify that the IR borrow checker correctly identifies ownership
+// violations as HARD ERRORS under adversarial and edge-case conditions.
+// The fundamental invariant: ownership violations are NEVER warnings.
+// =============================================================================
+
+#[cfg(test)]
+mod stress_tests {
+    use super::*;
+    use crate::compiler::ir::{
+        AliasKind, BlockId, CostHint, EffectFlags, FlatBlock, FlatIrFunction, FlatIrModule,
+        IrInstr, IrOp, IrType, Ownership, ValueId,
+    };
+    use crate::compiler::lexer::Span;
+
+    fn dummy_span() -> Span {
+        Span::dummy()
+    }
+
+    fn vid(n: u32) -> ValueId {
+        ValueId(n)
+    }
+
+    fn bid(n: u32) -> BlockId {
+        BlockId(n)
+    }
+
+    fn make_module_with_fns(fns: Vec<FlatIrFunction>) -> FlatIrModule {
+        FlatIrModule {
+            functions: fns,
+            intrinsics: vec![],
+            span: dummy_span(),
+            lowering_errors: vec![],
+        }
+    }
+
+    fn make_module(blocks: Vec<FlatBlock>) -> FlatIrModule {
+        FlatIrModule {
+            functions: vec![FlatIrFunction {
+                name: "stress_fn".to_string(),
+                params: vec![],
+                ret_ty: IrType::Unit,
+                blocks,
+                entry: bid(0),
+                effects: EffectFlags::pure(),
+                requires: vec![],
+                ensures: vec![],
+                span: dummy_span(),
+            }],
+            intrinsics: vec![],
+            span: dummy_span(),
+            lowering_errors: vec![],
+        }
+    }
+
+    fn make_instr(dst: Option<ValueId>, op: IrOp, ownership: Ownership) -> IrInstr {
+        IrInstr {
+            dst,
+            op,
+            span: dummy_span(),
+            effects: EffectFlags::pure(),
+            ownership,
+            cost: CostHint::Unknown,
+            alias: AliasKind::Unknown,
+        }
+    }
+
+    // ── INVARIANT: All diagnostics are errors, never warnings ────────────
+
+    #[test]
+    fn stress_all_ownership_diagnostics_are_errors() {
+        // Build a module with multiple ownership violations.
+        // Every single diagnostic must be an error — warnings count must be 0.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                // v0 = Owned value
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::ConstInt {
+                        value: 1,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Owned,
+                ),
+                // v1 = Move v0 (consumes v0)
+                make_instr(Some(vid(1)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                // v2 = Move v0 — use-after-move!
+                make_instr(Some(vid(2)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                // v3 = Alloca
+                make_instr(
+                    Some(vid(3)),
+                    IrOp::Alloca {
+                        ty: IrType::Int { width: 64, signed: true },
+                        align: 8,
+                    },
+                    Ownership::Owned,
+                ),
+                // v4 = Load v3 (MutRef)
+                make_instr(
+                    Some(vid(4)),
+                    IrOp::Load {
+                        ptr: vid(3),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::MutRef,
+                ),
+                // v5 = Load v3 (MutRef) — double mut borrow!
+                make_instr(
+                    Some(vid(5)),
+                    IrOp::Load {
+                        ptr: vid(3),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::MutRef,
+                ),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+
+        // FUNDAMENTAL INVARIANT: warnings count is always 0.
+        assert_eq!(
+            result.warnings, 0,
+            "OWNERSHIP VIOLATION: warnings count must be 0, got {} warnings. \
+             Ownership is ALWAYS a hard error!",
+            result.warnings
+        );
+
+        // Must have at least 2 errors (use-after-move + double-mut-borrow).
+        assert!(
+            result.errors >= 2,
+            "expected at least 2 errors, got {} errors: {:?}",
+            result.errors,
+            result.diagnostics
+        );
+    }
+
+    // ── STRESS: Cascading use-after-move ──────────────────────────────────
+
+    #[test]
+    fn stress_cascading_use_after_move() {
+        // Move a value, then use it multiple times — each use is a separate error.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::ConstInt {
+                        value: 42,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Owned,
+                ),
+                make_instr(Some(vid(1)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                // Three uses of moved value v0
+                make_instr(
+                    Some(vid(2)),
+                    IrOp::BinOp {
+                        op: crate::compiler::ast::BinOpKind::Add,
+                        lhs: vid(0),
+                        rhs: vid(0),
+                    },
+                    Ownership::Copy,
+                ),
+                make_instr(
+                    Some(vid(3)),
+                    IrOp::UnOp {
+                        op: crate::compiler::ast::UnOpKind::Neg,
+                        operand: vid(0),
+                    },
+                    Ownership::Copy,
+                ),
+                make_instr(Some(vid(4)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        let uam_count = result.diagnostics.iter()
+            .filter(|d| d.kind == IrBorrowDiagKind::UseAfterMove)
+            .count();
+        assert!(
+            uam_count >= 3,
+            "expected at least 3 use-after-move errors for cascading violations, got {}: {:?}",
+            uam_count,
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0, "ownership errors must never be warnings");
+    }
+
+    // ── STRESS: Borrow-then-move chain ────────────────────────────────────
+
+    #[test]
+    fn stress_borrow_then_move_chain() {
+        // Allocate, borrow mutably, then try to move — should error.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::Alloca {
+                        ty: IrType::Int { width: 64, signed: true },
+                        align: 8,
+                    },
+                    Ownership::Owned,
+                ),
+                // v1 = Load v0 (MutRef) — borrows v0
+                make_instr(
+                    Some(vid(1)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::MutRef,
+                ),
+                // v2 = Move v0 — move while mutably borrowed!
+                make_instr(Some(vid(2)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                // v3 = Move v1 — move the mut ref itself
+                make_instr(Some(vid(3)), IrOp::Move { src: vid(1) }, Ownership::Owned),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::MoveWhileBorrowed),
+            "expected move-while-borrowed error, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0, "ownership errors must never be warnings");
+    }
+
+    // ── STRESS: Multiple functions with ownership violations ──────────────
+
+    #[test]
+    fn stress_multiple_functions_independent_errors() {
+        // Two functions, each with an ownership violation.
+        // Both must be caught — no cross-function leakage.
+        let fn1 = FlatIrFunction {
+            name: "fn1".to_string(),
+            params: vec![],
+            ret_ty: IrType::Unit,
+            blocks: vec![FlatBlock {
+                id: bid(0),
+                instrs: vec![
+                    make_instr(
+                        Some(vid(0)),
+                        IrOp::ConstInt {
+                            value: 1,
+                            ty: IrType::Int { width: 64, signed: true },
+                        },
+                        Ownership::Owned,
+                    ),
+                    make_instr(Some(vid(1)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                    make_instr(Some(vid(2)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                ],
+                span: dummy_span(),
+            }],
+            entry: bid(0),
+            effects: EffectFlags::pure(),
+            requires: vec![],
+            ensures: vec![],
+            span: dummy_span(),
+        };
+        let fn2 = FlatIrFunction {
+            name: "fn2".to_string(),
+            params: vec![],
+            ret_ty: IrType::Unit,
+            blocks: vec![FlatBlock {
+                id: bid(0),
+                instrs: vec![
+                    make_instr(
+                        Some(vid(0)),
+                        IrOp::Alloca {
+                            ty: IrType::Int { width: 64, signed: true },
+                            align: 8,
+                        },
+                        Ownership::Owned,
+                    ),
+                    make_instr(
+                        Some(vid(1)),
+                        IrOp::Load {
+                            ptr: vid(0),
+                            ty: IrType::Int { width: 64, signed: true },
+                        },
+                        Ownership::MutRef,
+                    ),
+                    make_instr(
+                        Some(vid(2)),
+                        IrOp::Load {
+                            ptr: vid(0),
+                            ty: IrType::Int { width: 64, signed: true },
+                        },
+                        Ownership::MutRef,
+                    ),
+                ],
+                span: dummy_span(),
+            }],
+            entry: bid(0),
+            effects: EffectFlags::pure(),
+            requires: vec![],
+            ensures: vec![],
+            span: dummy_span(),
+        };
+        let result = ir_borrowck(&make_module_with_fns(vec![fn1, fn2]));
+        assert!(
+            result.errors >= 2,
+            "expected at least 2 errors across two functions, got {}: {:?}",
+            result.errors,
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0, "ownership errors must never be warnings");
+    }
+
+    // ── STRESS: Function parameters with ownership ────────────────────────
+
+    #[test]
+    fn stress_function_params_ownership_tracking() {
+        // Function takes a String parameter (Owned, not Copy), moves it,
+        // then tries to use again — should detect use-after-move.
+        let fn_with_params = FlatIrFunction {
+            name: "consume_then_use".to_string(),
+            params: vec![
+                (vid(0), IrType::String), // String is Owned (not Copy)
+            ],
+            ret_ty: IrType::Unit,
+            blocks: vec![FlatBlock {
+                id: bid(0),
+                instrs: vec![
+                    // Move the parameter
+                    make_instr(Some(vid(1)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                    // Try to use the moved parameter — error!
+                    make_instr(
+                        Some(vid(2)),
+                        IrOp::BinOp {
+                            op: crate::compiler::ast::BinOpKind::Add,
+                            lhs: vid(0),
+                            rhs: vid(1),
+                        },
+                        Ownership::Owned,
+                    ),
+                ],
+                span: dummy_span(),
+            }],
+            entry: bid(0),
+            effects: EffectFlags::pure(),
+            requires: vec![],
+            ensures: vec![],
+            span: dummy_span(),
+        };
+        let result = ir_borrowck(&make_module_with_fns(vec![fn_with_params]));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::UseAfterMove),
+            "expected use-after-move for moved String parameter, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0, "ownership errors must never be warnings");
+    }
+
+    // ── STRESS: Copy types never trigger use-after-move ───────────────────
+
+    #[test]
+    fn stress_copy_types_always_safe() {
+        // Use Copy types extensively — no ownership violations should be detected.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::ConstInt {
+                        value: 1,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Copy,
+                ),
+                make_instr(
+                    Some(vid(1)),
+                    IrOp::ConstBool { value: true },
+                    Ownership::Copy,
+                ),
+                // Use v0 many times — Copy, so never moved
+                make_instr(
+                    Some(vid(2)),
+                    IrOp::BinOp {
+                        op: crate::compiler::ast::BinOpKind::Add,
+                        lhs: vid(0),
+                        rhs: vid(0),
+                    },
+                    Ownership::Copy,
+                ),
+                make_instr(
+                    Some(vid(3)),
+                    IrOp::BinOp {
+                        op: crate::compiler::ast::BinOpKind::Mul,
+                        lhs: vid(0),
+                        rhs: vid(2),
+                    },
+                    Ownership::Copy,
+                ),
+                make_instr(Some(vid(4)), IrOp::Copy { src: vid(0) }, Ownership::Copy),
+                make_instr(
+                    Some(vid(5)),
+                    IrOp::BinOp {
+                        op: crate::compiler::ast::BinOpKind::Add,
+                        lhs: vid(0),
+                        rhs: vid(4),
+                    },
+                    Ownership::Copy,
+                ),
+                make_instr(None, IrOp::Ret { value: Some(vid(5)) }, Ownership::Copy),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert_eq!(
+            result.errors, 0,
+            "Copy types should never cause ownership errors, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: TaskSpawn moves Owned args ────────────────────────────────
+
+    #[test]
+    fn stress_task_spawn_move_then_use() {
+        // Spawn a task with Move ownership, then try to use the value.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::ConstInt {
+                        value: 99,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Owned,
+                ),
+                make_instr(
+                    Some(vid(1)),
+                    IrOp::TaskSpawn {
+                        func: "worker".to_string(),
+                        args: vec![vid(0)],
+                        ownership: crate::compiler::ir::TaskOwnership::Move,
+                    },
+                    Ownership::Owned,
+                ),
+                // Try to use v0 after it was moved into the task — error!
+                make_instr(
+                    Some(vid(2)),
+                    IrOp::BinOp {
+                        op: crate::compiler::ast::BinOpKind::Add,
+                        lhs: vid(0),
+                        rhs: vid(0),
+                    },
+                    Ownership::Copy,
+                ),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::UseAfterMove),
+            "expected use-after-move after TaskSpawn(Move), got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0, "ownership errors must never be warnings");
+    }
+
+    // ── STRESS: Return moves the value ────────────────────────────────────
+
+    #[test]
+    fn stress_return_moves_value_then_use() {
+        // Return a value, then try to use it again — use-after-move.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::ConstInt {
+                        value: 7,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Owned,
+                ),
+                // Return v0 (moves it)
+                make_instr(None, IrOp::Ret { value: Some(vid(0)) }, Ownership::Owned),
+                // Use v0 after return — unreachable but still an error
+                make_instr(Some(vid(1)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::UseAfterMove),
+            "expected use-after-move after Ret, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: Store through moved pointer ───────────────────────────────
+
+    #[test]
+    fn stress_store_through_moved_pointer() {
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::Alloca {
+                        ty: IrType::Int { width: 64, signed: true },
+                        align: 8,
+                    },
+                    Ownership::Owned,
+                ),
+                // Move the pointer
+                make_instr(Some(vid(1)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                // Try to store through the moved pointer
+                make_instr(
+                    None,
+                    IrOp::Store {
+                        ptr: vid(0),
+                        value: vid(1),
+                    },
+                    Ownership::Owned,
+                ),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::UseAfterMove),
+            "expected use-after-move on Store through moved pointer, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: Borrow-after-move ─────────────────────────────────────────
+
+    #[test]
+    fn stress_borrow_after_move_explicit() {
+        // Move a value, then try to create a reference to it.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::Alloca {
+                        ty: IrType::Int { width: 64, signed: true },
+                        align: 8,
+                    },
+                    Ownership::Owned,
+                ),
+                // Move v0
+                make_instr(Some(vid(1)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                // Try to immutably borrow v0 after move
+                make_instr(
+                    Some(vid(2)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Ref,
+                ),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::BorrowAfterMove),
+            "expected borrow-after-move, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: Deeply nested borrows ─────────────────────────────────────
+
+    #[test]
+    fn stress_triple_mut_borrow() {
+        // Three mutable borrows of the same allocation — all errors.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::Alloca {
+                        ty: IrType::Int { width: 64, signed: true },
+                        align: 8,
+                    },
+                    Ownership::Owned,
+                ),
+                make_instr(
+                    Some(vid(1)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::MutRef,
+                ),
+                make_instr(
+                    Some(vid(2)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::MutRef,
+                ),
+                make_instr(
+                    Some(vid(3)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::MutRef,
+                ),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        // At least 2 errors (2nd and 3rd MutRef loads are both violations)
+        let double_mut_count = result.diagnostics.iter()
+            .filter(|d| d.kind == IrBorrowDiagKind::DoubleMutBorrow)
+            .count();
+        assert!(
+            double_mut_count >= 2,
+            "expected at least 2 DoubleMutBorrow errors, got {}: {:?}",
+            double_mut_count,
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: Call with Owned args moves them ───────────────────────────
+
+    #[test]
+    fn stress_call_moves_owned_args() {
+        // Call a function with Owned ownership — args are moved.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::ConstInt {
+                        value: 42,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Owned,
+                ),
+                // Call with Owned ownership — moves v0
+                make_instr(
+                    Some(vid(1)),
+                    IrOp::Call {
+                        func: "consume".to_string(),
+                        args: vec![vid(0)],
+                    },
+                    Ownership::Owned,
+                ),
+                // Try to use v0 after call — use-after-move!
+                make_instr(
+                    Some(vid(2)),
+                    IrOp::BinOp {
+                        op: crate::compiler::ast::BinOpKind::Add,
+                        lhs: vid(0),
+                        rhs: vid(0),
+                    },
+                    Ownership::Copy,
+                ),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::UseAfterMove),
+            "expected use-after-move after Call(Owned), got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: Mixed ownership across blocks (phi nodes) ─────────────────
+
+    #[test]
+    fn stress_phi_node_merged_state() {
+        // Block 0: define v0 (Owned), move v0 → v1
+        // Block 1: phi from block 0 (v0 is Moved)
+        // Use the phi — should detect moved state
+        let blocks = vec![
+            FlatBlock {
+                id: bid(0),
+                instrs: vec![
+                    make_instr(
+                        Some(vid(0)),
+                        IrOp::ConstInt {
+                            value: 10,
+                            ty: IrType::Int { width: 64, signed: true },
+                        },
+                        Ownership::Owned,
+                    ),
+                    make_instr(Some(vid(1)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                ],
+                span: dummy_span(),
+            },
+            FlatBlock {
+                id: bid(1),
+                instrs: vec![
+                    // phi: merge v0 from block 0 (Moved state)
+                    make_instr(
+                        Some(vid(2)),
+                        IrOp::Phi { incoming: vec![(bid(0), vid(0))] },
+                        Ownership::Owned,
+                    ),
+                    // Use the phi value — should detect Moved state
+                    make_instr(
+                        Some(vid(3)),
+                        IrOp::BinOp {
+                            op: crate::compiler::ast::BinOpKind::Add,
+                            lhs: vid(2),
+                            rhs: vid(2),
+                        },
+                        Ownership::Copy,
+                    ),
+                ],
+                span: dummy_span(),
+            },
+        ];
+        let result = ir_borrowck(&make_module(blocks));
+        // The phi node should carry the Moved state from block 0
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::UseAfterMove),
+            "expected use-after-move through phi node, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: Large number of values (performance) ──────────────────────
+
+    #[test]
+    fn stress_many_values_no_false_positives() {
+        // Create 100 Copy values and use them all — should be 0 errors.
+        let mut instrs: Vec<IrInstr> = Vec::new();
+        for i in 0..100u32 {
+            instrs.push(make_instr(
+                Some(vid(i)),
+                IrOp::ConstInt {
+                    value: i as i128,
+                    ty: IrType::Int { width: 64, signed: true },
+                },
+                Ownership::Copy,
+            ));
+        }
+        // Use all of them in one big BinOp chain
+        for i in 0..50u32 {
+            instrs.push(make_instr(
+                Some(vid(100 + i)),
+                IrOp::BinOp {
+                    op: crate::compiler::ast::BinOpKind::Add,
+                    lhs: vid(i * 2),
+                    rhs: vid(i * 2 + 1),
+                },
+                Ownership::Copy,
+            ));
+        }
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs,
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert_eq!(
+            result.errors, 0,
+            "expected 0 errors for 100 Copy values, got {}: {:?}",
+            result.errors,
+            result.diagnostics
+        );
+    }
+
+    // ── STRESS: Large number of Owned values with violations ──────────────
+
+    #[test]
+    fn stress_many_owned_all_violations() {
+        // Create 50 Owned values, move each one, then try to use each one again.
+        // Should get 50 use-after-move errors.
+        let mut instrs: Vec<IrInstr> = Vec::new();
+        for i in 0..50u32 {
+            let base = i * 3;
+            instrs.push(make_instr(
+                Some(vid(base)),
+                IrOp::ConstInt {
+                    value: i as i128,
+                    ty: IrType::Int { width: 64, signed: true },
+                },
+                Ownership::Owned,
+            ));
+            instrs.push(make_instr(
+                Some(vid(base + 1)),
+                IrOp::Move { src: vid(base) },
+                Ownership::Owned,
+            ));
+            // Use after move
+            instrs.push(make_instr(
+                Some(vid(base + 2)),
+                IrOp::BinOp {
+                    op: crate::compiler::ast::BinOpKind::Add,
+                    lhs: vid(base),
+                    rhs: vid(base + 1),
+                },
+                Ownership::Copy,
+            ));
+        }
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs,
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        let uam_count = result.diagnostics.iter()
+            .filter(|d| d.kind == IrBorrowDiagKind::UseAfterMove)
+            .count();
+        assert!(
+            uam_count >= 50,
+            "expected at least 50 use-after-move errors, got {}: {:?}",
+            uam_count,
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: Immut borrow then mut borrow ──────────────────────────────
+
+    #[test]
+    fn stress_immut_then_mut_borrow_same_root() {
+        // First take an immutable borrow, then try a mutable borrow — error.
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::Alloca {
+                        ty: IrType::Int { width: 64, signed: true },
+                        align: 8,
+                    },
+                    Ownership::Owned,
+                ),
+                make_instr(
+                    Some(vid(1)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Ref,
+                ),
+                make_instr(
+                    Some(vid(2)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::MutRef, // Error: can't mutably borrow while immutably borrowed
+                ),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::DoubleMutBorrow),
+            "expected DoubleMutBorrow for mut borrow while immutably borrowed, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: Multiple immutable borrows are OK ─────────────────────────
+
+    #[test]
+    fn stress_many_immut_borrows_ok() {
+        // Take 10 immutable borrows — all fine.
+        let mut instrs: Vec<IrInstr> = vec![
+            make_instr(
+                Some(vid(0)),
+                IrOp::Alloca {
+                    ty: IrType::Int { width: 64, signed: true },
+                    align: 8,
+                },
+                Ownership::Owned,
+            ),
+        ];
+        for i in 1..=10u32 {
+            instrs.push(make_instr(
+                Some(vid(i)),
+                IrOp::Load {
+                    ptr: vid(0),
+                    ty: IrType::Int { width: 64, signed: true },
+                },
+                Ownership::Ref,
+            ));
+        }
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs,
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert_eq!(
+            result.errors, 0,
+            "multiple immutable borrows should be OK, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    // ── STRESS: error_codes module ownership invariants ───────────────────
+
+    #[test]
+    fn stress_ownership_codes_never_warning_eligible() {
+        use crate::compiler::error_codes::is_warning_eligible;
+
+        // Exhaustively check ALL E4xxx codes — none should be warning-eligible.
+        for code_num in 4000u32..=4999 {
+            let code = format!("E{}", code_num);
+            assert!(
+                !is_warning_eligible(&code),
+                "OWNERSHIP VIOLATION: {} is warning-eligible! \
+                 All ownership/borrow codes must be hard errors.",
+                code
+            );
+        }
+    }
+
+    // ── STRESS: IR borrowck result invariant ──────────────────────────────
+
+    #[test]
+    fn stress_borrowck_result_warnings_always_zero() {
+        // Regardless of what module we check, the warnings count must always be 0.
+        // This is the fundamental ownership = hard error invariant.
+
+        // Test 1: Module with violations
+        let module_with_violations = make_module(vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::ConstInt {
+                        value: 1,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Owned,
+                ),
+                make_instr(Some(vid(1)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+                make_instr(Some(vid(2)), IrOp::Move { src: vid(0) }, Ownership::Owned),
+            ],
+            span: dummy_span(),
+        }]);
+        let result = ir_borrowck(&module_with_violations);
+        assert_eq!(
+            result.warnings, 0,
+            "FUNDAMENTAL INVARIANT VIOLATED: ir_borrowck returned {} warnings. \
+             Ownership is ALWAYS a hard error!",
+            result.warnings
+        );
+
+        // Test 2: Module without violations
+        let module_clean = make_module(vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::ConstInt {
+                        value: 1,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Copy,
+                ),
+                make_instr(
+                    Some(vid(1)),
+                    IrOp::ConstInt {
+                        value: 2,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Copy,
+                ),
+                make_instr(None, IrOp::Ret { value: Some(vid(0)) }, Ownership::Copy),
+            ],
+            span: dummy_span(),
+        }]);
+        let result = ir_borrowck(&module_clean);
+        assert_eq!(
+            result.warnings, 0,
+            "FUNDAMENTAL INVARIANT VIOLATED: ir_borrowck returned {} warnings on clean module.",
+            result.warnings
+        );
+
+        // Test 3: Empty module
+        let module_empty = FlatIrModule {
+            functions: vec![],
+            intrinsics: vec![],
+            span: dummy_span(),
+            lowering_errors: vec![],
+        };
+        let result = ir_borrowck(&module_empty);
+        assert_eq!(
+            result.warnings, 0,
+            "FUNDAMENTAL INVARIANT VIOLATED: ir_borrowck returned {} warnings on empty module.",
+            result.warnings
+        );
+    }
+
+    // ── STRESS: Move inside a call chain ──────────────────────────────────
+
+    #[test]
+    fn stress_move_inside_call_chain() {
+        // v0 = Owned
+        // Call(f, [v0]) with Owned ownership — moves v0
+        // Call(g, [v0]) — use after move!
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::ConstInt {
+                        value: 42,
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Owned,
+                ),
+                make_instr(
+                    Some(vid(1)),
+                    IrOp::Call {
+                        func: "f".to_string(),
+                        args: vec![vid(0)],
+                    },
+                    Ownership::Owned,
+                ),
+                make_instr(
+                    Some(vid(2)),
+                    IrOp::Call {
+                        func: "g".to_string(),
+                        args: vec![vid(0)],
+                    },
+                    Ownership::Owned,
+                ),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::UseAfterMove),
+            "expected use-after-move in call chain, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
+    }
+
+    // ── STRESS: Store invalidates immutable borrows ───────────────────────
+
+    #[test]
+    fn stress_store_invalidate_multiple_immut_borrows() {
+        // v0 = Alloca
+        // v1, v2, v3 = Load v0 (Ref) — 3 immutable borrows
+        // Store v0, v1 — write while 3 immutable borrows exist
+        let blocks = vec![FlatBlock {
+            id: bid(0),
+            instrs: vec![
+                make_instr(
+                    Some(vid(0)),
+                    IrOp::Alloca {
+                        ty: IrType::Int { width: 64, signed: true },
+                        align: 8,
+                    },
+                    Ownership::Owned,
+                ),
+                make_instr(
+                    Some(vid(1)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Ref,
+                ),
+                make_instr(
+                    Some(vid(2)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Ref,
+                ),
+                make_instr(
+                    Some(vid(3)),
+                    IrOp::Load {
+                        ptr: vid(0),
+                        ty: IrType::Int { width: 64, signed: true },
+                    },
+                    Ownership::Ref,
+                ),
+                make_instr(
+                    None,
+                    IrOp::Store {
+                        ptr: vid(0),
+                        value: vid(1),
+                    },
+                    Ownership::Owned,
+                ),
+            ],
+            span: dummy_span(),
+        }];
+        let result = ir_borrowck(&make_module(blocks));
+        assert!(
+            result.diagnostics.iter().any(|d| d.kind == IrBorrowDiagKind::AliasViolation),
+            "expected alias violation on Store with multiple immutable borrows, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(result.warnings, 0);
     }
 }

@@ -984,6 +984,10 @@ pub fn is_error(code: &str) -> bool {
 /// - **E3xxx (Semantic)**: many are lints (unused variable, shadowing, etc.)
 /// - **E5xxx (Effect)**: effect violations can be warnings in permissive mode
 ///
+/// **IMPORTANT**: Ownership / borrow-check codes (E4xxx) are NEVER eligible
+/// for downgrading.  Ownership violations are memory-safety issues and must
+/// ALWAYS be hard errors.  This is non-negotiable.
+///
 /// All other categories are hard errors that cannot be downgraded.
 pub fn is_warning_eligible(code: &str) -> bool {
     if !is_error(code) {
@@ -1008,11 +1012,14 @@ pub fn is_warning_eligible(code: &str) -> bool {
         return true;
     }
 
-    // A few borrow-check codes can be downgraded to warnings (aliasing
-    // diagnostics that are advisory rather than soundness violations).
-    if matches!(num, 4003 | 4004 | 4005) {
-        return true;
-    }
+    // OWNERSHIP IS ALWAYS A HARD ERROR.
+    // No borrow-check / ownership code (E4xxx) can ever be downgraded to a
+    // warning.  E4003, E4004, E4005 were previously "advisory" aliasing
+    // diagnostics, but ownership violations are memory-safety issues and
+    // must always be hard errors.  This is non-negotiable.
+    // if matches!(num, 4003 | 4004 | 4005) {
+    //     return true;
+    // }
 
     false
 }
@@ -1111,11 +1118,15 @@ mod tests {
     }
 
     #[test]
-    fn is_warning_eligible_borrow_advisory() {
-        // Borrow-while-borrowed can be a warning.
-        assert!(is_warning_eligible("E4004"));
-        // Use-after-move is a hard error.
-        assert!(!is_warning_eligible("E4001"));
+    fn is_warning_eligible_borrow_always_hard_error() {
+        // Ownership/borrow-check codes are NEVER warning-eligible.
+        // Ownership violations are memory-safety issues — always hard errors.
+        assert!(!is_warning_eligible("E4001"), "E4001 (use-after-move) must be hard error");
+        assert!(!is_warning_eligible("E4002"), "E4002 (borrow of moved value) must be hard error");
+        assert!(!is_warning_eligible("E4003"), "E4003 (mut borrow in parallel) must be hard error");
+        assert!(!is_warning_eligible("E4004"), "E4004 (borrow while borrowed) must be hard error");
+        assert!(!is_warning_eligible("E4005"), "E4005 (imm borrow while mut borrowed) must be hard error");
+        assert!(!is_warning_eligible("E4006"), "E4006 (assign to moved value) must be hard error");
     }
 
     #[test]
