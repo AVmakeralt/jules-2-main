@@ -50,27 +50,37 @@
 - **Next Immediate Step:** If user uploads architecture MD, apply additional optimization improvements (SIMD vectorization, tiered compilation, inline caching, SoA alignment, allocation sinking) from the optimization guide.
 - **Warnings:** Do not reintroduce `rule_mul_div_cancel` or `rule_div_mul_cancel` without integer-overflow guards. The `sub_self` EGraph rule (`x - x → 0`) is still active but safe since `0 - 0 = 0` is always valid.
 
-## [YYYY-MM-DD] - [Title of Current Task]
-**Status:** 🟡 In Progress | 🟢 Completed | 🔴 Blocked
-**System Layer:** [e.g., JHAL / Unified-IR / JIT / Prefetch]
+## [2026-05-13] - Create BENCHMARKS.md with Real Performance Data
+**Status:** 🟢 Completed
+**System Layer:** Cross-cutting (Compiler / Runtime / ECS / JHAL)
 
 ### 1. The Mission
-- [ ] Primary Goal (e.g., Implement `APIC` timer frequency scaling)
-- [ ] Secondary Goal (e.g., Add `cfg_validator` check for unreachable blocks)
+- [x] Create BENCHMARKS.md — Global Performance Benchmarks & Golden Standards
+- [x] Run all available benchmark suites with real data (no placeholders)
+- [x] Document environment specs, known issues, and regression protocol
+- [x] Push to repo
 
 ### 2. Invariants & Guardrails
-- **Invariants Touched:** [e.g., SSA Form, Hardware Interrupt Latency]
-- **Safety Check:** [e.g., Verified zero-heap in `src/jhal`]
+- **Invariants Touched:** Documentation only — no runtime code modified
+- **Safety Check:** No `todo!()` or `unimplemented!()` stubs added. No source code changed. Verified zero-heap in `src/jhal/` untouched.
 
 ### 3. Execution Log
-- **Change:** Describe specific logic modification.
-- **Why:** The architectural justification for this path.
-- **Deletions:** [List any files/structs removed and reference dev consent].
+- **Change:** Created `BENCHMARKS.md` with real benchmark data from 6 suites.
+- **Why:** Establish a Single Source of Truth for performance metrics to prevent Performance Drift. User provided template; all placeholder values replaced with real measurements.
+- **Benchmarks Run:**
+  - `micro-benchmark 10` — compile pipeline p50/p95 timings
+  - `quick-inferno` — BytecodeVM runtime (7 benches, 4 pass / 3 fail)
+  - `bench-inferno 1` — full stress suite (28 benches, 16 pass / 12 fail)
+  - `bench-jhal` — hardware abstraction layer (26 ops measured)
+  - `bench-ecs 5000 10` — entity component system (5 modes vs Rust)
+  - `bench-speed` — while-loop correctness (7/7 pass)
+- **Environment:** Intel Xeon, x86_64, 8GB RAM, release profile (LTO=fat, codegen-units=1)
+- **Deletions:** None.
 
 ### 4. Current Save Point (Context for Next Session)
-- **Current State:** [e.g., "The IR lowering works, but the emitter produces invalid x86_64 for `VectorAdd`."]
-- **Next Immediate Step:** [e.g., Debug `src/jit/emitter.rs` line 442.]
-- **Warnings:** [e.g., "Do not touch `local_apic.rs` until the timer overflow bug is mapped."]
+- **Current State:** BENCHMARKS.md pushed to main (commit 91a1676). 687/722 lib tests pass. 16/28 inferno benches pass. Known issues: ownership/move errors in some benchmark programs, unit type leak in if-else, Mandelbrot integer overflow watchdog.
+- **Next Immediate Step:** Apply architecture.md refactoring items (Unified SSA IR, tiered execution, NUMA/huge pages, optimizer gating, attribute preservation).
+- **Warnings:** Do not modify JHAL zero-heap code without consent. The BytecodeVM is currently slower than the interpreter for simple workloads — this is expected and documented.
 
 ---
 
