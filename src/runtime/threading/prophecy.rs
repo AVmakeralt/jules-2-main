@@ -40,6 +40,182 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+// ─── 2-Bit Saturating Counter Predictor ────────────────────────────────────────
+
+/// A 2-bit saturating counter for branch prediction.
+///
+/// The 4 states provide hysteresis: a single misprediction doesn't
+/// flip the prediction, preventing thrashing on loosely-correlated branches.
+#[derive(Debug, Clone, Copy)]
+enum SaturatingCounter {
+    StronglyNotTaken,  // 0
+    WeaklyNotTaken,    // 1
+    WeaklyTaken,       // 2
+    StronglyTaken,     // 3
+}
+
+impl SaturatingCounter {
+    fn predict(&self) -> bool {
+        matches!(self, SaturatingCounter::WeaklyTaken | SaturatingCounter::StronglyTaken)
+    }
+
+    fn update(&mut self, taken: bool) {
+        *self = match (*self, taken) {
+            (SaturatingCounter::StronglyNotTaken, false) => SaturatingCounter::StronglyNotTaken,
+            (SaturatingCounter::StronglyNotTaken, true) => SaturatingCounter::WeaklyNotTaken,
+            (SaturatingCounter::WeaklyNotTaken, false) => SaturatingCounter::StronglyNotTaken,
+            (SaturatingCounter::WeaklyNotTaken, true) => SaturatingCounter::WeaklyTaken,
+            (SaturatingCounter::WeaklyTaken, false) => SaturatingCounter::WeaklyNotTaken,
+            (SaturatingCounter::WeaklyTaken, true) => SaturatingCounter::StronglyTaken,
+            (SaturatingCounter::StronglyTaken, false) => SaturatingCounter::WeaklyTaken,
+            (SaturatingCounter::StronglyTaken, true) => SaturatingCounter::StronglyTaken,
+        };
+    }
+}
+
+// ─── GShare Branch Predictor ──────────────────────────────────────────────────
+
+/// A GShare branch predictor that XORs the PC with a global history register
+/// to index into a Branch History Table (BHT) of 2-bit saturating counters.
+///
+/// GShare captures correlation between different branches by using the
+/// global history — if branch A's outcome predicts branch B's outcome,
+/// GShare will learn this correlation.
+#[derive(Debug, Clone)]
+struct GSharePredictor {
+    /// BHT: Branch History Table (indexed by XOR of PC and GHR)
+    counters: Vec<SaturatingCounter>,
+    /// GHR: Global History Register (shift register of recent branch outcomes)
+    ghr: u64,
+    /// Number of BHT entries (must be power of 2)
+    table_size: usize,
+    /// Mask for indexing
+    index_mask: usize,
+}
+
+impl GSharePredictor {
+    fn new(table_size: usize) -> Self {
+        Self {
+            counters: vec![SaturatingCounter::WeaklyNotTaken; table_size],
+            ghr: 0,
+            table_size,
+            index_mask: table_size - 1,
+        }
+    }
+
+    fn predict(&self, pc: usize) -> bool {
+        let index = (pc ^ self.ghr as usize) & self.index_mask;
+        self.counters[index % self.table_size].predict()
+    }
+
+    fn update(&mut self, pc: usize, taken: bool) {
+        let index = (pc ^ self.ghr as usize) & self.index_mask;
+        self.counters[index % self.table_size].update(taken);
+        // Update GHR: shift left and add new outcome
+        self.ghr = (self.ghr << 1) | if taken { 1 } else { 0 };
+    }
+}
+
+// ─── Branch Record ────────────────────────────────────────────────────────────
+
+/// A record of a branch's behavior, used for O(1) lookup by PC.
+#[derive(Debug, Clone)]
+pub struct BranchRecord {
+    /// The program counter (address) of the branch instruction
+    pub pc: usize,
+    /// Number of times this branch was taken
+    pub taken_count: u64,
+    /// Number of times this branch was not taken
+    pub not_taken_count: u64,
+    /// Last prediction was correct
+    pub last_prediction_correct: bool,
+    /// Whether this branch is currently being tracked for speculation
+    pub is_tracked: bool,
+}
+
+impl BranchRecord {
+    /// Create a new branch record for the given PC.
+    pub fn new(pc: usize) -> Self {
+        Self {
+            pc,
+            taken_count: 0,
+            not_taken_count: 0,
+            last_prediction_correct: false,
+            is_tracked: false,
+        }
+    }
+
+    /// Record a branch outcome.
+    pub fn record_outcome(&mut self, taken: bool) {
+        if taken {
+            self.taken_count += 1;
+        } else {
+            self.not_taken_count += 1;
+        }
+    }
+
+    /// Empirical taken rate (0.0–1.0).
+    pub fn taken_rate(&self) -> f64 {
+        let total = self.taken_count + self.not_taken_count;
+        if total == 0 {
+            0.5
+        } else {
+            self.taken_count as f64 / total as f64
+        }
+    }
+
+    /// Whether this branch is highly predictable (taken rate > 0.9 or < 0.1).
+    pub fn is_predictable(&self) -> bool {
+        let rate = self.taken_rate();
+        rate > 0.9 || rate < 0.1
+    }
+}
+
+// ─── Misprediction Cost Model ─────────────────────────────────────────────────
+
+/// Configurable cost model for misprediction penalties.
+///
+/// Instead of hardcoded cycle costs, this allows the runtime to configure
+/// the cost model based on the target microarchitecture.
+#[derive(Debug, Clone, Copy)]
+pub struct MispredictionCost {
+    /// Pipeline depth (cycles lost on misprediction)
+    pub pipeline_depth: u32,
+    /// Correct prediction cost (near-zero)
+    pub correct_cost: u32,
+}
+
+impl Default for MispredictionCost {
+    fn default() -> Self {
+        Self {
+            pipeline_depth: 17,  // Typical for modern x86 (15-20)
+            correct_cost: 0,     // Near-zero for correct prediction
+        }
+    }
+}
+
+impl MispredictionCost {
+    /// Create a cost model for a specific microarchitecture.
+    pub fn new(pipeline_depth: u32, correct_cost: u32) -> Self {
+        Self { pipeline_depth, correct_cost }
+    }
+
+    /// Cost of a correct prediction.
+    pub fn correct_prediction_cost(&self) -> u32 {
+        self.correct_cost
+    }
+
+    /// Cost of a misprediction (pipeline flush + re-fetch).
+    pub fn misprediction_penalty(&self) -> u32 {
+        self.pipeline_depth
+    }
+
+    /// Cost of a TSX abort (typically higher than a simple misprediction).
+    pub fn tsx_abort_cost(&self) -> u32 {
+        self.pipeline_depth * 5  // TSX abort is ~5x more expensive
+    }
+}
+
 // ─── Prophecy Prediction ──────────────────────────────────────────────────────
 
 /// What kind of value a prophecy variable predicts.
@@ -131,6 +307,10 @@ pub struct ProphecyOracle {
     /// Global correct/wrong counters.
     global_correct: Arc<AtomicU64>,
     global_wrong: Arc<AtomicU64>,
+    /// GShare branch predictor for PC-indexed predictions.
+    gshare: GSharePredictor,
+    /// Branch records indexed by PC for O(1) lookup.
+    branch_records: HashMap<usize, BranchRecord>,
 }
 
 impl ProphecyOracle {
@@ -142,6 +322,8 @@ impl ProphecyOracle {
             max_concurrent,
             global_correct: Arc::new(AtomicU64::new(0)),
             global_wrong: Arc::new(AtomicU64::new(0)),
+            gshare: GSharePredictor::new(1024), // 1024-entry BHT
+            branch_records: HashMap::new(),
         }
     }
 
@@ -182,6 +364,34 @@ impl ProphecyOracle {
     /// Look up a prophecy by name.
     pub fn get(&self, name: &str) -> Option<&ProphecyVariable> {
         self.prophecies.get(name)
+    }
+
+    /// Predict a branch outcome at a given PC using the GShare predictor.
+    /// Returns the predicted outcome (true = taken, false = not taken).
+    pub fn predict_branch(&self, pc: usize) -> bool {
+        self.gshare.predict(pc)
+    }
+
+    /// Update the GShare predictor with the actual branch outcome.
+    /// Also updates the branch record for this PC.
+    pub fn record_branch_outcome(&mut self, pc: usize, taken: bool) {
+        self.gshare.update(pc, taken);
+        let record = self.branch_records.entry(pc).or_insert_with(|| BranchRecord::new(pc));
+        record.record_outcome(taken);
+    }
+
+    /// Look up a branch record by PC (O(1) via HashMap).
+    pub fn get_branch_record(&self, pc: usize) -> Option<&BranchRecord> {
+        self.branch_records.get(&pc)
+    }
+
+    /// Get all branch PCs that are highly predictable.
+    pub fn predictable_branches(&self) -> Vec<usize> {
+        self.branch_records
+            .iter()
+            .filter(|(_, record)| record.is_predictable())
+            .map(|(pc, _)| *pc)
+            .collect()
     }
 
     /// Global accuracy across all prophecies.
@@ -330,6 +540,8 @@ pub struct ProphecyExecutor {
     failed_speculations: u64,
     /// Number of aborted speculations (TSX abort, etc.).
     aborted_speculations: u64,
+    /// Configurable misprediction cost model.
+    misprediction_cost: MispredictionCost,
 }
 
 impl ProphecyExecutor {
@@ -346,6 +558,26 @@ impl ProphecyExecutor {
             successful_speculations: 0,
             failed_speculations: 0,
             aborted_speculations: 0,
+            misprediction_cost: MispredictionCost::default(),
+        }
+    }
+
+    /// Create a ProphecyExecutor with a custom misprediction cost model.
+    pub fn with_cost_model(
+        tsx_available: bool,
+        rseq_available: bool,
+        io_uring_available: bool,
+        misprediction_cost: MispredictionCost,
+    ) -> Self {
+        Self {
+            oracle: ProphecyOracle::default(),
+            tsx_available,
+            rseq_available,
+            io_uring_available,
+            successful_speculations: 0,
+            failed_speculations: 0,
+            aborted_speculations: 0,
+            misprediction_cost,
         }
     }
 
@@ -388,20 +620,22 @@ impl ProphecyExecutor {
         }
     }
 
-    /// Estimate the speedup from speculation.
+    /// Estimate the speedup from speculation using the configurable cost model.
     ///
     /// Each successful speculation converts a sequential dependency into
-    /// parallel work, saving the latency of the dependent computation.
-    /// Failed speculations cost a TSX abort (~20 cycles) plus the
-    /// re-execution cost.
+    /// parallel work, saving the pipeline depth in latency. Failed
+    /// speculations cost a misprediction penalty (pipeline flush) plus
+    /// re-execution. Aborted speculations cost a TSX abort (~5x pipeline
+    /// depth).
     pub fn estimated_speedup(&self) -> f64 {
         if self.successful_speculations == 0 {
             return 1.0;
         }
-        // Simplified model: each successful speculation saves ~50 cycles
-        // of latency, each failed one costs ~30 cycles.
-        let savings = self.successful_speculations as f64 * 50.0;
-        let cost = self.failed_speculations as f64 * 30.0 + self.aborted_speculations as f64 * 100.0;
+        // Use configurable cost model instead of hardcoded values
+        let savings = self.successful_speculations as f64 * self.misprediction_cost.pipeline_depth as f64;
+        let misprediction = self.failed_speculations as f64 * self.misprediction_cost.misprediction_penalty() as f64;
+        let abort_cost = self.aborted_speculations as f64 * self.misprediction_cost.tsx_abort_cost() as f64;
+        let cost = misprediction + abort_cost;
         let total_cycles = savings + cost;
         if total_cycles <= 0.0 {
             1.0

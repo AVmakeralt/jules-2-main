@@ -21,6 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// CPU microarchitectural model parameters
@@ -181,6 +182,7 @@ pub struct TraceInstr {
 }
 
 /// Graph representation of a basic block for GNN processing
+#[derive(Clone, Debug)]
 pub struct BlockGraph {
     pub nodes: Vec<TraceInstr>,
     pub edges: Vec<(usize, usize)>, // (from, to)
@@ -329,8 +331,10 @@ pub struct MicroArchGNN {
     readout_w1: Vec<Vec<f32>>,
     /// Readout MLP layer 2 weights (hidden_dim/4 × 1)
     readout_w2: Vec<f32>,
-    /// Training samples
-    training_samples: Vec<(Vec<f32>, f32)>,
+    /// Instance-local RNG seed (replaces static mut for thread safety)
+    seed: u64,
+    /// Training samples (graph + measured IPC)
+    training_samples: Vec<(BlockGraph, f32)>,
 }
 
 impl MicroArchGNN {
@@ -339,18 +343,20 @@ impl MicroArchGNN {
         let fan_out = hidden_dim;
         let limit = (6.0f32 / (fan_in as f32 + fan_out as f32)).sqrt();
 
-        // Xavier/Glorot uniform initialization
-        let init_weight = || -> f32 {
-            // Deterministic initialization based on a simple LCG
-            static mut SEED: u64 = 42;
-            unsafe {
-                SEED = SEED.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let val = (SEED >> 33) as f32 / (1u64 << 31) as f32;
-                (val * 2.0 - 1.0) * limit
-            }
+        // Instance-local seed: use atomic counter so different GNN instances
+        // get different initial weights (thread-safe, unlike static mut)
+        static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let instance_id = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut seed = 42u64.wrapping_add(instance_id.wrapping_mul(0x517cc1b727220a95));
+
+        // Xavier/Glorot uniform initialization using instance-local seed
+        let mut init_weight = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let val = (seed >> 33) as f32 / (1u64 << 31) as f32;
+            (val * 2.0 - 1.0) * limit
         };
 
-        let make_matrix = |rows: usize, cols: usize| -> Vec<Vec<f32>> {
+        let mut make_matrix = |rows: usize, cols: usize| -> Vec<Vec<f32>> {
             (0..rows).map(|_| (0..cols).map(|_| init_weight()).collect()).collect()
         };
 
@@ -364,6 +370,7 @@ impl MicroArchGNN {
             w_msg: make_matrix(hidden_dim, hidden_dim),
             readout_w1: make_matrix(readout_dim, hidden_dim * 2), // mean + max pooling
             readout_w2: (0..readout_dim).map(|_| init_weight()).collect(),
+            seed,
             training_samples: Vec::new(),
         }
     }
@@ -462,42 +469,219 @@ impl MicroArchGNN {
         }).collect()
     }
 
-    /// Online training from hardware counters (SGD with MSE loss)
+    /// Online training from hardware counters (SGD with MSE loss, full backprop through GNN)
     pub fn train(&mut self, iterations: usize) {
         if self.training_samples.len() < 10 { return; }
 
         let lr = 0.001f32;
+        let n_rounds = 2usize;
+        let readout_dim = self.hidden_dim / 4;
+        if readout_dim == 0 { return; }
+        let grad_clip = 1.0f32;
 
         for _ in 0..iterations {
-            // Pick a random sample (simple LCG)
-            static mut SEED: u64 = 12345;
-            unsafe {
-                SEED = SEED.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // Pick a random sample using instance-local seed
+            self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let idx = (self.seed as usize) % self.training_samples.len();
+
+            // Clone the sample to release the borrow on self.training_samples
+            // before we mutate self.* weights in the backward pass.
+            let (graph, measured_ipc) = self.training_samples[idx].clone();
+
+            let n_nodes = graph.nodes.len();
+            if n_nodes == 0 { continue; }
+
+            let node_feats = graph.node_features();
+            let csr = CsrAdjacency::from_edges(n_nodes, &graph.edges);
+
+            // ===== FORWARD PASS (saving all intermediate values) =====
+
+            // Initialize hidden states from features
+            let h_init: Vec<Vec<f32>> = node_feats.iter().map(|f| {
+                f.iter().cloned().take(self.hidden_dim.min(f.len()))
+                    .chain(std::iter::repeat(0.0))
+                    .take(self.hidden_dim)
+                    .collect()
+            }).collect();
+
+            // all_hidden[0] = h_init, all_hidden[r+1] = hidden after round r
+            let mut all_hidden: Vec<Vec<Vec<f32>>> = vec![h_init];
+            let mut pre_relu_rounds: Vec<Vec<Vec<f32>>> = Vec::with_capacity(n_rounds);
+
+            for _round in 0..n_rounds {
+                let h_input = &all_hidden[all_hidden.len() - 1];
+                let mut pre_relu = vec![vec![0.0f32; self.hidden_dim]; n_nodes];
+                let mut new_hidden = vec![vec![0.0f32; self.hidden_dim]; n_nodes];
+
+                for i in 0..n_nodes {
+                    let neighbors = csr.neighbors(i);
+                    let self_contrib = self.mat_vec(&self.w_self, &h_input[i]);
+                    let mut msg = vec![0.0f32; self.hidden_dim];
+                    if !neighbors.is_empty() {
+                        for &j in neighbors {
+                            let w_msg_h = self.mat_vec(&self.w_msg, &h_input[j]);
+                            for k in 0..self.hidden_dim {
+                                msg[k] += w_msg_h[k];
+                            }
+                        }
+                        let n = neighbors.len() as f32;
+                        for k in 0..self.hidden_dim { msg[k] /= n; }
+                    }
+                    for k in 0..self.hidden_dim {
+                        pre_relu[i][k] = self_contrib[k] + msg[k];
+                        new_hidden[i][k] = pre_relu[i][k].max(0.0);
+                    }
+                }
+
+                pre_relu_rounds.push(pre_relu);
+                all_hidden.push(new_hidden);
             }
-            let idx = unsafe { (SEED as usize) % self.training_samples.len() };
-            let (features, measured_ipc) = &self.training_samples[idx];
 
-            // Initialize node_embeddings from training features if empty.
-            if self.node_embeddings.is_empty() && !features.is_empty() {
-                self.node_embeddings = vec![features.clone()];
+            let h_final = &all_hidden[n_rounds];
+
+            // Pooling: mean || max
+            let n_nodes_f = n_nodes as f32;
+            let mean_pool: Vec<f32> = (0..self.hidden_dim).map(|j| {
+                h_final.iter().map(|h| h[j]).sum::<f32>() / n_nodes_f
+            }).collect();
+
+            let mut max_pool = vec![f32::NEG_INFINITY; self.hidden_dim];
+            let mut max_indices = vec![0usize; self.hidden_dim];
+            for (i, h) in h_final.iter().enumerate() {
+                for j in 0..self.hidden_dim {
+                    if h[j] > max_pool[j] {
+                        max_pool[j] = h[j];
+                        max_indices[j] = i;
+                    }
+                }
             }
 
-            // Simple gradient step on readout weights
-            // (Full backprop through GNN is complex; this is a simplified approach)
-            let pred_ipc: f32 = features.iter().take(self.readout_w2.len())
-                .zip(self.readout_w2.iter())
-                .map(|(f, w)| f * w).sum();
+            let pooled: Vec<f32> = mean_pool.iter().chain(max_pool.iter()).cloned().collect();
 
-            let error = pred_ipc - *measured_ipc;
+            // Readout layer 1: hidden_dim*2 → readout_dim
+            let mut h1_pre = vec![0.0f32; readout_dim];
+            for i in 0..readout_dim.min(self.readout_w1.len()) {
+                for j in 0..pooled.len().min(self.readout_w1[i].len()) {
+                    h1_pre[i] += self.readout_w1[i][j] * pooled[j];
+                }
+            }
+            let h1: Vec<f32> = h1_pre.iter().map(|&v| v.max(0.0)).collect();
 
-            // Update readout_w2 (simplified gradient)
-            for i in 0..self.readout_w2.len().min(features.len()) {
-                self.readout_w2[i] -= lr * error * features[i];
+            // Readout layer 2: readout_dim → 1
+            let mut predicted_ipc = 0.0f32;
+            for i in 0..readout_dim.min(self.readout_w2.len()) {
+                predicted_ipc += self.readout_w2[i] * h1[i];
+            }
+
+            // ===== BACKWARD PASS (full backprop through all GNN layers) =====
+            let error = predicted_ipc - measured_ipc;
+
+            // --- Readout layer 2 gradients ---
+            // dL/d(readout_w2[i]) = error * h1[i]
+            // dL/d(h1[i]) = error * readout_w2[i]
+            let mut grad_h1 = vec![0.0f32; readout_dim];
+            for i in 0..readout_dim.min(self.readout_w2.len()) {
+                grad_h1[i] = error * self.readout_w2[i];
+                let g = (lr * error * h1[i]).clamp(-grad_clip, grad_clip);
+                self.readout_w2[i] -= g;
+            }
+
+            // --- Readout layer 1 gradients ---
+            // dL/d(readout_w1[i][j]) = grad_pre * pooled[j]
+            // dL/d(pooled[j]) = Σ_i grad_pre * readout_w1[i][j]
+            let mut grad_pooled = vec![0.0f32; pooled.len()];
+            for i in 0..readout_dim.min(self.readout_w1.len()) {
+                let relu_mask = if h1_pre[i] > 0.0 { 1.0f32 } else { 0.0f32 };
+                let grad_pre = grad_h1[i] * relu_mask;
+                for j in 0..pooled.len().min(self.readout_w1[i].len()) {
+                    grad_pooled[j] += grad_pre * self.readout_w1[i][j];
+                    let g = (lr * grad_pre * pooled[j]).clamp(-grad_clip, grad_clip);
+                    self.readout_w1[i][j] -= g;
+                }
+            }
+
+            // --- Pooling gradients → dL/d(h_final) ---
+            let mut grad_hidden: Vec<Vec<f32>> = vec![vec![0.0f32; self.hidden_dim]; n_nodes];
+
+            // Mean pool: dL/d(h_final[i][j]) += dL/d(mean_pool[j]) / N
+            for j in 0..self.hidden_dim {
+                let g = grad_pooled[j] / n_nodes_f;
+                for i in 0..n_nodes {
+                    grad_hidden[i][j] += g;
+                }
+            }
+
+            // Max pool: dL/d(h_final[argmax[j]][j]) += dL/d(max_pool[j])
+            for j in 0..self.hidden_dim {
+                grad_hidden[max_indices[j]][j] += grad_pooled[self.hidden_dim + j];
+            }
+
+            // --- Message passing rounds (reverse order) ---
+            // Accumulate gradients for shared w_self and w_msg across rounds
+            let mut grad_w_self = vec![vec![0.0f32; self.hidden_dim]; self.hidden_dim];
+            let mut grad_w_msg = vec![vec![0.0f32; self.hidden_dim]; self.hidden_dim];
+
+            for round in (0..n_rounds).rev() {
+                let h_input = &all_hidden[round];
+
+                // Apply ReLU mask: grad_hidden currently = dL/d(h_output)
+                // h_output = ReLU(pre_relu), so dL/d(pre_relu) = dL/d(h_output) * 1_{pre_relu>0}
+                for i in 0..n_nodes {
+                    for k in 0..self.hidden_dim {
+                        if pre_relu_rounds[round][i][k] <= 0.0 {
+                            grad_hidden[i][k] = 0.0;
+                        }
+                    }
+                }
+
+                // Now grad_hidden = dL/d(pre_relu[round])
+                // pre_relu[i][k] = (W_self * h_input[i])[k] + (1/|N(i)|) Σ_{j∈N(i)} (W_msg * h_input[j])[k]
+                //
+                // Gradients:
+                //   dL/d(W_self[k][m]) += grad_hidden[i][k] * h_input[i][m]
+                //   dL/d(h_input[i][m]) += Σ_k grad_hidden[i][k] * W_self[k][m]   (self path)
+                //   dL/d(W_msg[k][m])  += Σ_{j∈N(i)} grad_hidden[i][k] * h_input[j][m] / |N(i)|
+                //   dL/d(h_input[j][m]) += Σ_k grad_hidden[i][k] * W_msg[k][m] / |N(i)|  (msg path)
+                let mut grad_h_input = vec![vec![0.0f32; self.hidden_dim]; n_nodes];
+
+                for i in 0..n_nodes {
+                    let neighbors = csr.neighbors(i);
+
+                    // Self contribution
+                    for k in 0..self.hidden_dim {
+                        for m in 0..self.hidden_dim {
+                            grad_w_self[k][m] += grad_hidden[i][k] * h_input[i][m];
+                            grad_h_input[i][m] += grad_hidden[i][k] * self.w_self[k][m];
+                        }
+                    }
+
+                    // Message contribution
+                    if !neighbors.is_empty() {
+                        let n_nbrs = neighbors.len() as f32;
+                        for &j in neighbors {
+                            for k in 0..self.hidden_dim {
+                                for m in 0..self.hidden_dim {
+                                    grad_w_msg[k][m] += grad_hidden[i][k] * h_input[j][m] / n_nbrs;
+                                    grad_h_input[j][m] += grad_hidden[i][k] * self.w_msg[k][m] / n_nbrs;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                grad_hidden = grad_h_input;
+            }
+
+            // Apply accumulated weight updates for w_self and w_msg
+            for k in 0..self.hidden_dim {
+                for m in 0..self.hidden_dim {
+                    let g_self = grad_w_self[k][m].clamp(-grad_clip, grad_clip);
+                    self.w_self[k][m] -= lr * g_self;
+                    let g_msg = grad_w_msg[k][m].clamp(-grad_clip, grad_clip);
+                    self.w_msg[k][m] -= lr * g_msg;
+                }
             }
         }
-
-        // Ensure embed_dim is at least consistent with hidden_dim.
-        let _ = self.embed_dim;
     }
 
     /// Predict register pressure for block
@@ -662,14 +846,7 @@ impl NeuralSuperblockPredictor {
 
     /// Record actual performance for training
     pub fn record_performance(&mut self, graph: &BlockGraph, measured_ipc: f32) {
-        let features: Vec<f32> = graph.node_features()
-            .iter()
-            .flatten()
-            .take(32)
-            .copied()
-            .collect();
-
-        self.gnn.training_samples.push((features, measured_ipc));
+        self.gnn.training_samples.push((graph.clone(), measured_ipc));
     }
 
     /// Simple training (gradient descent on error)
@@ -717,10 +894,12 @@ impl NeuralTracingJIT {
             return None;
         }
 
+        let estimated_ipc = self.predictor.gnn.predict_ipc(&graph, &self.predictor.arch);
         let superblock = CompiledSuperblock {
             block_id,
             decision,
-            estimated_ipc: self.predictor.gnn.predict_ipc(&graph, &self.predictor.arch),
+            estimated_ipc,
+            graph, // Store the graph so record_execution can use the real structure
         };
 
         self.compiled_traces.write().unwrap().insert(block_id, superblock.clone());
@@ -729,10 +908,10 @@ impl NeuralTracingJIT {
 
     /// Record actual IPC after execution
     pub fn record_execution(&mut self, block_id: usize, measured_ipc: f32) {
-        let exists = self.compiled_traces.read().unwrap().contains_key(&block_id);
-        if exists {
-            // Rebuild graph for recording
-            let graph = BlockGraph::new(); // Would need to rebuild from actual trace
+        // Use the stored graph from the compiled trace (not an empty graph)
+        let graph = self.compiled_traces.read().unwrap().get(&block_id)
+            .map(|c| c.graph.clone());
+        if let Some(graph) = graph {
             self.predictor.record_performance(&graph, measured_ipc);
         }
     }
@@ -750,6 +929,8 @@ pub struct CompiledSuperblock {
     pub block_id: usize,
     pub decision: SuperblockDecision,
     pub estimated_ipc: f32,
+    /// Stored graph so record_execution can use the actual graph structure
+    pub graph: BlockGraph,
 }
 
 #[cfg(test)]

@@ -182,6 +182,8 @@ pub enum DependenceDirection {
     Equal,
     /// Unknown / any direction: cannot determine statically (*)
     Any,
+    /// No dependence: accesses are independent (e.g., different arrays or both reads)
+    Independent,
 }
 
 /// Kind of dependence between two memory accesses.
@@ -217,6 +219,43 @@ pub struct DependenceVector {
     pub kind: DependenceKind,
     /// Name of the array that both accesses reference
     pub array_name: String,
+}
+
+/// Access pattern for dependence analysis — describes a single array access
+/// within a loop nest with detailed subscript information.
+#[derive(Debug, Clone)]
+pub struct AccessPattern {
+    /// Name of the array being accessed
+    pub array_name: String,
+    /// Whether this access is a write
+    pub is_write: bool,
+    /// Subscript expressions: one per dimension, as string expressions
+    pub subscripts: Vec<String>,
+}
+
+/// Context information for a loop nest, used to improve heuristics.
+#[derive(Debug, Clone, Default)]
+pub struct LoopContext {
+    /// Known loop bounds from program analysis (variable name → bound)
+    pub known_bounds: std::collections::HashMap<String, i64>,
+}
+
+/// Cache hierarchy information for miss rate estimation.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheInfo {
+    /// L1 data cache size in bytes
+    pub l1_size_bytes: usize,
+    /// L2 cache size in bytes
+    pub l2_size_bytes: usize,
+}
+
+impl Default for CacheInfo {
+    fn default() -> Self {
+        Self {
+            l1_size_bytes: 32 * 1024,      // 32 KiB
+            l2_size_bytes: 512 * 1024,     // 512 KiB
+        }
+    }
 }
 
 /// Result of polyhedral optimization
@@ -258,6 +297,10 @@ struct LoopLayer {
 pub struct PolyhedralOptimizer {
     /// Cache model for the target machine
     pub cache: CacheModel,
+    /// Cache info for miss rate estimation
+    pub cache_info: CacheInfo,
+    /// Loop context for bound estimation
+    pub loop_context: LoopContext,
     /// Statistics
     pub loops_optimized: u64,
     pub total_cache_miss_reduction: f64,
@@ -267,6 +310,8 @@ impl PolyhedralOptimizer {
     pub fn new() -> Self {
         Self {
             cache: CacheModel::default(),
+            cache_info: CacheInfo::default(),
+            loop_context: LoopContext::default(),
             loops_optimized: 0,
             total_cache_miss_reduction: 0.0,
         }
@@ -275,6 +320,8 @@ impl PolyhedralOptimizer {
     pub fn with_cache_model(cache: CacheModel) -> Self {
         Self {
             cache,
+            cache_info: CacheInfo::default(),
+            loop_context: LoopContext::default(),
             loops_optimized: 0,
             total_cache_miss_reduction: 0.0,
         }
@@ -425,7 +472,7 @@ impl PolyhedralOptimizer {
                             Expr::IntLit { value, .. } => {
                                 upper_bounds.push(*value as i64);
                             }
-                            _ => upper_bounds.push(1024),
+                            _ => upper_bounds.push(self.estimate_loop_bound(name)),
                         }
                     }
                     Expr::Call { func, args, .. } => {
@@ -436,14 +483,23 @@ impl PolyhedralOptimizer {
                                     Expr::IntLit { value, .. } => {
                                         upper_bounds.push(*value as i64);
                                     }
-                                    _ => upper_bounds.push(1024),
+                                    Expr::Ident { name, .. } => {
+                                        upper_bounds.push(self.estimate_loop_bound(name))
+                                    }
+                                    _ => upper_bounds.push(self.estimate_loop_bound("unknown")),
                                 }
                             }
-                            _ => upper_bounds.push(1024),
+                            _ => upper_bounds.push(self.estimate_loop_bound("unknown")),
                         }
                     }
                     _ => {
-                        upper_bounds.push(1024);
+                        // Use the iterator name as context for the heuristic
+                        let var_name = if let Pattern::Ident { name, .. } = pattern {
+                            name.as_str()
+                        } else {
+                            "unknown"
+                        };
+                        upper_bounds.push(self.estimate_loop_bound(var_name));
                     }
                 }
 
@@ -471,6 +527,80 @@ impl PolyhedralOptimizer {
                 Some(())
             }
             _ => None,
+        }
+    }
+
+    /// Compute dependence between two access patterns.
+    ///
+    /// If accessing different arrays, there is no dependence.
+    /// If both are reads, there is no dependence.
+    /// For same array with at least one write, check subscript-by-subscript:
+    ///   - If all subscripts are identical → Equal
+    ///   - If subscripts differ → Any (potential dependence)
+    fn compute_dependence(&self, source: &AccessPattern, dest: &AccessPattern) -> DependenceDirection {
+        // If accessing different arrays, no dependence
+        if source.array_name != dest.array_name {
+            return DependenceDirection::Independent;
+        }
+
+        // If both are reads, no dependence
+        if !source.is_write && !dest.is_write {
+            return DependenceDirection::Independent;
+        }
+
+        // Check subscript-by-subscript
+        // If all subscripts are identical affine functions of the loop variable → Equal
+        // If subscripts differ by a constant → can test for dependence
+        // If subscripts involve different loop variables → may be Any
+        let mut result = DependenceDirection::Equal;
+        for (s_sub, d_sub) in source.subscripts.iter().zip(dest.subscripts.iter()) {
+            if s_sub != d_sub {
+                // Different subscripts on the same array
+                // If one is write, this could be a true dependence
+                result = DependenceDirection::Any;
+            }
+        }
+        result
+    }
+
+    /// Estimate loop bound using context information and heuristics.
+    ///
+    /// Instead of defaulting to 1024, this uses:
+    ///   - Known bounds from context (e.g., from profile data or annotations)
+    ///   - Heuristics based on variable name patterns
+    fn estimate_loop_bound(&self, loop_var: &str) -> i64 {
+        // Use context information when available
+        if let Some(bound) = self.loop_context.known_bounds.get(loop_var) {
+            return *bound;
+        }
+        // Heuristic: common patterns
+        let lower = loop_var.to_lowercase();
+        if lower.contains("n") || lower.contains("size") || lower.contains("len") {
+            256  // Data-dependent loop — typical array size
+        } else if lower.contains("i") || lower.contains("j") || lower.contains("k") {
+            128  // Index loop — moderate size
+        } else {
+            64   // Conservative default (not 1024)
+        }
+    }
+
+    /// Estimate cache miss rate based on working set size and cache hierarchy.
+    ///
+    /// Instead of fabricated constants (0.5, 0.8), this models:
+    ///   - Working set fits in L1 → ~2% miss rate
+    ///   - Working set fits in L2 → 10-20% miss rate
+    ///   - Working set exceeds L2 → 30-70% miss rate
+    fn estimate_cache_misses(&self, working_set_bytes: usize) -> f64 {
+        let l1_size = self.cache_info.l1_size_bytes as f64;
+        let l2_size = self.cache_info.l2_size_bytes as f64;
+        let working_set = working_set_bytes as f64;
+
+        if working_set <= l1_size {
+            0.02  // ~2% miss rate when fits in L1
+        } else if working_set <= l2_size {
+            0.10 + 0.10 * (working_set / l2_size)  // 10-20% when fits in L2
+        } else {
+            0.30 + 0.20 * (working_set / l2_size - 1.0).min(2.0)  // 30-70% when exceeds L2
         }
     }
 
@@ -537,7 +667,11 @@ impl PolyhedralOptimizer {
         if optimal_order != nest.iterators {
             result.interchange_applied = true;
             result.optimized_order = optimal_order;
-            result.cache_miss_reduction = 0.5; // Conservative estimate
+            // Estimate cache miss reduction from interchange using cache model
+            let working_set = nest.access_patterns.len() * 4 * 64; // rough estimate
+            let miss_rate_before = self.estimate_cache_misses(working_set);
+            let miss_rate_after = self.estimate_cache_misses(working_set / 2); // interchange halves effective stride
+            result.cache_miss_reduction = (miss_rate_before - miss_rate_after).max(0.0).min(1.0);
         }
 
         // Determine tiling for cache optimization
@@ -549,7 +683,12 @@ impl PolyhedralOptimizer {
 
             result.tile_sizes = Some(self.cache.matmul_tile_sizes(m, k, n));
             result.tiling_applied = true;
-            result.cache_miss_reduction = result.cache_miss_reduction.max(0.8);
+            // Estimate cache miss reduction from tiling using cache model
+            let working_set = m * n * 4; // rough estimate
+            let miss_rate_before = self.estimate_cache_misses(working_set);
+            let miss_rate_after = self.estimate_cache_misses(self.cache_info.l1_size_bytes); // tiled fits in L1
+            let tiling_reduction = (miss_rate_before - miss_rate_after).max(0.0).min(1.0);
+            result.cache_miss_reduction = result.cache_miss_reduction.max(tiling_reduction);
         }
 
         Some(result)
@@ -622,8 +761,28 @@ impl PolyhedralOptimizer {
                 let access_i = &nest.access_patterns[i];
                 let access_j = &nest.access_patterns[j];
 
-                // Only consider pairs that access the same array
-                if access_i.array_name != access_j.array_name {
+                // Use compute_dependence for a high-level check first
+                let ap_i = AccessPattern {
+                    array_name: access_i.array_name.clone(),
+                    is_write: access_i.access_type == AccessType::Write || access_i.access_type == AccessType::ReadWrite,
+                    subscripts: access_i.indices.clone(),
+                };
+                let ap_j = AccessPattern {
+                    array_name: access_j.array_name.clone(),
+                    is_write: access_j.access_type == AccessType::Write || access_j.access_type == AccessType::ReadWrite,
+                    subscripts: access_j.indices.clone(),
+                };
+
+                let dep_dir = self.compute_dependence(&ap_i, &ap_j);
+                if dep_dir == DependenceDirection::Independent {
+                    // No dependence between these accesses — produce an Independent vector
+                    vectors.push(DependenceVector {
+                        source: vec![0; nest.iterators.len()],
+                        destination: vec![0; nest.iterators.len()],
+                        direction: vec![DependenceDirection::Independent; nest.iterators.len()],
+                        kind: DependenceKind::Raw, // doesn't matter for Independent
+                        array_name: access_i.array_name.clone(),
+                    });
                     continue;
                 }
 
@@ -710,6 +869,11 @@ impl PolyhedralOptimizer {
         }
 
         for dv in dep_vectors {
+            // Independent vectors impose no constraints — skip them
+            if dv.direction.iter().all(|d| *d == DependenceDirection::Independent) {
+                continue;
+            }
+
             // Check each pair of loop levels in the original order
             // For each pair (outer, inner) where outer has direction d1 and inner has d2:
             // If d1 = Forward and d2 = Backward, the interchange that swaps them is illegal.

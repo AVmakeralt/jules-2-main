@@ -294,11 +294,27 @@ fn skylake_port_map() -> &'static PortMap {
         uops.insert("shr", alu_uop(alu.clone(), 0.25));
         // x86-64 instruction selection: LEA, INC, DEC
         uops.insert("lea", alu_uop(vec![Port::P1, Port::P5, Port::P6], 1.0));
+        uops.insert("lea3", alu_uop(vec![Port::P1, Port::P5, Port::P6], 1.0));
         uops.insert("inc", alu_uop(alu.clone(), 0.25));
         uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P1], 3, 1.0, false));
         uops.insert("div", div_uop(vec![Port::P0], 35, 35.0));
         uops.insert("rem", div_uop(vec![Port::P0], 35, 35.0));
+        // BMI1/BMI2 instructions: ANDN, BLSI, BLSR, BLSMSK — 1 uop, 1 cycle
+        uops.insert("andn", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsi", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsr", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsmsk", alu_uop(alu.clone(), 0.25));
+        // XOR zeroing: 0 uops on modern CPUs (zero-idiom, register renaming eliminates it)
+        uops.insert("xor_zero", alu_uop(alu.clone(), 0.0));
+        // TEST instruction for flag-only comparison — 1 uop, 1 cycle, no register write
+        uops.insert("test_z", alu_uop(alu.clone(), 0.25));
+        uops.insert("test_nz", alu_uop(alu.clone(), 0.25));
+        // CMP instruction (flag-setting comparison)
+        uops.insert("cmp", alu_uop(alu.clone(), 0.25));
+        // Rotation instructions: ROR, ROL — 1 uop, 1 cycle
+        uops.insert("ror", alu_uop(alu.clone(), 0.25));
+        uops.insert("rol", alu_uop(alu.clone(), 0.25));
         uops.insert("jmp", store_uop(vec![Port::P5], 0.5));
         uops.insert("call", store_uop(vec![Port::P5], 0.5));
         uops.insert("load", load_uop(vec![Port::P2, Port::P3], 4, 0.5));
@@ -327,11 +343,22 @@ fn skylakex_port_map() -> &'static PortMap {
         uops.insert("shl", alu_uop(alu.clone(), 0.25));
         uops.insert("shr", alu_uop(alu.clone(), 0.25));
         uops.insert("lea", alu_uop(vec![Port::P1, Port::P5, Port::P6], 1.0));
+        uops.insert("lea3", alu_uop(vec![Port::P1, Port::P5, Port::P6], 1.0));
         uops.insert("inc", alu_uop(alu.clone(), 0.25));
         uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P1], 3, 1.0, false));
         uops.insert("div", div_uop(vec![Port::P0], 35, 35.0));
         uops.insert("rem", div_uop(vec![Port::P0], 35, 35.0));
+        uops.insert("andn", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsi", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsr", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsmsk", alu_uop(alu.clone(), 0.25));
+        uops.insert("xor_zero", alu_uop(alu.clone(), 0.0));
+        uops.insert("test_z", alu_uop(alu.clone(), 0.25));
+        uops.insert("test_nz", alu_uop(alu.clone(), 0.25));
+        uops.insert("cmp", alu_uop(alu.clone(), 0.25));
+        uops.insert("ror", alu_uop(alu.clone(), 0.25));
+        uops.insert("rol", alu_uop(alu.clone(), 0.25));
         uops.insert("load", load_uop(vec![Port::P2, Port::P3], 4, 0.5));
         PortMap {
             name: "Intel Skylake-X",
@@ -352,11 +379,22 @@ fn icelake_port_map() -> &'static PortMap {
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
         uops.insert("lea", alu_uop(vec![Port::P1, Port::P5, Port::P6], 1.0));
+        uops.insert("lea3", alu_uop(vec![Port::P1, Port::P5, Port::P6], 1.0));
         uops.insert("inc", alu_uop(alu.clone(), 0.25));
         uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1, Port::P5], 3, 0.5, true));
         uops.insert("div", div_uop(vec![Port::P0], 30, 30.0));
         uops.insert("rem", div_uop(vec![Port::P0], 30, 30.0));
+        uops.insert("andn", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsi", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsr", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsmsk", alu_uop(alu.clone(), 0.25));
+        uops.insert("xor_zero", alu_uop(alu.clone(), 0.0));
+        uops.insert("test_z", alu_uop(alu.clone(), 0.25));
+        uops.insert("test_nz", alu_uop(alu.clone(), 0.25));
+        uops.insert("cmp", alu_uop(alu.clone(), 0.25));
+        uops.insert("ror", alu_uop(alu.clone(), 0.25));
+        uops.insert("rol", alu_uop(alu.clone(), 0.25));
         uops.insert("load", load_uop(vec![Port::P2, Port::P3], 4, 0.5));
         PortMap {
             name: "Intel Ice Lake",
@@ -377,11 +415,22 @@ fn golden_cove_port_map() -> &'static PortMap {
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
         uops.insert("lea", alu_uop(vec![Port::P1, Port::P2, Port::P5], 1.0));
+        uops.insert("lea3", alu_uop(vec![Port::P1, Port::P2, Port::P5], 1.0));
         uops.insert("inc", alu_uop(alu.clone(), 0.25));
         uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1, Port::P2, Port::P5], 3, 0.5, true));
         uops.insert("div", div_uop(vec![Port::P0], 28, 28.0));
         uops.insert("rem", div_uop(vec![Port::P0], 28, 28.0));
+        uops.insert("andn", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsi", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsr", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsmsk", alu_uop(alu.clone(), 0.25));
+        uops.insert("xor_zero", alu_uop(alu.clone(), 0.0));
+        uops.insert("test_z", alu_uop(alu.clone(), 0.25));
+        uops.insert("test_nz", alu_uop(alu.clone(), 0.25));
+        uops.insert("cmp", alu_uop(alu.clone(), 0.25));
+        uops.insert("ror", alu_uop(alu.clone(), 0.25));
+        uops.insert("rol", alu_uop(alu.clone(), 0.25));
         uops.insert("load", load_uop(vec![Port::P2, Port::P3], 4, 0.5));
         PortMap {
             name: "Intel Golden Cove",
@@ -402,11 +451,22 @@ fn zen2_port_map() -> &'static PortMap {
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
         uops.insert("lea", alu_uop(vec![Port::P1, Port::P2, Port::P3], 1.0));
+        uops.insert("lea3", alu_uop(vec![Port::P1, Port::P2, Port::P3], 1.0));
         uops.insert("inc", alu_uop(alu.clone(), 0.25));
         uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1], 3, 0.5, true));
         uops.insert("div", div_uop(vec![Port::P0], 40, 40.0));
         uops.insert("rem", div_uop(vec![Port::P0], 40, 40.0));
+        uops.insert("andn", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsi", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsr", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsmsk", alu_uop(alu.clone(), 0.25));
+        uops.insert("xor_zero", alu_uop(alu.clone(), 0.0));
+        uops.insert("test_z", alu_uop(alu.clone(), 0.25));
+        uops.insert("test_nz", alu_uop(alu.clone(), 0.25));
+        uops.insert("cmp", alu_uop(alu.clone(), 0.25));
+        uops.insert("ror", alu_uop(alu.clone(), 0.25));
+        uops.insert("rol", alu_uop(alu.clone(), 0.25));
         uops.insert("load", load_uop(vec![Port::P4, Port::P5], 4, 0.5));
         PortMap {
             name: "AMD Zen 2",
@@ -427,11 +487,22 @@ fn zen3_port_map() -> &'static PortMap {
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
         uops.insert("lea", alu_uop(vec![Port::P1, Port::P2, Port::P3], 1.0));
+        uops.insert("lea3", alu_uop(vec![Port::P1, Port::P2, Port::P3], 1.0));
         uops.insert("inc", alu_uop(alu.clone(), 0.25));
         uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1, Port::P2, Port::P3], 3, 0.33, true));
         uops.insert("div", div_uop(vec![Port::P0], 35, 35.0));
         uops.insert("rem", div_uop(vec![Port::P0], 35, 35.0));
+        uops.insert("andn", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsi", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsr", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsmsk", alu_uop(alu.clone(), 0.25));
+        uops.insert("xor_zero", alu_uop(alu.clone(), 0.0));
+        uops.insert("test_z", alu_uop(alu.clone(), 0.25));
+        uops.insert("test_nz", alu_uop(alu.clone(), 0.25));
+        uops.insert("cmp", alu_uop(alu.clone(), 0.25));
+        uops.insert("ror", alu_uop(alu.clone(), 0.25));
+        uops.insert("rol", alu_uop(alu.clone(), 0.25));
         uops.insert("load", load_uop(vec![Port::P4, Port::P5], 4, 0.5));
         PortMap {
             name: "AMD Zen 3",
@@ -452,11 +523,22 @@ fn zen4_port_map() -> &'static PortMap {
         uops.insert("add", alu_uop(alu.clone(), 0.25));
         uops.insert("sub", alu_uop(alu.clone(), 0.25));
         uops.insert("lea", alu_uop(vec![Port::P1, Port::P2, Port::P3], 1.0));
+        uops.insert("lea3", alu_uop(vec![Port::P1, Port::P2, Port::P3], 1.0));
         uops.insert("inc", alu_uop(alu.clone(), 0.25));
         uops.insert("dec", alu_uop(alu.clone(), 0.25));
         uops.insert("mul", mul_uop(vec![Port::P0, Port::P1, Port::P2, Port::P3], 3, 0.33, true));
         uops.insert("div", div_uop(vec![Port::P0], 30, 30.0));
         uops.insert("rem", div_uop(vec![Port::P0], 30, 30.0));
+        uops.insert("andn", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsi", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsr", alu_uop(alu.clone(), 0.25));
+        uops.insert("blsmsk", alu_uop(alu.clone(), 0.25));
+        uops.insert("xor_zero", alu_uop(alu.clone(), 0.0));
+        uops.insert("test_z", alu_uop(alu.clone(), 0.25));
+        uops.insert("test_nz", alu_uop(alu.clone(), 0.25));
+        uops.insert("cmp", alu_uop(alu.clone(), 0.25));
+        uops.insert("ror", alu_uop(alu.clone(), 0.25));
+        uops.insert("rol", alu_uop(alu.clone(), 0.25));
         uops.insert("load", load_uop(vec![Port::P4, Port::P5], 4, 0.5));
         PortMap {
             name: "AMD Zen 4",
@@ -520,7 +602,7 @@ impl UopScheduler {
 
             for &port in &uop.ports {
                 if let Some(&available) = self.port_availability.get(&port) {
-                    let start = available.max(self.current_cycle);
+                    let start = available;
                     if start < best_cycle {
                         best_cycle = start;
                         best_port = Some(port);
@@ -529,10 +611,7 @@ impl UopScheduler {
             }
 
             let execution_cycle = match best_port {
-                Some(p) => {
-                    let avail = self.port_availability.get(&p).copied().unwrap_or(0);
-                    avail.max(self.current_cycle)
-                }
+                Some(_) => best_cycle,
                 None => self.current_cycle,
             };
 
@@ -543,9 +622,9 @@ impl UopScheduler {
                 self.port_availability.insert(port, execution_cycle + 1);
             }
 
-            // Advance current cycle
-            if execution_cycle >= self.current_cycle {
-                self.current_cycle = execution_cycle + 1;
+            // Track the latest completion cycle for overall sequence cost
+            if completion_cycle > self.current_cycle {
+                self.current_cycle = completion_cycle;
             }
 
             completion_cycle

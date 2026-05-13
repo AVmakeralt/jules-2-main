@@ -14,7 +14,7 @@
 // - Side-exit table for trace stitching & interpreter fallback
 // - Zero external dependencies (raw FFI for mmap/mprotect)
 // =============================================================================
-#![allow(dead_code)]
+
 
 use rustc_hash::FxHashMap;
 use std::mem;
@@ -65,6 +65,19 @@ impl Value {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Guard { pub slot: u16, pub expected_type: ValueType }
+
+impl From<u8> for ValueType {
+    fn from(v: u8) -> Self {
+        match v {
+            0 => ValueType::I64,
+            1 => ValueType::F64,
+            2 => ValueType::Bool,
+            3 => ValueType::Unit,
+            4 => ValueType::Tensor,
+            _ => ValueType::Unknown,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SideExit {
@@ -142,11 +155,19 @@ pub struct TraceRecorder {
     next_trace_id: u32,
     traces: Vec<Trace>,
     trace_selection: FxHashMap<u64, u32>,
+    /// Maximum number of instructions allowed in a single trace before
+    /// recording is aborted.  Prevents unbounded trace growth which would
+    /// blow compile time and i-cache footprint.
+    max_trace_length: usize,
 }
 
 impl TraceRecorder {
     pub fn new() -> Self {
-        Self { current_trace: None, next_trace_id: 0, traces: Vec::new(), trace_selection: FxHashMap::default() }
+        Self { current_trace: None, next_trace_id: 0, traces: Vec::new(), trace_selection: FxHashMap::default(), max_trace_length: 512 }
+    }
+
+    pub fn with_max_trace_length(max_trace_length: usize) -> Self {
+        Self { current_trace: None, next_trace_id: 0, traces: Vec::new(), trace_selection: FxHashMap::default(), max_trace_length }
     }
 
     pub fn start_recording(&mut self, entry_pc: usize) {
@@ -163,6 +184,24 @@ impl TraceRecorder {
         if let Some(ref mut trace) = self.current_trace {
             trace.instructions.push(TraceInstruction { original_pc: pc, instruction: instr.clone(), guard: None });
         }
+    }
+
+    /// Returns true if the current trace has exceeded the maximum trace
+    /// length and should be aborted.  Callers should check this after each
+    /// record_instruction call during execution-driven tracing.
+    pub fn should_abort_trace(&self) -> bool {
+        if let Some(ref trace) = self.current_trace {
+            trace.instructions.len() > self.max_trace_length
+        } else {
+            false
+        }
+    }
+
+    /// Abort the current recording, discarding the trace entirely.
+    /// Used when a trace grows beyond `max_trace_length` or when an
+    /// untraceable operation is encountered.
+    pub fn abort_recording(&mut self) {
+        self.current_trace = None;
     }
 
     pub fn record_guard(&mut self, slot: u16, expected_type: ValueType) {
@@ -935,6 +974,14 @@ pub struct TracingJIT {
     /// after the hot threshold — making the JIT essentially useless since
     /// compilation overhead (mmap + codegen + mprotect) exceeds any benefit.
     compiled_cache: FxHashMap<u32, CompiledTrace>,
+    /// Polymorphic Inline Cache: maps (slot, failed_type) → trace_id for
+    /// secondary traces compiled after a guard failure.  This enables trace
+    /// stitching — when a guard fails because a slot changed type, the PIC
+    /// provides an alternative trace specialised for the new type.
+    pic: PolymorphicInlineCache,
+    /// Maximum number of instructions allowed in a single trace before
+    /// recording is aborted (default: 512).
+    max_trace_length: usize,
 }
 
 impl TracingJIT {
@@ -944,11 +991,43 @@ impl TracingJIT {
             trace_trigger: 100, compile_trigger: 10, traces_recorded: 0,
             traces_compiled: 0, deoptimizations: 0, hot_counters: FxHashMap::default(),
             compiled_cache: FxHashMap::default(),
+            pic: PolymorphicInlineCache::new(16),
+            max_trace_length: 512,
         }
     }
 
-    pub fn should_start_tracing(&self, c: u64) -> bool { c == self.trace_trigger }
+    pub fn should_start_tracing(&self, c: u64) -> bool { c >= self.trace_trigger }
     pub fn should_compile(&self, t: &Trace) -> bool { t.execution_count >= self.compile_trigger }
+
+    /// Detect which guard failed by scanning the type array against the
+    /// trace's guard list.  Returns the first (slot, observed_type) pair
+    /// where the actual type differs from the guard's expected type.
+    fn detect_guard_failure(trace: &Trace, types: &[u8]) -> Option<(u16, ValueType)> {
+        for guard in &trace.guards {
+            let slot_idx = guard.slot as usize;
+            if let Some(&actual_byte) = types.get(slot_idx) {
+                let actual_type = ValueType::from(actual_byte);
+                if actual_type != guard.expected_type {
+                    return Some((guard.slot, actual_type));
+                }
+            }
+        }
+        None
+    }
+
+    /// Record a guard failure in the PIC and trigger recording of a new
+    /// trace for the failed type path.  The new trace will be compiled
+    /// on the next execution when it becomes hot.
+    fn record_guard_failure(&mut self, entry_pc: usize, slot: u16, failed_type: ValueType) {
+        // Start recording a secondary trace from this PC, specialised
+        // for the new type.  When it finishes, wire it into the PIC.
+        self.recorder.start_recording(entry_pc);
+        self.recorder.record_guard(slot, failed_type);
+        if let Some(new_trace_id) = self.recorder.finish_recording() {
+            self.pic.add_side_exit(slot, failed_type, new_trace_id);
+        }
+        self.traces_recorded += 1;
+    }
 
     pub fn execute_with_jit(&mut self, entry_pc: usize, slots: &mut [Value], types: &mut [u8], _instructions: &[Instr]) -> Result<Value, RuntimeError> {
         if let Some(tid) = self.recorder.find_trace(entry_pc) {
@@ -963,7 +1042,27 @@ impl TracingJIT {
             if let Some(ct) = self.compiled_cache.get(&tid) {
                 let res = unsafe { ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr(), std::ptr::null_mut() as *mut u8) };
                 if res >= 0 { return Ok(Value::I64(res)); }
+                // Guard failed — try PIC recovery before falling back to interpreter
                 self.deoptimizations += 1;
+                if let Some(trace) = self.recorder.get_trace(tid) {
+                    if let Some((slot, failed_type)) = Self::detect_guard_failure(trace, types) {
+                        // Try PIC: look up a secondary trace for this guard failure
+                        if let Some(pic_tid) = self.pic.lookup(slot, failed_type) {
+                            if let Some(pic_ct) = self.compiled_cache.get(&pic_tid) {
+                                let pic_res = unsafe { pic_ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr(), std::ptr::null_mut() as *mut u8) };
+                                if pic_res >= 0 { return Ok(Value::I64(pic_res)); }
+                                // PIC trace also deoptimized
+                                self.deoptimizations += 1;
+                            }
+                        } else {
+                            // No PIC entry yet — record the guard failure so a
+                            // secondary trace can be compiled for next time
+                            self.record_guard_failure(entry_pc, slot, failed_type);
+                        }
+                    }
+                }
+                // Fall back to interpreter gracefully (return Err signals the
+                // caller to use the interpreter, which is the correct behaviour)
             } else if let Some(trace) = self.recorder.get_trace(tid) {
                 if self.should_compile(trace) && !trace.instructions.is_empty() {
                     match self.codegen.compile_trace(trace, None) {
@@ -975,7 +1074,26 @@ impl TracingJIT {
                                 self.compiled_cache.insert(tid, ct);
                                 return Ok(Value::I64(res));
                             }
+                            // Guard failed on freshly compiled trace — try PIC recovery
                             self.deoptimizations += 1;
+                            if let Some((slot, failed_type)) = Self::detect_guard_failure(trace, types) {
+                                if let Some(pic_tid) = self.pic.lookup(slot, failed_type) {
+                                    if let Some(pic_ct) = self.compiled_cache.get(&pic_tid) {
+                                        let pic_res = unsafe { pic_ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr(), std::ptr::null_mut() as *mut u8) };
+                                        if pic_res >= 0 {
+                                            self.compiled_cache.insert(tid, ct);
+                                            return Ok(Value::I64(pic_res));
+                                        }
+                                        self.deoptimizations += 1;
+                                    }
+                                } else {
+                                    // Record guard failure for future PIC entry
+                                    self.record_guard_failure(entry_pc, slot, failed_type);
+                                }
+                            }
+                            // Still cache the primary trace so we don't recompile
+                            // next time (it will just deopt again and fall through)
+                            self.compiled_cache.insert(tid, ct);
                         }
                         Err(_) => { self.deoptimizations += 1; }
                     }
@@ -984,7 +1102,11 @@ impl TracingJIT {
             if let Some(t) = self.recorder.get_trace_mut(tid) { t.execution_count += 1; }
         }
         let hot_count = *self.hot_counters.entry(entry_pc as u64).and_modify(|c| *c += 1).or_insert(1);
-        if self.should_start_tracing(hot_count) { self.recorder.start_recording(entry_pc); self.traces_recorded += 1; }
-        Err(RuntimeError::new("Interpreter fallback: JIT trace hot but not compiled, or guard failed"))
+        if self.should_start_tracing(hot_count) {
+            self.recorder = TraceRecorder::with_max_trace_length(self.max_trace_length);
+            self.recorder.start_recording(entry_pc);
+            self.traces_recorded += 1;
+        }
+        Err(RuntimeError::new("Deoptimization: falling back to interpreter"))
     }
 }

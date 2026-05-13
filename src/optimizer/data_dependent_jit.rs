@@ -587,13 +587,16 @@ impl DataDependentJIT {
                 }
             }
 
-            // Check for SIMD batch specialization opportunity
-            let name_lower = info.var_name.to_lowercase();
-            if (name_lower.contains("batch") || name_lower.contains("size"))
-                && Self::is_simd_friendly_size(info.hot_value as usize)
-            {
-                let batch_size = info.hot_value as usize;
-                let simd_lanes = 8; // AVX2 f32
+            // Check for SIMD opportunity based on observed value characteristics
+            // (data-driven: any variable with a SIMD-friendly hot value is a candidate,
+            // not just ones whose names happen to contain "batch" or "size")
+            let value = info.hot_value;
+            let is_simd_candidate = value >= 4 && Self::is_simd_friendly_size(value as usize);
+            if is_simd_candidate {
+                let batch_size = value as usize;
+                let simd_lanes = if batch_size >= 16 { 16 } // AVX-512
+                                else if batch_size >= 8 { 8 }  // AVX2
+                                else { 4 };                     // SSE
                 let full_vectors = batch_size / simd_lanes;
                 let remainder = batch_size % simd_lanes;
                 let estimated_speedup = if remainder == 0 {
@@ -788,34 +791,18 @@ impl DataDependentJIT {
                 0
             };
 
-            // Find which variables would benefit most
-            let mut candidates: Vec<(String, f64)> = Vec::new();
-            for (var_name, obs) in &self.profiles {
-                if let Some(ref hot) = obs.hot_value {
-                    // Check if this variable is relevant to this function
-                    // Heuristic: include if the variable name contains the function name
-                    // or if it's a universally relevant variable (batch, size, etc.)
-                    let relevant = var_name.contains(fn_name)
-                        || {
-                            let lower = var_name.to_lowercase();
-                            lower.contains("batch")
-                                || lower.contains("size")
-                                || lower.contains("flag")
-                                || lower.contains("enable")
-                                || lower.contains("count")
-                                || lower.contains("dim")
-                                || lower.contains("len")
-                                || lower.contains("width")
-                                || lower.contains("is_")
-                                || lower.contains("has_")
-                                || lower.contains("can_")
-                                || lower.contains("use")
-                        };
-                    if relevant {
-                        candidates.push((var_name.clone(), hot.estimated_speedup));
-                    }
-                }
-            }
+            // Rank ALL hot variables by estimated speedup, not just name-matched ones.
+            // The old approach used variable name matching (checking for "batch",
+            // "size", "flag", etc.) which was fundamentally broken — a variable
+            // named `x` would be missed even if it was a batch size.
+            // Now we rank by actual estimated speedup from observed data.
+            let mut candidates: Vec<(String, f64)> = self.profiles.iter()
+                .filter_map(|(var_name, obs)| {
+                    obs.hot_value.as_ref().map(|hot| {
+                        (var_name.clone(), hot.estimated_speedup)
+                    })
+                })
+                .collect();
 
             // Sort by estimated speedup descending
             candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -838,57 +825,51 @@ impl DataDependentJIT {
     // ── Internal estimation methods ─────────────────────────────────────
 
     fn estimate_speedup(&self, var_name: &str, value: i64, frequency: f64) -> f64 {
-        // Heuristic speedup estimation based on what specialization enables
-        let name_lower = var_name.to_lowercase();
+        // Data-driven speedup estimation: analyze the ACTUAL OBSERVED DATA
+        // rather than relying on variable name patterns.
+        let obs = match self.profiles.get(var_name) {
+            Some(o) => o,
+            None => return 1.2 * frequency,
+        };
 
-        // Batch-size-like variables enable loop unrolling + SIMD
-        if name_lower.contains("batch") || name_lower.contains("size") || name_lower.contains("count") {
-            // Check for SIMD opportunity
-            if Self::is_simd_friendly_size(value as usize) {
-                let simd_lanes = 8.0; // AVX2 f32
-                let batch = value as f64;
-                let remainder = value as usize % 8;
-                let simd_speedup = if remainder == 0 {
-                    simd_lanes
-                } else {
-                    (batch / simd_lanes).floor() * simd_lanes / batch * simd_lanes
-                };
-                return simd_speedup * frequency;
-            }
-            if value <= 8 {
-                8.0 * frequency  // Full unroll: 8x speedup * hit rate
-            } else if value <= 64 {
-                3.0 * frequency  // Partial unroll
+        // Data-driven heuristic: analyze the observed value distribution
+        let distinct_values = obs.int_values.len();
+        let is_power_of_2 = value > 0 && (value as usize & (value as usize - 1)) == 0;
+        let range = obs.observed_max - obs.observed_min;
+        let is_small_range = range <= 8 && distinct_values <= 8;
+
+        // Large constant value suggests batch/array size → SIMD opportunity
+        let likely_batch_size = value >= 4 && is_power_of_2;
+
+        // Boolean-like (only 0/1 observed) → branch elimination
+        let is_boolean_like = obs.is_boolean;
+
+        // Narrow value distribution → good specialization target
+        let narrow_distribution = frequency >= 0.9;
+
+        if is_boolean_like {
+            // Branch elimination: 2-4x speedup
+            if narrow_distribution { 3.0 * frequency }
+            else { 2.0 * frequency }
+        } else if likely_batch_size {
+            // SIMD batch: speedup depends on batch size alignment
+            let simd_lanes = if value >= 16 { 16.0 } // AVX-512
+                            else if value >= 8 { 8.0 }  // AVX2
+                            else { 4.0 };                // SSE
+            if value as usize % (simd_lanes as usize) == 0 {
+                simd_lanes * frequency  // Perfect SIMD fit
             } else {
-                1.5 * frequency  // Bound check elimination only
+                (simd_lanes * 0.7) * frequency  // Imperfect fit
             }
-        }
-        // Dimension-like variables enable SIMD specialization
-        else if name_lower.contains("dim") || name_lower.contains("width") || name_lower.contains("len") {
-            if Self::is_simd_friendly_size(value as usize) {
-                6.0 * frequency // SIMD + unrolling
-            } else {
-                2.0 * frequency
-            }
-        }
-        // Flag-like variables enable branch elimination (higher speedup: 2-4x)
-        else if name_lower.contains("flag")
-            || name_lower.contains("enable")
-            || name_lower.contains("use")
-            || name_lower.contains("is_")
-            || name_lower.contains("has_")
-            || name_lower.contains("can_")
-        {
-            // If the value is boolean (0 or 1) and always the same, entire branches
-            // can be eliminated, giving 2-4x speedup
-            if value == 0 || value == 1 {
-                3.0 * frequency // Branch elimination: 3x average
-            } else {
-                1.5 * frequency
-            }
-        }
-        else {
-            1.2 * frequency  // Conservative default
+        } else if is_small_range {
+            // Small range → switch table optimization
+            2.5 * frequency
+        } else if narrow_distribution {
+            // Narrow distribution → constant specialization
+            1.5 * frequency
+        } else {
+            // Conservative default
+            1.2 * frequency
         }
     }
 
@@ -903,6 +884,25 @@ impl DataDependentJIT {
     /// Check if a size is SIMD-friendly (power of 2 and >= 4)
     fn is_simd_friendly_size(size: usize) -> bool {
         size >= 4 && (size & (size - 1)) == 0
+    }
+
+    /// Adapt thresholds based on observed data to optimize specialization selectivity.
+    ///
+    /// If too many variables are classified as "hot", we increase the threshold
+    /// to be more selective. If too few, we lower it to catch more opportunities.
+    pub fn adapt_thresholds(&mut self) {
+        // If many variables are hot, increase threshold to be more selective
+        let hot_ratio = self.profiles.values()
+            .filter(|p| p.hot_value.is_some())
+            .count() as f64 / self.profiles.len().max(1) as f64;
+
+        if hot_ratio > 0.5 {
+            // Too many hot variables — be more selective
+            self.hot_threshold = (self.hot_threshold + 0.05).min(0.95);
+        } else if hot_ratio < 0.1 {
+            // Too few — be less selective
+            self.hot_threshold = (self.hot_threshold - 0.05).max(0.5);
+        }
     }
 
     /// Handle drift detected for a variable
@@ -1206,9 +1206,10 @@ mod tests {
         assert!(spec.simd_specialization.is_some());
         let simd = spec.simd_specialization.unwrap();
         assert_eq!(simd.batch_size, 16);
-        assert_eq!(simd.simd_lanes, 8);
-        assert_eq!(simd.full_vectors, 2);
-        assert_eq!(simd.remainder, 0);
+        // With data-driven SIMD lanes: batch_size >= 16 → AVX-512 (16 lanes)
+        assert_eq!(simd.simd_lanes, 16);
+        assert_eq!(simd.full_vectors, 1); // 16 / 16 = 1
+        assert_eq!(simd.remainder, 0);   // 16 % 16 = 0
         assert!(simd.estimated_speedup > 0.0);
     }
 
@@ -1240,8 +1241,9 @@ mod tests {
         assert!(spec.simd_specialization.is_some());
         let simd = spec.simd_specialization.unwrap();
         assert_eq!(simd.batch_size, 4);
-        assert_eq!(simd.remainder, 4); // 4 % 8 = 4
-        assert_eq!(simd.full_vectors, 0); // 4 / 8 = 0
+        // With data-driven SIMD lanes: batch_size < 8 → SSE (4 lanes)
+        assert_eq!(simd.remainder, 0);   // 4 % 4 = 0
+        assert_eq!(simd.full_vectors, 1); // 4 / 4 = 1
     }
 
     #[test]
@@ -1470,6 +1472,202 @@ mod tests {
                 assert_eq!(estimated_savings, 1000);
             }
             _ => panic!("Expected FixedCount"),
+        }
+    }
+
+    // ── Tests for data-driven heuristics (replacing name-based matching) ──
+
+    #[test]
+    fn test_data_driven_speedup_generic_variable_with_power_of_2() {
+        // The KEY bug fix: a variable named "x" with value 64 (power of 2)
+        // should get SIMD speedup, not just the conservative 1.2x default.
+        let mut jit = DataDependentJIT::new();
+        jit.min_observations = 10;
+
+        // Observe a generically-named variable with a power-of-2 value
+        for _ in 0..10 {
+            jit.observe_int("x", 64);
+        }
+
+        let hot = jit.get_hot_value("x");
+        assert!(hot.is_some());
+        let hot = hot.unwrap();
+        assert_eq!(hot.value, 64);
+        // With data-driven heuristics, 64 is power of 2 and >= 16 → AVX-512 (16 lanes)
+        // 64 % 16 == 0, so perfect fit: speedup = 16.0 * frequency
+        assert!(hot.estimated_speedup > 1.2, "Generic variable x with power-of-2 value should get SIMD speedup, got {}", hot.estimated_speedup);
+    }
+
+    #[test]
+    fn test_data_driven_simd_specialization_for_generic_name() {
+        // A variable named "n" with value 8 should trigger SIMD specialization
+        // even though the name doesn't contain "batch" or "size"
+        let mut jit = DataDependentJIT::new();
+        jit.min_observations = 10;
+
+        for _ in 0..10 {
+            jit.observe_int("n", 8);
+        }
+
+        let spec = jit.try_specialize("process", &["n".to_string()]);
+        assert!(spec.is_some());
+        let spec = spec.unwrap();
+        // With data-driven detection, "n"=8 should get SIMD specialization
+        assert!(spec.simd_specialization.is_some());
+        let simd = spec.simd_specialization.unwrap();
+        assert_eq!(simd.batch_size, 8);
+        assert_eq!(simd.simd_lanes, 8); // 8 → AVX2
+        assert_eq!(simd.full_vectors, 1);
+        assert_eq!(simd.remainder, 0);
+    }
+
+    #[test]
+    fn test_data_driven_speedup_boolean_observable() {
+        // A variable that is observed as boolean should get branch elimination speedup
+        // regardless of its name
+        let mut jit = DataDependentJIT::new();
+        jit.min_observations = 10;
+
+        for _ in 0..10 {
+            jit.observe_bool("config_val", true);
+        }
+
+        let hot = jit.get_hot_value("config_val");
+        assert!(hot.is_some());
+        let hot = hot.unwrap();
+        // Boolean with narrow distribution → 3.0 * frequency
+        assert!(hot.estimated_speedup >= 2.0,
+            "Boolean variable should get branch elimination speedup, got {}", hot.estimated_speedup);
+    }
+
+    #[test]
+    fn test_data_driven_speedup_small_range() {
+        // A variable with small observed range should get switch table speedup
+        let mut jit = DataDependentJIT::new();
+        jit.min_observations = 10;
+
+        for i in 0..10 {
+            jit.observe_int("mode", (i % 3) as i64);
+        }
+
+        // "mode" with values 0,1,2 has a small range
+        // The hot value will have frequency 0.4 (4/10) which is < 0.7 threshold
+        // So we need to increase observations for a single value to be "hot"
+        // Let's observe more of value 1 to make it hot
+        for _ in 0..90 {
+            jit.observe_int("mode", 1);
+        }
+
+        let hot = jit.get_hot_value("mode");
+        // With 94 observations of value 1 out of 100 total = 0.94 frequency
+        if let Some(h) = hot {
+            // Small range (0-2) → switch table speedup = 2.5 * frequency
+            assert!(h.estimated_speedup > 1.5,
+                "Small range variable should get switch table speedup, got {}", h.estimated_speedup);
+        }
+    }
+
+    #[test]
+    fn test_adapt_thresholds_increases_when_many_hot() {
+        let mut jit = DataDependentJIT::new();
+        jit.min_observations = 10;
+        jit.hot_threshold = 0.7;
+
+        // Make most variables hot
+        for i in 0..10 {
+            let var_name = format!("var_{}", i);
+            for _ in 0..10 {
+                jit.observe_int(&var_name, i);
+            }
+        }
+
+        let threshold_before = jit.hot_threshold;
+        jit.adapt_thresholds();
+        // With all 10 variables hot, ratio = 1.0 > 0.5 → increase threshold
+        assert!(jit.hot_threshold > threshold_before,
+            "Threshold should increase when many variables are hot: {} -> {}", threshold_before, jit.hot_threshold);
+    }
+
+    #[test]
+    fn test_adapt_thresholds_decreases_when_few_hot() {
+        let mut jit = DataDependentJIT::new();
+        jit.min_observations = 10;
+        jit.hot_threshold = 0.7;
+
+        // Create many variables but make only 1 hot
+        for i in 0..20 {
+            let var_name = format!("var_{}", i);
+            if i == 0 {
+                for _ in 0..10 {
+                    jit.observe_int(&var_name, 42);
+                }
+            } else {
+                // Observe diverse values so they won't be hot
+                for j in 0..10 {
+                    jit.observe_int(&var_name, j * 100 + i);
+                }
+            }
+        }
+
+        let threshold_before = jit.hot_threshold;
+        jit.adapt_thresholds();
+        // With only 1/20 = 5% hot, ratio < 0.1 → decrease threshold
+        assert!(jit.hot_threshold < threshold_before,
+            "Threshold should decrease when few variables are hot: {} -> {}", threshold_before, jit.hot_threshold);
+    }
+
+    #[test]
+    fn test_adapt_thresholds_no_change_when_balanced() {
+        let mut jit = DataDependentJIT::new();
+        jit.min_observations = 10;
+        jit.hot_threshold = 0.7;
+
+        // Make roughly half the variables hot
+        for i in 0..10 {
+            let var_name = format!("var_{}", i);
+            if i < 3 {
+                for _ in 0..10 {
+                    jit.observe_int(&var_name, 42);
+                }
+            } else {
+                for j in 0..10 {
+                    jit.observe_int(&var_name, j * 100 + i);
+                }
+            }
+        }
+
+        let threshold_before = jit.hot_threshold;
+        jit.adapt_thresholds();
+        // 3/10 = 30% hot, which is between 10% and 50% → no change
+        assert_eq!(jit.hot_threshold, threshold_before,
+            "Threshold should not change when hot ratio is balanced");
+    }
+
+    #[test]
+    fn test_identify_hot_paths_includes_all_hot_variables() {
+        // Verify that identify_hot_paths ranks ALL hot variables by speedup,
+        // not just ones with name-based keywords
+        let mut jit = DataDependentJIT::new();
+        jit.min_observations = 10;
+
+        // Profile a function call with various arg values
+        for _ in 0..50 {
+            jit.post_call("compute", &[64, 1], 1000);
+        }
+
+        let paths = jit.identify_hot_paths();
+        assert!(!paths.is_empty());
+
+        let compute = paths.iter().find(|p| p.fn_name == "compute");
+        assert!(compute.is_some());
+        let compute = compute.unwrap();
+        // Should have candidates regardless of variable names
+        // compute_arg0=64 (SIMD-friendly, high speedup) should be ranked first
+        if !compute.best_specialization_candidates.is_empty() {
+            // The top candidate should be the one with highest speedup
+            // which is the SIMD-friendly arg0=64
+            let top = &compute.best_specialization_candidates[0];
+            assert!(top.1 > 1.5, "Top candidate should have significant speedup, got {}", top.1);
         }
     }
 }

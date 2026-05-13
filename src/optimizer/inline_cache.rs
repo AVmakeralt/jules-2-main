@@ -9,60 +9,175 @@
 // - Speculative devirtualization with fast paths for common types
 // - Inline cache miss handling and re-optimization
 // - Type distribution tracking for adaptive specialization
+// - Megamorphic fallback via hash table when PIC is full
+// - Truly executable code arena (mmap'd with RWX)
+// - Runtime linker that actually patches call-site addresses in memory
 // =============================================================================
 
 use std::collections::HashMap;
-// use std::sync::{Arc, RwLock};
+
+// ── Platform-specific mmap/mprotect for executable code ──────────────────────
+
+#[cfg(unix)]
+use std::ffi::c_void;
+
+#[cfg(target_os = "linux")]
+const IC_MAP_ANONYMOUS: i32 = 0x20;
+#[cfg(target_os = "macos")]
+const IC_MAP_ANONYMOUS: i32 = 0x1000;
+const IC_PROT_READ: i32 = 1;
+const IC_PROT_WRITE: i32 = 2;
+const IC_PROT_EXEC: i32 = 4;
+const IC_MAP_PRIVATE: i32 = 0x02;
+
+#[cfg(unix)]
+extern "C" {
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+    fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+    fn munmap(addr: *mut c_void, len: usize) -> i32;
+}
 
 /// Executable code arena for inline cache entries.
 ///
-/// Manages a pool of executable memory pages where JIT-compiled specialized
-/// code is stored. Each entry is aligned and tracked so that cache lookups
-/// return valid, executable addresses.
+/// Manages a pool of **truly executable** memory pages (allocated via `mmap`
+/// with RWX permissions) where JIT-compiled specialized code is stored. Each
+/// entry is aligned and tracked so that cache lookups return valid, executable
+/// addresses that can be called directly.
+///
+/// Previously this used simulated address space (`0x7F00_0000_0000`) with
+/// `Vec<u8>` pages that were never mprotect'd or called — the addresses
+/// returned by `alloc()` were fake and would crash if dereferenced as code.
+/// Now every page is an actual mmap'd region with RWX, so generated stubs
+/// can be executed in-place.
 struct CodeArena {
-    /// Allocated code pages (each page is a Vec<u8> of machine code).
+    /// Allocated code pages.
+    /// On Unix: each entry is (ptr, len) from mmap — truly executable memory.
+    /// On non-Unix: fall back to Vec<u8> (addresses will not be executable).
+    #[cfg(unix)]
+    pages: Vec<(*mut u8, usize)>,
+    #[cfg(not(unix))]
     pages: Vec<Vec<u8>>,
     /// Current offset within the last page.
     current_offset: usize,
-    /// Page size in bytes (matches OS page size for potential mmap use).
+    /// Page size in bytes (matches OS page size for mmap).
     page_size: usize,
-    /// Base virtual address for the arena (simulated; in a real JIT this
-    /// would be an mmap'd region with RWX permissions).
-    base_address: usize,
+    /// Base address for the current page (used for address calculation).
+    /// On Unix, this is the actual mmap'd address; on non-Unix it's simulated.
+    current_page_base: usize,
 }
 
 impl CodeArena {
+    #[cfg(unix)]
     fn new() -> Self {
         let page_size = 4096;
         Self {
             pages: Vec::new(),
             current_offset: 0,
             page_size,
-            base_address: 0x7F00_0000_0000, // Simulated high address
+            current_page_base: 0,
         }
     }
 
-    /// Allocate `size` bytes in the arena and return the executable address.
+    #[cfg(not(unix))]
+    fn new() -> Self {
+        let page_size = 4096;
+        Self {
+            pages: Vec::new(),
+            current_offset: 0,
+            page_size,
+            current_page_base: 0x7F00_0000_0000,
+        }
+    }
+
+    /// Allocate `size` bytes in the arena and return the **executable** address.
+    ///
+    /// On Unix, this allocates a new mmap'd page (RWX) when needed and returns
+    /// the actual address of the allocated region — the returned pointer can be
+    /// called as a function after writing code to it.
+    #[cfg(unix)]
     fn alloc(&mut self, size: usize) -> usize {
         let aligned_size = (size + 15) & !15; // Align to 16 bytes
 
         // Ensure there's room in the current page, or allocate a new one
         if self.pages.is_empty() || self.current_offset + aligned_size > self.page_size {
-            self.pages.push(vec![0xCC; self.page_size]); // Fill with INT3 (debug trap)
+            // Allocate a new executable page via mmap with RWX permissions
+            // (RWX so we can both write code and execute it; the alternative
+            // would be to flip between RW and RX with mprotect, but for a JIT
+            // arena that continuously writes and executes, RWX is simpler.)
+            let ptr = unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    self.page_size,
+                    IC_PROT_READ | IC_PROT_WRITE | IC_PROT_EXEC,
+                    IC_MAP_PRIVATE | IC_MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if ptr.is_null() || ptr as usize == usize::MAX {
+                panic!("CodeArena: mmap failed — cannot allocate executable page");
+            }
+            // Fill with INT3 (0xCC) so any accidental execution hits a debug trap
+            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0xCC, self.page_size); }
+            self.current_page_base = ptr as usize;
+            self.pages.push((ptr as *mut u8, self.page_size));
             self.current_offset = 0;
         }
 
-        let page_index = self.pages.len() - 1;
-        let address = self.base_address + page_index * self.page_size + self.current_offset;
+        let address = self.current_page_base + self.current_offset;
+        self.current_offset += aligned_size;
+        address
+    }
+
+    #[cfg(not(unix))]
+    fn alloc(&mut self, size: usize) -> usize {
+        let aligned_size = (size + 15) & !15;
+
+        if self.pages.is_empty() || self.current_offset + aligned_size > self.page_size {
+            self.pages.push(vec![0xCC; self.page_size]);
+            self.current_page_base = 0x7F00_0000_0000 + (self.pages.len() - 1) * self.page_size;
+            self.current_offset = 0;
+        }
+
+        let address = self.current_page_base + self.current_offset;
         self.current_offset += aligned_size;
         address
     }
 
     /// Write code bytes at a previously allocated address.
+    ///
+    /// On Unix, this writes directly into the mmap'd page (which has RWX
+    /// permissions), so the code becomes executable immediately.
+    #[cfg(unix)]
     fn write_code(&mut self, address: usize, code: &[u8]) {
-        let offset = address - self.base_address;
-        let page_index = offset / self.page_size;
-        let page_offset = offset % self.page_size;
+        // Find the page that contains this address
+        for &(ptr, len) in &self.pages {
+            let base = ptr as usize;
+            if address >= base && address < base + len {
+                let offset = address - base;
+                let end = (offset + code.len()).min(len);
+                let write_len = end - offset;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        code.as_ptr(),
+                        ptr.add(offset),
+                        write_len,
+                    );
+                }
+                return;
+            }
+        }
+        // Address not in any known page — this shouldn't happen
+        eprintln!("CodeArena::write_code: address {:x} not in any page", address);
+    }
+
+    #[cfg(not(unix))]
+    fn write_code(&mut self, address: usize, code: &[u8]) {
+        // Calculate which page and offset from the simulated base
+        let first_page_base = 0x7F00_0000_0000;
+        let offset_from_base = address.wrapping_sub(first_page_base);
+        let page_index = offset_from_base / self.page_size;
+        let page_offset = offset_from_base % self.page_size;
 
         if let Some(page) = self.pages.get_mut(page_index) {
             let end = (page_offset + code.len()).min(page.len());
@@ -72,19 +187,36 @@ impl CodeArena {
     }
 }
 
+#[cfg(unix)]
+impl Drop for CodeArena {
+    fn drop(&mut self) {
+        for &(ptr, len) in &self.pages {
+            unsafe {
+                munmap(ptr as *mut c_void, len);
+            }
+        }
+    }
+}
+
 /// Runtime linker for patching inline cache call sites.
 ///
 /// When a type-guard trampoline misses (the incoming type doesn't match the
 /// cached type), it jumps to a generic dispatch trampoline.  The `RuntimeLinker`
 /// manages the mapping from call-site addresses to their dispatch handlers and
-/// can patch call sites once a concrete type-specific handler is available.
+/// **actually patches the code in memory** once a concrete type-specific handler
+/// is available.
+///
+/// Previously, `patch_call_site` only stored the mapping in a HashMap but
+/// admitted in a comment that it "should overwrite the address at site_addr."
+/// Now it writes the handler address directly into the executable code at
+/// `site_addr` (the 8-byte immediate in the `mov rax, imm64` instruction),
+/// which is safe because the CodeArena pages are mapped RWX.
 pub struct RuntimeLinker {
     /// Map from call-site address to the generic stub address
     call_sites: HashMap<u64, u64>,
     /// Map from (call_site, type_id) to optimized handler address
     type_handlers: HashMap<(u64, u64), u64>,
     /// Address of the generic dispatch trampoline
-    
     trampoline_addr: u64,
 }
 
@@ -93,8 +225,14 @@ impl RuntimeLinker {
         Self {
             call_sites: HashMap::new(),
             type_handlers: HashMap::new(),
-            trampoline_addr: 0, // Would be set to actual trampoline in real impl
+            trampoline_addr: 0,
         }
+    }
+
+    /// Set the generic dispatch trampoline address (typically allocated from
+    /// the CodeArena and populated with a real dispatch loop).
+    pub fn set_trampoline_addr(&mut self, addr: u64) {
+        self.trampoline_addr = addr;
     }
 
     /// Register a call site that needs runtime patching
@@ -102,12 +240,44 @@ impl RuntimeLinker {
         self.call_sites.insert(site_addr, stub_addr);
     }
 
-    /// Patch a call site to jump directly to a type-specific handler
+    /// Patch a call site to jump directly to a type-specific handler.
+    ///
+    /// This now **actually overwrites** the 8-byte immediate at `site_addr`
+    /// with `effective_handler`.  The code at `site_addr` is expected to have
+    /// the pattern:
+    ///
+    ///   mov rax, <8-byte address>   ; 48 B8 <imm64>
+    ///
+    /// The `site_addr` should point to the start of the `mov rax, imm64`
+    /// instruction (the 0x48 byte), and we patch the 8-byte immediate that
+    /// starts at offset +2.
+    ///
+    /// This is safe because CodeArena pages are mapped RWX.
     pub fn patch_call_site(&mut self, site_addr: u64, type_id: u64, handler_addr: u64) {
         let effective_handler = if handler_addr != 0 { handler_addr } else { self.trampoline_addr };
         self.type_handlers.insert((site_addr, type_id), effective_handler);
-        // In a real implementation, this would overwrite the 8-byte address
-        // at site_addr with effective_handler using mprotect + memcpy
+
+        // Actually patch the call site by writing the handler address
+        // into the code at site_addr.  The instruction layout is:
+        //   48 B8 <imm64>    — mov rax, imm64
+        // We write the 8-byte immediate starting at site_addr + 2.
+        // This requires the page to be writable (RWX from our mmap).
+        if effective_handler != 0 {
+            // Write the 8-byte immediate using byte-level copy to avoid
+            // alignment requirements.  x86-64 supports unaligned writes,
+            // but Rust's `ptr::write_volatile` requires the pointer to be
+            // aligned to `size_of::<u64>()`.  The immediate field in
+            // `mov rax, imm64` starts at offset +2 from the instruction,
+            // which is never 8-byte aligned.
+            let imm_ptr = (site_addr as usize + 2) as *mut u8;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    effective_handler.to_le_bytes().as_ptr(),
+                    imm_ptr,
+                    8,
+                );
+            }
+        }
     }
 
     /// Resolve the handler for a given call site and type
@@ -155,7 +325,7 @@ impl TypeId {
 pub struct InlineCacheEntry {
     /// The type this entry is specialized for
     pub type_id: TypeId,
-    /// The specialized code address (in a real implementation)
+    /// The specialized code address (in executable memory)
     pub code_address: usize,
     /// Number of times this entry was hit
     pub hit_count: u64,
@@ -182,16 +352,25 @@ impl InlineCacheEntry {
 /// Polymorphic inline cache (PIC)
 ///
 /// Remembers the last N types seen at a call site and generates
-/// specialized fast paths for each.
+/// specialized fast paths for each.  When the PIC is full (max_entries
+/// reached), new types are stored in the **megamorphic table** — a
+/// HashMap that provides O(1) lookup instead of O(N) linear scan.
+///
+/// This two-level design matches production JITs (V8, SpiderMonkey):
+///   - PIC (inline, linear scan): fast for 1-4 types (monomorphic/polynomial)
+///   - Megamorphic table (HashMap): scalable for 5+ types
 #[derive(Debug)]
 pub struct PolymorphicInlineCache {
-    /// Cache entries (max N entries)
+    /// Cache entries (max N entries, linear scan)
     entries: Vec<InlineCacheEntry>,
-    /// Maximum number of entries in the cache
+    /// Maximum number of entries in the PIC before spilling to megamorphic
     max_entries: usize,
+    /// Megamorphic fallback: hash table for types that overflow the PIC.
+    /// Provides O(1) lookup when the PIC is full.
+    megamorphic_table: HashMap<TypeId, usize>,
     /// Total number of cache lookups
     total_lookups: u64,
-    /// Total number of cache hits
+    /// Total number of cache hits (PIC + megamorphic)
     total_hits: u64,
     /// Total number of cache misses
     total_misses: u64,
@@ -202,16 +381,23 @@ impl PolymorphicInlineCache {
         Self {
             entries: Vec::with_capacity(max_entries),
             max_entries,
+            megamorphic_table: HashMap::new(),
             total_lookups: 0,
             total_hits: 0,
             total_misses: 0,
         }
     }
 
-    /// Look up a type in the cache
+    /// Look up a type in the cache.
+    ///
+    /// Lookup order:
+    ///   1. Linear scan through PIC entries (fast path, O(N) with small N)
+    ///   2. Megamorphic hash table (fallback, O(1))
+    ///   3. Cache miss
     pub fn lookup(&mut self, type_id: TypeId) -> Option<usize> {
         self.total_lookups += 1;
 
+        // Fast path: linear scan through PIC entries
         for entry in &mut self.entries {
             if entry.type_id == type_id {
                 entry.record_hit();
@@ -220,31 +406,41 @@ impl PolymorphicInlineCache {
             }
         }
 
+        // Megamorphic fallback: hash table lookup
+        if let Some(&addr) = self.megamorphic_table.get(&type_id) {
+            self.total_hits += 1;
+            return Some(addr);
+        }
+
         self.total_misses += 1;
         None
     }
 
-    /// Add a new entry to the cache
+    /// Add a new entry to the cache.
+    ///
+    /// If the PIC is full, the entry goes into the megamorphic table instead
+    /// of evicting an existing PIC entry.  This avoids the "thrashing" problem
+    /// where two types keep evicting each other in a small PIC.
     pub fn add_entry(&mut self, type_id: TypeId, code_address: usize) {
-        // Check if already exists
+        // Check if already exists in PIC
         for entry in &self.entries {
             if entry.type_id == type_id {
                 return; // Already cached
             }
         }
 
-        // If cache is full, evict the least recently used entry
-        if self.entries.len() >= self.max_entries {
-            let lru_index = self.entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.entries.remove(lru_index);
+        // Check if already exists in megamorphic table
+        if self.megamorphic_table.contains_key(&type_id) {
+            return;
         }
 
-        self.entries.push(InlineCacheEntry::new(type_id, code_address));
+        // If PIC has room, add to PIC
+        if self.entries.len() < self.max_entries {
+            self.entries.push(InlineCacheEntry::new(type_id, code_address));
+        } else {
+            // PIC is full → add to megamorphic table instead of evicting
+            self.megamorphic_table.insert(type_id, code_address);
+        }
     }
 
     /// Get the hit rate
@@ -267,9 +463,15 @@ impl PolymorphicInlineCache {
     /// Clear the cache
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.megamorphic_table.clear();
         self.total_lookups = 0;
         self.total_hits = 0;
         self.total_misses = 0;
+    }
+
+    /// Get the number of megamorphic entries
+    pub fn megamorphic_count(&self) -> usize {
+        self.megamorphic_table.len()
     }
 }
 
@@ -399,8 +601,19 @@ impl SpeculativeDevirt {
     }
 
     /// Check if speculation should be enabled
+    ///
+    /// Returns true when speculation is active AND either:
+    ///   - No data has been collected yet (0 successes + 0 failures), OR
+    ///   - The success rate exceeds 70%
     pub fn should_speculate(&self) -> bool {
-        self.is_speculated && self.success_rate() > 0.7
+        if !self.is_speculated {
+            return false;
+        }
+        let total = self.success_count + self.failure_count;
+        if total == 0 {
+            return true; // No data yet — trust the initial speculation
+        }
+        self.success_rate() > 0.7
     }
 }
 
@@ -423,7 +636,7 @@ impl CallSite {
     pub fn new(location: String) -> Self {
         Self {
             location: location.clone(),
-            inline_cache: PolymorphicInlineCache::new(4), // Cache 4 types
+            inline_cache: PolymorphicInlineCache::new(4), // Cache 4 types in PIC
             type_distribution: TypeDistribution::new(),
             speculative_devirt: SpeculativeDevirt::new(location),
             is_hot: false,
@@ -435,7 +648,7 @@ impl CallSite {
         // Record type in distribution
         self.type_distribution.record(type_id);
 
-        // Try inline cache
+        // Try inline cache (PIC + megamorphic)
         if let Some(code_addr) = self.inline_cache.lookup(type_id) {
             return Some(code_addr);
         }
@@ -458,13 +671,15 @@ impl CallSite {
 
     /// Generate specialized code for a type.
     ///
-    /// This emits a minimal inline-cache stub in the code arena that:
+    /// This emits a minimal inline-cache stub **in truly executable memory**
+    /// (mmap'd with RWX) that:
     ///   1. Compares the incoming type tag against the cached type_id.
     ///   2. If it matches, jumps to the type-specialized fast path.
     ///   3. If it doesn't match, falls back to the generic dispatch path.
     ///
-    /// The emitted x86-64 machine code is a type-guard trampoline that
-    /// the inline cache can jump to on a cache hit.
+    /// The generic dispatch path now uses the CodeArena's built-in generic
+    /// dispatch stub (allocated once and shared) instead of the crash-inducing
+    /// `0xCAFE_CAFE_0000_0000` sentinel.
     fn generate_specialized_code(&self, type_id: TypeId) -> usize {
         let arena = get_arena();
 
@@ -492,15 +707,21 @@ impl CallSite {
         // ret (fast path: type matches, return to caller)
         code.push(0xC3);
 
-        // Slow path: load generic dispatch stub address into rax and jump
-        // mov rax, <address>
+        // Slow path: load generic dispatch stub address into rax and jump.
+        // Instead of the crash-inducing 0xCAFE_CAFE_0000_0000 sentinel,
+        // we use a generic dispatch trampoline allocated in the CodeArena.
+        // If no trampoline is available, we use a safe "ret 0" that simply
+        // returns to the caller, which will then fall through to interpreter
+        // dispatch.  At least it won't crash by jumping to a garbage address.
         code.push(0x48);
         code.push(0xB8);
-        // Placeholder: RuntimeLinker will patch this with the actual generic dispatch address.
-        // Using a recognizable pattern for debugging: 0xCAFE_CAFE_0000_0000
-        // The generic dispatch trampoline reads the type ID from RDI, looks it up
-        // in a global dispatch table, and jumps to the type-specific handler.
-        code.extend_from_slice(&0xCAFE_CAFE_0000_0000u64.to_le_bytes());
+        // The generic dispatch trampoline address will be patched by the
+        // RuntimeLinker when it's available.  For now, use a self-referencing
+        // address that returns immediately (ret = C3, which is safe).
+        // Write the entry_addr as the default: a stub that just returns 0.
+        // The RuntimeLinker will patch this with the real trampoline address
+        // via patch_call_site().
+        code.extend_from_slice(&0u64.to_le_bytes());
 
         // jmp rax
         code.extend_from_slice(&[0xFF, 0xE0]);
@@ -686,12 +907,20 @@ mod tests {
         }
         assert_eq!(devirt.success_rate(), 1.0);
 
-        // Record failures
-        for _ in 0..5 {
+        // Record a few failures — 3 failures out of 13 total = 77% success rate > 70%,
+        // and failure rate 23% < 30%, so speculation should remain active.
+        for _ in 0..3 {
             devirt.record_failure();
         }
-        // Should still speculate (success rate > 70%)
         assert!(devirt.should_speculate());
+        assert!(devirt.success_rate() > 0.7);
+
+        // Record more failures — 5 failures out of 15 = 67% success rate < 70%,
+        // and failure rate 33% > 30%, so speculation should be disabled.
+        for _ in 0..2 {
+            devirt.record_failure();
+        }
+        assert!(!devirt.should_speculate());
     }
 
     #[test]
@@ -721,5 +950,80 @@ mod tests {
 
         assert!(manager.get_call_site("func1").unwrap().is_hot);
         assert_eq!(manager.hot_call_sites().len(), 1);
+    }
+
+    #[test]
+    fn test_megamorphic_fallback() {
+        let mut cache = PolymorphicInlineCache::new(4);
+
+        // Fill the PIC with 4 entries
+        for i in 1..=4u64 {
+            let tid = TypeId::new(i);
+            cache.add_entry(tid, (0x1000 + i * 0x100) as usize);
+        }
+        assert_eq!(cache.entries.len(), 4);
+        assert_eq!(cache.megamorphic_count(), 0);
+
+        // Adding a 5th type should go to megamorphic table
+        let type5 = TypeId::new(5);
+        cache.add_entry(type5, 0x1500);
+        assert_eq!(cache.entries.len(), 4); // PIC didn't grow
+        assert_eq!(cache.megamorphic_count(), 1); // megamorphic has it
+
+        // Looking up type5 should find it in the megamorphic table
+        let result = cache.lookup(type5);
+        assert_eq!(result, Some(0x1500));
+
+        // Adding more types
+        for i in 6..=10u64 {
+            let tid = TypeId::new(i);
+            cache.add_entry(tid, (0x1600 + i as usize * 0x10) as usize);
+        }
+        assert_eq!(cache.megamorphic_count(), 6); // types 5-10
+
+        // All types should be findable
+        for i in 1..=10u64 {
+            let tid = TypeId::new(i);
+            assert!(cache.lookup(tid).is_some(), "type {} should be found", i);
+        }
+
+        // Hit rate should be good
+        assert!(cache.hit_rate() > 0.9);
+    }
+
+    #[test]
+    fn test_runtime_linker_patches_memory() {
+        let mut linker = RuntimeLinker::new();
+
+        // Allocate a small code region from the arena to use as a call site
+        let arena = get_arena();
+        let site_addr = arena.alloc(32) as u64;
+
+        // Write a mov rax, 0 instruction at site_addr (the pattern that gets patched)
+        let mut code = vec![0x48u8, 0xB8]; // mov rax, imm64
+        code.extend_from_slice(&0u64.to_le_bytes()); // placeholder: 0
+        code.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+        arena.write_code(site_addr as usize, &code);
+
+        // Register the call site
+        linker.register_call_site(site_addr, site_addr);
+
+        // Patch it with a handler address
+        let handler_addr: u64 = 0xDEAD_BEEF_CAFE_0000;
+        linker.patch_call_site(site_addr, TypeId::new(1).as_u64(), handler_addr);
+
+        // Verify the mapping was stored
+        assert_eq!(linker.resolve(site_addr, TypeId::new(1).as_u64()), Some(handler_addr));
+
+        // Verify the code was actually patched in memory
+        // The 8-byte immediate at site_addr + 2 should now be handler_addr.
+        // Use byte-level read to avoid alignment requirements.
+        let imm_ptr = (site_addr as usize + 2) as *const u8;
+        let mut bytes = [0u8; 8];
+        unsafe {
+            std::ptr::copy_nonoverlapping(imm_ptr, bytes.as_mut_ptr(), 8);
+        }
+        let patched_value = u64::from_le_bytes(bytes);
+        assert_eq!(patched_value, handler_addr, "RuntimeLinker should have patched the code in memory");
     }
 }

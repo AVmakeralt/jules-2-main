@@ -68,6 +68,12 @@ pub enum VectorOp {
     Min,
     /// Vector max
     Max,
+    /// Vector bitwise and
+    And,
+    /// Vector bitwise or
+    Or,
+    /// Vector bitwise xor
+    Xor,
     /// Vector compare
     Cmp,
     /// Vector gather (indexed load)
@@ -76,6 +82,23 @@ pub enum VectorOp {
     Scatter,
     /// Vector reduce (sum, min, max, etc.)
     Reduce,
+}
+
+/// Type of reduction operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReductionType {
+    /// Sum reduction (additive)
+    Sum,
+    /// Product reduction (multiplicative)
+    Product,
+    /// Minimum reduction
+    Min,
+    /// Maximum reduction
+    Max,
+    /// Logical any reduction (OR of booleans)
+    Any,
+    /// Logical all reduction (AND of booleans)
+    All,
 }
 
 /// Vector pattern detected in code
@@ -91,6 +114,8 @@ pub enum VectorPattern {
         op: VectorOp,
         element_type: String,
         initial: String,
+        /// The kind of reduction being performed
+        reduction_type: ReductionType,
     },
     /// Zip pattern: combine two arrays element-wise
     Zip {
@@ -234,7 +259,31 @@ impl VectorPatternDetector {
         let width = self.select_width(&pattern, loop_info.iteration_count)?;
         
         // Estimate speedup
-        let speedup = self.estimate_speedup(&pattern, width, loop_info.iteration_count);
+        let (vec_width_elements, element_size, op) = match &pattern {
+            VectorPattern::Map { element_type, op } => {
+                let sz = if element_type == "f64" || element_type == "i64" { 8 } else { 4 };
+                let elems = if element_type == "f64" || element_type == "i64" { width.elements_i64() } else { width.elements_i32() };
+                (elems, sz, *op)
+            }
+            VectorPattern::Reduce { element_type, op, .. } => {
+                let sz = if element_type == "f64" || element_type == "i64" { 8 } else { 4 };
+                let elems = if element_type == "f64" || element_type == "i64" { width.elements_i64() } else { width.elements_i32() };
+                (elems, sz, *op)
+            }
+            VectorPattern::Zip { element_type, op } => {
+                let sz = if element_type == "f64" || element_type == "i64" { 8 } else { 4 };
+                let elems = if element_type == "f64" || element_type == "i64" { width.elements_i64() } else { width.elements_i32() };
+                (elems, sz, *op)
+            }
+            VectorPattern::Indexed { is_gather, .. } => {
+                let op = if *is_gather { VectorOp::Gather } else { VectorOp::Scatter };
+                (width.elements_i32(), 4, op)
+            }
+            VectorPattern::Stencil { .. } => {
+                (width.elements_i32(), 4, VectorOp::FMA)
+            }
+        };
+        let speedup = self.estimate_speedup(vec_width_elements, element_size, loop_info.iteration_count, &op);
         
         Some(VectorizationCandidate {
             location,
@@ -247,12 +296,25 @@ impl VectorPatternDetector {
 
     /// Detect the vectorization pattern
     fn detect_pattern(&self, loop_info: &LoopInfo) -> Option<VectorPattern> {
+        // Infer the actual operation from the loop body operations
+        let op = Self::infer_vector_op(&loop_info.operations);
+
         // Simple pattern detection based on loop body
         if loop_info.is_reduction {
+            let reduction_type = Self::infer_reduction_type(&loop_info.operations);
+            let initial = match reduction_type {
+                ReductionType::Sum => "0".to_string(),
+                ReductionType::Product => "1".to_string(),
+                ReductionType::Min => "inf".to_string(),
+                ReductionType::Max => "-inf".to_string(),
+                ReductionType::Any => "false".to_string(),
+                ReductionType::All => "true".to_string(),
+            };
             Some(VectorPattern::Reduce {
-                op: VectorOp::Add, // Most common reduction
+                op,
                 element_type: loop_info.element_type.clone(),
-                initial: "0".to_string(),
+                initial,
+                reduction_type,
             })
         } else if loop_info.has_indexed_access {
             Some(VectorPattern::Indexed {
@@ -261,12 +323,48 @@ impl VectorPatternDetector {
             })
         } else if loop_info.is_element_wise {
             Some(VectorPattern::Map {
-                op: VectorOp::Add, // Simplified
+                op, // Preserve the actual operation type
                 element_type: loop_info.element_type.clone(),
             })
         } else {
             None
         }
+    }
+
+    /// Infer the VectorOp from the loop body operation strings.
+    fn infer_vector_op(operations: &[String]) -> VectorOp {
+        for op_str in operations {
+            match op_str.to_lowercase().as_str() {
+                "add" | "+" => return VectorOp::Add,
+                "sub" | "-" => return VectorOp::Sub,
+                "mul" | "*" => return VectorOp::Mul,
+                "div" | "/" => return VectorOp::Div,
+                "fma" | "muladd" => return VectorOp::FMA,
+                "min" => return VectorOp::Min,
+                "max" => return VectorOp::Max,
+                "and" | "&" => return VectorOp::And,
+                "or" | "|" => return VectorOp::Or,
+                "xor" | "^" => return VectorOp::Xor,
+                _ => continue,
+            }
+        }
+        VectorOp::Add // default fallback
+    }
+
+    /// Infer the ReductionType from the loop body operation strings.
+    fn infer_reduction_type(operations: &[String]) -> ReductionType {
+        for op_str in operations {
+            match op_str.to_lowercase().as_str() {
+                "add" | "+" | "sum" => return ReductionType::Sum,
+                "mul" | "*" | "product" => return ReductionType::Product,
+                "min" => return ReductionType::Min,
+                "max" => return ReductionType::Max,
+                "any" => return ReductionType::Any,
+                "all" => return ReductionType::All,
+                _ => continue,
+            }
+        }
+        ReductionType::Sum // default fallback
     }
 
     /// Select the optimal vector width
@@ -296,30 +394,37 @@ impl VectorPatternDetector {
         self.available_widths.first().copied()
     }
 
-    /// Estimate speedup from vectorization
-    fn estimate_speedup(&self, pattern: &VectorPattern, width: VectorWidth, iteration_count: usize) -> f64 {
-        let elements_per_vector = match pattern {
-            VectorPattern::Map { element_type, .. } | VectorPattern::Reduce { element_type, .. } => {
-                if element_type == "f64" || element_type == "i64" {
-                    width.elements_i64()
-                } else {
-                    width.elements_i32()
-                }
-            }
-            _ => width.elements_i32(),
+    /// Estimate speedup from vectorization using a bandwidth-aware model.
+    ///
+    /// Instead of a simple two-tier formula, this models:
+    ///   - SIMD throughput varies by operation type (add/sub full, mul half, div 10%)
+    ///   - Memory bandwidth saturation for large working sets
+    fn estimate_speedup(&self, vec_width: usize, element_size: usize, iterations: usize, op: &VectorOp) -> f64 {
+        let simd_throughput = match op {
+            VectorOp::Add | VectorOp::Sub => vec_width as f64,  // Full throughput for simple ops
+            VectorOp::Mul => (vec_width as f64) * 0.5,         // Half throughput for multiply
+            VectorOp::Div => (vec_width as f64) * 0.1,         // Low throughput for divide
+            VectorOp::FMA => (vec_width as f64) * 0.75,        // FMA is efficient but not full throughput
+            VectorOp::Max | VectorOp::Min => (vec_width as f64) * 0.5,
+            VectorOp::And | VectorOp::Or | VectorOp::Xor => vec_width as f64,
+            VectorOp::Cmp => vec_width as f64,
+            VectorOp::Gather | VectorOp::Scatter => (vec_width as f64) * 0.25, // Gather/scatter is slow
+            VectorOp::Reduce => (vec_width as f64) * 0.5,      // Reduction has horizontal overhead
         };
-        
-        // Base speedup from parallelism
-        let parallel_speedup = elements_per_vector as f64;
-        
-        // Adjust for overhead
-        let overhead_factor = if iteration_count < 100 {
-            0.7 // Higher overhead for small loops
+
+        // Model bandwidth saturation: for large iterations, memory becomes the bottleneck
+        let bytes_per_iter = vec_width * element_size;
+        let _memory_bandwidth_gbps = 40.0; // Approx DDR4 bandwidth
+        let _compute_gops = 10.0; // Approx SIMD GFLOPS
+        let is_memory_bound = bytes_per_iter as f64 * iterations as f64 > 1e8; // > 100MB → likely memory bound
+
+        if is_memory_bound {
+            // Memory-bound: speedup limited by bandwidth, not compute
+            simd_throughput * 0.3 // Conservative: SIMD helps but bandwidth is the bottleneck
         } else {
-            0.95 // Lower overhead for large loops
-        };
-        
-        parallel_speedup * overhead_factor
+            // Compute-bound: full SIMD speedup
+            simd_throughput
+        }
     }
 }
 
@@ -588,7 +693,7 @@ impl AutoVectorizer {
                     instr = instr,
                 )
             }
-            VectorPattern::Reduce { op, element_type, initial } => {
+            VectorPattern::Reduce { op, element_type, initial, .. } => {
                 let (instr, suffix) = match (op, element_type.as_str()) {
                     (VectorOp::Add, "f32") => ("add", "ps"),
                     (VectorOp::Add, "f64") => ("add", "pd"),
@@ -863,6 +968,7 @@ mod tests {
             op: VectorOp::Add,
             element_type: "f64".to_string(),
             initial: "0".to_string(),
+            reduction_type: ReductionType::Sum,
         };
         assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
 
@@ -871,6 +977,7 @@ mod tests {
             op: VectorOp::Mul,
             element_type: "f64".to_string(),
             initial: "1".to_string(),
+            reduction_type: ReductionType::Product,
         };
         assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
 
@@ -879,6 +986,7 @@ mod tests {
             op: VectorOp::Min,
             element_type: "f32".to_string(),
             initial: "inf".to_string(),
+            reduction_type: ReductionType::Min,
         };
         assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
 
@@ -887,6 +995,7 @@ mod tests {
             op: VectorOp::Max,
             element_type: "f32".to_string(),
             initial: "-inf".to_string(),
+            reduction_type: ReductionType::Max,
         };
         assert_eq!(analyzer.analyze(&pattern), VerificationResult::Safe);
     }
@@ -899,6 +1008,7 @@ mod tests {
             op: VectorOp::Sub,
             element_type: "f64".to_string(),
             initial: "0".to_string(),
+            reduction_type: ReductionType::Sum,
         };
         assert_eq!(analyzer.analyze(&pattern), VerificationResult::Unsafe);
 
@@ -907,6 +1017,7 @@ mod tests {
             op: VectorOp::Div,
             element_type: "f64".to_string(),
             initial: "1".to_string(),
+            reduction_type: ReductionType::Product,
         };
         assert_eq!(analyzer.analyze(&pattern), VerificationResult::Unsafe);
     }

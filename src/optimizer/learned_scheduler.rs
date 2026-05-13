@@ -182,12 +182,35 @@ impl MicroLatencyNet {
     /// The network will initially approximate the static table.
     pub fn from_static_tables() -> Self {
         let mut net = Self::new();
-        // Initialize the output layer to roughly reproduce static latencies.
-        // The hidden layer will learn corrections from training data.
+
+        // Initialize output weights so that each hidden neuron contributes
+        // meaningfully to predicting its associated opcode latency.
+        // The hidden layer should learn to specialize for different opcode classes.
+        let latencies: Vec<f32> = vec![
+            1.0, 3.0, 20.0, 4.0, 5.0, 14.0, 4.0, 4.0, 1.0, 2.0,
+            1.0, 1.0, 1.0, 4.0, 5.0, 1.0, 3.0, 0.25, 2.0,
+        ];
+
+        // Initialize hidden-to-output weights with diversity
         for i in 0..Self::HIDDEN_DIM {
-            net.weights_ho[i] = 0.1; // Small positive contribution
+            let lat_idx = i % latencies.len();
+            net.weights_ho[i] = latencies[lat_idx] / Self::HIDDEN_DIM as f32;
         }
-        net.bias_o = 3.0; // Average latency
+        net.bias_o = 1.0; // Baseline latency offset
+
+        // Initialize input-to-hidden weights with Xavier (already done by new())
+        // but add structured initialization for the first 8 features (opcode class)
+        // so hidden neurons respond differently to different opcodes
+        for j in 0..Self::HIDDEN_DIM {
+            for i in 0..8 {
+                // Create diverse receptive fields: each hidden neuron
+                // responds preferentially to a different subset of opcodes
+                let phase = (j * 7 + i * 13) % 20;
+                net.weights_ih[i * Self::HIDDEN_DIM + j] =
+                    if phase % 3 == 0 { 0.5 } else if phase % 3 == 1 { -0.3 } else { 0.1 };
+            }
+        }
+
         net
     }
 
@@ -333,15 +356,57 @@ impl FeatureExtractor {
             features[base + 3] = inst.opcode_class.default_latency() as f32 / 20.0;
         }
 
-        // Features 32–63: Reserved for future expansion
-        // (e.g., dependency graph features, register pressure)
+        // Features 32–47: Dependency graph features
+        // Compute register pressure and dependency depth
+        let mut reg_pressure = 0.0f32;
+        let mut load_store_count = 0.0f32;
+        let mut alu_count = 0.0f32;
+        for inst in instructions.iter().take(8) {
+            if inst.mem_operands > 0 { load_store_count += 1.0; }
+            if inst.mem_operands == 0 { alu_count += 1.0; }
+            reg_pressure += inst.reg_operands as f32;
+        }
+        reg_pressure /= instructions.len().max(1) as f32;
+        features[32] = reg_pressure;
+        features[33] = load_store_count / instructions.len().max(1) as f32;
+        features[34] = alu_count / instructions.len().max(1) as f32;
+        features[35] = instructions.iter().filter(|i| i.has_dependency).count() as f32
+            / instructions.len().max(1) as f32;
+
+        // Features 36–47: Distribution of opcode classes in the window
+        let mut opcode_hist = [0.0f32; 12];
+        for inst in instructions.iter().take(8) {
+            let idx = (inst.opcode_class as u8 as usize).min(11);
+            opcode_hist[idx] += 1.0;
+        }
+        let norm = instructions.len().max(1) as f32;
+        for (i, &count) in opcode_hist.iter().enumerate() {
+            features[36 + i] = count / norm;
+        }
+
+        // Features 48–63: Cross-features (interaction terms)
+        // These capture how PEBS context interacts with instruction properties
+        for i in 0..8 {
+            features[48 + i] = features[i] * features[8 + i.min(7)]; // opcode × PEBS
+        }
+        // Remaining features 56–63: second-order statistics
+        features[56] = features[7] * features[7]; // squared latency estimate
+        features[57] = features[0] * features[14]; // opcode × port contention
+        features[58] = features[5] * features[10]; // data_width × IPC
+        features[59] = features[6] * features[9]; // is_simd × branch_misprediction
+        features[60] = reg_pressure * features[14]; // reg_pressure × port_contention
+        features[61] = features[4] * features[12]; // dependency × L2 miss
+        features[62] = features[2] * features[8]; // mem_operands × cache_miss
+        features[63] = features[3] * features[11]; // immediate × L1D miss
 
         features
     }
 }
 
 fn pebs_cycles_to_rate(rate: f64) -> f64 {
-    rate
+    // Clamp to [0, 1] range — PEBS rates should already be normalized,
+    // but ensure they don't exceed valid bounds.
+    rate.clamp(0.0, 1.0)
 }
 
 /// Hardware performance counter snapshot from PEBS.
@@ -395,6 +460,12 @@ pub struct AdaptiveScheduler {
     use_learned_model: bool,
     /// Training learning rate.
     training_lr: f32,
+    /// Initial learning rate for decay computation.
+    initial_lr: f32,
+    /// Learning rate decay factor per step.
+    lr_decay: f32,
+    /// Minimum learning rate.
+    min_lr: f32,
     /// Number of predictions made.
     predictions: u64,
     /// Number of training steps.
@@ -405,11 +476,15 @@ pub struct AdaptiveScheduler {
 
 impl AdaptiveScheduler {
     pub fn new(use_learned_model: bool) -> Self {
+        let initial_lr = 0.001;
         Self {
             model: MicroLatencyNet::from_static_tables(),
             pebs: PebsCounters::default(),
             use_learned_model,
-            training_lr: 0.001,
+            training_lr: initial_lr,
+            initial_lr,
+            lr_decay: 0.9999,
+            min_lr: 0.0001,
             predictions: 0,
             training_steps: 0,
             total_error: 0.0,
@@ -447,7 +522,10 @@ impl AdaptiveScheduler {
         let predicted = self.model.predict(&features);
         self.total_error += (predicted - actual_latency).abs();
 
-        self.model.train_one(&features, actual_latency as f32, self.training_lr);
+        let effective_lr = (self.initial_lr * self.lr_decay.powi(self.training_steps as i32))
+            .max(self.min_lr);
+        self.training_lr = effective_lr;
+        self.model.train_one(&features, actual_latency as f32, effective_lr);
     }
 
     /// Schedule a window of instructions for minimum total latency.
@@ -455,8 +533,8 @@ impl AdaptiveScheduler {
     /// Uses list scheduling with the learned latency model:
     /// 1. Compute predicted latency for each instruction
     /// 2. Topologically sort by dependencies
-    /// 3. Greedily schedule the instruction with the earliest possible start
-    ///    that has all dependencies satisfied
+    /// 3. Greedily schedule up to `issue_width` instructions per cycle
+    ///    that have all dependencies satisfied
     pub fn schedule(&mut self, instructions: &mut [SchedInstruction]) {
         // Step 1: Predict latencies.
         let window: Vec<InstructionFeatures> = instructions
@@ -468,12 +546,15 @@ impl AdaptiveScheduler {
             inst.estimated_latency = self.predict_latency(&inst.features, &window);
         }
 
-        // Step 2: List scheduling.
+        // Step 2: Multi-issue list scheduling.
+        let issue_width = 4; // Modern x86-64 issue width
         let n = instructions.len();
         let mut scheduled_count = 0;
+        let mut current_cycle = 0.0f64;
 
         while scheduled_count < n {
-            // Find instructions whose dependencies are all scheduled.
+            // Find instructions whose dependencies are all scheduled AND
+            // whose dependency end cycle <= current_cycle
             let mut ready: Vec<usize> = Vec::new();
             for (i, inst) in instructions.iter().enumerate() {
                 if inst.scheduled {
@@ -482,17 +563,52 @@ impl AdaptiveScheduler {
                 let deps_met = inst.dependencies.iter().all(|dep| {
                     instructions.get(*dep).map_or(true, |d| d.scheduled)
                 });
-                if deps_met {
+                let dep_end = inst
+                    .dependencies
+                    .iter()
+                    .map(|dep| {
+                        instructions
+                            .get(*dep)
+                            .map_or(0.0, |d| d.start_cycle + d.estimated_latency)
+                    })
+                    .fold(0.0f64, f64::max);
+                if deps_met && dep_end <= current_cycle {
                     ready.push(i);
                 }
             }
 
             if ready.is_empty() {
-                break; // Deadlock or bug
+                // Advance cycle to the earliest completion time
+                let earliest = instructions
+                    .iter()
+                    .filter(|i| !i.scheduled)
+                    .filter_map(|i| {
+                        let deps_met = i.dependencies.iter().all(|dep| {
+                            instructions.get(*dep).map_or(true, |d| d.scheduled)
+                        });
+                        if !deps_met {
+                            return None;
+                        }
+                        let dep_end = i
+                            .dependencies
+                            .iter()
+                            .map(|d| {
+                                instructions
+                                    .get(*d)
+                                    .map_or(0.0, |d| d.start_cycle + d.estimated_latency)
+                            })
+                            .fold(0.0f64, f64::max);
+                        Some(dep_end)
+                    })
+                    .fold(f64::MAX, f64::min);
+                if earliest == f64::MAX {
+                    break; // Deadlock or bug
+                }
+                current_cycle = earliest;
+                continue;
             }
 
-            // Among ready instructions, pick the one with the highest
-            // latency (critical-path-first heuristic).
+            // Sort ready by critical path length (longest first)
             ready.sort_by(|&a, &b| {
                 instructions[b]
                     .estimated_latency
@@ -500,21 +616,14 @@ impl AdaptiveScheduler {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            // Schedule the best candidate.
-            let best = ready[0];
-            let dep_end_cycle = instructions[best]
-                .dependencies
-                .iter()
-                .map(|dep| {
-                    instructions
-                        .get(*dep)
-                        .map_or(0.0, |d| d.start_cycle + d.estimated_latency)
-                })
-                .fold(0.0f64, f64::max);
+            // Schedule up to issue_width instructions this cycle
+            for &idx in ready.iter().take(issue_width) {
+                instructions[idx].start_cycle = current_cycle;
+                instructions[idx].scheduled = true;
+                scheduled_count += 1;
+            }
 
-            instructions[best].start_cycle = dep_end_cycle;
-            instructions[best].scheduled = true;
-            scheduled_count += 1;
+            current_cycle += 1.0; // Advance by one cycle
         }
     }
 
