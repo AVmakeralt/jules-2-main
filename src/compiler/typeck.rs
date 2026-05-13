@@ -590,7 +590,6 @@ pub struct TypeCk {
     pub infer: InferCtx,
 }
 
-#[allow(dead_code)]
 impl TypeCk {
     fn is_runtime_builtin_path(name: &str) -> bool {
         const PREFIXES: &[&str] = &[
@@ -3739,6 +3738,8 @@ impl TypeCk {
             if let crate::compiler::ast::Attribute::Named { name, .. } = attr {
                 if is_network_decorator(name) {
                     self.validate_ai_decorator(a, attr, name);
+                    // Also validate via the more thorough network decorator check.
+                    self.validate_network_decorator(a, attr, name);
                 }
             }
         }
@@ -4041,6 +4042,8 @@ impl TypeCk {
     ///   - allows key/value style specs (`d_model=768,heads=12,layers=12`)
     ///   - checks balanced delimiters and disallows invalid punctuation
     fn validate_architecture_string(&self, s: &str) -> Result<(), String> {
+        // First, validate the layer structure via extract_layers_from_arch.
+        self.extract_layers_from_arch(s)?;
         let s = s.trim();
         if s.is_empty() {
             return Err("empty architecture specification".into());

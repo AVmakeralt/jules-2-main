@@ -486,6 +486,9 @@ impl DiffCompiler {
                 _ => {}
             }
         }
+        for item in &program.items {
+            count_loops(item, 0, &mut max_loop_depth);
+        }
         features[1] = max_loop_depth as f32;
 
         // Feature 2: Function calls
@@ -505,6 +508,9 @@ impl DiffCompiler {
                     calls_in_block(body, c);
                 }
             }
+        }
+        for item in &program.items {
+            count_calls(item, &mut call_count);
         }
         features[2] = (call_count as f32).log2().clamp(0.0, 8.0);
 

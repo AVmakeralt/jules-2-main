@@ -22,7 +22,7 @@ pub trait ComponentStorageTrait: Send + Sync {
 
 /// Sparse set for component storage with epoch protection
 /// Fixed: Uses Vec instead of FxHashMap for 3-5x faster lookup
-#[allow(dead_code)]
+
 pub struct SparseSet {
     /// Sparse array: entity ID -> index into dense. usize::MAX = not present.
     sparse: Vec<usize>,
@@ -123,6 +123,11 @@ impl SparseSet {
     pub fn has(&self, entity: EntityId) -> bool {
         let eid = entity as usize;
         eid < self.sparse.len() && self.sparse[eid] != usize::MAX
+    }
+
+    /// Access the epoch participant used by this sparse set.
+    pub fn participant(&self) -> &Arc<Participant> {
+        &self.participant
     }
 }
 

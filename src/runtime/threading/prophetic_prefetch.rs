@@ -296,8 +296,9 @@ impl PrefetchTracker {
         // Update last_address
         self.states.get_mut(&instruction_id).unwrap().last_address = accessed_addr;
 
-        // Only suggest prefetch if the pattern is stable
-        if snapshot.stride_stability >= MIN_STABLE_OBSERVATIONS {
+        // Only suggest prefetch if the pattern is stable and we don't already
+        // have an equivalent active hint for this instruction
+        if snapshot.stride_stability >= MIN_STABLE_OBSERVATIONS && !snapshot.has_active_hint() {
             if let Some(hint) = generate_prefetch_hint(
                 instruction_id,
                 &snapshot,
@@ -316,7 +317,6 @@ impl PrefetchTracker {
 
 /// Snapshot of instruction access state, used to avoid borrow conflicts
 /// when generating prefetch hints.
-#[allow(dead_code)]
 struct StateSnapshot {
     last_address: usize,
     stride: Option<isize>,
@@ -336,6 +336,10 @@ impl StateSnapshot {
         } else {
             self.correct_predictions as f64 / total as f64
         }
+    }
+
+    fn has_active_hint(&self) -> bool {
+        self.current_hint.is_some()
     }
 }
 

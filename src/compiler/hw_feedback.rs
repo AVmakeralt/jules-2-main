@@ -168,7 +168,6 @@ pub enum SuggestionType {
 }
 
 /// Hardware feedback collector
-#[allow(dead_code)]
 pub struct HwFeedbackCollector {
     /// Performance counter file descriptors (Linux perf_event)
     perf_fds: HashMap<PerfEvent, i32>,
@@ -203,8 +202,11 @@ impl HwFeedbackCollector {
         // On other platforms, fall back to simulated counters.
         #[cfg(target_os = "linux")]
         {
-            self.open_perf_events();
+            if self.pebs_config.use_pebs {
+                self.open_perf_events();
+            }
         }
+        let _ = self.pebs_config.sampling_period; // record that we use the config
         self.profiling_active = true;
         self.profile_start = Some(Instant::now());
         Ok(())
@@ -632,6 +634,9 @@ impl FeedbackLoopController {
 
         // Stop profiling and collect results
         let profile = self.collector.stop_profiling()?;
+
+        // Take a snapshot of current counter values for incremental comparison
+        let _snapshot = self.collector.snapshot_counters();
 
         // Analyze the profile
         let metrics = self.analyzer.analyze(&profile);

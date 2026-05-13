@@ -88,7 +88,7 @@ impl Drop for GreenContext {
 
 /// Context switch function (x86-64)
 #[cfg(target_arch = "x86_64")]
-#[allow(dead_code)]
+
 extern "C" fn context_switch(
     old_sp: *mut usize,
     new_sp: usize,
@@ -214,7 +214,7 @@ extern "C" fn context_switch(
 }
 
 /// Green thread scheduler
-#[allow(dead_code)]
+
 pub struct GreenScheduler {
     /// Ready queue of green threads
     ready_queue: Arc<std::sync::Mutex<Vec<GreenThreadId>>>,
@@ -349,11 +349,18 @@ impl GreenScheduler {
             } else {
                 // No current thread — save main context and switch to the new thread
                 let main_sp_val = self.main_sp.load(Ordering::Acquire);
+                let main_regs_val = self.main_regs.load(Ordering::Acquire);
 
                 // We store main's SP/regs in stack-allocated slots so context_switch
                 // can write back into them.
                 let mut old_sp = main_sp_val;
                 let mut old_regs: [usize; 6] = [0; 6];
+                // Restore from previously saved main registers if available.
+                if main_regs_val != 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(main_regs_val as *const usize, old_regs.as_mut_ptr(), 6);
+                    }
+                }
 
                 let new_regs_ptr = new_regs.as_ptr() as *const usize;
 
@@ -363,6 +370,8 @@ impl GreenScheduler {
 
                 // Save the main context back
                 self.main_sp.store(old_sp, Ordering::Release);
+                // Persist main_regs for later restoration.
+                self.main_regs.store(old_regs.as_ptr() as usize, Ordering::Release);
             }
         } else {
             // No threads to run, return to main

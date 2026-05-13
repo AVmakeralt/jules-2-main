@@ -228,7 +228,6 @@ pub enum ProphecyResult<T: Clone> {
 
 /// The execution context for a single speculative prophecy.
 /// Holds the predicted state and a rollback mechanism.
-#[allow(dead_code)]
 pub struct ProphecyContext<T: Clone + Send + 'static> {
     /// The prophecy variable being tested.
     prophecy: ProphecyVariable,
@@ -282,8 +281,11 @@ impl<T: Clone + Send + 'static> ProphecyContext<T> {
                 // TSX will automatically abort the transactional region,
                 // discarding all speculative writes.
                 ProphecyResult::Wrong
+            } else if self.rseq_available {
+                // With rseq we can attempt per-CPU state recovery
+                ProphecyResult::Aborted("prophecy wrong, rseq-based recovery".into())
             } else {
-                // Without TSX, we need manual rollback (not implemented here
+                // Without TSX or rseq, we need manual rollback (not implemented here
                 // — the runtime should snapshot state before speculation).
                 ProphecyResult::Aborted("prophecy wrong, no TSX for auto-rollback".into())
             }

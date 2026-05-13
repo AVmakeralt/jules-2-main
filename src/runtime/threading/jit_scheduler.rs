@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
 
 /// Task function pointer type
-#[allow(dead_code)]
 type TaskFn = fn(*mut ());
 
 /// Task wrapper for scheduler execution
@@ -17,6 +16,8 @@ type TaskFn = fn(*mut ());
 struct SchedTask {
     /// The task closure (Box<Box<dyn FnOnce()>>)
     func_ptr: *mut (),
+    /// Optional typed function pointer for direct invocation
+    task_fn: Option<TaskFn>,
     /// Estimated cost (0 = unknown, higher = more expensive)
     cost_hint: u32,
     /// Affinity hint: preferred worker (-1 = any)
@@ -335,7 +336,10 @@ impl JitSchedulerCompiler {
             // default to immediate execution (throughput mode).
             let sched_task = &*(task as *const SchedTask);
             
-            if sched_task.io_bound {
+            // If a typed function pointer is available, invoke it directly
+            if let Some(tfn) = sched_task.task_fn {
+                tfn(sched_task.func_ptr);
+            } else if sched_task.io_bound {
                 // I/O-bound task: execute and yield
                 let func: Box<Box<dyn FnOnce()>> = Box::from_raw(
                     sched_task.func_ptr as *mut Box<dyn FnOnce()>
@@ -565,7 +569,6 @@ impl TraceBasedScheduler {
 
 /// Self-optimizing runtime
 /// Combines JIT compilation with hardware counter feedback
-#[allow(dead_code)]
 pub struct SelfOptimizingRuntime {
     /// JIT scheduler compiler
     jit: JitSchedulerCompiler,
@@ -615,8 +618,11 @@ impl SelfOptimizingRuntime {
     
     /// Adapt the runtime based on current conditions
     pub fn adapt(&mut self) {
-        // Sample hardware counters
-        let _counters = self.jit.sample_counters();
+        // Sample hardware counters using the dedicated reader
+        let _counters = self.hw_counter.read(HwCounter::CacheMisses);
+        
+        // Also sample via the JIT compiler (which has its own reader)
+        let _ = self.jit.sample_counters();
         
         // Adapt strategy
         self.jit.adapt_strategy();

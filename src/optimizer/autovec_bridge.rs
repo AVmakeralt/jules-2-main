@@ -67,7 +67,7 @@ struct RawLoop {
 }
 
 /// Classify a `BinOpKind` into a `VectorOp`, if applicable.
-#[allow(dead_code)]
+
 fn binop_to_vectorop(kind: BinOpKind) -> Option<VectorOp> {
     match kind {
         BinOpKind::Add => Some(VectorOp::Add),
@@ -206,7 +206,7 @@ fn detect_loops(instrs: &[Instr]) -> Vec<RawLoop> {
 /// the auto-vectorizer judges safe and beneficial to vectorize.
 ///
 /// Returns `None` when no loops are detected or none can be safely vectorized.
-#[allow(dead_code)]
+
 pub fn try_vectorize_instructions(instrs: &[Instr], slot_count: u16) -> Option<Vec<SimdHint>> {
     let raw_loops = detect_loops(instrs);
     if raw_loops.is_empty() {
@@ -281,7 +281,7 @@ pub fn try_vectorize_instructions(instrs: &[Instr], slot_count: u16) -> Option<V
 ///
 /// Prefetching is worthwhile for sequential or small-stride access patterns
 /// that will be traversed repeatedly — typical of vectorised loops.
-#[allow(dead_code)]
+
 pub fn should_emit_prefetch(slot: u16, stride: i64) -> bool {
     // Skip slot 0 (usually a special/void slot).
     if slot == 0 {

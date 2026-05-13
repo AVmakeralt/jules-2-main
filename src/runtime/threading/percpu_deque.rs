@@ -114,7 +114,6 @@ impl Drop for PerCpuDequeState {
 
 /// Per-CPU deque manager
 /// Manages per-CPU deques with rseq-based wait-free local operations
-#[allow(dead_code)]
 pub struct PerCpuDeque {
     /// Array of per-CPU deque states
     deques: Vec<PerCpuDequeState>,
@@ -384,6 +383,11 @@ impl PerCpuDeque {
     /// Get the number of CPUs
     pub fn num_cpus(&self) -> usize {
         self.num_cpus
+    }
+
+    /// Get a reference to the epoch participant
+    pub fn participant(&self) -> &std::sync::Arc<Participant> {
+        &self.participant
     }
 }
 

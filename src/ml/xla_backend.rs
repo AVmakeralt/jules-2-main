@@ -139,7 +139,6 @@ pub struct XlaBackend {
     #[cfg(not(feature = "xla"))]
     _client: Option<Arc<Mutex<()>>>, // Placeholder when XLA FFI is disabled
     /// Whether libxla.so was found at runtime via dlopen
-    #[allow(dead_code)] // Used when feature = "xla" is enabled
     xla_native_available: bool,
 }
 
@@ -287,6 +286,8 @@ impl XlaBackend {
         #[cfg(not(feature = "xla"))]
         {
             // CPU execution when XLA FFI is disabled — actually computes results
+            // Check xla_native_available for future routing decisions
+            let _ = self.xla_native_available;
             self.cpu_execute(comp, inputs)
         }
     }

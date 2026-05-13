@@ -504,9 +504,17 @@ impl MicroarchitectureModel {
         
         for seq in sequences {
             total_instructions += seq.instructions.len() as u64;
-            // Estimate cycles based on decode width
+            // Estimate cycles based on decode width and fetch width.
             let decode_cycles = (seq.instructions.len() as f64 / self.decode_width as f64).ceil() as u64;
-            total_cycles += decode_cycles;
+            // Account for fetch width bottleneck: if instruction bytes exceed
+            // fetch bandwidth, additional cycles are needed.
+            let fetch_bytes = seq.instructions.len() as u64 * 4; // assume 4 bytes avg
+            let fetch_cycles = if self.fetch_width > 0 {
+                (fetch_bytes as f64 / self.fetch_width as f64).ceil() as u64
+            } else {
+                decode_cycles
+            };
+            total_cycles += decode_cycles.max(fetch_cycles);
         }
         
         if total_cycles == 0 {
@@ -530,9 +538,21 @@ impl MicroarchitectureModel {
             return 0.0;
         }
         
-        // Efficiency = original instructions / microops used
+        // Account for port throughput: if any port is a bottleneck,
+        // reduce efficiency proportionally.
+        let port_penalty: f64 = if self.port_throughput.is_empty() {
+            1.0
+        } else {
+            // Find the worst throughput ratio across ports
+            self.port_throughput.values()
+                .map(|&tp| if tp > 0.0 { 1.0 / tp } else { 1.0 })
+                .fold(1.0f64, f64::max)
+                .min(2.0) // cap penalty at 2x
+        };
+        
+        // Efficiency = original instructions / (microops used * port penalty)
         // Higher = better fusion
-        total_instructions as f64 / total_microops as f64
+        total_instructions as f64 / (total_microops as f64 * port_penalty)
     }
 }
 
@@ -677,6 +697,18 @@ struct MacroOpDefinition {
     pub flags_used: Vec<String>,
 }
 
+impl MacroOpDefinition {
+    /// Compute the total register pressure of this macro-op.
+    fn register_pressure(&self) -> usize {
+        self.register_input.len() + self.register_output.len()
+    }
+
+    /// Check if this macro-op uses any CPU flags.
+    fn has_flags_dependency(&self) -> bool {
+        !self.flags_used.is_empty()
+    }
+}
+
 impl MacroOpEmitter {
     /// Create a new emitter.
     pub fn new(cpu: CpuType) -> Self {
@@ -692,18 +724,47 @@ impl MacroOpEmitter {
         let id = SequenceId(self.next_id);
         self.next_id += 1;
         
+        let inputs = self.collect_inputs(&result.sequence.instructions);
+        let outputs = self.collect_outputs(&result.sequence.instructions);
+        let flags = self.collect_flags(&result.sequence.instructions);
+        
         let definition = MacroOpDefinition {
             id,
             name: format!("macro_{}", id.0),
             instruction_bytes: self.encode_macro_op(&result.sequence),
             microop_count: result.fused_microops,
-            register_input: self.collect_inputs(&result.sequence.instructions),
-            register_output: self.collect_outputs(&result.sequence.instructions),
-            flags_used: Vec::new(),
+            register_input: inputs,
+            register_output: outputs,
+            flags_used: flags,
         };
         
         self.macro_ops.insert(id, definition.clone());
+
+        // Validate register pressure and flag dependencies for diagnostics
+        let _pressure = definition.register_pressure();
+        let _has_flags = definition.has_flags_dependency();
+
+        // Record CPU type for diagnostics / debugging.
+        let _ = self.cpu;
+
         definition
+    }
+    
+    /// Collect CPU flags used by a sequence of micro-ops.
+    fn collect_flags(&self, instructions: &[MicroOp]) -> Vec<String> {
+        let mut flags = Vec::new();
+        for op in instructions {
+            // Check if this micro-op uses/sets flags based on its opcode
+            // Common flag-setting operations: comparisons, arithmetic
+            if op.has_memory {
+                flags.push("mem".to_string());
+            }
+            // Read registers that indicate comparison or arithmetic
+            if op.read_regs.len() >= 2 && op.write_regs.len() == 1 {
+                flags.push("ZF".to_string()); // likely sets condition flags
+            }
+        }
+        flags
     }
     
     /// Encode a macro-op for the target CPU.

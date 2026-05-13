@@ -204,7 +204,6 @@ enum BufferState {
 }
 
 /// Double-buffered GPU buffer
-#[allow(dead_code)]
 struct GpuBuffer {
     /// Buffer ID
     id: usize,
@@ -243,6 +242,10 @@ impl GpuBuffer {
 
     fn set_state(&self, state: BufferState) {
         self.state.store(state as usize, Ordering::Release);
+    }
+
+    fn id(&self) -> usize {
+        self.id
     }
 }
 
@@ -348,6 +351,11 @@ impl GpuPipeline {
     /// Get current buffer index for double-buffering
     pub fn current_buffer(&self) -> usize {
         self.buffer_index.load(Ordering::Acquire)
+    }
+
+    /// Get the ID of the buffer at the given index
+    pub fn buffer_id(&self, index: usize) -> Option<usize> {
+        self.buffers.get(index).map(|b| b.id())
     }
 
     /// Swap buffers

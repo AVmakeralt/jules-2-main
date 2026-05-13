@@ -48,7 +48,6 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
-    #[allow(dead_code)]
     fn error(&mut self, span: Span, message: impl Into<String>) {
         self.items.push(Diagnostic {
             severity: Severity::Error,
@@ -60,7 +59,6 @@ impl Diagnostics {
         });
     }
 
-    #[allow(dead_code)]
     fn error_with_fix(&mut self, span: Span, message: impl Into<String>, fix: impl Into<String>) {
         self.items.push(Diagnostic {
             severity: Severity::Error,
@@ -257,15 +255,10 @@ impl BorrowChecker {
         }
         if let Some(st) = self.loans_by_target.get(name) {
             if st.mut_ > 0 {
-                self.diag.push_diag(
-                    Diagnostic {
-                        severity: Severity::Error,
-                        span,
-                        message: format!("cannot use `{name}` while it is mutably borrowed"),
-                        labels: vec![],
-                        code: Some("E4004"),
-                        hint: Some("wait for the mutable borrow to end before accessing this variable".into()),
-                    }
+                self.diag.error_with_fix(
+                    span,
+                    format!("cannot use `{name}` while it is mutably borrowed"),
+                    "wait for the mutable borrow to end before accessing this variable",
                 );
             }
         }
@@ -288,15 +281,10 @@ impl BorrowChecker {
         }
         if let Some(st) = self.loans_by_target.get(name) {
             if st.mut_ > 0 || st.imm > 0 {
-                self.diag.push_diag(
-                    Diagnostic {
-                        severity: Severity::Error,
-                        span,
-                        message: format!("cannot assign to `{name}` while it is borrowed"),
-                        labels: vec![],
-                        code: Some("E4007"),
-                        hint: Some("wait for the borrow to end before assigning".into()),
-                    }
+                self.diag.error_with_fix(
+                    span,
+                    format!("cannot assign to `{name}` while it is borrowed"),
+                    "wait for the borrow to end before assigning",
                 );
             }
         }
@@ -559,15 +547,9 @@ impl BorrowChecker {
                                 ),
                             }
                         } else {
-                            self.diag.push_diag(
-                                Diagnostic {
-                                    severity: Severity::Error,
-                                    span: *span,
-                                    message: "unsupported assignment target through dereference".into(),
-                                    labels: vec![],
-                                    code: Some("E4012"),
-                                    hint: Some("this dereference pattern is not supported for assignment".into()),
-                                }
+                            self.diag.error(
+                                *span,
+                                "unsupported assignment target through dereference",
                             );
                         }
                     }

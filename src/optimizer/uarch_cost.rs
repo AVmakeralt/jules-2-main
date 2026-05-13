@@ -99,6 +99,8 @@ pub struct DepDag {
     num_nodes: usize,
     /// Opcode for each node (needed for cost lookup during traversal)
     opcodes: Vec<Opcode>,
+    /// Dependency kind for each predecessor edge (parallel to `predecessors`).
+    dep_kinds: Vec<Vec<DepKind>>,
     /// For each node index, the set of predecessor node indices
     /// (edges pred -> node, meaning node depends on pred)
     predecessors: Vec<Vec<usize>>,
@@ -107,15 +109,29 @@ pub struct DepDag {
     successors: Vec<Vec<usize>>,
 }
 
-/// Dependency type (used internally during DAG construction)
+/// Dependency type (used internally during DAG construction and costing)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DepKind {
+pub(crate) enum DepKind {
     /// Read-After-Write: consumer reads a register written by producer
     Raw,
     /// Write-After-Write: later writer must wait for earlier writer
     Waw,
     /// Write-After-Read: later writer must wait for earlier reader
     War,
+}
+
+impl DepKind {
+    /// Latency multiplier for this dependency type.
+    /// RAW is a true dependency (full latency), while WAW/WAR are
+    /// name dependencies that can be resolved by register renaming
+    /// and thus have reduced effective latency on out-of-order CPUs.
+    fn latency_weight(&self) -> f64 {
+        match self {
+            DepKind::Raw => 1.0,
+            DepKind::Waw => 0.5,
+            DepKind::War => 0.5,
+        }
+    }
 }
 
 // =============================================================================
@@ -751,6 +767,7 @@ pub fn build_dependency_dag(instrs: &[MachineInstr]) -> DepDag {
     let n = instrs.len();
     let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut dep_kinds: Vec<Vec<DepKind>> = vec![Vec::new(); n];
     let opcodes: Vec<Opcode> = instrs.iter().map(|i| i.opcode).collect();
 
     // Maps: register → last instruction index that defined (wrote) it
@@ -758,11 +775,13 @@ pub fn build_dependency_dag(instrs: &[MachineInstr]) -> DepDag {
     // Maps: register → last instruction index that used (read) it
     let mut last_use: HashMap<u8, usize> = HashMap::new();
 
-    /// Add a dependency edge from `from` to `to`, avoiding duplicates
+    /// Add a dependency edge from `from` to `to` with a given DepKind, avoiding duplicates
     fn add_edge(
         from: usize,
         to: usize,
+        kind: DepKind,
         predecessors: &mut [Vec<usize>],
+        dep_kinds: &mut [Vec<DepKind>],
         successors: &mut [Vec<usize>],
     ) {
         if from == to {
@@ -771,6 +790,7 @@ pub fn build_dependency_dag(instrs: &[MachineInstr]) -> DepDag {
         // Avoid duplicate edges
         if !predecessors[to].contains(&from) {
             predecessors[to].push(from);
+            dep_kinds[to].push(kind);
             successors[from].push(to);
         }
     }
@@ -779,19 +799,19 @@ pub fn build_dependency_dag(instrs: &[MachineInstr]) -> DepDag {
         // --- RAW dependencies: this instruction reads a register written earlier ---
         if reads_src1(instr.opcode) {
             if let Some(&prev) = last_def.get(&instr.src1) {
-                add_edge(prev, i, &mut predecessors, &mut successors);
+                add_edge(prev, i, DepKind::Raw, &mut predecessors, &mut dep_kinds, &mut successors);
             }
         }
         if reads_src2(instr.opcode, instr.has_imm) {
             if let Some(&prev) = last_def.get(&instr.src2) {
-                add_edge(prev, i, &mut predecessors, &mut successors);
+                add_edge(prev, i, DepKind::Raw, &mut predecessors, &mut dep_kinds, &mut successors);
             }
         }
 
         // --- WAW dependency: this instruction writes a register written earlier ---
         if writes_dst(instr.opcode) {
             if let Some(&prev) = last_def.get(&instr.dst) {
-                add_edge(prev, i, &mut predecessors, &mut successors);
+                add_edge(prev, i, DepKind::Waw, &mut predecessors, &mut dep_kinds, &mut successors);
             }
         }
 
@@ -801,7 +821,7 @@ pub fn build_dependency_dag(instrs: &[MachineInstr]) -> DepDag {
                 // Only add WAR edge if the reader is not the same as the last
                 // writer (otherwise it's already covered by RAW/WAW)
                 if last_def.get(&instr.dst).map_or(true, |&d| d != prev) {
-                    add_edge(prev, i, &mut predecessors, &mut successors);
+                    add_edge(prev, i, DepKind::War, &mut predecessors, &mut dep_kinds, &mut successors);
                 }
             }
         }
@@ -823,6 +843,7 @@ pub fn build_dependency_dag(instrs: &[MachineInstr]) -> DepDag {
     DepDag {
         num_nodes: n,
         opcodes,
+        dep_kinds,
         predecessors,
         successors,
     }
@@ -887,10 +908,12 @@ pub fn critical_path_length(dag: &DepDag, cost_db: &dyn Fn(Opcode) -> CostEntry)
         let cost = cost_db(dag.opcodes[node]);
         let node_latency = cost.latency as f64;
 
-        // dist[node] = latency[node] + max(dist[pred] for all predecessors)
+        // dist[node] = latency[node] + max(weighted dist[pred] for all predecessors)
+        // Weight each predecessor's distance by the dependency kind's latency weight.
         let max_pred = dag.predecessors[node]
             .iter()
-            .map(|&pred| dist[pred])
+            .zip(dag.dep_kinds[node].iter())
+            .map(|(&pred, &kind)| dist[pred] * kind.latency_weight())
             .fold(0.0f64, f64::max);
 
         dist[node] = node_latency + max_pred;

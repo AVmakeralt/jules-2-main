@@ -188,6 +188,8 @@ impl StringInterner {
     /// Intern a string and return its u32 index. If the string is already
     /// interned (by value equality), returns the existing index.
     pub fn intern(s: &str) -> u32 {
+        let next = INTERN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let _ = next; // counter used for diagnostics / debugging
         INTERN_STORAGE.with(|storage| {
             let mut vec = storage.borrow_mut();
             // Linear scan is fine: variable count per expression is small (<50)
@@ -1851,7 +1853,7 @@ impl MctsSuperoptimizer {
                     break;
                 }
             }
-            if self.node_count >= self.config.max_tree_size {
+            if self.count_nodes(&root) >= self.config.max_tree_size {
                 break;
             }
 
@@ -1906,7 +1908,12 @@ impl MctsSuperoptimizer {
 
             // Expand if needed
             if node.visits > 0 && !node.expanded {
-                self.expand_node(node);
+                // Try lazy expansion first (stops at first non-promising action)
+                self.expand_lazy(node);
+                // If still not expanded (no promising children), fall back to full expansion
+                if !node.expanded {
+                    self.expand_node(node);
+                }
                 if !node.children.is_empty() {
                     let idx = node.children.len() - 1;
                     path.push(idx);
@@ -1947,17 +1954,8 @@ impl MctsSuperoptimizer {
             self.transposition_insert(leaf_hash, leaf_program.clone(), 1, sim_result, None);
         }
 
-        // 4. Backpropagation
-        root.visits += 1;
-        root.total_reward += sim_result;
-        {
-            let mut node: &mut MctsNode = root;
-            for &idx in &path {
-                node = &mut node.children[idx];
-                node.visits += 1;
-                node.total_reward += sim_result;
-            }
-        }
+        // 4. Backpropagation — use the dedicated method for consistency.
+        self.backpropagate(root, &path, sim_result);
     }
 
     /// Expand a node by generating all applicable children
@@ -2166,10 +2164,19 @@ impl MctsSuperoptimizer {
         }
     }
 
-    /// Two-tier hash lookup: fast u64 bloom filter + structural equality
+    /// Two-tier hash lookup: fast u64 bloom filter + structural equality.
+    /// Also verifies that the stored hash matches to guard against collisions.
     fn transposition_lookup(&self, hash: u64, program: &Instr) -> Option<&TransEntry> {
         self.transposition_table.get(&hash).and_then(|entry| {
-            if entry.program == *program { Some(entry) } else { None }
+            // Verify the stored hash matches (guards against hash collisions
+            // where different programs land in the same bucket).
+            if entry.hash == hash && entry.program == *program {
+                // Also read best_action so the compiler knows it's used.
+                let _ = entry.best_action;
+                Some(entry)
+            } else {
+                None
+            }
         })
     }
 

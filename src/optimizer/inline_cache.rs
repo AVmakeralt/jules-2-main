@@ -84,7 +84,7 @@ pub struct RuntimeLinker {
     /// Map from (call_site, type_id) to optimized handler address
     type_handlers: HashMap<(u64, u64), u64>,
     /// Address of the generic dispatch trampoline
-    #[allow(dead_code)]
+    
     trampoline_addr: u64,
 }
 
@@ -104,9 +104,10 @@ impl RuntimeLinker {
 
     /// Patch a call site to jump directly to a type-specific handler
     pub fn patch_call_site(&mut self, site_addr: u64, type_id: u64, handler_addr: u64) {
-        self.type_handlers.insert((site_addr, type_id), handler_addr);
+        let effective_handler = if handler_addr != 0 { handler_addr } else { self.trampoline_addr };
+        self.type_handlers.insert((site_addr, type_id), effective_handler);
         // In a real implementation, this would overwrite the 8-byte address
-        // at site_addr with handler_addr using mprotect + memcpy
+        // at site_addr with effective_handler using mprotect + memcpy
     }
 
     /// Resolve the handler for a given call site and type

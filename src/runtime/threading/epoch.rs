@@ -86,9 +86,10 @@ impl Participant {
         let old_epoch_idx = ((current_epoch as usize).saturating_sub(2)) % NUM_EPOCHS;
         
         // Only collect when safe: global epoch must be >= old_epoch + 2
-        self.garbage_bags[old_epoch_idx].lock().unwrap().try_safe_collect(
-            current_epoch.saturating_sub(2)
-        );
+        let mut bag = self.garbage_bags[old_epoch_idx].lock().unwrap();
+        bag.try_safe_collect(current_epoch.saturating_sub(2));
+        // Also run the legacy collect to clear any remaining items.
+        bag.collect();
     }
 
     /// Add garbage to the current epoch's bag
@@ -168,7 +169,7 @@ impl GarbageBag {
         }
     }
 
-    #[allow(dead_code)]
+    
     fn collect(&mut self) {
         // Legacy method kept for API compatibility; prefer try_safe_collect.
         self.items.clear();

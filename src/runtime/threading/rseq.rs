@@ -7,11 +7,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// rseq ABI version (from Linux kernel)
-#[allow(dead_code)]
 const RSEQ_ABI_VERSION: u32 = 0;
 
 /// rseq flags
-#[allow(dead_code)]
 const RSEQ_FLAG_UNREGISTER: u32 = 1;
 
 /// rseq CPU ID flags
@@ -117,6 +115,8 @@ pub fn register_rseq() -> bool {
         {
             let rseq_ptr = &state.rseq as *const Rseq as *const libc::c_void;
             let rseq_len = std::mem::size_of::<Rseq>() as libc::size_t;
+            // Verify ABI version matches the kernel's expected version
+            state.rseq.rseq_flags.store(RSEQ_ABI_VERSION, Ordering::Release);
             let flags: u32 = 0;
             let sig: u32 = 0;
 
@@ -205,6 +205,45 @@ pub fn rseq_validate(cpu_id_start: usize) -> bool {
         let start_cpu = state.rseq.cpu_id_start.load(Ordering::Acquire);
         
         current_cpu as usize == cpu_id_start && start_cpu as usize == cpu_id_start
+    })
+}
+
+/// Unregister rseq for the current thread
+pub fn unregister_rseq() -> bool {
+    RSEQ_STATE.with(|state| {
+        if !state.registered.load(Ordering::Acquire) {
+            return true; // Already unregistered
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let rseq_ptr = &state.rseq as *const Rseq as *const libc::c_void;
+            let rseq_len = std::mem::size_of::<Rseq>() as libc::size_t;
+
+            let ret = unsafe {
+                libc::syscall(
+                    334, // __NR_rseq on x86_64
+                    rseq_ptr as libc::c_ulong,
+                    rseq_len as libc::c_ulong,
+                    RSEQ_FLAG_UNREGISTER as libc::c_ulong,
+                    0u32 as libc::c_ulong,
+                )
+            };
+
+            if ret == 0 {
+                state.registered.store(false, Ordering::Release);
+                state.rseq.cpu_id.store(RSEQ_CPU_FLAG_UNREGISTERED, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            state.registered.store(false, Ordering::Release);
+            true
+        }
     })
 }
 

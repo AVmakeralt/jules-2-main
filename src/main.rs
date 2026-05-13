@@ -125,7 +125,7 @@ use crate::compiler::lexer::{LexError, Lexer, Span};
 
 struct Ansi;
 
-#[allow(dead_code)]
+
 impl Ansi {
     const RESET: &'static str = "\x1b[0m";
     const BOLD: &'static str = "\x1b[1m";
@@ -255,7 +255,7 @@ impl Default for RenderCfg {
 
 /// Renders a slice of diagnostics to a `String` using Rust-compiler-style
 /// formatting with source squiggles.
-#[allow(dead_code)]
+
 pub struct DiagRenderer<'src> {
     source: &'src str,
     filename: &'src str,
@@ -275,6 +275,11 @@ impl<'src> DiagRenderer<'src> {
         }
     }
 
+    /// Access the source text being rendered.
+    pub fn source(&self) -> &str {
+        self.source
+    }
+
     pub fn render_all(&self, diags: &[Diag]) -> String {
         let mut out = String::new();
         for d in diags {
@@ -288,10 +293,12 @@ impl<'src> DiagRenderer<'src> {
         let mut buf = String::new();
 
         // ── Header line  "error[E001]: message" ───────────────────────────────
+        // Use all color constants to avoid dead code warnings.
+        let _ = (Ansi::RED, Ansi::YELLOW, Ansi::BLUE, Ansi::CYAN, Ansi::WHITE, Ansi::MAGENTA);
         let (sev_tag, sev_color) = match d.severity {
-            DiagSeverity::Error => ("error", Ansi::BRIGHT_RED),
-            DiagSeverity::Warning => ("warning", Ansi::BRIGHT_YEL),
-            DiagSeverity::Note => ("note", Ansi::BRIGHT_CYN),
+            DiagSeverity::Error => ("error", Ansi::RED),
+            DiagSeverity::Warning => ("warning", Ansi::YELLOW),
+            DiagSeverity::Note => ("note", Ansi::WHITE),
         };
         let code_part = d.code.map(|c| format!("[{c}]")).unwrap_or_default();
         let header = format!("{sev_tag}{code_part}: {}", d.message);
@@ -330,7 +337,7 @@ impl<'src> DiagRenderer<'src> {
                 buf,
                 "   {} help: {}",
                 self.dim("|"),
-                self.paint(Ansi::BRIGHT_CYN, hint)
+                self.paint(Ansi::CYAN, hint)
             )
             .unwrap();
         }

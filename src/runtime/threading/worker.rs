@@ -124,14 +124,12 @@ impl MpmcQueue {
 /// latency before a sleeping worker noticed new work. The Condvar approach
 /// provides kernel-level wake/sleep with microsecond response times and
 /// zero CPU usage while sleeping.
-#[allow(dead_code)]
 struct Notify {
     flag: AtomicBool,
     condvar: std::sync::Condvar,
     mutex: std::sync::Mutex<()>,
 }
 
-#[allow(dead_code)]
 impl Notify {
     fn new() -> Self {
         Self {
@@ -165,13 +163,18 @@ impl Notify {
 struct Injector {
     queue: MpmcQueue,
     notify: Arc<Notify>,
+    shutdown_notify: Arc<Notify>,
+    wait_notify: Arc<Notify>,
 }
 
 impl Injector {
     fn new() -> Self {
+        let notify = Arc::new(Notify::new());
         Self {
             queue: MpmcQueue::new(),
-            notify: Arc::new(Notify::new()),
+            notify: notify.clone(),
+            shutdown_notify: Arc::new(Notify::new()),
+            wait_notify: notify,
         }
     }
 
@@ -182,6 +185,14 @@ impl Injector {
 
     fn try_pop(&self) -> Option<*mut ()> {
         self.queue.try_pop()
+    }
+
+    fn notify_shutdown(&self) {
+        self.shutdown_notify.notify_all();
+    }
+
+    fn wait_for_work(&self) {
+        self.wait_notify.wait();
     }
 }
 
@@ -280,16 +291,19 @@ impl Worker {
             
             // No work found, exponential backoff
             idle_iterations += 1;
-            let sleep_us = if idle_iterations < 10 {
-                1
-            } else if idle_iterations < 100 {
-                10
-            } else if idle_iterations < 1000 {
-                100
+            if idle_iterations > 1000 {
+                // Use condvar-based wait for long idle periods
+                self.injector.wait_for_work();
             } else {
-                1000
-            };
-            thread::sleep(Duration::from_micros(sleep_us));
+                let sleep_us = if idle_iterations < 10 {
+                    1
+                } else if idle_iterations < 100 {
+                    10
+                } else {
+                    100
+                };
+                thread::sleep(Duration::from_micros(sleep_us));
+            }
         }
     }
 
@@ -443,7 +457,6 @@ pub struct WorkerStats {
 }
 
 /// Thread pool for managing workers
-#[allow(dead_code)]
 pub struct ThreadPool {
     workers: Arc<Vec<Arc<Worker>>>,
     injector: Arc<Injector>,
@@ -538,6 +551,12 @@ impl ThreadPool {
     /// Shutdown the thread pool
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        self.injector.notify_shutdown();
+    }
+
+    /// Get a reference to the epoch participant
+    pub fn participant(&self) -> &Arc<Participant> {
+        &self.participant
     }
 }
 

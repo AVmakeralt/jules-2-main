@@ -308,7 +308,6 @@ impl DataAffinityMap {
 }
 
 /// SoA scheduler with cache warming
-#[allow(dead_code)]
 pub struct SoaScheduler {
     /// Ready queue (SoA layout)
     ready_queue: SoaTaskQueue,
@@ -373,6 +372,11 @@ impl SoaScheduler {
     /// Get the affinity map reference
     pub fn affinity_map(&self) -> &DataAffinityMap {
         &self.affinity_map
+    }
+    
+    /// Get the number of workers
+    pub fn num_workers(&self) -> usize {
+        self.num_workers
     }
     
     /// Submit a task to the SoA scheduler

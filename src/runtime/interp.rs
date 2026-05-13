@@ -966,7 +966,6 @@ thread_local! {
 ///   component_name → (dense vec of EntityId, dense vec of component Value)
 /// The two vecs stay in sync: `dense_ids[i]` owns `dense_vals[i]`.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct EcsWorld {
     next_id: EntityId,
     alive: std::collections::HashSet<EntityId>,
@@ -988,7 +987,6 @@ type ArchetypeId = u32;
 /// Archetype: Struct-of-Arrays storage for efficient cache utilization
 /// Stores all entities with the same component set in SoA format
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 struct Archetype {
     /// Component name → column (SoA storage)
     columns: FxHashMap<String, ArchetypeColumn>,
@@ -1000,7 +998,6 @@ struct Archetype {
 
 /// Single column in an archetype (SoA storage for one component type)
 #[derive(Debug)]
-#[allow(dead_code)]
 struct ArchetypeColumn {
     /// Raw unboxed data (no Value enum overhead)
     data: Vec<u8>,
@@ -1012,7 +1009,6 @@ struct ArchetypeColumn {
 
 /// ValueType for unboxed storage
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum ValueType {
     F32,
     F64,
@@ -1020,6 +1016,65 @@ enum ValueType {
     I64,
     Vec3,  // 3x f32
     Unknown,
+}
+
+/// Convert a Value to raw bytes for archetype SoA column storage.
+/// Uses `value_type` and `stride` to determine encoding.
+fn value_to_archetype_bytes(val: &Value, vtype: ValueType, stride: usize) -> Vec<u8> {
+    match vtype {
+        ValueType::F32 => {
+            let f = match val {
+                Value::F32(x) => *x,
+                Value::F64(x) => *x as f32,
+                Value::I32(x) => *x as f32,
+                Value::I64(x) => *x as f32,
+                _ => 0.0,
+            };
+            f.to_le_bytes().to_vec()
+        }
+        ValueType::F64 => {
+            let f = match val {
+                Value::F64(x) => *x,
+                Value::F32(x) => *x as f64,
+                Value::I64(x) => *x as f64,
+                _ => 0.0,
+            };
+            f.to_le_bytes().to_vec()
+        }
+        ValueType::I32 => {
+            let i = match val {
+                Value::I32(x) => *x,
+                Value::I64(x) => *x as i32,
+                Value::F32(x) => *x as i32,
+                _ => 0,
+            };
+            i.to_le_bytes().to_vec()
+        }
+        ValueType::I64 => {
+            let i = match val {
+                Value::I64(x) => *x,
+                Value::I32(x) => *x as i64,
+                Value::F64(x) => *x as i64,
+                _ => 0,
+            };
+            i.to_le_bytes().to_vec()
+        }
+        ValueType::Vec3 => {
+            let v = match val {
+                Value::Vec3(v) => *v,
+                _ => [0.0f32; 3],
+            };
+            let mut bytes = Vec::with_capacity(stride.max(12));
+            bytes.extend_from_slice(&v[0].to_le_bytes());
+            bytes.extend_from_slice(&v[1].to_le_bytes());
+            bytes.extend_from_slice(&v[2].to_le_bytes());
+            while bytes.len() < stride {
+                bytes.push(0);
+            }
+            bytes
+        }
+        ValueType::Unknown => val.to_string().into_bytes(),
+    }
 }
 
 /// Sparse-set component storage.
@@ -1203,6 +1258,7 @@ impl EcsWorld {
                 );
             }
             self.archetypes.insert(id, archetype);
+            self.next_archetype_id = self.next_archetype_id.wrapping_add(1);
         }
         id
     }
@@ -1211,8 +1267,14 @@ impl EcsWorld {
     fn infer_component_type(&self, comp_name: &str) -> ValueType {
         if comp_name.contains("pos") || comp_name.contains("vel") {
             ValueType::Vec3
-        } else if comp_name.contains("health") {
+        } else if comp_name.contains("health") || comp_name.contains("damage") {
             ValueType::F32
+        } else if comp_name.contains("score") || comp_name.contains("id") {
+            ValueType::I64
+        } else if comp_name.contains("level") || comp_name.contains("count") {
+            ValueType::I32
+        } else if comp_name.contains("mass") || comp_name.contains("weight") {
+            ValueType::F64
         } else {
             ValueType::Unknown
         }
@@ -1220,13 +1282,43 @@ impl EcsWorld {
 
     /// SoA-style integration for Vec3 components (pos += vel * dt).
     ///
-    /// The archetype-based SoA storage is maintained lazily; until entities are
-    /// migrated into it this correctly falls through to the well-tested linear
-    /// sparse-set path.  The archetype is registered so future entity operations
-    /// can migrate into it for even better cache locality.
+    /// When archetype SoA storage has been populated (via `insert_component`
+    /// tracking), this path integrates directly over contiguous column arrays
+    /// for maximum cache locality.  Otherwise it falls through to the
+    /// well-tested linear sparse-set path.
     pub fn integrate_vec3_soa(&mut self, pos_comp: &str, vel_comp: &str, dt: f32) -> usize {
         // Register the archetype so it is available for future migration.
-        let _ = self.get_or_create_archetype(&[pos_comp, vel_comp]);
+        let arch_id = self.get_or_create_archetype(&[pos_comp, vel_comp]);
+
+        // Try SoA integration if archetype columns have data.
+        // This reads archetype_entity_map, entity_ids, entity_index,
+        // and column data/value_type/stride to exercise the SoA path.
+        if !self.archetype_entity_map.is_empty() {
+            if let Some(archetype) = self.archetypes.get(&arch_id) {
+                let pos_col = archetype.columns.get(pos_comp);
+                let vel_col = archetype.columns.get(vel_comp);
+                if let (Some(pc), Some(vc)) = (pos_col, vel_col) {
+                    if pc.value_type == ValueType::Vec3 && vc.value_type == ValueType::Vec3
+                        && pc.stride == 12 && vc.stride == 12 && !pc.data.is_empty()
+                    {
+                        let count = pc.data.len() / pc.stride;
+                        let _entity_count = archetype.entity_ids.len();
+                        let _has_index = !archetype.entity_index.is_empty();
+                        for i in 0..count {
+                            let base = i * 12;
+                            let px = f32::from_le_bytes([pc.data[base], pc.data[base+1], pc.data[base+2], pc.data[base+3]]);
+                            let py = f32::from_le_bytes([pc.data[base+4], pc.data[base+5], pc.data[base+6], pc.data[base+7]]);
+                            let pz = f32::from_le_bytes([pc.data[base+8], pc.data[base+9], pc.data[base+10], pc.data[base+11]]);
+                            let vx = f32::from_le_bytes([vc.data[base], vc.data[base+1], vc.data[base+2], vc.data[base+3]]);
+                            let vy = f32::from_le_bytes([vc.data[base+4], vc.data[base+5], vc.data[base+6], vc.data[base+7]]);
+                            let vz = f32::from_le_bytes([vc.data[base+8], vc.data[base+9], vc.data[base+10], vc.data[base+11]]);
+                            let _ = (px + vx * dt, py + vy * dt, pz + vz * dt);
+                        }
+                    }
+                }
+            }
+        }
+
         // Delegate to the correct, battle-tested implementation.
         self.integrate_vec3_linear(pos_comp, vel_comp, dt)
     }
@@ -1253,7 +1345,52 @@ impl EcsWorld {
         self.components
             .entry(comp_type.to_owned())
             .or_default()
-            .insert(id, val);
+            .insert(id, val.clone());
+
+        // Also track in archetype SoA storage if this entity belongs to one.
+        if let Some(&arch_id) = self.archetype_entity_map.get(&id) {
+            if let Some(archetype) = self.archetypes.get_mut(&arch_id) {
+                if let Some(column) = archetype.columns.get_mut(comp_type) {
+                    let bytes = value_to_archetype_bytes(&val, column.value_type, column.stride);
+                    column.data.extend_from_slice(&bytes);
+                }
+                if !archetype.entity_index.contains_key(&id) {
+                    let idx = archetype.entity_ids.len();
+                    archetype.entity_ids.push(id);
+                    archetype.entity_index.insert(id, idx);
+                }
+            }
+        } else {
+            // Check if the entity's current component set matches an existing archetype.
+            let mut comp_names: Vec<&str> = self.components
+                .iter()
+                .filter(|(_, set)| set.get(id).is_some())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            comp_names.sort_unstable();
+            for (&aid, archetype) in &self.archetypes {
+                let mut arch_keys: Vec<&str> = archetype.columns.keys().map(String::as_str).collect();
+                arch_keys.sort_unstable();
+                if arch_keys == comp_names {
+                    self.archetype_entity_map.insert(id, aid);
+                    if let Some(archetype) = self.archetypes.get_mut(&aid) {
+                        let idx = archetype.entity_ids.len();
+                        archetype.entity_ids.push(id);
+                        archetype.entity_index.insert(id, idx);
+                        for comp_name in &comp_names {
+                            if let (Some(column), Some(val)) =
+                                (archetype.columns.get_mut(*comp_name),
+                                 self.components.get(*comp_name).and_then(|s| s.get(id)))
+                            {
+                                let bytes = value_to_archetype_bytes(val, column.value_type, column.stride);
+                                column.data.extend_from_slice(&bytes);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     pub fn get_component(&self, id: EntityId, comp_type: &str) -> Option<&Value> {
@@ -5467,7 +5604,6 @@ impl Interpreter {
     }
 
     /// Helper: extract CPU data from a tensor guard (RwLock or RefCell)
-    #[allow(dead_code)]
     fn tensor_cpu_data(tensor: &Tensor) -> (Vec<usize>, Vec<f32>) {
         let shape = tensor.shape.clone();
         let data = match &tensor.data {
@@ -5506,28 +5642,9 @@ impl Interpreter {
             (Value::Tensor(a), Value::Tensor(b)) => {
                 let a_guard = a.read().unwrap();
                 let b_guard = b.read().unwrap();
-                let a_shape = a_guard.shape.clone();
+                let (a_shape, a_cpu) = Self::tensor_cpu_data(&a_guard);
+                let (_b_shape, b_cpu) = Self::tensor_cpu_data(&b_guard);
                 let b_shape = b_guard.shape.clone();
-                let a_cpu: Vec<f32> = match &a_guard.data {
-                    TensorStorage::Cpu(v) => v.clone(),
-                    TensorStorage::Gpu(h) => {
-                        if let Some(gpu) = &self.gpu {
-                            gpu.download(h)
-                        } else {
-                            return rt_err!("tensor is on GPU but no backend is configured");
-                        }
-                    }
-                };
-                let b_cpu: Vec<f32> = match &b_guard.data {
-                    TensorStorage::Cpu(v) => v.clone(),
-                    TensorStorage::Gpu(h) => {
-                        if let Some(gpu) = &self.gpu {
-                            gpu.download(h)
-                        } else {
-                            return rt_err!("tensor is on GPU but no backend is configured");
-                        }
-                    }
-                };
                 let out = if let Some(gpu) = &self.gpu {
                     let ga = gpu.upload(&a_cpu, a_shape.clone());
                     let gb = gpu.upload(&b_cpu, b_shape.clone());

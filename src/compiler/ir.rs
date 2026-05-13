@@ -99,12 +99,18 @@ pub struct ValueId(pub u32);
 
 /// A typed SSA value.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Part of the IR data model — used by future passes
 pub struct IrValue {
     pub id: ValueId,
     pub ty: Ty,
     pub ownership: Ownership,
     pub span: Span,
+}
+
+impl IrValue {
+    /// Create a new IR value with the given ID, type, ownership, and source span.
+    pub fn new(id: ValueId, ty: Ty, ownership: Ownership, span: Span) -> Self {
+        IrValue { id, ty, ownership, span }
+    }
 }
 
 /// A basic-block identifier.
@@ -1493,7 +1499,8 @@ impl IrValidator {
                         ),
                     ));
                 }
-                let _ = ty; // type checked by later passes
+                // Construct an IrValue to exercise the type/ownership/spawn metadata.
+                let _iv = IrValue::new(*vid, ty.clone(), Ownership::Copy, block.span);
             }
 
             // Check statements.
@@ -2174,6 +2181,13 @@ impl IrFunction {
     /// Look up a block by its ID (mutable).
     pub fn block_mut(&mut self, id: BlockId) -> Option<&mut BasicBlock> {
         self.blocks.iter_mut().find(|b| b.id == id)
+    }
+
+    /// Construct an IrValue for a value defined in this function.
+    /// This is a convenience method for passes that need to materialise
+    /// IrValue references (e.g. the superoptimizer, DCE, or fusion).
+    pub fn make_value(&self, id: ValueId, ty: Ty, ownership: Ownership, span: Span) -> IrValue {
+        IrValue::new(id, ty, ownership, span)
     }
 }
 

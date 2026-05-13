@@ -421,7 +421,7 @@ pub struct HugePageAllocator {
 }
 
 /// Huge page region
-#[allow(dead_code)]
+
 struct HugePageRegion {
     /// Base address
     addr: *mut u8,

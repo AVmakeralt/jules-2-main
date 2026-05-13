@@ -530,7 +530,6 @@ pub fn generate_rewrite_rules() -> Vec<RewriteRule> {
 }
 
 /// Superoptimizer integration for threading (extended)
-#[allow(dead_code)]
 pub struct SuperoptThreadingIntegration {
     /// Thread pool for task execution
     pool: ThreadPool,
@@ -1068,6 +1067,11 @@ impl SuperoptThreadingIntegration {
     /// Get hybrid notification system
     pub fn hybrid_notify(&self) -> Option<&HybridNotify> {
         self.hybrid_notify.as_ref()
+    }
+    
+    /// Get the huge page allocator
+    pub fn huge_pages(&self) -> Option<&HugePageAllocator> {
+        self.huge_pages.as_ref()
     }
 
     /// Get the prophetic hardware prefetcher engine

@@ -197,7 +197,7 @@ pub fn is_uintr_available() -> bool {
 /// io_uring submission queue entry (simplified)
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
+
 pub struct IoUringSqe {
     /// Opcode
     pub opcode: u8,
@@ -253,7 +253,7 @@ pub struct IoUring {
     /// SQE array mapping (separate from the ring)
     sqes: *mut IoUringSqe,
     /// Ring buffer size (deprecated, kept for API compat)
-    #[allow(dead_code)]
+    
     ring_size: usize,
     /// SQPOLL mode enabled
     sqpoll: bool,
@@ -529,6 +529,21 @@ impl IoUring {
                 None
             }
         }
+    }
+
+    /// Return the number of completion queue entries.
+    pub fn cq_entries(&self) -> u32 {
+        self.cq_entries
+    }
+
+    /// Return the ring buffer size.
+    pub fn ring_size(&self) -> usize {
+        self.ring_size
+    }
+
+    /// Return the CQ ring offsets.
+    pub fn cq_off(&self) -> [u64; 5] {
+        self.cq_off
     }
 }
 

@@ -217,7 +217,7 @@ impl Default for FastSocket {
 }
 
 /// I/O operation for batched submission
-#[allow(dead_code)]
+
 enum IoOperation {
     Read {
         fd: u32,

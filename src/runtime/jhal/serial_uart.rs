@@ -64,7 +64,7 @@ const REG_MCR: u16 = 4;
 /// Offset 5: Line Status Register
 const REG_LSR: u16 = 5;
 /// Offset 6: Modem Status Register
-#[allow(dead_code)]
+
 const REG_MSR: u16 = 6;
 /// Offset 7: Scratch Register
 const REG_SCR: u16 = 7;
@@ -72,16 +72,16 @@ const REG_SCR: u16 = 7;
 // ─── Bit Field Definitions ────────────────────────────────────────────────
 
 /// IER: Enable Received Data Available Interrupt
-#[allow(dead_code)]
+
 const IER_RX_ENABLE: u8 = 1 << 0;
 /// IER: Enable Transmit Holding Register Empty Interrupt
-#[allow(dead_code)]
+
 const IER_TX_ENABLE: u8 = 1 << 1;
 /// IER: Enable Receiver Line Status Interrupt
-#[allow(dead_code)]
+
 const IER_RX_LINE_STATUS: u8 = 1 << 2;
 /// IER: Enable Modem Status Interrupt
-#[allow(dead_code)]
+
 const IER_MODEM_STATUS: u8 = 1 << 3;
 
 /// LCR: Divisor Latch Access Bit (bit 7)
@@ -100,7 +100,7 @@ const FCR_CLEAR_RX: u8 = 1 << 1;
 /// FCR: Clear transmit FIFO (bit 2)
 const FCR_CLEAR_TX: u8 = 1 << 2;
 /// FCR: DMA mode (bit 3)
-#[allow(dead_code)]
+
 const FCR_DMA_MODE: u8 = 1 << 3;
 /// FCR: 14-byte trigger level (bits 7:6 = 11)
 const FCR_TRIGGER_14: u8 = 0b11 << 6;
@@ -110,7 +110,7 @@ const MCR_DTR: u8 = 1 << 0;
 /// MCR: Request To Send (bit 1)
 const MCR_RTS: u8 = 1 << 1;
 /// MCR: Auxiliary Output 1 (bit 2) — used as interrupt gate on some systems
-#[allow(dead_code)]
+
 const MCR_OUT1: u8 = 1 << 2;
 /// MCR: Auxiliary Output 2 (bit 3) — enables IRQ on PC-compatible UARTs
 const MCR_OUT2: u8 = 1 << 3;

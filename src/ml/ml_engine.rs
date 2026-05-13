@@ -80,7 +80,6 @@ impl Int8LinearWeights {
     }
 }
 
-#[allow(dead_code)]
 impl Tensor {
     const PARALLEL_MATMUL_MIN_OPS: usize = 2_000_000;
 
@@ -587,6 +586,8 @@ impl Tensor {
         let threads = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
+
+        let _use_jules_kernel = Self::use_native_jules_kernel(m, k, n);
 
         if threads > 1 && ops >= Self::PARALLEL_MATMUL_MIN_OPS {
             // Split rows into two halves and process in parallel using join

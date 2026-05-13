@@ -65,7 +65,7 @@ impl FusedOperation {
 }
 
 /// Zero-copy data transfer between lossy and hyper-sparse
-#[allow(dead_code)]
+
 pub struct ZeroCopyTransfer {
     /// Source data pointer
     source: *mut u8,
@@ -109,6 +109,11 @@ impl ZeroCopyTransfer {
     /// Get the destination pointer
     pub fn destination(&self) -> *mut u8 {
         self.destination
+    }
+    
+    /// Get the size in bytes of this transfer.
+    pub fn size(&self) -> usize {
+        self.size
     }
 }
 

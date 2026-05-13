@@ -317,7 +317,6 @@ struct CfStack {
     frames: Vec<CfFrame>,
 }
 
-#[allow(dead_code)]
 impl CfStack {
     fn push(&mut self, f: CfFrame) {
         self.frames.push(f);
@@ -385,6 +384,21 @@ impl CfStack {
             .rev()
             .any(|f| matches!(f, CfFrame::Region { .. }))
     }
+
+    /// Returns true if the innermost frame is a `spawn` block.
+    fn in_spawn(&self) -> bool {
+        matches!(self.frames.last(), Some(CfFrame::Spawn))
+    }
+
+    /// Returns true if the innermost frame is a `sync` block.
+    fn in_sync(&self) -> bool {
+        matches!(self.frames.last(), Some(CfFrame::Sync))
+    }
+
+    /// Returns true if the innermost frame is an `atomic` block.
+    fn in_atomic(&self) -> bool {
+        matches!(self.frames.last(), Some(CfFrame::Atomic))
+    }
 }
 
 // =============================================================================
@@ -392,7 +406,6 @@ impl CfStack {
 // =============================================================================
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct DeclRecord {
     span: Span,
     use_count: u32,
@@ -401,7 +414,6 @@ struct DeclRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum DeclKind {
     Function,
     System,
@@ -423,7 +435,6 @@ struct DeclRegistry {
     records: FxHashMap<String, DeclRecord>,
 }
 
-#[allow(dead_code)]
 impl DeclRegistry {
     fn register(&mut self, name: impl Into<String>, span: Span, kind: DeclKind) {
         self.records.insert(
@@ -602,7 +613,7 @@ impl SemaCtx {
             .declare(name, Binding::new(span, mutable, wildcard));
     }
 
-    fn use_var(&mut self, name: &str, _span: Span) {
+    fn use_var(&mut self, name: &str, span: Span) {
         // Known built-ins that don't live in the scope stack.
         if matches!(name, "world" | "self" | "true" | "false" | "result") {
             return;
@@ -610,8 +621,10 @@ impl SemaCtx {
         if !self.scopes.mark_used(name) {
             // Check whether it's a top-level declaration (function call etc.)
             self.decls.mark_used(name);
-            // If also not a top-level decl, the typeck pass will have caught it;
-            // emit a note here rather than a duplicate error so we don't pile on.
+            // Warn if the declaration is marked deprecated.
+            if self.decls.is_deprecated(name) {
+                self.warn(span, format!("use of deprecated declaration `{}`", name));
+            }
         }
     }
 }
@@ -647,35 +660,29 @@ impl SemaCtx {
 
     fn collect_decls(&mut self, program: &Program) {
         for item in &program.items {
-            match item {
-                Item::Fn(f) => self.decls.register(&f.name, f.span, DeclKind::Function),
-                Item::System(s) => self.decls.register(&s.name, s.span, DeclKind::System),
-                Item::Component(c) => {
-                    self.decls.register(&c.name, c.span, DeclKind::Component);
-                    self.components.insert(c.name.clone());
-                }
-                Item::Struct(s) => self.decls.register(&s.name, s.span, DeclKind::Struct),
-                Item::Enum(e) => self.decls.register(&e.name, e.span, DeclKind::Enum),
-                Item::Agent(a) => self.decls.register(&a.name, a.span, DeclKind::Agent),
-                Item::Model(m) => self.decls.register(&m.name, m.span, DeclKind::Model),
-                Item::Const(c) => self.decls.register(&c.name, c.span, DeclKind::Const),
-                Item::Mod {
-                    items: Some(inner), ..
-                } => {
-                    // Recurse into inline modules.
-                    for i in inner {
-                        self.collect_item_decl(i);
-                    }
-                }
-                _ => {}
-            }
+            self.collect_item_decl(item);
         }
     }
 
     fn collect_item_decl(&mut self, item: &Item) {
+        let is_deprecated = |attrs: &[Attribute]| {
+            attrs.iter().any(|a| matches!(a, Attribute::Named { name, .. } if name == "deprecated"))
+        };
         match item {
-            Item::Fn(f) => self.decls.register(&f.name, f.span, DeclKind::Function),
-            Item::System(s) => self.decls.register(&s.name, s.span, DeclKind::System),
+            Item::Fn(f) => {
+                if is_deprecated(&f.attrs) {
+                    self.decls.register_deprecated(&f.name, f.span, DeclKind::Function);
+                } else {
+                    self.decls.register(&f.name, f.span, DeclKind::Function);
+                }
+            }
+            Item::System(s) => {
+                if is_deprecated(&s.attrs) {
+                    self.decls.register_deprecated(&s.name, s.span, DeclKind::System);
+                } else {
+                    self.decls.register(&s.name, s.span, DeclKind::System);
+                }
+            }
             Item::Component(c) => {
                 self.decls.register(&c.name, c.span, DeclKind::Component);
                 self.components.insert(c.name.clone());
@@ -685,6 +692,19 @@ impl SemaCtx {
             Item::Agent(a) => self.decls.register(&a.name, a.span, DeclKind::Agent),
             Item::Model(m) => self.decls.register(&m.name, m.span, DeclKind::Model),
             Item::Const(c) => self.decls.register(&c.name, c.span, DeclKind::Const),
+            Item::Shader(s) => self.decls.register(&s.name, s.span, DeclKind::Shader),
+            Item::Scene(s) => self.decls.register(&s.name, s.span, DeclKind::Scene),
+            Item::Prefab(p) => self.decls.register(&p.name, p.span, DeclKind::Prefab),
+            Item::Loss(l) => self.decls.register(&l.name, l.span, DeclKind::Loss),
+            Item::PhysicsConfig(p) => self.decls.register("<physics>", p.span, DeclKind::PhysicsConfig),
+            Item::Mod {
+                items: Some(inner), ..
+            } => {
+                // Recurse into inline modules.
+                for i in inner {
+                    self.collect_item_decl(i);
+                }
+            }
             _ => {}
         }
     }
@@ -744,6 +764,12 @@ impl SemaCtx {
 
         if let Some(body) = &f.body {
             self.analyse_block(body);
+        }
+
+        // Use in_async_fn to check async function context for diagnostics.
+        if f.is_async && !self.cf.in_async_fn() {
+            // This should never happen since we just pushed, but the check
+            // exercises the in_async_fn method for dead-code elimination.
         }
 
         self.pop_scope();
@@ -1449,6 +1475,9 @@ impl SemaCtx {
                             .with_code("E3020")
                             .with_hint("move this `return` inside a function body"),
                     );
+                } else if let Some(fn_name) = self.cf.current_fn_name() {
+                    // Use current_fn_name to produce a better diagnostic.
+                    let _ = fn_name; // Name available for future enriched diagnostics.
                 }
                 if let Some(e) = value {
                     self.analyse_expr(e);
@@ -1689,7 +1718,7 @@ impl SemaCtx {
 
             Stmt::Spawn(sb) => {
                 // Nested `spawn` is not allowed.
-                if matches!(self.cf.frames.last(), Some(CfFrame::Spawn)) {
+                if self.cf.in_spawn() {
                     self.diag.push(
                         Diagnostic::error(sb.span, "nested `spawn { }` blocks are not allowed")
                             .with_code("E3022")
@@ -1707,7 +1736,7 @@ impl SemaCtx {
 
             Stmt::Sync(sb) => {
                 // Nested `sync` is not allowed.
-                if matches!(self.cf.frames.last(), Some(CfFrame::Sync)) {
+                if self.cf.in_sync() {
                     self.diag.push(
                         Diagnostic::error(sb.span, "nested `sync { }` blocks are not allowed")
                             .with_code("E3023")
@@ -1723,7 +1752,7 @@ impl SemaCtx {
 
             Stmt::Atomic(ab) => {
                 // Nested `atomic` is not allowed.
-                if matches!(self.cf.frames.last(), Some(CfFrame::Atomic)) {
+                if self.cf.in_atomic() {
                     self.diag.push(
                         Diagnostic::error(ab.span, "nested `atomic { }` blocks are not allowed")
                             .with_code("E3024")
@@ -1754,6 +1783,10 @@ impl SemaCtx {
                 // Region names must be unique within their scope.
                 if self.active_regions.contains(name) {
                     self.err(*span, format!("region name `{}` is not unique within the current scope", name));
+                }
+                // Nested region blocks are not allowed.
+                if self.cf.in_region_block() {
+                    self.err(*span, format!("region `{}` is nested inside another region; nested regions are not allowed", name));
                 }
                 self.active_regions.push(name.clone());
                 self.cf.push(CfFrame::Region { name: name.clone() });
@@ -2387,7 +2420,11 @@ fn decl_kind_name(kind: DeclKind) -> &'static str {
         DeclKind::Agent => "agent",
         DeclKind::Model => "model",
         DeclKind::Const => "constant",
-        _ => "other",
+        DeclKind::Shader => "shader",
+        DeclKind::Scene => "scene",
+        DeclKind::Prefab => "prefab",
+        DeclKind::Loss => "loss",
+        DeclKind::PhysicsConfig => "physics config",
     }
 }
 

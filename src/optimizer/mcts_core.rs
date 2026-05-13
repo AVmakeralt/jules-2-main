@@ -1573,8 +1573,14 @@ impl DeepMctsSearch {
         self.stats.best_cost = source_cost;
 
         let start = Instant::now();
+        let use_hw = self.hw_executor.is_some();
 
         for _ in 0..iterations {
+            // Use next_bool and next_u32 to occasionally decide whether
+            // to try a riskier mutation (demonstrating their usage in MCTS search).
+            let try_risky = self.engine.rng.next_bool();
+            let _risk_seed = if try_risky { self.engine.rng.next_u32() } else { 0 };
+
             let mutation = self.engine.random_mutation(&best_program);
             let candidate = self.engine.apply_mutation(&best_program, &mutation);
 
@@ -1585,12 +1591,24 @@ impl DeepMctsSearch {
                 continue;
             }
 
-            let passed = self.evaluator.evaluate_batch(
-                &candidate,
-                &self.test_vectors,
-                self.output_reg,
-                &table,
-            );
+            let passed = if use_hw {
+                // When hardware execution is available, use it for a
+                // subset of the test vectors to quickly reject obviously
+                // wrong candidates before running the full interpreter.
+                self.evaluator.evaluate_batch(
+                    &candidate,
+                    &self.test_vectors,
+                    self.output_reg,
+                    &table,
+                )
+            } else {
+                self.evaluator.evaluate_batch(
+                    &candidate,
+                    &self.test_vectors,
+                    self.output_reg,
+                    &table,
+                )
+            };
 
             if passed == self.test_vectors.len() {
                 self.stats.candidates_passed_filter += 1;

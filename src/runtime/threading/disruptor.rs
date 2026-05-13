@@ -16,7 +16,6 @@ const CACHE_LINE_SIZE: usize = 64;
 const RING_CAPACITY: usize = 1024;
 
 /// Sequence number type
-#[allow(dead_code)]
 type Sequence = u64;
 
 /// Ring buffer entry
@@ -185,12 +184,12 @@ impl<T> DisruptorRing<T> {
     }
     
     /// Get the producer sequence
-    pub fn producer_sequence(&self) -> u64 {
+    pub fn producer_sequence(&self) -> Sequence {
         self.producer_sequence.load(Ordering::Acquire)
     }
     
     /// Get the consumer sequence
-    pub fn consumer_sequence(&self) -> u64 {
+    pub fn consumer_sequence(&self) -> Sequence {
         self.consumer_sequence.load(Ordering::Acquire)
     }
     

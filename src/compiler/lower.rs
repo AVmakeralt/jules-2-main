@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::fmt;
 
 /// Loop context for break/continue lowering.
-#[allow(dead_code)]
 struct LoopContext {
     /// The block to jump to on `break`.
     break_block: BlockId,
@@ -317,7 +316,19 @@ impl LowerCtx {
         let fn_effects = match decl.effect.as_deref() {
             Some("pure") => EffectFlags::PURE,
             Some("io") => EffectFlags::PURE.union(EffectFlags::IO),
-            _ => EffectFlags::PURE, // default to pure
+            _ => {
+                // Infer effects from the body if no explicit annotation.
+                if let Some(body) = &decl.body {
+                    let inferred = self.infer_block_effects(body);
+                    if inferred.is_pure() {
+                        EffectFlags::PURE
+                    } else {
+                        inferred
+                    }
+                } else {
+                    EffectFlags::PURE // default to pure
+                }
+            }
         };
 
         // Lower requires/ensures as function metadata (lower the expressions
@@ -475,7 +486,7 @@ impl LowerCtx {
         self.push_scope();
         for stmt in &block.stmts {
             self.lower_stmt(stmt);
-            if self.is_terminated() {
+            if self.is_terminated_fast() {
                 self.pop_scope();
                 return None;
             }
@@ -1889,8 +1900,18 @@ impl LowerCtx {
 
         self.switch_to_block(exit_block);
 
-        // Pop loop context
-        self.loop_stack.pop();
+        // Pop loop context — emit loop-carried state variable metadata
+        // so the optimizer can reason about loop induction variables.
+        if let Some(lctx) = self.loop_stack.pop() {
+            for (vid, ir_ty) in &lctx.loop_state_vars {
+                self.emit(
+                    IrOp::Move { src: *vid },
+                    span,
+                    EffectFlags::pure(),
+                    self.infer_ownership(ir_ty),
+                );
+            }
+        }
     }
 
     fn lower_match(&mut self, expr: &Expr, arms: &[MatchArm], span: Span) {
@@ -2150,7 +2171,6 @@ impl LowerCtx {
 
     // ── Effect Inference ────────────────────────────────────────────────────
 
-    #[allow(dead_code)]
     fn infer_effects(&self, expr: &Expr) -> EffectFlags {
         match expr {
             Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit { .. } | Expr::StrLit { .. } => {
@@ -2185,7 +2205,6 @@ impl LowerCtx {
         }
     }
 
-    #[allow(dead_code)]
     fn infer_block_effects(&self, block: &Block) -> EffectFlags {
         let mut effects = EffectFlags::pure();
         for stmt in &block.stmts {
@@ -2197,7 +2216,6 @@ impl LowerCtx {
         effects
     }
 
-    #[allow(dead_code)]
     fn infer_stmt_effects(&self, stmt: &Stmt) -> EffectFlags {
         match stmt {
             Stmt::Let { init, .. } => {
@@ -2233,7 +2251,6 @@ impl LowerCtx {
 
     // ── Ownership Inference ─────────────────────────────────────────────────
 
-    #[allow(dead_code)]
     fn infer_ownership(&self, ty: &IrType) -> Ownership {
         match ty {
             IrType::Int { .. } | IrType::Float { .. } | IrType::Bool | IrType::Unit => Ownership::Copy,

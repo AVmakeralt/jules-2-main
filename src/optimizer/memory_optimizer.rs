@@ -311,7 +311,7 @@ pub struct MemoryOptimizer {
     /// Huge page size (in bytes)
     huge_page_size: usize,
     /// Whether huge pages are available
-    #[allow(dead_code)]
+    
     huge_pages_available: bool,
 }
 
@@ -341,7 +341,16 @@ impl MemoryOptimizer {
     }
 
     /// Register a data region
-    pub fn register_region(&mut self, region: DataRegion) {
+    pub fn register_region(&mut self, mut region: DataRegion) {
+        // If huge pages are available and the region is large enough,
+        // upgrade the allocation strategy to use huge pages.
+        if self.huge_pages_available && region.size >= self.huge_page_size {
+            if region.strategy == AllocationStrategy::Standard {
+                region.strategy = AllocationStrategy::HugePages;
+            } else if region.strategy == AllocationStrategy::NumaLocal {
+                region.strategy = AllocationStrategy::NumaHuge;
+            }
+        }
         let name = region.name.clone();
         self.regions.insert(name, region);
     }

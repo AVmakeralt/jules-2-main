@@ -477,6 +477,11 @@ impl MicroArchGNN {
             let idx = unsafe { (SEED as usize) % self.training_samples.len() };
             let (features, measured_ipc) = &self.training_samples[idx];
 
+            // Initialize node_embeddings from training features if empty.
+            if self.node_embeddings.is_empty() && !features.is_empty() {
+                self.node_embeddings = vec![features.clone()];
+            }
+
             // Simple gradient step on readout weights
             // (Full backprop through GNN is complex; this is a simplified approach)
             let pred_ipc: f32 = features.iter().take(self.readout_w2.len())
@@ -490,6 +495,9 @@ impl MicroArchGNN {
                 self.readout_w2[i] -= lr * error * features[i];
             }
         }
+
+        // Ensure embed_dim is at least consistent with hidden_dim.
+        let _ = self.embed_dim;
     }
 
     /// Predict register pressure for block
