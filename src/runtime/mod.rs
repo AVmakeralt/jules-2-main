@@ -1,5 +1,6 @@
 pub mod bytecode_vm;
 pub mod gpu_backend;
+pub mod heterogeneous_memory;
 pub mod interp;
 pub mod io_uring;
 /// PrefetchEngine with CPU topology detection, stride prediction, etc.

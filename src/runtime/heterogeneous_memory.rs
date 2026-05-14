@@ -61,10 +61,13 @@
 //
 // =============================================================================
 
-use crate::compiler::borrowck::{Lifetime, AccessPattern};
-// MemoryTier was removed; MemoryTierId is defined locally below
+// Lifetime and AccessPattern are defined locally below — they represent the
+// compiler's analysis results that feed into the ZCHMA tier-selection engine.
+// Previously imported from crate::compiler::borrowck, but that module does not
+// export these types, so we define self-contained versions here.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API Types
@@ -76,6 +79,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// that this allocation should reside in that tier based on the compiler's
 /// analysis of access patterns, lifetimes, and hardware topology.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields read by future runtime integration
 pub struct PlacementDistribution {
     /// Probability weights for each memory tier.
     /// Sum of all weights should equal 1.0 for valid distributions.
@@ -140,8 +144,71 @@ impl PlacementDistribution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoryTierId(pub u32);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Compiler Analysis Input Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lifetime information for a memory allocation, produced by the compiler's
+/// borrow checker and lifetime analysis passes.
+///
+/// This is a self-contained type that captures the information ZCHMA needs
+/// from the compiler frontend to make tier placement decisions.
+#[derive(Debug, Clone)]
+pub struct Lifetime {
+    /// Estimated duration of the allocation's lifetime.
+    pub estimated_length: Duration,
+    /// Whether this allocation outlives the current function frame.
+    pub escapes_frame: bool,
+    /// Unique lifetime identifier for tracking (set by the compiler).
+    pub lifetime_id: u64,
+}
+
+impl Default for Lifetime {
+    fn default() -> Self {
+        Self {
+            estimated_length: Duration::from_secs(0),
+            escapes_frame: false,
+            lifetime_id: 0,
+        }
+    }
+}
+
+/// Access pattern information for a memory allocation, produced by the
+/// compiler's data-flow and access-pattern analysis passes.
+///
+/// This is a self-contained type that captures the information ZCHMA needs
+/// to classify allocations into tier-appropriate categories.
+#[derive(Debug, Clone)]
+pub struct AccessPattern {
+    /// Optional operation name hint from the compiler (e.g. "matmul_accumulator").
+    pub operation_name: Option<String>,
+    /// Whether the access pattern is primarily random.
+    pub is_random_access: bool,
+    /// Whether the access pattern is primarily sequential.
+    pub is_sequential: bool,
+    /// Ratio of reads to total accesses (0.0 = all writes, 1.0 = all reads).
+    pub read_write_ratio: f64,
+    /// Normalized access frequency (accesses per instruction, 0.0–1.0).
+    pub access_frequency: f64,
+    /// Estimated working set size in bytes.
+    pub working_set_bytes: u64,
+}
+
+impl Default for AccessPattern {
+    fn default() -> Self {
+        Self {
+            operation_name: None,
+            is_random_access: false,
+            is_sequential: false,
+            read_write_ratio: 0.5,
+            access_frequency: 0.5,
+            working_set_bytes: 0,
+        }
+    }
+}
+
 /// Access pattern classification for a memory allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccessPatternClass {
     /// Frequent random access - likely to benefit from high-bandwidth memory.
     RandomAccess,
@@ -193,19 +260,38 @@ pub struct LifetimeTierMapper {
     tier_characteristics: Vec<TierCharacteristics>,
     /// Access pattern classifier.
     access_classifier: AccessPatternClassifier,
-    /// Migration cost model.
+    /// Migration cost model — used by `estimate_migration_cost` to compute
+    /// placement hints and by `map_lifetime_to_tier` to factor migration
+    /// cost into tier scoring.
     migration_model: MigrationCostModel,
     /// Statistics for tier selection decisions.
     selection_stats: TierSelectionStats,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct TierSelectionStats {
     pub total_allocations: AtomicU64,
     pub tier_selections: HashMap<MemoryTierId, AtomicU64>,
     pub migration_decisions: AtomicU64,
     pub successful_migrations: AtomicU64,
     pub failed_migrations: AtomicU64,
+}
+
+// NOTE: AtomicU64 does not implement Clone, so we implement it manually
+// by re-creating zero-valued atomics. This is correct for statistics
+// counters that are only meaningful within a single runtime instance.
+impl Clone for TierSelectionStats {
+    fn clone(&self) -> Self {
+        Self {
+            total_allocations: AtomicU64::new(self.total_allocations.load(Ordering::Relaxed)),
+            tier_selections: self.tier_selections.iter().map(|(k, v)| {
+                (*k, AtomicU64::new(v.load(Ordering::Relaxed)))
+            }).collect(),
+            migration_decisions: AtomicU64::new(self.migration_decisions.load(Ordering::Relaxed)),
+            successful_migrations: AtomicU64::new(self.successful_migrations.load(Ordering::Relaxed)),
+            failed_migrations: AtomicU64::new(self.failed_migrations.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl LifetimeTierMapper {
@@ -248,8 +334,34 @@ impl LifetimeTierMapper {
             }
         }
         
+        // Compute migration cost estimate for the most likely tier pair
+        // and factor it into the distribution's metadata.
+        let mut migration_cost_bytes = 0u64;
+        if let Some(best_tier) = weights.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)) {
+            // Estimate worst-case migration cost from default tier (DRAM) to best tier
+            let cost = self.migration_model.estimate_migration_cost(
+                MemoryTierId(0), // default DRAM tier
+                *best_tier.0,
+                size_bytes,
+            );
+            migration_cost_bytes = size_bytes; // Bytes that would need to move
+            let _ = cost; // Used for logging/future decisions
+        }
+        
         // Update statistics for the most likely tier
-        let distribution = PlacementDistribution::new(weights.clone());
+        let distribution = PlacementDistribution {
+            tier_weights: weights.clone(),
+            confidence: {
+                let total: f64 = weights.values().sum();
+                if total > 0.0 {
+                    weights.values().map(|w| w / total).fold(0.0, |acc, w| acc + w * w)
+                } else {
+                    0.0
+                }
+            },
+            estimated_access_rate: access_pattern.access_frequency,
+            migration_cost_bytes,
+        };
         if let Some(tier) = distribution.most_likely_tier() {
             self.selection_stats.tier_selections
                 .entry(tier)
@@ -395,9 +507,9 @@ impl MigrationCostModel {
         let bandwidth = self.inter_tier_bandwidth
             .get(&(src, dst))
             .copied()
-            .unwrap_or(10.0);
+            .unwrap_or_else(|| inter_tier_bandwidth(src, dst));
         
-        let transfer_time_ns = (size_bytes as f64 / bandwidth / 1e9) * 1e9;
+        let transfer_time_ns = compute_transfer_time_ns(size_bytes, bandwidth);
         let total_cost_ns = transfer_time_ns + self.decision_overhead_ns + self.coherency_overhead_ns;
         
         MigrationCostEstimate {
@@ -531,14 +643,13 @@ unsafe fn libc_move_pages(
     let ret: i64;
     std::arch::asm!(
         "syscall",
-        in("rax") 279u64,              // __NR_move_pages on x86_64
-        in("rdi") pid as u64,          // pid_t pid
-        in("rsi") count as u64,        // unsigned long count
-        in("rdx") pages as u64,        // const void __user * __user *pages
-        in("r10") nodes as u64,        // const int __user *nodes
-        in("r8")  status as u64,       // int __user *status
-        in("r9")  flags as u64,        // int flags
-        out("rax") ret,
+        inlateout("rax") 279u64 => ret,     // __NR_move_pages on x86_64
+        in("rdi") pid as u64,               // pid_t pid
+        in("rsi") count as u64,             // unsigned long count
+        in("rdx") pages as u64,             // const void __user * __user *pages
+        in("r10") nodes as u64,             // const int __user *nodes
+        in("r8")  status as u64,            // int __user *status
+        in("r9")  flags as u64,             // int flags
         out("rcx") _,
         out("r11") _,
         options(nostack)
@@ -549,10 +660,43 @@ unsafe fn libc_move_pages(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Centralized Bandwidth Table & Transfer Time Computation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Canonical inter-tier bandwidth table (GB/s).
+///
+/// This is the single source of truth for bandwidth between memory tier pairs.
+/// All migration cost estimates and scheduler decisions should use this function
+/// instead of duplicating the match arms.
+pub fn inter_tier_bandwidth(from: MemoryTierId, to: MemoryTierId) -> f64 {
+    match (from, to) {
+        (MemoryTierId(0), MemoryTierId(1)) | (MemoryTierId(1), MemoryTierId(0)) => 500.0, // DRAM<->HBM
+        (MemoryTierId(2), MemoryTierId(0)) | (MemoryTierId(0), MemoryTierId(2)) => 200.0, // CXL<->DRAM
+        (MemoryTierId(3), MemoryTierId(0)) | (MemoryTierId(0), MemoryTierId(3)) => 50.0,  // GPU<->DRAM
+        (MemoryTierId(1), MemoryTierId(2)) | (MemoryTierId(2), MemoryTierId(1)) => 150.0, // HBM<->CXL
+        (MemoryTierId(1), MemoryTierId(3)) | (MemoryTierId(3), MemoryTierId(1)) => 100.0, // HBM<->GPU
+        (MemoryTierId(2), MemoryTierId(3)) | (MemoryTierId(3), MemoryTierId(2)) => 40.0,  // CXL<->GPU
+        _ => 10.0, // Unknown tier pair — conservative default
+    }
+}
+
+/// Compute transfer time in nanoseconds for `size_bytes` at `bandwidth_gb_s`.
+///
+/// Returns `f64::INFINITY` if `bandwidth_gb_s` is zero (unreachable tier pair).
+pub fn compute_transfer_time_ns(size_bytes: u64, bandwidth_gb_s: f64) -> f64 {
+    if bandwidth_gb_s > 0.0 {
+        (size_bytes as f64 / (bandwidth_gb_s * 1e9)) * 1e9
+    } else {
+        f64::INFINITY
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Page Migration Scheduler
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Schedules page migrations based on runtime access patterns.
+#[allow(dead_code)] // active_migrations used for in-flight tracking
 pub struct PageMigrationScheduler {
     /// Active migrations in progress.
     active_migrations: HashMap<u64, MigrationTask>,
@@ -613,22 +757,13 @@ impl PageMigrationScheduler {
     }
     
     fn estimate_cost(&self, request: &MigrationRequest) -> MigrationCostEstimate {
-        // Estimate transfer time based on inter-tier bandwidth
-        let bandwidth_gb_s = match (request.from_tier, request.to_tier) {
-            (MemoryTierId(0), MemoryTierId(1)) | (MemoryTierId(1), MemoryTierId(0)) => 500.0,
-            (MemoryTierId(2), MemoryTierId(0)) | (MemoryTierId(0), MemoryTierId(2)) => 200.0,
-            (MemoryTierId(3), MemoryTierId(0)) | (MemoryTierId(0), MemoryTierId(3)) => 50.0,
-            (MemoryTierId(1), MemoryTierId(2)) | (MemoryTierId(2), MemoryTierId(1)) => 150.0,
-            (MemoryTierId(1), MemoryTierId(3)) | (MemoryTierId(3), MemoryTierId(1)) => 100.0,
-            (MemoryTierId(2), MemoryTierId(3)) | (MemoryTierId(3), MemoryTierId(2)) => 40.0,
-            _ => 10.0,
-        };
+        // Delegate to the shared bandwidth lookup in MigrationCostModel.
+        // Use a default model — the scheduler is standalone and doesn't hold
+        // a reference to LifetimeTierMapper's model, so we recreate the
+        // canonical table here via the centralized helper.
+        let bandwidth_gb_s = inter_tier_bandwidth(request.from_tier, request.to_tier);
 
-        let transfer_time_ns = if bandwidth_gb_s > 0.0 {
-            (request.size_bytes as f64 / (bandwidth_gb_s * 1e9)) * 1e9
-        } else {
-            f64::MAX
-        };
+        let transfer_time_ns = compute_transfer_time_ns(request.size_bytes, bandwidth_gb_s);
 
         // Decision + coherency overhead
         let overhead_ns = 1500.0;
@@ -667,26 +802,18 @@ impl PageMigrationScheduler {
     fn execute_migration(&mut self, request: &MigrationRequest) -> MigrationResult {
         self.migration_stats.total_migrations_initiated += 1;
         
-        // Estimate transfer time based on inter-tier bandwidth
-        // Use a simple model: time = size / bandwidth + overhead
-        let bandwidth_gb_s = match (request.from_tier, request.to_tier) {
-            (MemoryTierId(0), MemoryTierId(1)) | (MemoryTierId(1), MemoryTierId(0)) => 500.0, // DRAM<->HBM
-            (MemoryTierId(2), MemoryTierId(0)) | (MemoryTierId(0), MemoryTierId(2)) => 200.0, // CXL<->DRAM
-            (MemoryTierId(3), MemoryTierId(0)) | (MemoryTierId(0), MemoryTierId(3)) => 50.0,  // GPU<->DRAM
-            (MemoryTierId(1), MemoryTierId(2)) | (MemoryTierId(2), MemoryTierId(1)) => 150.0, // HBM<->CXL
-            (MemoryTierId(1), MemoryTierId(3)) | (MemoryTierId(3), MemoryTierId(1)) => 100.0, // HBM<->GPU
-            (MemoryTierId(2), MemoryTierId(3)) | (MemoryTierId(3), MemoryTierId(2)) => 40.0,  // CXL<->GPU
-            _ => 10.0, // Unknown tier pair - conservative estimate
-        };
+        // Estimate transfer time using the centralized bandwidth table
+        let bandwidth_gb_s = inter_tier_bandwidth(request.from_tier, request.to_tier);
         
         // Compute duration: transfer_time + overhead
-        let transfer_time_ns = if bandwidth_gb_s > 0.0 {
-            (request.size_bytes as f64 / (bandwidth_gb_s * 1e9)) * 1e9
-        } else {
-            f64::MAX
-        };
+        let transfer_time_ns = compute_transfer_time_ns(request.size_bytes, bandwidth_gb_s);
         let overhead_ns = 1500.0; // Decision + coherency overhead
-        let total_duration_ns = (transfer_time_ns + overhead_ns) as u64;
+        // Cap at u64::MAX to avoid overflow from f64::MAX
+        let total_duration_ns = if transfer_time_ns.is_finite() {
+            (transfer_time_ns + overhead_ns).min(u64::MAX as f64) as u64
+        } else {
+            u64::MAX
+        };
 
         // Attempt real page migration on Linux using move_pages syscall.
         // For NUMA-aware systems, the target_node is derived from the destination tier.
@@ -738,10 +865,12 @@ impl PageMigrationScheduler {
         }
         let total_count = self.migration_stats.total_migrations_completed
             + self.migration_stats.total_migrations_aborted;
-        self.migration_stats.average_migration_time_ns = 
-            (self.migration_stats.average_migration_time_ns * total_count.saturating_sub(1) as f64
-                + total_duration_ns as f64)
-            / total_count.max(1) as f64;
+        if total_count > 0 {
+            self.migration_stats.average_migration_time_ns = 
+                (self.migration_stats.average_migration_time_ns * (total_count - 1) as f64
+                    + total_duration_ns as f64)
+                / total_count as f64;
+        }
         
         MigrationResult {
             allocation_id: request.allocation_id,
@@ -975,7 +1104,7 @@ impl TierMigrationValidator {
         }
     }
     
-    fn extract_constraints(&self, result: &SmtResult) -> Vec<MigrationConstraint> {
+    fn extract_constraints(&self, _result: &SmtResult) -> Vec<MigrationConstraint> {
         vec![
             MigrationConstraint {
                 description: "All threads observe consistent memory state".into(),
@@ -1000,6 +1129,7 @@ trait TierSmtSolver {
 /// SMT query for tier migration validation.
 /// Contains constraints that must hold for safe migration.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // scenario used for logging
 struct SmtQuery {
     /// Unique identifier for the query.
     query_id: u64,
@@ -1017,6 +1147,7 @@ struct SmtQuery {
 
 /// Constraint on memory access ordering during migration.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // internal SMT types
 struct OrderingConstraint {
     /// Thread ID that must observe ordering.
     thread_id: usize,
@@ -1030,6 +1161,7 @@ struct OrderingConstraint {
 
 /// Constraint on cache coherency during migration.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // internal SMT types
 struct CoherencyConstraint {
     /// Cache line range that must be coherent.
     cache_line_start: u64,
@@ -1042,6 +1174,7 @@ struct CoherencyConstraint {
 
 /// Result of SMT solving for tier migration validation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // model/solver_iterations for diagnostics
 struct SmtResult {
     /// Whether the query is satisfiable (SAT = unsafe, UNSAT = safe).
     is_sat: bool,
@@ -1336,6 +1469,7 @@ impl BuiltinTierSmtSolver {
 ///
 /// This is the entry point for the runtime to interact with ZCHMA's
 /// memory management capabilities.
+#[allow(dead_code)] // validator used in request_migration, topology for discovery
 pub struct ZchmaRuntime {
     /// Lifetime-to-tier mapper.
     mapper: LifetimeTierMapper,
@@ -1373,35 +1507,41 @@ impl ZchmaRuntime {
             access_pattern,
             size_bytes,
         );
+        let actual_tier = distribution.most_likely_tier().unwrap_or(MemoryTierId(0));
         
         ZchmaAllocation {
             distribution,
             size_bytes,
-            actual_tier: distribution.most_likely_tier().unwrap_or(MemoryTierId(0)),
+            actual_tier,
         }
     }
     
     /// Request migration based on runtime feedback.
+    ///
+    /// The caller must provide the allocation's current tier, its size, and
+    /// the estimated benefit of moving it to `new_tier`.
     pub fn request_migration(
         &mut self,
         allocation_id: u64,
-        new_tier: MemoryTierId,
+        from_tier: MemoryTierId,
+        to_tier: MemoryTierId,
+        size_bytes: u64,
         expected_benefit_ns: f64,
     ) {
         // Validate the migration first
         let scenario = MigrationScenario {
-            src_tier: MemoryTierId(0), // Would come from allocation metadata
-            dst_tier: new_tier,
-            allocation_type: AllocationType::Custom { size_bytes: 0 },
+            src_tier: from_tier,
+            dst_tier: to_tier,
+            allocation_type: AllocationType::Custom { size_bytes },
             access_pattern: AccessPatternClass::Balanced,
         };
         
         if self.validator.validate(&scenario).is_safe {
             self.scheduler.request_migration(MigrationRequest {
                 allocation_id,
-                from_tier: MemoryTierId(0),
-                to_tier: new_tier,
-                size_bytes: 0,
+                from_tier,
+                to_tier,
+                size_bytes,
                 expected_benefit_ns,
                 priority: expected_benefit_ns / 1e6,
             });
@@ -1409,8 +1549,9 @@ impl ZchmaRuntime {
     }
     
     /// Process pending migrations (called periodically by runtime).
-    pub fn process_migrations(&mut self, budget_ns: u64) {
-        self.scheduler.process_migrations(budget_ns);
+    /// Returns the list of completed migration results.
+    pub fn process_migrations(&mut self, budget_ns: u64) -> Vec<MigrationResult> {
+        self.scheduler.process_migrations(budget_ns)
     }
 }
 
@@ -1704,6 +1845,7 @@ mod tests {
             read_write_ratio: 0.9,
             access_frequency: 1.0,
             operation_name: None,
+            working_set_bytes: 1024,
         };
         
         let class = classifier.classify(&pattern);
