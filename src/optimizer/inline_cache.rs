@@ -15,6 +15,7 @@
 // =============================================================================
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 // ── Platform-specific mmap/mprotect for executable code ──────────────────────
 
@@ -66,6 +67,13 @@ struct CodeArena {
     /// On Unix, this is the actual mmap'd address; on non-Unix it's simulated.
     current_page_base: usize,
 }
+
+// SAFETY: CodeArena owns its mmap'd pages. The raw pointers are just addresses
+// of executable memory regions that the arena manages exclusively. It is safe
+// to send the arena across threads as long as access is synchronized (which
+// Mutex provides).
+unsafe impl Send for CodeArena {}
+unsafe impl Sync for CodeArena {}
 
 impl CodeArena {
     #[cfg(unix)]
@@ -294,17 +302,11 @@ impl Default for RuntimeLinker {
 }
 
 /// Global code arena shared across all inline caches.
-static mut CODE_ARENA: Option<CodeArena> = None;
+static CODE_ARENA: OnceLock<Mutex<CodeArena>> = OnceLock::new();
 
 /// Get or create the global code arena.
-#[allow(static_mut_refs)]
-fn get_arena() -> &'static mut CodeArena {
-    unsafe {
-        if CODE_ARENA.is_none() {
-            CODE_ARENA = Some(CodeArena::new());
-        }
-        CODE_ARENA.as_mut().unwrap()
-    }
+fn get_arena() -> &'static Mutex<CodeArena> {
+    CODE_ARENA.get_or_init(|| Mutex::new(CodeArena::new()))
 }
 
 /// Type identifier for dynamic dispatch
@@ -694,7 +696,7 @@ impl CallSite {
         //
         // Total size: 7 + 6 + 1 + 10 + 2 = 26 bytes
         let code_size = 32; // Padded to 32 bytes for alignment
-        let entry_addr = arena.alloc(code_size);
+        let entry_addr = arena.lock().unwrap().alloc(code_size);
 
         let mut code = Vec::with_capacity(code_size);
 
@@ -732,7 +734,7 @@ impl CallSite {
             code.push(0x90);
         }
 
-        arena.write_code(entry_addr, &code);
+        arena.lock().unwrap().write_code(entry_addr, &code);
         entry_addr
     }
 
@@ -998,13 +1000,13 @@ mod tests {
 
         // Allocate a small code region from the arena to use as a call site
         let arena = get_arena();
-        let site_addr = arena.alloc(32) as u64;
+        let site_addr = arena.lock().unwrap().alloc(32) as u64;
 
         // Write a mov rax, 0 instruction at site_addr (the pattern that gets patched)
         let mut code = vec![0x48u8, 0xB8]; // mov rax, imm64
         code.extend_from_slice(&0u64.to_le_bytes()); // placeholder: 0
         code.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
-        arena.write_code(site_addr as usize, &code);
+        arena.lock().unwrap().write_code(site_addr as usize, &code);
 
         // Register the call site
         linker.register_call_site(site_addr, site_addr);

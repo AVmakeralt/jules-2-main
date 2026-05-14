@@ -79,18 +79,17 @@ use std::time::Duration;
 /// that this allocation should reside in that tier based on the compiler's
 /// analysis of access patterns, lifetimes, and hardware topology.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields read by future runtime integration
 pub struct PlacementDistribution {
     /// Probability weights for each memory tier.
     /// Sum of all weights should equal 1.0 for valid distributions.
-    tier_weights: HashMap<MemoryTierId, f64>,
+    pub tier_weights: HashMap<MemoryTierId, f64>,
     /// Confidence score (0.0 to 1.0) in the placement prediction.
     /// Lower confidence means the compiler couldn't determine a clear winner.
-    confidence: f64,
+    pub confidence: f64,
     /// Estimated access frequency per second for this allocation.
-    estimated_access_rate: f64,
+    pub estimated_access_rate: f64,
     /// Estimated total bytes transferred if migrated between tiers.
-    migration_cost_bytes: u64,
+    pub migration_cost_bytes: u64,
 }
 
 impl PlacementDistribution {
@@ -112,7 +111,11 @@ impl PlacementDistribution {
     }
     
     /// Create a uniform distribution across all tiers.
+    /// Returns an empty distribution if `tiers` is empty.
     pub fn uniform(tiers: &[MemoryTierId]) -> Self {
+        if tiers.is_empty() {
+            return Self::new(HashMap::new());
+        }
         let weight = 1.0 / tiers.len() as f64;
         let tier_weights: HashMap<MemoryTierId, f64> = tiers
             .iter()
@@ -227,7 +230,7 @@ pub enum AccessPatternClass {
 impl AccessPatternClass {
     /// Returns true if this access pattern can benefit from direct access
     /// (no writeback needed during migration).
-    fn supports_direct_access_hint(&self) -> bool {
+    pub fn supports_direct_access_hint(&self) -> bool {
         matches!(self, AccessPatternClass::Streaming | AccessPatternClass::Infrequent)
     }
 }
@@ -468,8 +471,6 @@ impl AccessPatternClassifier {
 
 /// Models the cost of migrating pages between memory tiers.
 pub struct MigrationCostModel {
-    /// Bandwidth between tier pairs (in GB/s).
-    inter_tier_bandwidth: HashMap<(MemoryTierId, MemoryTierId), f64>,
     /// Overhead per migration decision (in nanoseconds).
     decision_overhead_ns: f64,
     /// Cache coherency cost (for NUMA/CXL scenarios).
@@ -478,20 +479,7 @@ pub struct MigrationCostModel {
 
 impl MigrationCostModel {
     pub fn new() -> Self {
-        let mut inter_tier_bandwidth = HashMap::new();
-        // Initialize with common hardware topologies
-        // DRAM <-> HBM: ~500 GB/s
-        inter_tier_bandwidth.insert((MemoryTierId(0), MemoryTierId(1)), 500.0);
-        inter_tier_bandwidth.insert((MemoryTierId(1), MemoryTierId(0)), 500.0);
-        // CXL <-> DRAM: ~200 GB/s
-        inter_tier_bandwidth.insert((MemoryTierId(2), MemoryTierId(0)), 200.0);
-        inter_tier_bandwidth.insert((MemoryTierId(0), MemoryTierId(2)), 200.0);
-        // GPU VRAM <-> DRAM: ~50 GB/s (PCIe/NVLink)
-        inter_tier_bandwidth.insert((MemoryTierId(3), MemoryTierId(0)), 50.0);
-        inter_tier_bandwidth.insert((MemoryTierId(0), MemoryTierId(3)), 50.0);
-        
         Self {
-            inter_tier_bandwidth,
             decision_overhead_ns: 1000.0,
             coherency_overhead_ns: 500.0,
         }
@@ -504,10 +492,7 @@ impl MigrationCostModel {
         dst: MemoryTierId,
         size_bytes: u64,
     ) -> MigrationCostEstimate {
-        let bandwidth = self.inter_tier_bandwidth
-            .get(&(src, dst))
-            .copied()
-            .unwrap_or_else(|| inter_tier_bandwidth(src, dst));
+        let bandwidth = inter_tier_bandwidth(src, dst);
         
         let transfer_time_ns = compute_transfer_time_ns(size_bytes, bandwidth);
         let total_cost_ns = transfer_time_ns + self.decision_overhead_ns + self.coherency_overhead_ns;
@@ -696,7 +681,6 @@ pub fn compute_transfer_time_ns(size_bytes: u64, bandwidth_gb_s: f64) -> f64 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Schedules page migrations based on runtime access patterns.
-#[allow(dead_code)] // active_migrations used for in-flight tracking
 pub struct PageMigrationScheduler {
     /// Active migrations in progress.
     active_migrations: HashMap<u64, MigrationTask>,
@@ -815,16 +799,26 @@ impl PageMigrationScheduler {
             u64::MAX
         };
 
+        // Track this migration as in-flight
+        let started_at_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let task = MigrationTask {
+            allocation_id: request.allocation_id,
+            from_tier: request.from_tier,
+            to_tier: request.to_tier,
+            pages: Vec::new(), // Populated when we have actual page addresses
+            started_at_ns,
+            priority: request.priority,
+        };
+        self.active_migrations.insert(request.allocation_id, task);
+
         // Attempt real page migration on Linux using move_pages syscall.
         // For NUMA-aware systems, the target_node is derived from the destination tier.
         // On non-Linux or if migration fails, we fall back to metadata-only tracking.
         let migration_ok = if request.size_bytes > 0 {
             // Map MemoryTierId to a NUMA node number.
-            // On typical multi-socket / HBM systems:
-            //   Tier 0 (DRAM) → NUMA node 0 (or 1 for second socket)
-            //   Tier 1 (HBM)  → NUMA node 1 (or higher, system-dependent)
-            //   Tier 2 (CXL)  → NUMA node 2+
-            //   Tier 3 (GPU)  → not directly migratable via move_pages
             let target_numa_node: Option<usize> = match request.to_tier {
                 MemoryTierId(0) => Some(0),
                 MemoryTierId(1) => Some(1),
@@ -837,25 +831,30 @@ impl PageMigrationScheduler {
                 _ => None,
             };
 
-            if let Some(node) = target_numa_node {
-                // We don't have the actual allocation address here, but we
-                // record the migration intent. In a real runtime, the
-                // PageMigrationScheduler would have access to the allocation's
-                // base address via the allocation_id lookup.
-                // For now, we attempt migration using a placeholder address
-                // which will fail gracefully on non-NUMA systems.
-                // The real implementation would look up addr from allocation_id.
-                let _ = node; // Used when we have the actual address
-                true // Assume success for metadata tracking; real migration
-                     // happens when we have the actual page addresses
-            } else {
-                // GPU tier or unknown — cannot use move_pages
-                true // Metadata-only migration is still "successful" for tracking
+            match target_numa_node {
+                Some(node) => {
+                    // In a full runtime, the allocation_id would be used to look
+                    // up the actual page address. For now we record the NUMA node
+                    // and mark the migration as a metadata-only success.
+                    // Real page migration via move_pages would happen here if
+                    // we had the actual virtual address of the allocation.
+                    let _ = node; // Used when we have the actual address
+                    true // Metadata-only success; real migration deferred
+                }
+                None => {
+                    // GPU tier or unknown — cannot use move_pages.
+                    // This is a metadata-only migration; it's tracked as
+                    // "aborted" since no physical page movement occurs.
+                    false
+                }
             }
         } else {
-            true
+            true // Zero-size migration is trivially successful
         };
         
+        // Remove from active_migrations now that the migration is complete
+        self.active_migrations.remove(&request.allocation_id);
+
         // Update stats only if migration was successful
         if migration_ok {
             self.migration_stats.total_migrations_completed += 1;

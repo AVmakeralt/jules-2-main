@@ -60,6 +60,7 @@ pub enum Instr {
     Sub { dst: u16, lhs: u16, rhs: u16 },
     Mul { dst: u16, lhs: u16, rhs: u16 },
     Div { dst: u16, lhs: u16, rhs: u16 },
+    FloorDiv { dst: u16, lhs: u16, rhs: u16 },
     Rem { dst: u16, lhs: u16, rhs: u16 },
     Neg { dst: u16, src: u16 },
     
@@ -586,6 +587,7 @@ impl BytecodeCompiler {
             | Instr::Sub { dst, .. }
             | Instr::Mul { dst, .. }
             | Instr::Div { dst, .. }
+            | Instr::FloorDiv { dst, .. }
             | Instr::Rem { dst, .. }
             | Instr::Neg { dst, .. }
             | Instr::BitAnd { dst, .. }
@@ -1317,7 +1319,7 @@ impl BytecodeCompiler {
                             BinOpKind::Mul     => self.emit(Instr::Mul { dst, lhs: dst, rhs: rhs_slot }),
                             BinOpKind::Div     => self.emit(Instr::Div { dst, lhs: dst, rhs: rhs_slot }),
                             BinOpKind::Rem     => self.emit(Instr::Rem { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::FloorDiv => self.emit(Instr::Div { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::FloorDiv => self.emit(Instr::FloorDiv { dst, lhs: dst, rhs: rhs_slot }),
                             BinOpKind::Eq      => self.emit(Instr::Eq { dst, lhs: dst, rhs: rhs_slot }),
                             BinOpKind::Ne      => self.emit(Instr::Ne { dst, lhs: dst, rhs: rhs_slot }),
                             BinOpKind::Lt      => self.emit(Instr::Lt { dst, lhs: dst, rhs: rhs_slot }),
@@ -2170,6 +2172,43 @@ impl BytecodeVM {
                     let lhs_val = l_val.clone();
                     let rhs_val = r_val.clone();
                     slots[*dst as usize] = Self::div_values_static(&lhs_val, &rhs_val)?;
+                    pc += 1;
+                }
+
+                // ── Floor division (rounds toward -∞, unlike Div which truncates toward 0) ──
+                Instr::FloorDiv { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+
+                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                        if *r == 0 {
+                            return Err(RuntimeError::new("floor division by zero"));
+                        }
+                        let d = l / r; // truncating division (toward 0)
+                        // Correction: when signs differ and there's a remainder,
+                        // floor division is one less than truncating division.
+                        let result = if (*l < 0) != (*r < 0) && *l % *r != 0 {
+                            d - 1
+                        } else {
+                            d
+                        };
+                        slots[*dst as usize] = Value::I64(result);
+                        pc += 1;
+                        continue;
+                    }
+                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                        if *r == 0.0 {
+                            return Err(RuntimeError::new("floor division by zero"));
+                        }
+                        slots[*dst as usize] = Value::F64((l / r).floor());
+                        pc += 1;
+                        continue;
+                    }
+
+                    // Fallback: delegate to the interpreter's floor_div logic
+                    let lhs_val = l_val.clone();
+                    let rhs_val = r_val.clone();
+                    slots[*dst as usize] = Self::floor_div_values_static(&lhs_val, &rhs_val)?;
                     pc += 1;
                 }
 
@@ -3510,6 +3549,37 @@ impl BytecodeVM {
         }
         Err(RuntimeError::new(format!(
             "cannot divide {} by {}",
+            l.type_name(),
+            r.type_name()
+        )))
+    }
+
+    #[inline(always)]
+    fn floor_div_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
+        // Try integer floor division first
+        if let (Some(li), Some(ri)) = (l.as_i64(), r.as_i64()) {
+            if ri == 0 {
+                return Err(RuntimeError::new("floor division by zero"));
+            }
+            let d = li / ri; // truncating
+            let result = if (li < 0) != (ri < 0) && li % ri != 0 {
+                d - 1
+            } else {
+                d
+            };
+            return Ok(Value::I64(result));
+        }
+        // Fallback: float floor division
+        if let Some(lf) = l.as_f64() {
+            if let Some(rf) = r.as_f64() {
+                if rf == 0.0 {
+                    return Err(RuntimeError::new("floor division by zero"));
+                }
+                return Ok(Value::F64((lf / rf).floor()));
+            }
+        }
+        Err(RuntimeError::new(format!(
+            "cannot floor-divide {} by {}",
             l.type_name(),
             r.type_name()
         )))

@@ -4,58 +4,43 @@
 // Implements vtable pattern for type-erased execution
 // =========================================================================
 
-#![allow(static_mut_refs)]
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::mem::ManuallyDrop;
+use std::sync::OnceLock;
 
 use super::epoch::Participant;
 use crate::runtime::threading::ThreadResult;
 use super::slab::SlabAllocator;
 use super::worker::ThreadPool;
 
-/// Global thread pool (lazy initialization)
-static mut GLOBAL_POOL: Option<ThreadPool> = None;
-static mut GLOBAL_PARTICIPANT: Option<Participant> = None;
-static mut GLOBAL_SLAB: Option<SlabAllocator> = None;
-static POOL_INIT: std::sync::Once = std::sync::Once::new();
+/// Global thread pool (lazy initialization via OnceLock)
+static GLOBAL_POOL: OnceLock<ThreadPool> = OnceLock::new();
+static GLOBAL_PARTICIPANT: OnceLock<Participant> = OnceLock::new();
+static GLOBAL_SLAB: OnceLock<SlabAllocator> = OnceLock::new();
+
+/// Ensure all globals are initialized (idempotent).
+fn init_globals() {
+    GLOBAL_PARTICIPANT.get_or_init(Participant::new);
+    GLOBAL_SLAB.get_or_init(SlabAllocator::new);
+    GLOBAL_POOL.get_or_init(ThreadPool::new);
+}
 
 /// Get or create the global thread pool
-#[allow(static_mut_refs)]
 fn get_pool() -> &'static ThreadPool {
-    unsafe {
-        POOL_INIT.call_once(|| {
-            GLOBAL_PARTICIPANT = Some(Participant::new());
-            GLOBAL_SLAB = Some(SlabAllocator::new());
-            GLOBAL_POOL = Some(ThreadPool::new());
-        });
-        GLOBAL_POOL.as_ref().unwrap()
-    }
+    init_globals();
+    GLOBAL_POOL.get().unwrap()
 }
 
 /// Get the global slab allocator
-#[allow(static_mut_refs)]
 fn get_slab() -> &'static SlabAllocator {
-    unsafe {
-        POOL_INIT.call_once(|| {
-            GLOBAL_PARTICIPANT = Some(Participant::new());
-            GLOBAL_SLAB = Some(SlabAllocator::new());
-            GLOBAL_POOL = Some(ThreadPool::new());
-        });
-        GLOBAL_SLAB.as_ref().unwrap()
-    }
+    init_globals();
+    GLOBAL_SLAB.get().unwrap()
 }
 
 /// Get the global epoch participant
-#[allow(static_mut_refs)]
 pub fn get_participant() -> &'static Participant {
-    unsafe {
-        POOL_INIT.call_once(|| {
-            GLOBAL_PARTICIPANT = Some(Participant::new());
-            GLOBAL_SLAB = Some(SlabAllocator::new());
-            GLOBAL_POOL = Some(ThreadPool::new());
-        });
-        GLOBAL_PARTICIPANT.as_ref().unwrap()
-    }
+    init_globals();
+    GLOBAL_PARTICIPANT.get().unwrap()
 }
 
 /// Vtable for task execution

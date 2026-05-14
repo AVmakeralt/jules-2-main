@@ -263,7 +263,7 @@ impl FunctionCompiler {
                             BinOpKind::Mul => Instr::Mul { dst, lhs: lhs_slot, rhs: rhs_slot },
                             BinOpKind::Div => Instr::Div { dst, lhs: lhs_slot, rhs: rhs_slot },
                             BinOpKind::Rem => Instr::Rem { dst, lhs: lhs_slot, rhs: rhs_slot },
-                            BinOpKind::FloorDiv => Instr::Div { dst, lhs: lhs_slot, rhs: rhs_slot },
+                            BinOpKind::FloorDiv => Instr::FloorDiv { dst, lhs: lhs_slot, rhs: rhs_slot },
                             BinOpKind::Eq  => Instr::Eq  { dst, lhs: lhs_slot, rhs: rhs_slot },
                             BinOpKind::Ne  => Instr::Ne  { dst, lhs: lhs_slot, rhs: rhs_slot },
                             BinOpKind::Lt  => Instr::Lt  { dst, lhs: lhs_slot, rhs: rhs_slot },

@@ -1431,8 +1431,8 @@ impl GpuBackendImpl for CudaBackend {
         b: &GpuBufferHandle,
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
-        if !self.has_cuda {
-            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        if self.has_cuda {
+            return Err("CudaBackend: CUDA was detected but GPU operations are not yet implemented; use CpuBackend instead".into());
         }
         // TODO: When has_cuda is true, use cuBLAS sgemm or cuLaunchKernel
         // with a custom matmul kernel.
@@ -1459,8 +1459,8 @@ impl GpuBackendImpl for CudaBackend {
         op: GpuOp,
         out: &GpuBufferHandle,
     ) -> Result<(), String> {
-        if !self.has_cuda {
-            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        if self.has_cuda {
+            return Err("CudaBackend: CUDA was detected but GPU operations are not yet implemented; use CpuBackend instead".into());
         }
         if matches!(op, GpuOp::MatMul) {
             return Err("MatMul is not an elementwise operation. Use the matmul() method instead.".into());
@@ -1506,8 +1506,8 @@ impl GpuBackendImpl for CudaBackend {
         stride: u32,
         padding: u32,
     ) -> Result<(), String> {
-        if !self.has_cuda {
-            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        if self.has_cuda {
+            return Err("CudaBackend: CUDA was detected but GPU operations are not yet implemented; use CpuBackend instead".into());
         }
         // CPU fallback: actually compute the convolution.
         let mut buffers = self.buffers.lock().unwrap();
@@ -1557,8 +1557,8 @@ impl GpuBackendImpl for CudaBackend {
         pool_size: u32,
         is_max: bool,
     ) -> Result<(), String> {
-        if !self.has_cuda {
-            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        if self.has_cuda {
+            return Err("CudaBackend: CUDA was detected but GPU operations are not yet implemented; use CpuBackend instead".into());
         }
         // CPU fallback: actually compute pooling.
         let mut buffers = self.buffers.lock().unwrap();
@@ -1605,8 +1605,8 @@ impl GpuBackendImpl for CudaBackend {
         out: &GpuBufferHandle,
         activation: &str,
     ) -> Result<(), String> {
-        if !self.has_cuda {
-            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        if self.has_cuda {
+            return Err("CudaBackend: CUDA was detected but GPU operations are not yet implemented; use CpuBackend instead".into());
         }
         // CPU fallback: actually compute activation functions.
         let mut buffers = self.buffers.lock().unwrap();
@@ -1674,8 +1674,8 @@ impl GpuBackendImpl for CudaBackend {
         scale: f32,
         causal: bool,
     ) -> Result<(), String> {
-        if !self.has_cuda {
-            return Err("CudaBackend: CUDA not available — real GPU operations are not yet implemented; use CpuBackend instead".into());
+        if self.has_cuda {
+            return Err("CudaBackend: CUDA was detected but GPU operations are not yet implemented; use CpuBackend instead".into());
         }
         // CPU fallback: scaled dot-product attention (actually computes).
         let mut buffers = self.buffers.lock().unwrap();

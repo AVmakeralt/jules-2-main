@@ -42,3 +42,4 @@ pub mod known_bits;
 #[cfg(feature = "core-superopt")]
 pub mod machine_instr_model;
 pub mod superopt_pass;
+pub mod whole_program_dce;

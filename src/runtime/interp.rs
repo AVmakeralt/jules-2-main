@@ -2780,8 +2780,61 @@ pub enum Instr {
     // ── Grad ─────────────────────────────────────────────────────────────────
     EnableGrad(u16, u16), // dst, src (enables grad, returns same tensor)
 
+    // ── AMX tile operations ──────────────────────────────────────────────────
+    /// AMX tile operation: (opcode, tmm_dst, tmm_src1, tmm_src2)
+    /// Encodes Intel AMX instructions for matrix operations on tile registers TMM0–TMM7.
+    /// The JIT translator emits real x86 AMX machine code; the VM interpreter treats
+    /// these as no-ops (AMX requires hardware support).
+    AmxOp(AmxOpCode, u8, u8, u8),
+
     // ── Misc ─────────────────────────────────────────────────────────────────
     Nop,
+}
+
+/// AMX tile operation codes for the `Instr::AmxOp` instruction.
+///
+/// These correspond to Intel Advanced Matrix Extensions instructions available on
+/// Sapphire Rapids / Alder Lake and later CPUs.  CPUID leaf 0x07 sub-leaf 0x0
+/// EDX bits 22/24/25 advertise AMX-BF16, AMX-TILE, and AMX-INT8 respectively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AmxOpCode {
+    /// LDTILECFG – load tile configuration from memory.
+    ///   tmm_dst unused, tmm_src1 unused, tmm_src2 unused.
+    ///   Address/stride are set up by preceding LoadI64 instructions.
+    TileConfig = 0,
+    /// TILELOADD – load tile from memory into TMM register.
+    ///   tmm_dst = target tile register (0–7).
+    ///   Address in slot 0, stride in slot 1 (set by preceding LoadI64).
+    TileLoad = 1,
+    /// TILESTORED – store tile from TMM register to memory.
+    ///   tmm_dst = source tile register (0–7).
+    ///   Address in slot 0, stride in slot 1.
+    TileStore = 2,
+    /// TILEZERO – zero a tile register.
+    ///   tmm_dst = tile register to zero (0–7).
+    TileZero = 3,
+    /// TDPBSSD – signed-byte × signed-byte dot product, accumulate into 32-bit.
+    ///   tmm_dst = accumulator tile, tmm_src1 = A tile, tmm_src2 = B tile.
+    Tdpbssd = 4,
+    /// TDPBSUD – signed-byte × unsigned-byte dot product.
+    Tdpbsud = 5,
+    /// TDPBUSD – unsigned-byte × signed-byte dot product.
+    Tdpbusd = 6,
+    /// TDPBUUD – unsigned-byte × unsigned-byte dot product.
+    Tdpbuud = 7,
+    /// TDPBF16PS – bfloat16 dot product accumulate into FP32.
+    Tdpbf16ps = 8,
+    /// TILERELEASE – release tile configuration, freeing tile registers.
+    TileRelease = 9,
+    /// Tile ReLU – apply max(0, x) element-wise to tile in register.
+    ///   tmm_dst = tile register to apply ReLU (in-place).
+    ///   This is a composite operation: TILESTORE → scalar ReLU → TILELOAD.
+    TileRelu = 10,
+    /// Prefetch tile data into specified cache level.
+    ///   tmm_src1 encodes the prefetch level (0=L1, 1=L2, 2=L3).
+    ///   Address in slot 0.
+    TilePrefetch = 11,
 }
 
 /// A compiled function body ready for the VM.
@@ -3568,6 +3621,9 @@ pub fn vm_exec(
 
         match instr {
             Instr::Nop => {}
+            // AMX tile operations are no-ops in the software VM interpreter;
+            // they only take effect when JIT-compiled to native x86 AMX instructions.
+            Instr::AmxOp(_, _, _, _) => {}
             Instr::LoadUnit(d) => *reg_mut!(*d) = Value::Unit,
             Instr::LoadBool(d, b) => *reg_mut!(*d) = Value::Bool(*b),
             Instr::LoadI32(d, v) => *reg_mut!(*d) = Value::I32(*v),
@@ -4036,6 +4092,8 @@ pub fn vm_exec_i32(
 
         match instr {
             Instr::Nop => {}
+            // AMX tile operations are no-ops in the software VM interpreter.
+            Instr::AmxOp(_, _, _, _) => {}
             Instr::LoadUnit(d) => *reg_mut!(*d) = 0,
             Instr::LoadBool(d, b) => *reg_mut!(*d) = if *b { 1 } else { 0 },
             Instr::LoadI32(d, v) => *reg_mut!(*d) = *v,
@@ -5501,16 +5559,16 @@ impl Interpreter {
                 }
                 let mut val = self.eval_expr(&stages[0], env)?;
                 for stage in &stages[1..] {
-                    // Apply each stage as a function call: stage(val)
-                    val = self.eval_expr(stage, env)?;
-                    // TODO: proper pipeline semantics — call stage with val as arg
+                    // Pipeline: thread the value through each stage as a function call
+                    let func = self.eval_expr(stage, env)?;
+                    val = self.eval_call(func, vec![val], env)?;
                 }
                 Ok(val)
             }
             Expr::Emit { value, .. } => {
-                let _ = self.eval_expr(value, env)?;
-                // TODO: actual effect emission
-                Ok(Value::Unit)
+                // Emit passes its value through (the effect is a side observation,
+                // not a replacement of the value)
+                self.eval_expr(value, env)
             }
             Expr::Copy { inner, .. } => {
                 // For now, just evaluate the inner expression.
