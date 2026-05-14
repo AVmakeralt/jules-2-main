@@ -158,6 +158,73 @@ impl LowerCtx {
         self.env.iter().rev().find(|(n, _)| n == name).map(|&(_, v)| v)
     }
 
+    /// Snapshot the current env (name → ValueId bindings) for later comparison.
+    /// Used to detect which variables were re-bound inside a control flow branch.
+    fn snapshot_env(&self) -> Vec<(String, ValueId)> {
+        self.env.clone()
+    }
+
+    /// Emit phi nodes in the current (merge) block for any variable whose
+    /// ValueId differs between the `pre_env` (before the branch) and the
+    /// current env (after the branch). Rebinds the variable to the phi result.
+    ///
+    /// `then_block` and `else_block` are the predecessor blocks for the phi.
+    /// `then_env` is the env snapshot taken after lowering the then-branch.
+    /// `else_env` is the env snapshot taken after lowering the else-branch.
+    fn emit_phis_for_changed_vars(
+        &mut self,
+        then_block: BlockId,
+        else_block: BlockId,
+        then_env: &[(String, ValueId)],
+        else_env: &[(String, ValueId)],
+        span: Span,
+    ) {
+        // Collect all variable names from both branches
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (name, _) in then_env {
+            names.insert(name.clone());
+        }
+        for (name, _) in else_env {
+            names.insert(name.clone());
+        }
+
+        for name in names {
+            let then_vid = then_env.iter().rev().find(|(n, _)| n == &name).map(|&(_, v)| v);
+            let else_vid = else_env.iter().rev().find(|(n, _)| n == &name).map(|&(_, v)| v);
+
+            match (then_vid, else_vid) {
+                (Some(tv), Some(ev)) => {
+                    // Both branches have this variable. If the ValueIds differ,
+                    // we need a phi node.
+                    if tv != ev {
+                        if let Some(phi_vid) = self.emit(
+                            IrOp::Phi { incoming: vec![(then_block, tv), (else_block, ev)] },
+                            span,
+                            EffectFlags::pure(),
+                            Ownership::Copy,
+                        ) {
+                            self.bind(name, phi_vid);
+                        }
+                    } else {
+                        // Same value in both branches — just rebind
+                        self.bind(name, tv);
+                    }
+                }
+                (Some(tv), None) => {
+                    // Variable only exists in then-branch — rebind to then value
+                    self.bind(name, tv);
+                }
+                (None, Some(ev)) => {
+                    // Variable only exists in else-branch — rebind to else value
+                    self.bind(name, ev);
+                }
+                (None, None) => {
+                    // Variable doesn't exist in either branch — nothing to do
+                }
+            }
+        }
+    }
+
     /// Check if the current block already has a terminator (O(1) via cached index).
     fn is_terminated_fast(&self) -> bool {
         let idx = self.current_block_id.0 as usize;
@@ -1135,19 +1202,25 @@ impl LowerCtx {
                         }
                     }
                     AssignOpKind::MutAssign => {
-                        // Explicit mutation — emit Store
+                        // Explicit mutation — for simple ident targets, just rebind
+                        // (same as Assign). We only emit Store for field/deref targets
+                        // that actually need a memory write.
+                        //
+                        // Previously, this always emitted Store{ptr: old_vid, value: val},
+                        // which was incorrect because:
+                        //   1. old_vid is the old SSA value, NOT a pointer — the type checker
+                        //      would flag "store: ptr must be a reference type, got i32"
+                        //   2. The borrow checker marks value as Moved, but then the lowerer
+                        //      rebinds the variable name to that Moved value, causing false
+                        //      use-after-move errors for subsequent accesses
                         if let Expr::Ident { name, .. } = target.as_ref() {
-                            if let (Some(ptr), Some(val)) = (self.lookup(name), val_vid) {
-                                self.emit(
-                                    IrOp::Store { ptr, value: val },
-                                    *span,
-                                    EffectFlags::WRITE,
-                                    Ownership::MUT_BORROW,
-                                );
-                                self.bind(name.clone(), val);
-                                return Some(val);
+                            if let Some(vid) = val_vid {
+                                self.bind(name.clone(), vid);
+                                return Some(vid);
                             }
                         }
+                        // For field/deref targets, emit Store with a proper pointer
+                        // (TODO: implement when field/deref lowering supports pointers)
                         val_vid
                     }
                     _ => {
@@ -1675,6 +1748,9 @@ impl LowerCtx {
         let else_block = self.create_block();
         let merge_block = self.create_block();
 
+        // Snapshot env before branching
+        let pre_env = self.snapshot_env();
+
         // Emit CondBr in current block
         if let Some(cv) = cond_vid {
             self.emit_terminator(
@@ -1687,6 +1763,7 @@ impl LowerCtx {
         // Lower then block
         self.switch_to_block(then_block);
         let then_val = self.lower_block(then);
+        let then_env = self.snapshot_env();
         if !self.is_terminated() {
             self.emit_terminator(
                 IrOp::Jump { target: merge_block },
@@ -1697,7 +1774,10 @@ impl LowerCtx {
 
         // Lower else block
         self.switch_to_block(else_block);
+        // Restore pre-branch env so else-branch starts from the same state
+        self.env = pre_env.clone();
         let else_val = else_.as_ref().and_then(|b| self.lower_block(b));
+        let else_env = self.snapshot_env();
         if !self.is_terminated() {
             self.emit_terminator(
                 IrOp::Jump { target: merge_block },
@@ -1706,8 +1786,12 @@ impl LowerCtx {
             );
         }
 
-        // Merge block with Phi node
+        // Merge block with Phi node for the expression value
         self.switch_to_block(merge_block);
+
+        // Emit phi nodes for any variable that was re-bound in either branch.
+        // This handles mutable variables modified inside the if-else.
+        self.emit_phis_for_changed_vars(then_block, else_block, &then_env, &else_env, span);
 
         match (then_val, else_val) {
             (Some(tv), Some(ev)) => {
@@ -1719,7 +1803,46 @@ impl LowerCtx {
                     Ownership::Copy,
                 )
             }
-            _ => None,
+            (Some(tv), None) => {
+                // Then branch has a value, else branch doesn't.
+                // Emit a ConstUnit for the else branch and create a phi.
+                // This handles cases like: let x = if cond { 42 } else { do_thing(); }
+                let else_unit = self.emit(
+                    IrOp::ConstUnit,
+                    span,
+                    EffectFlags::pure(),
+                    Ownership::Copy,
+                );
+                match else_unit {
+                    Some(ev) => self.emit(
+                        IrOp::Phi { incoming: vec![(then_block, tv), (else_block, ev)] },
+                        span,
+                        EffectFlags::pure(),
+                        Ownership::Copy,
+                    ),
+                    None => None,
+                }
+            }
+            (None, Some(ev)) => {
+                // Else branch has a value, then branch doesn't.
+                // Symmetric to above.
+                let then_unit = self.emit(
+                    IrOp::ConstUnit,
+                    span,
+                    EffectFlags::pure(),
+                    Ownership::Copy,
+                );
+                match then_unit {
+                    Some(tv) => self.emit(
+                        IrOp::Phi { incoming: vec![(then_block, tv), (else_block, ev)] },
+                        span,
+                        EffectFlags::pure(),
+                        Ownership::Copy,
+                    ),
+                    None => None,
+                }
+            }
+            (None, None) => None,
         }
     }
 
@@ -1729,6 +1852,10 @@ impl LowerCtx {
         let then_block = self.create_block();
         let else_block = self.create_block();
         let merge_block = self.create_block();
+
+        // Snapshot env before branching so we can detect which variables
+        // are modified in either branch and emit phi nodes accordingly.
+        let pre_env = self.snapshot_env();
 
         if let Some(cv) = cond_vid {
             self.emit_terminator(
@@ -1741,6 +1868,7 @@ impl LowerCtx {
         // Lower then
         self.switch_to_block(then_block);
         self.lower_block(then);
+        let then_env = self.snapshot_env();
         if !self.is_terminated() {
             self.emit_terminator(
                 IrOp::Jump { target: merge_block },
@@ -1751,6 +1879,8 @@ impl LowerCtx {
 
         // Lower else
         self.switch_to_block(else_block);
+        // Restore pre-branch env so else-branch starts from the same state
+        self.env = pre_env.clone();
         if let Some(else_branch) = else_ {
             match else_branch.as_ref() {
                 IfOrBlock::If(if_stmt) => {
@@ -1763,6 +1893,7 @@ impl LowerCtx {
                 }
             }
         }
+        let else_env = self.snapshot_env();
         if !self.is_terminated() {
             self.emit_terminator(
                 IrOp::Jump { target: merge_block },
@@ -1771,7 +1902,9 @@ impl LowerCtx {
             );
         }
 
+        // Merge: emit phi nodes for any variable that differs between branches
         self.switch_to_block(merge_block);
+        self.emit_phis_for_changed_vars(then_block, else_block, &then_env, &else_env, span);
     }
 
     fn lower_while(&mut self, cond: &Expr, body: &Block, span: Span) {
@@ -1785,6 +1918,9 @@ impl LowerCtx {
             continue_block: header_block,
             loop_state_vars: vec![],
         });
+
+        // Snapshot env before the loop to detect loop-carried variables
+        let pre_loop_env = self.snapshot_env();
 
         // Jump from current block to header
         self.emit_terminator(
@@ -1815,8 +1951,20 @@ impl LowerCtx {
             );
         }
 
-        // Continue after loop
+        // After loop body, check which variables were modified and
+        // emit phi nodes in the header block. We need to rebuild the
+        // header with phi nodes for loop-carried variables.
+        let post_body_env = self.snapshot_env();
+
+        // Emit phi nodes in the exit block for any variable whose ValueId
+        // changed inside the loop body. These ensure that after the loop,
+        // variables have the correct SSA value.
+        // Note: A full SSA construction would also insert phi nodes in the
+        // header block for the back-edge. For now, we handle the common case
+        // by emitting phi nodes in the exit block that merge the pre-loop and
+        // post-loop values.
         self.switch_to_block(exit_block);
+        self.emit_phis_for_changed_vars(header_block, body_block, &pre_loop_env, &post_body_env, span);
 
         // Pop loop context
         self.loop_stack.pop();
@@ -1832,6 +1980,9 @@ impl LowerCtx {
             continue_block: header_block,
             loop_state_vars: vec![],
         });
+
+        // Snapshot env before the loop to detect loop-carried variables
+        let pre_loop_env = self.snapshot_env();
 
         self.emit_terminator(
             IrOp::Jump { target: header_block },
@@ -1849,7 +2000,10 @@ impl LowerCtx {
             );
         }
 
+        let post_body_env = self.snapshot_env();
+
         self.switch_to_block(exit_block);
+        self.emit_phis_for_changed_vars(header_block, header_block, &pre_loop_env, &post_body_env, span);
 
         // Pop loop context
         self.loop_stack.pop();
@@ -1869,6 +2023,9 @@ impl LowerCtx {
             continue_block: header_block,
             loop_state_vars: vec![],
         });
+
+        // Snapshot env before the loop to detect loop-carried variables
+        let pre_loop_env = self.snapshot_env();
 
         // Jump to header
         self.emit_terminator(
@@ -1932,7 +2089,10 @@ impl LowerCtx {
             );
         }
 
+        let post_body_env = self.snapshot_env();
+
         self.switch_to_block(exit_block);
+        self.emit_phis_for_changed_vars(header_block, body_block, &pre_loop_env, &post_body_env, span);
 
         // Pop loop context — emit loop-carried state variable metadata
         // so the optimizer can reason about loop induction variables.

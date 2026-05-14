@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 
 use crate::compiler::ast::{BinOpKind, UnOpKind};
-use crate::compiler::ir::{FlatIrFunction, FlatIrModule, IrOp, IrType, ValueId};
+use crate::compiler::ir::{BlockId, FlatIrFunction, FlatIrModule, IrOp, IrType, ValueId};
 use crate::compiler::lexer::Span;
 
 // =============================================================================
@@ -149,6 +149,22 @@ struct TypeckCtx {
     intrinsic_sigs: HashMap<String, IntrinsicSig>,
     /// Function signatures by name (for Call validation).
     func_sigs: HashMap<String, FuncSig>,
+    /// Deferred phi-node checks.  Phi incoming values may reference ValueIds
+    /// defined in blocks that appear later in the block list (e.g. nested
+    /// if-else creates blocks in BFS order: outer-merge before inner blocks).
+    /// We defer their validation until all blocks have been processed and the
+    /// type table is complete.
+    deferred_phi_checks: Vec<DeferredPhiCheck>,
+}
+
+/// A phi-node check that was deferred because some incoming values were not
+/// yet in the type table during the forward pass.
+#[derive(Debug)]
+struct DeferredPhiCheck {
+    /// The incoming (predecessor block, value) pairs.
+    incoming: Vec<(BlockId, ValueId)>,
+    /// Source span of the phi instruction.
+    span: Span,
 }
 
 /// Stored signature for a flat IR function.
@@ -168,6 +184,7 @@ impl TypeckCtx {
             current_ret_ty: None,
             intrinsic_sigs: HashMap::new(),
             func_sigs: HashMap::new(),
+            deferred_phi_checks: Vec::new(),
         }
     }
 
@@ -232,6 +249,15 @@ impl TypeckCtx {
         // Walk all blocks and instructions.
         for block in &func.blocks {
             self.check_block(block);
+        }
+
+        // Deferred phi-node validation: now that every block has been
+        // processed, all instruction dst types are in the type table.
+        // Re-check any phi nodes whose incoming values were not yet
+        // available during the forward pass.
+        let deferred = std::mem::take(&mut self.deferred_phi_checks);
+        for check in deferred {
+            self.check_deferred_phi(&check);
         }
 
         self.current_ret_ty = None;
@@ -767,18 +793,36 @@ impl TypeckCtx {
     }
 
     /// Check Phi: all incoming values must have the same type.
-    fn check_phi(&mut self, incoming: &[(crate::compiler::ir::BlockId, ValueId)], span: Span) -> IrType {
+    ///
+    /// Incoming values may be defined in blocks that appear later in the
+    /// block list (e.g. with nested if-else, the outer merge block and its
+    /// phi nodes come before the inner blocks in the flat block list).
+    /// When an incoming value is not yet in the type table, we defer the
+    /// check rather than emitting a false-positive "undefined value" error.
+    fn check_phi(&mut self, incoming: &[(BlockId, ValueId)], span: Span) -> IrType {
         if incoming.is_empty() {
             return IrType::Unknown;
         }
 
         let mut first_ty: Option<IrType> = None;
+        let mut any_deferred = false;
 
         for (_block, vid) in incoming {
-            let ty = self.require_type(*vid, span);
+            let ty = match self.lookup_type(*vid) {
+                Some(ty) => ty.clone(),
+                None => {
+                    // Incoming value not yet in the type table — its
+                    // defining block may not have been processed yet.
+                    // Defer the check rather than emitting a false-positive.
+                    any_deferred = true;
+                    IrType::Unknown
+                }
+            };
             match &first_ty {
                 None => first_ty = Some(ty),
                 Some(expected) => {
+                    // Only report type mismatches when both types are
+                    // concrete (not Unknown).  Unknown is always compatible.
                     if !types_compatible(expected, &ty) {
                         self.emit_error(
                             span,
@@ -793,7 +837,39 @@ impl TypeckCtx {
             }
         }
 
+        if any_deferred {
+            self.deferred_phi_checks.push(DeferredPhiCheck {
+                incoming: incoming.iter().map(|&(b, v)| (b, v)).collect(),
+                span,
+            });
+        }
+
         first_ty.unwrap_or(IrType::Unknown)
+    }
+
+    /// Validate a deferred phi-node check.  Called after all blocks have been
+    /// processed, so the type table should now contain every instruction dst.
+    fn check_deferred_phi(&mut self, check: &DeferredPhiCheck) {
+        let mut first_ty: Option<IrType> = None;
+
+        for (_block, vid) in &check.incoming {
+            let ty = self.require_type(*vid, check.span);
+            match &first_ty {
+                None => first_ty = Some(ty),
+                Some(expected) => {
+                    if !types_compatible(expected, &ty) {
+                        self.emit_error(
+                            check.span,
+                            IrTypeDiagKind::PhiTypeMismatch,
+                            format!(
+                                "phi node has incoming values of different types: {} and {}",
+                                expected, ty
+                            ),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Check Call: args must match function signature.
@@ -1268,6 +1344,84 @@ mod tests {
         let result = ir_typeck(&make_module(func));
         assert!(result.has_errors());
         assert_eq!(result.diagnostics[0].kind, IrTypeDiagKind::PhiTypeMismatch);
+    }
+
+    /// Regression test: phi node referencing a ValueId defined in a block that
+    /// appears LATER in the block list.  This happens when nested if-else
+    /// blocks are lowered in BFS order (outer-merge before inner blocks).
+    /// The type checker must not emit false-positive "undefined value" errors.
+    #[test]
+    fn test_phi_forward_ref_no_false_positive() {
+        // Simulates the block layout produced by lowering a nested if-else:
+        //
+        //   Block 0 (entry):  v0 = true; CondBr v0 → bb1/bb2
+        //   Block 1 (outer_then):  CondBr v0 → bb4/bb5
+        //   Block 2 (outer_else):  v1 = 99; Jump → bb3
+        //   Block 3 (outer_merge): v6 = phi [bb6: v3, bb2: v1]  ← v3 is in block 6!
+        //   Block 4 (inner_then):  v4 = 1; Jump → bb6
+        //   Block 5 (inner_else):  v5 = 2; Jump → bb6
+        //   Block 6 (inner_merge): v3 = phi [bb4: v4, bb5: v5]; Jump → bb3
+        //
+        // Block 3 (outer_merge) references v3 which is defined in block 6.
+        // With sequential processing, block 3 is checked before block 6,
+        // so v3 is not yet in the type table.  The deferred phi check
+        // ensures no false-positive "undefined value" error is emitted.
+        let i32_ty = IrType::Int { width: 32, signed: true };
+        let func = make_func(
+            "nested_if",
+            vec![],
+            IrType::Unit,
+            vec![
+                // Block 0 (entry)
+                make_block(0, vec![
+                    make_instr(Some(ValueId(0)), IrOp::ConstBool { value: true }),
+                    make_instr(None, IrOp::CondBr {
+                        cond: ValueId(0),
+                        if_true: BlockId(1),
+                        if_false: BlockId(2),
+                    }),
+                ]),
+                // Block 1 (outer_then) — branches into inner if-else
+                make_block(1, vec![
+                    make_instr(None, IrOp::CondBr {
+                        cond: ValueId(0),
+                        if_true: BlockId(4),
+                        if_false: BlockId(5),
+                    }),
+                ]),
+                // Block 2 (outer_else)
+                make_block(2, vec![
+                    make_instr(Some(ValueId(1)), IrOp::ConstInt { value: 99, ty: i32_ty.clone() }),
+                    make_instr(None, IrOp::Jump { target: BlockId(3) }),
+                ]),
+                // Block 3 (outer_merge) — phi references v3 from block 6 (forward ref!)
+                make_block(3, vec![
+                    make_instr(Some(ValueId(6)), IrOp::Phi {
+                        incoming: vec![(BlockId(6), ValueId(3)), (BlockId(2), ValueId(1))],
+                    }),
+                    make_instr(None, IrOp::Ret { value: None }),
+                ]),
+                // Block 4 (inner_then)
+                make_block(4, vec![
+                    make_instr(Some(ValueId(4)), IrOp::ConstInt { value: 1, ty: i32_ty.clone() }),
+                    make_instr(None, IrOp::Jump { target: BlockId(6) }),
+                ]),
+                // Block 5 (inner_else)
+                make_block(5, vec![
+                    make_instr(Some(ValueId(5)), IrOp::ConstInt { value: 2, ty: i32_ty.clone() }),
+                    make_instr(None, IrOp::Jump { target: BlockId(6) }),
+                ]),
+                // Block 6 (inner_merge) — v3 defined here, referenced by block 3's phi
+                make_block(6, vec![
+                    make_instr(Some(ValueId(3)), IrOp::Phi {
+                        incoming: vec![(BlockId(4), ValueId(4)), (BlockId(5), ValueId(5))],
+                    }),
+                    make_instr(None, IrOp::Jump { target: BlockId(3) }),
+                ]),
+            ],
+        );
+        let result = ir_typeck(&make_module(func));
+        assert!(!result.has_errors(), "false-positive errors: {:?}", result.diagnostics);
     }
 
     #[test]

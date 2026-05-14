@@ -338,6 +338,14 @@ impl FunctionCompiler {
                     // ── Conditional branch ─────────────────────────────────
                     IrOp::CondBr { cond, if_true, if_false } => {
                         let cond_slot = self.slot_for(*cond);
+
+                        // Phi resolution for the FALSE branch: emit moves from
+                        // the current block to the if_false target BEFORE the
+                        // JumpFalse instruction. At runtime, when the condition
+                        // is false, the JumpFalse transfers control to if_false,
+                        // and these moves must have already executed.
+                        self.emit_phi_moves_for_predecessor(block.id, *if_false);
+
                         // JumpFalse to the false block; fall through to the true block.
                         let jf_pos = self.emit(Instr::JumpFalse {
                             cond: cond_slot,
@@ -347,6 +355,13 @@ impl FunctionCompiler {
                             instr_idx: jf_pos,
                             target_block: *if_false,
                         });
+
+                        // Phi resolution for the TRUE branch: emit moves from
+                        // the current block to the if_true target. These only
+                        // execute when the condition is true (fall-through path),
+                        // before the unconditional jump to if_true.
+                        self.emit_phi_moves_for_predecessor(block.id, *if_true);
+
                         // Jump to the true block.
                         let j_pos = self.emit(Instr::Jump { offset: 0 });
                         self.pending_jumps.push(PendingJump {
@@ -360,7 +375,7 @@ impl FunctionCompiler {
                         // Before emitting the jump, insert phi-resolution Moves
                         // for the target block's phi nodes. The incoming values
                         // come from the current block's definitions.
-                        self.emit_phi_moves_for_predecessor(*target);
+                        self.emit_phi_moves_for_predecessor(block.id, *target);
 
                         let j_pos = self.emit(Instr::Jump { offset: 0 });
                         self.pending_jumps.push(PendingJump {
@@ -624,7 +639,17 @@ impl FunctionCompiler {
     ///
     /// For each phi in the target block, we copy the incoming value from this
     /// predecessor into the phi's destination slot.
-    fn emit_phi_moves_for_predecessor(&mut self, target_block: BlockId) {
+    /// Emit Move instructions to resolve phi nodes for `target_block` before
+    /// a Jump/CondBr transfers control there from `source_block`.
+    ///
+    /// For each phi in the target block, we copy ONLY the incoming value from
+    /// this specific predecessor into the phi's destination slot.
+    ///
+    /// IMPORTANT: We must only emit the Move for the current predecessor,
+    /// NOT for all incoming values. If we emit moves for all predecessors,
+    /// the last move always wins, making the phi always take the else-branch
+    /// value regardless of which branch was actually taken.
+    fn emit_phi_moves_for_predecessor(&mut self, source_block: BlockId, target_block: BlockId) {
         // Clone the phi data to avoid borrowing self.phis_by_block while
         // we mutably borrow self for slot_for() and emit().
         let phis = match self.phis_by_block.get(&target_block.0) {
@@ -632,20 +657,17 @@ impl FunctionCompiler {
             None => return,
         };
         for phi in &phis {
-            // Emit Moves for ALL incoming values. Since only one predecessor's
-            // jumps are executed at runtime, only that predecessor's moves take
-            // effect. This is correct because:
-            //   - Each Jump/CondBr emits its own set of phi moves
-            //   - Only the moves from the taken edge are executed
-            //
-            // For circular phi dependencies (phi A uses B's value, phi B uses
-            // A's value from the predecessor), we should ideally use temporary
-            // slots. For simplicity, we emit moves in order — this works as
-            // long as phi destinations don't overlap with source values from the
-            // same block, which is typically ensured by SSA construction.
-            for (_pred_block, incoming_vid) in &phi.incoming {
-                let src_slot = self.slot_for(*incoming_vid);
-                self.emit(Instr::Move { dst: phi.dst_slot, src: src_slot });
+            // Only emit the Move for the incoming value from THIS predecessor.
+            // This is critical: each predecessor edge must only write its own
+            // incoming value to the phi destination slot. Writing all incoming
+            // values would cause the last-written value to always win,
+            // regardless of which branch was taken at runtime.
+            for (pred_block, incoming_vid) in &phi.incoming {
+                if *pred_block == source_block {
+                    let src_slot = self.slot_for(*incoming_vid);
+                    self.emit(Instr::Move { dst: phi.dst_slot, src: src_slot });
+                    break; // Only one incoming value per predecessor
+                }
             }
         }
     }

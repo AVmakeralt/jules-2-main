@@ -151,7 +151,8 @@ fn bench() -> i32 {
 
         let prog = match result {
             PipelineResult::Ok(p) => p,
-            _ => { println!("PIPELINE FAIL"); fail += 1; continue; }
+            PipelineResult::OkWithIr { program, .. } => program,
+            other => { println!("PIPELINE FAIL: {:?}", other); fail += 1; continue; }
         };
 
         let compile_us = t0.elapsed().as_micros();

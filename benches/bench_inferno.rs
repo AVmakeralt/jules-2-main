@@ -659,6 +659,7 @@ fn run_bench(name: &'static str, iterations: usize, src: &str, expected: Option<
 
     let prog = match result {
         PipelineResult::Ok(p) => p,
+        PipelineResult::OkWithIr { program, .. } => program,
         _ => {
             println!("PIPELINE FAILED");
             return (name, false, compile_start.elapsed().as_secs_f64(), Some("pipeline did not produce program".into()));
@@ -748,6 +749,7 @@ fn run_bench_vm_compare(name: &'static str, iterations: usize, src: &str) -> (&'
 
     let prog = match result {
         PipelineResult::Ok(p) => p,
+        PipelineResult::OkWithIr { program, .. } => program,
         _ => {
             println!("PIPELINE FAILED");
             return (name, false, 0.0, Some("pipeline failed".into()));

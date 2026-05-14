@@ -44,6 +44,7 @@ fn test(name: &str, src: &str) {
 
     let prog = match result {
         PipelineResult::Ok(p) => p,
+        PipelineResult::OkWithIr { program, .. } => program,
         _ => { println!("PIPELINE FAILED"); return; }
     };
 
