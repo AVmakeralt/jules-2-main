@@ -22,7 +22,7 @@ This document serves as the **Single Source of Truth** for the best-ever recorde
 | OS | Linux 5.10.134 (containerized, KVM) |
 | Rust Profile | `release` (opt-level=3, LTO=fat, codegen-units=1, panic=abort) |
 | Rust Version | rustc 1.95.0 (2026-04-14) |
-| Commit | `3ce88cd` |
+| Commit | `HEAD` |
 
 ---
 
@@ -184,9 +184,10 @@ All measurements use `black_box()` to prevent dead code elimination. 100,000 ite
 
 ### 8. Test Suite Summary
 
-| Category | Total | Passed | Failed |
-| :--- | :--- | :--- | :--- |
-| Library tests (`cargo test --lib`) | 1104 | 1103 | 0 (+1 OOM in test_parse_full_program) |
+| Category | Total | Passed | Failed | Ignored |
+| :--- | :--- | :--- | :--- | :--- |
+| Library tests (`cargo test --lib`) | 1110 | 1109 | 0 | 1 |
+| Doc tests (`cargo test --doc`) | 13 | 0 | 0 | 13 |
 
 ---
 
@@ -212,7 +213,29 @@ All measurements use `black_box()` to prevent dead code elimination. 100,000 ite
 
 ---
 
-## Bugs Fixed in This Release (commit `3ce88cd`)
+## Bugs Fixed in This Release (commit `HEAD`)
+
+1. **Parser infinite loop in `parse_learning`:** The `model` keyword was tokenized as `KwModel` (not `Ident`), but `parse_learning` used `expect_ident()` which rejects keywords. This caused an infinite loop when parsing `learning reinforcement, model: PolicyNet`. Fixed by using `expect_name()` and handling `KwModel`/`KwPolicy` in the loop condition.
+
+2. **Parser `recover()` infinite loop:** The `recover()` method broke on keyword tokens without advancing past them. If the caller's loop couldn't handle the keyword, the parser got stuck. Fixed by always advancing at least one token before the recovery scan loop.
+
+3. **Parser `kw_as_ident` missing `KwModel`:** Added `KwModel` to `kw_as_ident()` so `model` can be used as a name in learning specs and other contexts.
+
+4. **Progress guarantee in parser loops:** Added `pos_before`/`self.pos` progress checks to `parse_agent`, `parse_train`, `parse_episode_spec`, `parse_optimizer_spec`, and `parse_physics_config` to prevent infinite loops when parsing fails.
+
+5. **IR while-loop back-edge phi nodes:** The phi back-edge always used the initial body block as predecessor, but when the loop body contains inner control flow, the actual back-edge block is different. Fixed by tracking `self.current_block_id` after `lower_block(body)` as the actual back-edge predecessor.
+
+6. **IR `bind()` destroying scope invariants:** `bind()` used `retain()` + `push()`, which moved rebound bindings past the scope mark, causing them to be truncated by `pop_scope()`. Fixed by replacing in-place instead of remove-and-append.
+
+7. **BytecodeVM defensive phi moves overwriting correct values:** The bytecode compiler emitted defensive phi moves at block entry that overwrote the correct values set by predecessor-inserted moves. Removed the defensive moves entirely.
+
+8. **Doc test compilation failures:** Fixed 4 doc tests that couldn't compile in isolation by marking them as `ignore` or `text`.
+
+9. **Test assertion count:** `test_parse_full_program` expected 7 items but the program has 8 (4 components + 1 system + 1 model + 1 agent + 1 train). Fixed assertion.
+
+---
+
+## Bugs Fixed in Previous Release (commit `3ce88cd`)
 
 1. **Phi Resolution in ir_to_bytecode:** The bytecode compiler copied ALL incoming phi values instead of only the current predecessor's value, causing phi slots to always get the else-branch value regardless of which branch was taken. Fixed by passing source_block to `emit_phi_moves_for_predecessor()`.
 

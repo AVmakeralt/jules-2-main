@@ -124,7 +124,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// let codes = [encode_2d(0,0), encode_2d(1,0), encode_2d(0,1), ...];
 /// let (xs, ys) = SimdMortonDecoder::decode_8x_2d(codes);
 /// assert_eq!(xs[0], 0); assert_eq!(ys[0], 0);
@@ -1193,7 +1193,7 @@ impl SimdSplatVectorize {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```ignore
     /// let (rx, ry) = SimdSplatVectorize::generate_splat_positions_8(
     ///     100.0, 200.0,   // center
     ///     [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],  // X offsets

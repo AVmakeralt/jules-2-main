@@ -203,8 +203,14 @@ impl Parser {
     // ── Error recovery ────────────────────────────────────────────────────────
 
     /// Push a non-fatal error and synchronise to the next statement/item boundary.
+    /// Always advances at least one token to guarantee progress and prevent
+    /// infinite loops when the current token itself is a recovery point.
     fn recover(&mut self, e: ParseError) {
         self.errors.push(e);
+        // Always advance past the problematic token first to guarantee progress.
+        if !self.at_eof() {
+            self.advance();
+        }
         // Skip tokens until we see a plausible recovery point.
         loop {
             match self.peek().kind {
@@ -306,6 +312,7 @@ fn kw_as_ident(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::KwOutput => Some("output"),
         TokenKind::KwLinear => Some("linear"),
         TokenKind::KwPolicy => Some("policy"),
+        TokenKind::KwModel => Some("model"),
         _ => None,
     }
 }
@@ -2817,6 +2824,7 @@ impl Parser {
         let mut architecture = AgentArchitecture::Utility;
 
         while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            let pos_before = self.pos;
             match self.peek().kind.clone() {
                 TokenKind::KwPerception => {
                     perceptions.push(self.parse_perception()?);
@@ -2872,6 +2880,10 @@ impl Parser {
             }
             self.eat(&TokenKind::Semicolon);
             self.eat(&TokenKind::Comma);
+            // Guarantee progress: if nothing was consumed, advance manually.
+            if self.pos == pos_before {
+                self.advance();
+            }
         }
 
         let end = self.expect(&TokenKind::RBrace)?;
@@ -2965,11 +2977,27 @@ impl Parser {
         let mut gamma = None;
         let mut policy_model = None;
         // Optional: learning_rate: 0.001, gamma: 0.99, model: PolicyNet
-        while self.eat(&TokenKind::Comma) || matches!(self.peek().kind, TokenKind::Ident(_)) {
-            if !matches!(&self.peek().kind, TokenKind::Ident(_)) {
+        // Note: `model` is a keyword (KwModel), so we must use expect_name()
+        // instead of expect_ident() to handle keyword-as-key.
+        loop {
+            if !self.eat(&TokenKind::Comma) {
+                // No comma; stop unless the next token looks like a key name
+                // (Ident or a keyword that can serve as a key like `model`).
+                if !matches!(self.peek().kind, TokenKind::Ident(_))
+                    && !matches!(self.peek().kind, TokenKind::KwModel)
+                    && !matches!(self.peek().kind, TokenKind::KwPolicy)
+                {
+                    break;
+                }
+            }
+            // If we still don't see something name-like after consuming a comma, stop.
+            if !matches!(self.peek().kind, TokenKind::Ident(_))
+                && !matches!(self.peek().kind, TokenKind::KwModel)
+                && !matches!(self.peek().kind, TokenKind::KwPolicy)
+            {
                 break;
             }
-            let (_, key) = self.expect_ident()?;
+            let (_, key) = self.expect_name()?;
             self.eat(&TokenKind::Colon);
             match key.as_str() {
                 "learning_rate" | "lr" => {
@@ -2988,8 +3016,8 @@ impl Parser {
                             .unwrap_or(0.99),
                     );
                 }
-                "model" | "policy_model" => {
-                    policy_model = Some(self.expect_ident()?.1);
+                "model" | "policy_model" | "policy" => {
+                    policy_model = Some(self.expect_name()?.1);
                 }
                 _ => {}
             }
@@ -3398,6 +3426,7 @@ impl Parser {
         let mut value_model = None;
 
         while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            let pos_before = self.pos;
             match self.peek().kind.clone() {
                 TokenKind::KwReward | TokenKind::KwPenalty => {
                     let is_reward = matches!(self.peek().kind, TokenKind::KwReward);
@@ -3467,6 +3496,10 @@ impl Parser {
             }
             self.eat(&TokenKind::Semicolon);
             self.eat(&TokenKind::Comma);
+            // Guarantee progress: if nothing was consumed, advance manually.
+            if self.pos == pos_before {
+                self.advance();
+            }
         }
 
         let end = self.expect(&TokenKind::RBrace)?;
@@ -3494,6 +3527,7 @@ impl Parser {
         let mut num_envs = None;
 
         while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            let pos_before = self.pos;
             let (_, key) = self
                 .expect_name()
                 .unwrap_or((Span::dummy(), "".to_string()));
@@ -3526,6 +3560,10 @@ impl Parser {
                 }
             }
             self.eat(&TokenKind::Comma);
+            // Guarantee progress: if nothing was consumed, advance manually.
+            if self.pos == pos_before {
+                self.advance();
+            }
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(EpisodeSpec {
@@ -3555,6 +3593,7 @@ impl Parser {
         if self.is(&TokenKind::LBrace) {
             self.advance();
             while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+                let pos_before = self.pos;
                 let (_, k) = self
                     .expect_name()
                     .unwrap_or((Span::dummy(), "".to_string()));
@@ -3576,6 +3615,10 @@ impl Parser {
                     extra.push((k, v));
                 }
                 self.eat(&TokenKind::Comma);
+                // Guarantee progress: if nothing was consumed, advance manually.
+                if self.pos == pos_before {
+                    self.advance();
+                }
             }
             self.expect(&TokenKind::RBrace)?;
         }
@@ -3748,6 +3791,7 @@ impl Parser {
         let mut collision_layers = Vec::new();
 
         while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            let pos_before = self.pos;
             let (_, key) = self.expect_name().unwrap_or((Span::dummy(), String::new()));
             self.eat(&TokenKind::Colon);
             match key.as_str() {
@@ -3772,6 +3816,10 @@ impl Parser {
             }
             self.eat(&TokenKind::Comma);
             self.eat(&TokenKind::Semicolon);
+            // Guarantee progress: if nothing was consumed, advance manually.
+            if self.pos == pos_before {
+                self.advance();
+            }
         }
 
         let end = self.expect(&TokenKind::RBrace)?;
@@ -4734,6 +4782,90 @@ mod tests {
             }
         "#;
         let prog = ok(src);
-        assert_eq!(prog.items.len(), 7, "expected 7 top-level items: {prog:#?}");
+        assert_eq!(prog.items.len(), 8, "expected 8 top-level items: {prog:#?}");
+    }
+
+    // ── Incremental tests to isolate OOM ──────────────────────────────────
+    #[test]
+    fn test_parse_train_only() {
+        let src = r#"
+            train Soldier in BattleField {
+                reward survive 1.0
+                penalty damage  0.5
+                episode { max_steps: 500, num_envs: 32 }
+            }
+        "#;
+        let prog = ok(src);
+        assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_agent_only() {
+        let src = r#"
+            agent Soldier {
+                perception vision 30
+                learning reinforcement, model: PolicyNet
+                behavior Flee(priority: 100) {
+                    if self.health < 20.0 {
+                        return seek(spawn_point)
+                    }
+                }
+            }
+        "#;
+        let prog = ok(src);
+        assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_agent_perception_only() {
+        let src = r#"
+            agent Soldier {
+                perception vision 30
+            }
+        "#;
+        let prog = ok(src);
+        assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_agent_learning_only() {
+        let src = r#"
+            agent Soldier {
+                learning reinforcement, model: PolicyNet
+            }
+        "#;
+        let prog = ok(src);
+        assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_agent_behavior_only() {
+        let src = r#"
+            agent Soldier {
+                behavior Flee(priority: 100) {
+                    if self.health < 20.0 {
+                        return seek(spawn_point)
+                    }
+                }
+            }
+        "#;
+        let prog = ok(src);
+        assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_model_only() {
+        let src = r#"
+            @gpu
+            @grad
+            model PolicyNet {
+                input 64
+                dense 128 relu
+                dense 64  relu
+                output 4  softmax
+            }
+        "#;
+        let prog = ok(src);
+        assert_eq!(prog.items.len(), 1);
     }
 }

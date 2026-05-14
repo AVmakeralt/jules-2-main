@@ -148,10 +148,18 @@ impl LowerCtx {
     }
 
     fn bind(&mut self, name: String, vid: ValueId) {
-        // Remove any earlier binding of the same name in current scope
-        // (shadowing)
-        self.env.retain(|(n, _)| n != &name);
-        self.env.push((name, vid));
+        // Replace any earlier binding of the same name IN PLACE rather than
+        // removing and appending. This is critical for correct scope management:
+        // pop_scope truncates the env to a saved length, so bindings from
+        // outer scopes must remain at their original positions. The old
+        // remove-and-append pattern moved outer-scope bindings to the end of
+        // the vec, causing pop_scope to truncate them — the "unit type leak"
+        // bug where loop-carried variables lost their updated values.
+        if let Some(pos) = self.env.iter().rposition(|(n, _)| n == &name) {
+            self.env[pos] = (name, vid);
+        } else {
+            self.env.push((name, vid));
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<ValueId> {
@@ -220,6 +228,105 @@ impl LowerCtx {
                 }
                 (None, None) => {
                     // Variable doesn't exist in either branch — nothing to do
+                }
+            }
+        }
+    }
+
+    /// Emit phi nodes in the current block (which should be a loop header)
+    /// for all variables in the given pre-loop env. This creates single-input
+    /// phi nodes with just the initial incoming value; the back-edge incoming
+    /// value is added later via `update_header_phi_back_edge`.
+    ///
+    /// Returns the updated env (phi_env) with phi result bindings, which should
+    /// be used for condition evaluation and as the exit-block env.
+    ///
+    /// This is essential for correct SSA loop construction: without header phis,
+    /// the loop body and condition always see the pre-loop values of variables,
+    /// causing the exit block to always receive initial values instead of
+    /// accumulated values (the "unit type leak" bug where `()` replaces `i64`).
+    fn emit_loop_header_phis(
+        &mut self,
+        pre_loop_block: BlockId,
+        pre_loop_env: &[(String, ValueId)],
+        span: Span,
+    ) -> Vec<(String, ValueId)> {
+        // Deduplicate variable names (use the most recent binding for each)
+        let mut seen = std::collections::HashSet::new();
+        let mut unique_vars: Vec<(String, ValueId)> = Vec::new();
+        for (name, vid) in pre_loop_env.iter().rev() {
+            if seen.insert(name.clone()) {
+                unique_vars.push((name.clone(), *vid));
+            }
+        }
+        // Reverse to process in original order (first-binding wins for dedup)
+        unique_vars.reverse();
+
+        let mut phi_env = Vec::new();
+        for (name, pre_loop_vid) in &unique_vars {
+            // Create a phi with just the initial incoming value.
+            // The back-edge incoming value will be added after lowering the body.
+            let phi_vid = self.emit(
+                IrOp::Phi { incoming: vec![(pre_loop_block, *pre_loop_vid)] },
+                span,
+                EffectFlags::pure(),
+                Ownership::Copy,
+            );
+            if let Some(pv) = phi_vid {
+                phi_env.push((name.clone(), pv));
+                self.bind(name.clone(), pv);
+            } else {
+                // Phi should always produce a result; fallback to original value
+                phi_env.push((name.clone(), *pre_loop_vid));
+            }
+        }
+        phi_env
+    }
+
+    /// Update the header block's phi nodes with back-edge incoming values
+    /// from the body block. After lowering the loop body, we know the final
+    /// ValueId for each variable, and we add it as the second incoming value
+    /// to each phi: `phi(pre_loop: initial, body: updated)`.
+    fn update_header_phi_back_edge(
+        &mut self,
+        header_block: BlockId,
+        back_edge_block: BlockId,
+        phi_env: &[(String, ValueId)],
+        post_body_env: &[(String, ValueId)],
+    ) {
+        // Find the header block index
+        let header_idx = {
+            let idx = header_block.0 as usize;
+            if idx < self.current_blocks.len() && self.current_blocks[idx].id == header_block {
+                idx
+            } else {
+                match self.current_blocks.iter().position(|b| b.id == header_block) {
+                    Some(idx) => idx,
+                    None => return, // Header block not found (shouldn't happen)
+                }
+            }
+        };
+
+        // For each phi in the header, find the corresponding variable's
+        // post-body ValueId and add it as an incoming value from the back-edge block.
+        for instr in &mut self.current_blocks[header_idx].instrs {
+            if let IrOp::Phi { incoming } = &mut instr.op {
+                if let Some(dst_vid) = instr.dst {
+                    // Find the variable name for this phi result
+                    for (name, phi_vid) in phi_env {
+                        if *phi_vid == dst_vid {
+                            // Find the variable's value after the body
+                            let post_vid = post_body_env
+                                .iter()
+                                .rev()
+                                .find(|(n, _)| n == name)
+                                .map(|&(_, v)| v);
+                            if let Some(pv) = post_vid {
+                                incoming.push((back_edge_block, pv));
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1912,6 +2019,9 @@ impl LowerCtx {
         let body_block = self.create_block();
         let exit_block = self.create_block();
 
+        // Save the pre-loop block id for phi node predecessors
+        let pre_loop_block = self.current_block_id;
+
         // Push loop context for break/continue
         self.loop_stack.push(LoopContext {
             break_block: exit_block,
@@ -1929,7 +2039,51 @@ impl LowerCtx {
             EffectFlags::TERMINATES,
         );
 
-        // Header: evaluate condition
+        // Header: emit phi nodes for loop-carried variables FIRST.
+        // These merge the initial value (from pre_loop_block) with the
+        // back-edge value (from body_block, added after lowering the body).
+        // This is essential for correct SSA: without header phis, the loop
+        // body and condition always see the pre-loop values of variables,
+        // causing the exit block to always receive initial values instead
+        // of accumulated values (the "unit type leak" bug).
+        self.switch_to_block(header_block);
+        let phi_env = self.emit_loop_header_phis(pre_loop_block, &pre_loop_env, span);
+
+        // Body: lower body using phi result bindings so that loop-carried
+        // variables reference the current iteration's values.
+        self.switch_to_block(body_block);
+        self.lower_block(body);
+        let post_body_env = self.snapshot_env();
+
+        // Track the actual back-edge block. When the loop body contains
+        // inner control flow (if-else, nested loops, etc.), the block that
+        // jumps back to the header is NOT body_block — it's whatever block
+        // the body lowering ended in (e.g., a merge block from an if-else).
+        // Using body_block as the phi predecessor would be wrong because
+        // the bytecode compiler emits phi-resolution moves only for the
+        // block that actually contains the Jump to the header. A mismatch
+        // means the moves are never emitted, so phi values are never
+        // updated from the back-edge, and the loop always sees initial
+        // values — the "unit type leak" bug.
+        let back_edge_block = self.current_block_id;
+        if !self.is_terminated() {
+            self.emit_terminator(
+                IrOp::Jump { target: header_block },
+                body.span,
+                EffectFlags::TERMINATES,
+            );
+        }
+
+        // Update header phi nodes with back-edge incoming values from the
+        // actual back-edge block. This completes the two-input phi nodes:
+        //   v_phi = phi(pre_loop_block: initial_value, back_edge_block: updated_value)
+        self.update_header_phi_back_edge(header_block, back_edge_block, &phi_env, &post_body_env);
+
+        // Header: now emit condition and CondBr using phi result bindings.
+        // The condition must use the phi results (current iteration values),
+        // not the pre-loop values, so that e.g. `while i < 10` correctly
+        // tracks `i` across iterations.
+        self.env = phi_env.clone();
         self.switch_to_block(header_block);
         let cond_vid = self.lower_expr(cond);
         if let Some(cv) = cond_vid {
@@ -1940,31 +2094,12 @@ impl LowerCtx {
             );
         }
 
-        // Body: lower body, then jump back to header
-        self.switch_to_block(body_block);
-        self.lower_block(body);
-        if !self.is_terminated() {
-            self.emit_terminator(
-                IrOp::Jump { target: header_block },
-                body.span,
-                EffectFlags::TERMINATES,
-            );
-        }
-
-        // After loop body, check which variables were modified and
-        // emit phi nodes in the header block. We need to rebuild the
-        // header with phi nodes for loop-carried variables.
-        let post_body_env = self.snapshot_env();
-
-        // Emit phi nodes in the exit block for any variable whose ValueId
-        // changed inside the loop body. These ensure that after the loop,
-        // variables have the correct SSA value.
-        // Note: A full SSA construction would also insert phi nodes in the
-        // header block for the back-edge. For now, we handle the common case
-        // by emitting phi nodes in the exit block that merge the pre-loop and
-        // post-loop values.
+        // Exit block: variables after the loop have the phi result values,
+        // which represent the current iteration's values at the point of
+        // exit (when the condition became false). No additional phi nodes
+        // are needed in the exit block for the normal exit path.
         self.switch_to_block(exit_block);
-        self.emit_phis_for_changed_vars(header_block, body_block, &pre_loop_env, &post_body_env, span);
+        self.env = phi_env;
 
         // Pop loop context
         self.loop_stack.pop();
@@ -1973,6 +2108,9 @@ impl LowerCtx {
     fn lower_loop(&mut self, body: &Block, span: Span) {
         let header_block = self.create_block();
         let exit_block = self.create_block();
+
+        // Save the pre-loop block id for phi node predecessors
+        let pre_loop_block = self.current_block_id;
 
         // Push loop context for break/continue
         self.loop_stack.push(LoopContext {
@@ -1990,8 +2128,16 @@ impl LowerCtx {
             EffectFlags::TERMINATES,
         );
 
+        // Header: emit phi nodes for loop-carried variables first
         self.switch_to_block(header_block);
+        let phi_env = self.emit_loop_header_phis(pre_loop_block, &pre_loop_env, span);
+
+        // Body: lower using phi result bindings
         self.lower_block(body);
+        let post_body_env = self.snapshot_env();
+
+        // Track the actual back-edge block (see lower_while for rationale).
+        let back_edge_block = self.current_block_id;
         if !self.is_terminated() {
             self.emit_terminator(
                 IrOp::Jump { target: header_block },
@@ -2000,10 +2146,12 @@ impl LowerCtx {
             );
         }
 
-        let post_body_env = self.snapshot_env();
+        // Update header phi nodes with back-edge incoming values
+        self.update_header_phi_back_edge(header_block, back_edge_block, &phi_env, &post_body_env);
 
+        // Exit block: variables have the phi result values
         self.switch_to_block(exit_block);
-        self.emit_phis_for_changed_vars(header_block, header_block, &pre_loop_env, &post_body_env, span);
+        self.env = phi_env;
 
         // Pop loop context
         self.loop_stack.pop();
@@ -2016,6 +2164,9 @@ impl LowerCtx {
         let header_block = self.create_block();
         let body_block = self.create_block();
         let exit_block = self.create_block();
+
+        // Save the pre-loop block id for phi node predecessors
+        let pre_loop_block = self.current_block_id;
 
         // Push loop context for break/continue
         self.loop_stack.push(LoopContext {
@@ -2034,8 +2185,11 @@ impl LowerCtx {
             EffectFlags::TERMINATES,
         );
 
-        // Header: check has_next
+        // Header: emit phi nodes for loop-carried variables first
         self.switch_to_block(header_block);
+        let phi_env = self.emit_loop_header_phis(pre_loop_block, &pre_loop_env, span);
+
+        // Header: check has_next (using phi result bindings)
         let has_next = match iter_vid {
             Some(iv) => self.emit(
                 IrOp::Call {
@@ -2063,7 +2217,7 @@ impl LowerCtx {
             );
         }
 
-        // Body: get next value, bind pattern, lower body
+        // Body: get next value, bind pattern, lower body using phi result bindings
         self.switch_to_block(body_block);
         let next_val = match iter_vid {
             Some(iv) => self.emit(
@@ -2081,6 +2235,10 @@ impl LowerCtx {
             self.bind_pattern(pattern, nv, false);
         }
         self.lower_block(body);
+        let post_body_env = self.snapshot_env();
+
+        // Track the actual back-edge block (see lower_while for rationale).
+        let back_edge_block = self.current_block_id;
         if !self.is_terminated() {
             self.emit_terminator(
                 IrOp::Jump { target: header_block },
@@ -2089,10 +2247,12 @@ impl LowerCtx {
             );
         }
 
-        let post_body_env = self.snapshot_env();
+        // Update header phi nodes with back-edge incoming values
+        self.update_header_phi_back_edge(header_block, back_edge_block, &phi_env, &post_body_env);
 
+        // Exit block: variables have the phi result values
         self.switch_to_block(exit_block);
-        self.emit_phis_for_changed_vars(header_block, body_block, &pre_loop_env, &post_body_env, span);
+        self.env = phi_env;
 
         // Pop loop context — emit loop-carried state variable metadata
         // so the optimizer can reason about loop induction variables.

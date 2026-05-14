@@ -138,7 +138,7 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
 /// The bit layout is designed so that the GPU can unpack the packet with
 /// a few bit-shifts and masks — no complex decoding required.
 ///
-/// ```
+/// ```text
 /// Bits 0–31:   morton_xy      — Morton-encoded X, Y position
 /// Bits 32–47:  atlas_id_palette — Atlas ID (high 8 bits) + Palette (low 8 bits)
 /// Bits 48–63:  anim_frame     — Animation frame index (temporal hash)

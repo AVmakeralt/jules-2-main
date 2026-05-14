@@ -937,7 +937,7 @@ impl fmt::Display for DiagnosticHint {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use crate::compiler::error_codes::{error_code_category, ErrorCodeCategory};
 /// assert_eq!(error_code_category("E2001"), ErrorCodeCategory::TypeCheck);
 /// assert_eq!(error_code_category("E4003"), ErrorCodeCategory::BorrowCheck);

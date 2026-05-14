@@ -206,21 +206,15 @@ impl FunctionCompiler {
             // Record the start offset of this block.
             self.block_offsets.insert(block.id.0, self.output.instructions.len());
 
-            // Emit phi-resolution Moves at the top of the block.
-            // (These will be overwritten by predecessor-inserted moves at runtime
-            //  via the Move instructions inserted before jumps in predecessor blocks.)
-            // We emit the phi Moves here so that if control falls through
-            // (unlikely in SSA form, but defensive), the phi slots have values.
-            // Clone to avoid borrowing self.phis_by_block while calling self.slot_for/emit.
-            let block_phis = self.phis_by_block.get(&block.id.0).cloned();
-            if let Some(phis) = block_phis {
-                for phi in &phis {
-                    if let Some((_, first_vid)) = phi.incoming.first() {
-                        let src_slot = self.slot_for(*first_vid);
-                        self.emit(Instr::Move { dst: phi.dst_slot, src: src_slot });
-                    }
-                }
-            }
+            // NOTE: We do NOT emit phi-resolution Moves at the top of the block.
+            // Phi resolution is handled entirely by predecessor-inserted Move
+            // instructions (see emit_phi_moves_for_predecessor). Emitting
+            // defensive Moves here would OVERWRITE the correct values set by
+            // predecessor blocks at runtime, because these defensive Moves
+            // execute after the jump transfers control to this block. This was
+            // the cause of the "unit type leak" bug where loop header phis
+            // always received the initial (pre-loop) value instead of the
+            // back-edge (accumulated) value.
 
             // Emit instructions for this block.
             for instr in &block.instrs {
