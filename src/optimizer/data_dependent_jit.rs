@@ -413,19 +413,15 @@ impl DataDependentJIT {
     #[inline(always)]
     pub fn observe_int(&mut self, var_name: &str, value: i64) {
         // Ensure the observation entry exists
+        // FIX: Use ValueObservation::new() instead of manually duplicating the
+        // constructor fields. The previous code had a subtle drift: if new fields
+        // were added to ValueObservation, this manual construction would silently
+        // use Default::default() or fail to compile. Using the canonical
+        // constructor ensures consistency.
         if !self.profiles.contains_key(var_name) {
-            self.profiles.insert(var_name.to_string(), ValueObservation {
-                var_name: var_name.to_string(),
-                int_values: HashMap::new(),
-                float_buckets: HashMap::new(),
-                total_observations: 0,
-                hot_value: None,
-                drift_detector: DriftDetector::new(self.drift_window_size),
-                is_boolean: false, // don't assume boolean — require evidence
-                bool_constant: None,
-                observed_min: i64::MAX,
-                observed_max: i64::MIN,
-            });
+            let mut obs = ValueObservation::new(self.drift_window_size);
+            obs.var_name = var_name.to_string();
+            self.profiles.insert(var_name.to_string(), obs);
         }
 
         let obs = self.profiles.get_mut(var_name).unwrap();
@@ -678,9 +674,14 @@ impl DataDependentJIT {
 
     /// Get a specialization for a function by name and current argument values.
     /// Returns the first non-deprecated specialization whose guards all match.
+    /// FIX: Removed unused `Instant::now()` that was never stored — it
+    /// computed an elapsed time but then discarded it with `let _ = start`.
+    /// The `total_guard_check_ns` / `guard_check_count` fields were never
+    /// updated, making `avg_guard_check_ns` always return 0 in `stats()`.
+    /// If per-lookup timing is needed in the future, use an `AtomicU64`
+    /// for `total_guard_check_ns` so it can be updated from a `&self` method.
     pub fn get_specialization_for(&self, fn_name: &str, args: &[(String, i64)]) -> Option<&SpecializedVersion> {
-        let start = Instant::now();
-        let result = self.specializations.iter().find(|spec| {
+        self.specializations.iter().find(|spec| {
             if spec.fn_name != fn_name || spec.deprecated {
                 return false;
             }
@@ -694,11 +695,7 @@ impl DataDependentJIT {
                 }
             }
             true
-        });
-        // Note: we can't update total_guard_check_ns here because we borrow self
-        // This is fine - it's a read-only lookup in the hot path
-        let _ = start;
-        result
+        })
     }
 
     /// Record a guard hit (specialized code was used)

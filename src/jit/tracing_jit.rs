@@ -289,6 +289,12 @@ impl TraceRecorder {
 // =============================================================================
 pub struct ExecutableMemory { ptr: *mut u8, len: usize }
 
+// SAFETY: ExecutableMemory exclusively owns its mmap'd region.
+// It is safe to send across threads and share references because
+// the memory is only read/executed, never mutated after construction.
+unsafe impl Send for ExecutableMemory {}
+unsafe impl Sync for ExecutableMemory {}
+
 impl ExecutableMemory {
     #[cfg(unix)]
     pub fn new(code: &[u8]) -> Result<Self, String> {
@@ -301,6 +307,12 @@ impl ExecutableMemory {
         }
         Ok(Self { ptr: ptr as *mut u8, len })
     }
+
+    #[cfg(not(unix))]
+    pub fn new(_code: &[u8]) -> Result<Self, String> {
+        Err("ExecutableMemory not supported on this platform".into())
+    }
+
     pub fn entry_point(&self) -> *mut u8 { self.ptr }
 }
 
@@ -384,8 +396,17 @@ impl NativeCodeGenerator {
         // continues to work unchanged.
         if is_specialized {
             // mov r8, rdx — copy the buffer argument from RDX to R8
-            // REX.WRB: 4C (REX.WR) + 89 (MOV r/m64, r64) + C2 (mod=11, reg=rdx, rm=r8)
-            self.b(0x4C); self.b(0x89); self.b(0xD0); // mov r8, rdx
+            //
+            // Encoding: MOV r/m64, r64 (opcode 0x89)
+            //   R8 is the destination (rm field), RDX is the source (reg field).
+            //   REX: W=1, R=0 (rdx < 8), X=0, B=1 (r8 >= 8) → 0x49
+            //   ModRM: mod=11, reg=010(rdx), rm=000(r8 with REX.B) → 0xD0
+            //   Full: 49 89 D0
+            //
+            //   Previously this was encoded as 4C 89 D0 which decodes as
+            //   MOV RAX, R10 (REX.R=1 extends reg to r10, REX.B=0 leaves rm as rax),
+            //   completely wrong. Fixed to 49 89 D0.
+            self.b(0x49); self.b(0x89); self.b(0xD0); // mov r8, rdx
         }
 
         // 3. Optimization Pass: Constant Folding & Dead Store Elimination
@@ -667,19 +688,32 @@ impl NativeCodeGenerator {
         Ok(())
     }
 
-    fn emit_unboxed_load(&mut self, offset: u32, _vtype: ValueType, _buffer: *mut u8, reg: Reg) -> Result<(), String> {
+    fn emit_unboxed_load(&mut self, offset: u32, vtype: ValueType, _buffer: *mut u8, reg: Reg) -> Result<(), String> {
         // Load from unboxed buffer at [buffer + offset]
         // J2 fix: Removed redundant mov_r8_imm64 per load. The buffer base
         // address is now loaded once in compile_trace() prologue via
         // emit_unboxed_prologue(), so R8 already holds the correct base.
-        // Previously, every unboxed load/store emitted a 10-byte MOV R8,
-        // wasting 10 bytes + 1 cycle per memory op (200+ bytes per trace).
+        //
+        // Boolean fix: For ValueType::Bool, we only store 1 byte, so we must
+        // only load 1 byte (movzx) to avoid reading past the slot boundary
+        // and pulling in garbage from adjacent boolean values.
         let reg_code = reg as u8;
-        let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
-        self.b(rex);
-        self.b(0x8B); // MOV r64, r/m64
-        self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
-        self.i32(offset as i32);
+        if matches!(vtype, ValueType::Bool) {
+            // MOVZX r32, byte [r8 + disp32]
+            // REX: W=0 (32-bit dest zero-extends), REX.R if reg >= 8
+            let rex = if reg_code >= 8 { 0x44 } else { 0x00 }; // REX optional for REX.R only
+            if rex != 0 { self.b(rex); }
+            self.b(0x0F);
+            self.b(0xB6); // MOVZX r32, r/m8
+            self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
+            self.i32(offset as i32);
+        } else {
+            let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
+            self.b(rex);
+            self.b(0x8B); // MOV r64, r/m64
+            self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
+            self.i32(offset as i32);
+        }
         Ok(())
     }
 
@@ -689,16 +723,33 @@ impl NativeCodeGenerator {
         self.emit_unboxed_store_reg(offset, Reg::RAX, vtype, buffer);
     }
 
-    fn emit_unboxed_store_reg(&mut self, offset: u32, reg: Reg, _vtype: ValueType, _buffer: *mut u8) {
+    fn emit_unboxed_store_reg(&mut self, offset: u32, reg: Reg, vtype: ValueType, _buffer: *mut u8) {
         // Store register to unboxed buffer at [r8 + offset]
         // J2 fix: Removed redundant mov_r8_imm64 per store. R8 is loaded
         // once in the prologue; no need to reload on every store.
+        //
+        // Boolean fix: For ValueType::Bool, we must only write 1 byte to
+        // avoid corrupting adjacent boolean values in the tightly-packed
+        // unboxed buffer (1 byte per bool vs 8 bytes per i64/f64).
         let reg_code = reg as u8;
-        let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
-        self.b(rex);
-        self.b(0x89); // MOV r/m64, r64
-        self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
-        self.i32(offset as i32);
+        if matches!(vtype, ValueType::Bool) {
+            // MOV byte [r8 + disp32], r8_low  (AL for rax, CL for rcx, etc.)
+            // Use the low byte of the register. For RAX/RCX this is AL/CL.
+            // REX prefix is NOT needed for byte stores to AL/CL/DL/BL.
+            // For R8B-R15B, we need REX prefix (0x41 for REX.B).
+            if reg_code >= 8 {
+                self.b(0x41); // REX.B for r8b-r15b
+            }
+            self.b(0x88); // MOV r/m8, r8
+            self.modrm(2, reg_code & 7, 8); // mod=10, reg=low_byte(reg), rm=r8
+            self.i32(offset as i32);
+        } else {
+            let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
+            self.b(rex);
+            self.b(0x89); // MOV r/m64, r64
+            self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
+            self.i32(offset as i32);
+        }
     }
 
     // --- Register Allocation & Spilling ---

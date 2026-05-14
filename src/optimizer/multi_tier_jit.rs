@@ -816,9 +816,18 @@ impl MultiTierJit {
     }
 
     /// Trigger deoptimization for a function
+    ///
+    /// FIX: After deoptimization, the compiled code's mmap region is freed
+    /// (because `record_deopt` sets `self.code = CompiledCode::None`).
+    /// However, the OSR entry table still held the stale entry address,
+    /// so `get_osr_entry()` would return a dangling pointer. Now we remove
+    /// the OSR entry for the deoptimized function to prevent anyone from
+    /// jumping into freed memory.
     pub fn deoptimize(&mut self, name: &str, reason: DeoptReason, location: String) {
         if let Some(func) = self.functions.get_mut(name) {
             func.record_deopt(reason, location);
+            // Remove OSR entry — the old entry address points to freed mmap
+            self.osr.osr_entries.remove(&format!("{}:loop0", name));
         }
     }
 
@@ -842,11 +851,17 @@ impl MultiTierJit {
     }
 
     /// Force recompilation of a function at a specific tier
+    ///
+    /// FIX: Also remove the stale OSR entry (same dangling-pointer risk
+    /// as `deoptimize`).  The entry will be re-registered when the
+    /// function is promoted again.
     pub fn force_recompile(&mut self, name: &str, tier: JitTier) {
         if let Some(func) = self.functions.get_mut(name) {
             func.stats.tier = tier;
             func.stats.last_compiled = std::time::Instant::now();
             func.code = CompiledCode::None; // Will be recompiled on next execution
+            // Remove stale OSR entry to avoid jumping into freed mmap
+            self.osr.osr_entries.remove(&format!("{}:loop0", name));
         }
     }
 

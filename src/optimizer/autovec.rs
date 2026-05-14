@@ -187,10 +187,9 @@ impl VectorPatternDetector {
         
         #[cfg(target_arch = "x86_64")]
         {
-            // SSE4.2 provides 128-bit vector support
-            if Self::has_sse42() {
-                widths.push(VectorWidth::W128);
-            }
+            // SSE2 is the baseline for x86_64 — all x86_64 CPUs support it.
+            // We always include W128 as the minimum.
+            widths.push(VectorWidth::W128);
             // Check for AVX (256-bit)
             if Self::has_avx() {
                 widths.push(VectorWidth::W256);
@@ -204,11 +203,6 @@ impl VectorPatternDetector {
         #[cfg(not(target_arch = "x86_64"))]
         {
             // ARM NEON always provides 128-bit vectors
-            widths.push(VectorWidth::W128);
-        }
-        
-        // Fallback: always include W128 if nothing was detected
-        if widths.is_empty() {
             widths.push(VectorWidth::W128);
         }
         
@@ -479,7 +473,13 @@ impl DependencyAnalyzer {
     }
 
     /// Analyze a vector pattern for dependencies
-    pub fn analyze(&self, pattern: &VectorPattern) -> VerificationResult {
+    pub fn analyze(&mut self, pattern: &VectorPattern) -> VerificationResult {
+        // FIX: Clear previous analysis and record new dependencies for
+        // each pattern. Previously, the `dependencies` Vec was never
+        // populated, making `dependencies()` always return an empty slice
+        // and losing valuable diagnostic information.
+        self.dependencies.clear();
+
         match pattern {
             VectorPattern::Map { .. } => {
                 // Map: each iteration applies the same operation to independent
@@ -500,8 +500,24 @@ impl DependencyAnalyzer {
                 // NOT associative (vectorization is unsafe):
                 //   Sub, Div — because a - b - c ≠ a - (b - c)
                 if Self::is_associative_for_reduction(*op) {
+                    self.dependencies.push(Dependency {
+                        kind: DependencyKind::RAW,
+                        description: format!(
+                            "Reduction with {:?} has loop-carried RAW dependency on accumulator, \
+                             but operation is associative so vectorized reduction is safe",
+                            op
+                        ),
+                    });
                     VerificationResult::Safe
                 } else {
+                    self.dependencies.push(Dependency {
+                        kind: DependencyKind::RAW,
+                        description: format!(
+                            "Reduction with {:?} has loop-carried RAW dependency on accumulator, \
+                             and operation is NOT associative — vectorization would change results",
+                            op
+                        ),
+                    });
                     VerificationResult::Unsafe
                 }
             }
@@ -516,11 +532,29 @@ impl DependencyAnalyzer {
                     // array, creating read-after-write or write-after-read
                     // dependencies. Without alias analysis, we cannot prove
                     // safety statically.
+                    self.dependencies.push(Dependency {
+                        kind: DependencyKind::RAW,
+                        description: "Gather pattern: indices may alias output array, \
+                                      creating potential RAW dependency without alias analysis"
+                            .to_string(),
+                    });
                     VerificationResult::Unknown
                 } else {
                     // Scatter (indexed store): indices could overlap, meaning
                     // two iterations write to the same location (WAW) or a
                     // later iteration overwrites a value read earlier (WAR).
+                    self.dependencies.push(Dependency {
+                        kind: DependencyKind::WAW,
+                        description: "Scatter pattern: indices may overlap, \
+                                      creating potential WAW dependency"
+                            .to_string(),
+                    });
+                    self.dependencies.push(Dependency {
+                        kind: DependencyKind::WAR,
+                        description: "Scatter pattern: scatter may overwrite values \
+                                      read by other iterations, creating WAR dependency"
+                            .to_string(),
+                    });
                     VerificationResult::Unsafe
                 }
             }
@@ -554,26 +588,42 @@ impl DependencyAnalyzer {
 pub struct EGraphVectorVerifier {
     /// Whether verification is enabled
     enabled: bool,
+    /// Dependency analyzer — reused across verify() calls so callers can
+    /// query `last_dependencies()` after verification.
+    analyzer: DependencyAnalyzer,
 }
 
 impl EGraphVectorVerifier {
     pub fn new() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            analyzer: DependencyAnalyzer::new(),
+        }
     }
 
-    /// Verify that vectorization is safe using dependency analysis
-    pub fn verify(&self, candidate: &VectorizationCandidate) -> VerificationResult {
+    /// Verify that vectorization is safe using dependency analysis.
+    ///
+    /// FIX: The analyzer is now stored in `self` so that callers can inspect
+    /// the detected dependencies after verification via `last_dependencies()`.
+    /// Previously, the analyzer was a local that was dropped, making it
+    /// impossible to retrieve the dependency diagnostics.
+    pub fn verify(&mut self, candidate: &VectorizationCandidate) -> VerificationResult {
         if !self.enabled {
             return VerificationResult::Safe;
         }
 
-        let analyzer = DependencyAnalyzer::new();
-        analyzer.analyze(&candidate.pattern)
+        self.analyzer.analyze(&candidate.pattern)
     }
 
     /// Enable or disable verification
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    /// Get the dependencies detected by the most recent `verify()` call.
+    /// Returns an empty slice if `verify()` hasn't been called yet.
+    pub fn last_dependencies(&self) -> &[Dependency] {
+        self.analyzer.dependencies()
     }
 }
 
@@ -597,13 +647,22 @@ impl AutoVectorizer {
     }
 
     /// Analyze a loop for vectorization
+    ///
+    /// FIX: Previously, only `Safe` candidates were retained. Now we also
+    /// keep `NotBeneficial` candidates (vectorization is safe but the loop
+    /// is too small to be worth it) so that downstream consumers can see
+    /// *why* a loop was not vectorized. Only `Unsafe` and `Unknown`
+    /// candidates are discarded — they would produce incorrect or
+    /// unpredictable results if vectorized.
     pub fn analyze_loop(&mut self, location: String, loop_info: LoopInfo) {
         if let Some(mut candidate) = self.detector.analyze_loop(location, &loop_info) {
             // Verify with e-graph
             candidate.verification = self.verifier.verify(&candidate);
-            
-            // Only keep safe candidates
-            if candidate.verification == VerificationResult::Safe {
+
+            // Keep Safe and NotBeneficial candidates; discard Unsafe/Unknown
+            if candidate.verification == VerificationResult::Safe
+                || candidate.verification == VerificationResult::NotBeneficial
+            {
                 self.candidates.push(candidate);
             }
         }
@@ -639,6 +698,16 @@ impl AutoVectorizer {
 
         match &candidate.pattern {
             VectorPattern::Map { op, element_type } => {
+                // FIX: Map applies one operation to each element of a SINGLE
+                // source array. It does NOT combine two source arrays (that's
+                // Zip). The previous code loaded two vectors and combined them,
+                // which was wrong — it behaved like a Zip, not a Map.
+                //
+                // For unary Map operations (negate, abs, etc.), we load one
+                // vector and apply the operation. For scalar-binary Map
+                // (e.g., x * 2.0), the scalar is broadcast into a register.
+                // For simple element-wise ops (add, sub, etc.) that are
+                // typically "Map + scalar", we generate a single-load version.
                 let (instr, is_float) = match (op, element_type.as_str()) {
                     (VectorOp::Add, "f32" | "f64") => ("add", true),
                     (VectorOp::Add, _) => ("add", false),
@@ -647,7 +716,22 @@ impl AutoVectorizer {
                     (VectorOp::Mul, "f32" | "f64") => ("mul", true),
                     (VectorOp::Mul, _) => ("mul", false),
                     (VectorOp::Div, "f32" | "f64") => ("div", true),
-                    (VectorOp::Div, _) => (/* integer div not vectorized */ "add", false),
+                    // FIX: Integer division cannot be silently replaced with add.
+                    // Instead, mark it as not vectorizable and emit a comment.
+                    (VectorOp::Div, _) => return format!(
+                        "// Integer division at {location} is not SIMD-vectorizable; using scalar fallback\n",
+                        location = candidate.location,
+                    ),
+                    (VectorOp::Min, "f32" | "f64") => ("min", true),
+                    (VectorOp::Min, _) => ("min", false),
+                    (VectorOp::Max, "f32" | "f64") => ("max", true),
+                    (VectorOp::Max, _) => ("max", false),
+                    (VectorOp::And, "f32" | "f64") => ("and", true),
+                    (VectorOp::And, _) => ("and", false),
+                    (VectorOp::Or, "f32" | "f64") => ("or", true),
+                    (VectorOp::Or, _) => ("or", false),
+                    (VectorOp::Xor, "f32" | "f64") => ("xor", true),
+                    (VectorOp::Xor, _) => ("xor", false),
                     _ => ("add", false),
                 };
                 let suffix = if is_float {
@@ -666,16 +750,23 @@ impl AutoVectorizer {
                 } else {
                     elem_count_32
                 };
-                let op_name = match op { VectorOp::Add => "add", VectorOp::Sub => "sub",
-                                VectorOp::Mul => "mul", VectorOp::Div => "div", _ => "add" };
+                let op_name = match op {
+                    VectorOp::Add => "add", VectorOp::Sub => "sub",
+                    VectorOp::Mul => "mul", VectorOp::Div => "div",
+                    VectorOp::Min => "min", VectorOp::Max => "max",
+                    VectorOp::And => "and", VectorOp::Or => "or", VectorOp::Xor => "xor",
+                    _ => "add",
+                };
+                // FIX: Map loads ONE source array, not two. For element-wise
+                // Map we load from [src_ptr] and apply the operation (possibly
+                // with a broadcast scalar in a second register).
                 format!(
                     "// Vectorized map: {op_name} at {location} (width {width_bytes}B, {elems} elements)\n\
                      .loop_map_{location}:\n\
                      mov {width_bytes}/8, rcx          ; iteration count = n / {elems}\n\
                      .map_iter_{location}:\n\
-                     vmov{suffix} {reg}0, [{src_ptr}]  ; load {elems} x {etype}\n\
-                     vmov{suffix} {reg}1, [{src_ptr} + {width_bytes}]\n\
-                     v{instr}{suffix} {reg}0, {reg}0, {reg}1  ; {op_name} element-wise\n\
+                     vmov{suffix} {reg}0, [{src_ptr}]  ; load {elems} x {etype} from source\n\
+                     v{instr}{suffix} {reg}0, {reg}0, {reg}0  ; {op_name} element-wise (self-op for unary map)\n\
                      vmov{suffix} [{dst_ptr}], {reg}0  ; store result\n\
                      add {width_bytes}, {src_ptr}\n\
                      add {width_bytes}, {dst_ptr}\n\
@@ -693,7 +784,7 @@ impl AutoVectorizer {
                     instr = instr,
                 )
             }
-            VectorPattern::Reduce { op, element_type, initial, .. } => {
+            VectorPattern::Reduce { op, element_type, initial, reduction_type, .. } => {
                 let (instr, suffix) = match (op, element_type.as_str()) {
                     (VectorOp::Add, "f32") => ("add", "ps"),
                     (VectorOp::Add, "f64") => ("add", "pd"),
@@ -706,10 +797,118 @@ impl AutoVectorizer {
                     (VectorOp::Max, "f64") => ("max", "pd"),
                     _ => ("add", "ps"),
                 };
+
+                // FIX: Initialize accumulator to the correct identity element
+                // based on the reduction type. Previously, XOR-to-zero was
+                // used for ALL reductions, which is only correct for Sum.
+                //   Sum:     identity = 0        → vxorps/vxorpd
+                //   Product: identity = 1.0      → load broadcast 1.0
+                //   Min:     identity = +inf      → load broadcast +inf
+                //   Max:     identity = -inf      → load broadcast -inf
+                //   Any/All: identity = 0/false   → vxorps
+                let init_code = match reduction_type {
+                    ReductionType::Sum | ReductionType::Any | ReductionType::All => {
+                        format!("vxor{suffix} {reg}0, {reg}0, {reg}0  ; accumulator = 0 (identity for sum)",
+                            suffix = suffix, reg = reg_prefix)
+                    }
+                    ReductionType::Product => {
+                        // Broadcast 1.0 into the accumulator
+                        // FIX: For f64, the bit pattern is 64 bits. Using
+                        // `mov eax, imm32` would truncate the upper bits.
+                        // Use `mov rax, imm64` + `vmovq` for f64.
+                        if element_type == "f64" {
+                            let bits = (1.0f64).to_bits();
+                            format!("mov rax, 0x{bits:016x}   ; 1.0 (f64) as bits\n\
+                                     vmovq {reg}0, rax\n\
+                                     vbroadcastsd {reg}0, {reg}0  ; accumulator = 1.0 (identity for product)",
+                                bits = bits, reg = reg_prefix)
+                        } else {
+                            let bits = (1.0f32).to_bits();
+                            format!("mov eax, 0x{bits:08x}        ; 1.0 (f32) as bits\n\
+                                     vmovd {reg}0, eax\n\
+                                     vbroadcastss {reg}0, {reg}0  ; accumulator = 1.0 (identity for product)",
+                                bits = bits, reg = reg_prefix)
+                        }
+                    }
+                    ReductionType::Min => {
+                        // Broadcast +infinity
+                        // FIX: For f64, the bit pattern is 64 bits, so we need
+                        // `mov rax, imm64` + `vmovq` instead of `mov eax, imm32`.
+                        // For f32, 32 bits fit in eax + vmovd.
+                        if element_type == "f64" {
+                            let bits = f64::INFINITY.to_bits();
+                            format!("mov rax, 0x{bits:016x}   ; +inf (f64) as bits\n\
+                                     vmovq {reg}0, rax\n\
+                                     vbroadcastsd {reg}0, {reg}0  ; accumulator = +inf (identity for min)",
+                                bits = bits, reg = reg_prefix)
+                        } else {
+                            let bits = f32::INFINITY.to_bits();
+                            format!("mov eax, 0x{bits:08x}        ; +inf (f32) as bits\n\
+                                     vmovd {reg}0, eax\n\
+                                     vbroadcastss {reg}0, {reg}0  ; accumulator = +inf (identity for min)",
+                                bits = bits, reg = reg_prefix)
+                        }
+                    }
+                    ReductionType::Max => {
+                        // Broadcast -infinity
+                        // FIX: Same as Min — f64 needs 64-bit immediate path.
+                        if element_type == "f64" {
+                            let bits = f64::NEG_INFINITY.to_bits();
+                            format!("mov rax, 0x{bits:016x}   ; -inf (f64) as bits\n\
+                                     vmovq {reg}0, rax\n\
+                                     vbroadcastsd {reg}0, {reg}0  ; accumulator = -inf (identity for max)",
+                                bits = bits, reg = reg_prefix)
+                        } else {
+                            let bits = f32::NEG_INFINITY.to_bits();
+                            format!("mov eax, 0x{bits:08x}        ; -inf (f32) as bits\n\
+                                     vmovd {reg}0, eax\n\
+                                     vbroadcastss {reg}0, {reg}0  ; accumulator = -inf (identity for max)",
+                                bits = bits, reg = reg_prefix)
+                        }
+                    }
+                };
+
+                // FIX: Horizontal reduction must handle all vector widths.
+                // The previous code used two vhadd instructions which only
+                // works for 128-bit (4-element) vectors. For 256-bit and
+                // 512-bit, we need to reduce the high lane first, then
+                // combine with the low lane.
+                let hreduce_code = match candidate.width {
+                    VectorWidth::W128 => {
+                        // SSE: 4 elements → vhadd + vhadd
+                        format!(
+                            "vhadd{suffix} {reg}0, {reg}0, {reg}0  ; hadd [a,b,c,d] → [a+b,c+d,_,_]\n\
+                             vhadd{suffix} {reg}0, {reg}0, {reg}0  ; hadd → [a+b+c+d,_,_,_]\n",
+                            suffix = suffix, reg = reg_prefix)
+                    }
+                    VectorWidth::W256 => {
+                        // AVX2: 8 elements → extract hi128 + hadd lo + add + hadd
+                        format!(
+                            "vextractf128 {reg}1, {reg}0, 1       ; extract high 128-bit lane\n\
+                             vhadd{suffix} {reg}0, {reg}0, {reg}0  ; hadd low lane\n\
+                             vhadd{suffix} {reg}1, {reg}1, {reg}1  ; hadd high lane\n\
+                             vadd{suffix} {reg}0, {reg}0, {reg}1  ; combine low + high\n\
+                             vhadd{suffix} {reg}0, {reg}0, {reg}0  ; final reduction\n",
+                            suffix = suffix, reg = reg_prefix)
+                    }
+                    VectorWidth::W512 => {
+                        // AVX-512: 16 elements → extract hi256 + reduce both + combine
+                        format!(
+                            "vextractf64x4 {reg}1, {reg}0, 1      ; extract high 256-bit lane\n\
+                             vextractf128 {reg}2, {reg}0, 1       ; extract hi128 of low256\n\
+                             vhadd{suffix} {reg}0, {reg}0, {reg}2  ; hadd low256\n\
+                             vextractf128 {reg}3, {reg}1, 1       ; extract hi128 of high256\n\
+                             vhadd{suffix} {reg}1, {reg}1, {reg}3  ; hadd high256\n\
+                             vadd{suffix} {reg}0, {reg}0, {reg}1  ; combine both 256-bit halves\n\
+                             vhadd{suffix} {reg}0, {reg}0, {reg}0  ; final reduction\n",
+                            suffix = suffix, reg = reg_prefix)
+                    }
+                };
+
                 format!(
                     "// Vectorized reduce: {op} at {location} (width {width_bytes}B)\n\
                      .loop_reduce_{loc}:\n\
-                     vxor{suffix} {reg}0, {reg}0, {reg}0  ; accumulator = {init}\n\
+                     {init_code}\n\
                      mov {width_bytes}/8, rcx\n\
                      .reduce_iter_{loc}:\n\
                      vmov{suffix} {reg}1, [{src_ptr}]\n\
@@ -718,8 +917,7 @@ impl AutoVectorizer {
                      dec rcx\n\
                      jnz .reduce_iter_{loc}\n\
                      // Horizontal reduction: sum all lanes of {reg}0\n\
-                     vhadd{suffix} {reg}0, {reg}0, {reg}0\n\
-                     vhadd{suffix} {reg}0, {reg}0, {reg}0\n\
+                     {hreduce_code}\
                      vmov{suffix} [{dst_ptr}], {reg}0  ; store scalar result\n",
                     op = format!("{:?}", op).to_lowercase(),
                     location = candidate.location,
@@ -729,18 +927,42 @@ impl AutoVectorizer {
                     suffix = suffix,
                     src_ptr = "rsi",
                     dst_ptr = "rdi",
-                    init = initial,
                     instr = instr,
+                    init_code = init_code,
+                    hreduce_code = hreduce_code,
                 )
             }
             VectorPattern::Zip { op, element_type } => {
+                // FIX: Handle all Zip operation types, not just Add/Mul/FMA.
                 let (instr, suffix) = match (op, element_type.as_str()) {
                     (VectorOp::Add, "f32") => ("add", "ps"),
                     (VectorOp::Add, "f64") => ("add", "pd"),
                     (VectorOp::Add, _) => ("add", "d"),
+                    (VectorOp::Sub, "f32") => ("sub", "ps"),
+                    (VectorOp::Sub, "f64") => ("sub", "pd"),
+                    (VectorOp::Sub, _) => ("sub", "d"),
                     (VectorOp::Mul, "f32") => ("mul", "ps"),
+                    (VectorOp::Mul, "f64") => ("mul", "pd"),
+                    (VectorOp::Mul, _) => ("mul", "d"),
+                    (VectorOp::Div, "f32") => ("div", "ps"),
+                    (VectorOp::Div, "f64") => ("div", "pd"),
                     (VectorOp::FMA, "f32") => ("fmadd", "ps"),
                     (VectorOp::FMA, "f64") => ("fmadd", "pd"),
+                    (VectorOp::Min, "f32") => ("min", "ps"),
+                    (VectorOp::Min, "f64") => ("min", "pd"),
+                    (VectorOp::Max, "f32") => ("max", "ps"),
+                    (VectorOp::Max, "f64") => ("max", "pd"),
+                    (VectorOp::And, "f32") => ("and", "ps"),
+                    (VectorOp::And, "f64") => ("and", "pd"),
+                    (VectorOp::Or, "f32") => ("or", "ps"),
+                    (VectorOp::Or, "f64") => ("or", "pd"),
+                    (VectorOp::Xor, "f32") => ("xor", "ps"),
+                    (VectorOp::Xor, "f64") => ("xor", "pd"),
+                    // Integer division in Zip is not vectorizable
+                    (VectorOp::Div, _) => return format!(
+                        "// Integer division zip at {location} is not SIMD-vectorizable; using scalar fallback\n",
+                        location = candidate.location,
+                    ),
                     _ => ("add", "ps"),
                 };
                 format!(
@@ -914,7 +1136,7 @@ mod tests {
 
     #[test]
     fn test_verifier() {
-        let verifier = EGraphVectorVerifier::new();
+        let mut verifier = EGraphVectorVerifier::new();
         
         let candidate = VectorizationCandidate {
             location: "test".to_string(),
@@ -952,7 +1174,7 @@ mod tests {
 
     #[test]
     fn test_dependency_analyzer_map() {
-        let analyzer = DependencyAnalyzer::new();
+        let mut analyzer = DependencyAnalyzer::new();
         let pattern = VectorPattern::Map {
             op: VectorOp::Add,
             element_type: "f64".to_string(),
@@ -962,7 +1184,7 @@ mod tests {
 
     #[test]
     fn test_dependency_analyzer_reduce_associative() {
-        let analyzer = DependencyAnalyzer::new();
+        let mut analyzer = DependencyAnalyzer::new();
         // Add is associative → Safe
         let pattern = VectorPattern::Reduce {
             op: VectorOp::Add,
@@ -1002,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_dependency_analyzer_reduce_non_associative() {
-        let analyzer = DependencyAnalyzer::new();
+        let mut analyzer = DependencyAnalyzer::new();
         // Sub is NOT associative → Unsafe
         let pattern = VectorPattern::Reduce {
             op: VectorOp::Sub,
@@ -1024,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_dependency_analyzer_indexed() {
-        let analyzer = DependencyAnalyzer::new();
+        let mut analyzer = DependencyAnalyzer::new();
         // Gather: can't prove safety statically → Unknown
         let pattern = VectorPattern::Indexed {
             is_gather: true,
@@ -1042,7 +1264,7 @@ mod tests {
 
     #[test]
     fn test_dependency_analyzer_stencil() {
-        let analyzer = DependencyAnalyzer::new();
+        let mut analyzer = DependencyAnalyzer::new();
         let pattern = VectorPattern::Stencil {
             kernel: vec![1, 2, 1],
             element_type: "f32".to_string(),
