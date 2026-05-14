@@ -338,9 +338,7 @@ impl GreenScheduler {
                     let old_regs_ptr = current_context.regs.as_mut_ptr() as *mut usize;
                     let new_regs_ptr = new_regs.as_ptr() as *const usize;
 
-                    unsafe {
-                        context_switch(old_sp_ptr, new_sp, old_regs_ptr, new_regs_ptr);
-                    }
+                    context_switch(old_sp_ptr, new_sp, old_regs_ptr, new_regs_ptr);
 
                     // After context_switch returns (when this thread is resumed),
                     // update the stored SP from the context
@@ -364,9 +362,7 @@ impl GreenScheduler {
 
                 let new_regs_ptr = new_regs.as_ptr() as *const usize;
 
-                unsafe {
-                    context_switch(&mut old_sp as *mut usize, new_sp, old_regs.as_mut_ptr() as *mut usize, new_regs_ptr);
-                }
+                context_switch(&mut old_sp as *mut usize, new_sp, old_regs.as_mut_ptr() as *mut usize, new_regs_ptr);
 
                 // Save the main context back
                 self.main_sp.store(old_sp, Ordering::Release);

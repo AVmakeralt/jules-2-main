@@ -317,6 +317,7 @@ impl Drop for ExecutableMemory {
 // §4  HEAVILY OPTIMIZED NATIVE CODE GENERATOR
 // =============================================================================
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 enum Reg { RAX=0, RCX=1, RDX=2, R8=8, R9=9, R10=10, R11=11 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +335,7 @@ pub struct NativeCodeGenerator {
     /// J5 fix: Vec indexed by slot number instead of FxHashMap<u16, Reg>.
     /// Slots are sequential integers, making Vec the natural O(1) choice.
     slot_reg: Vec<Option<Reg>>,
+    #[allow(dead_code)]
     next_label_id: usize,
     /// FIX (JIT-1): Deopt label for division-by-zero guards. Set during
     /// compile_trace() so emit_instruction can reference it.
@@ -665,7 +667,7 @@ impl NativeCodeGenerator {
         Ok(())
     }
 
-    fn emit_unboxed_load(&mut self, offset: u32, _vtype: ValueType, buffer: *mut u8, reg: Reg) -> Result<(), String> {
+    fn emit_unboxed_load(&mut self, offset: u32, _vtype: ValueType, _buffer: *mut u8, reg: Reg) -> Result<(), String> {
         // Load from unboxed buffer at [buffer + offset]
         // J2 fix: Removed redundant mov_r8_imm64 per load. The buffer base
         // address is now loaded once in compile_trace() prologue via
@@ -887,6 +889,7 @@ impl NativeCodeGenerator {
     }
     fn mov_eax_imm32(&mut self, v: i32) { self.b(0xB8); self.i32(v); }
     fn mov_rax_imm64(&mut self, v: i64) { self.bb(0x48, 0xB8); self.i64(v); }
+    #[allow(dead_code)]
     fn mov_r8_imm64(&mut self, v: i64) { self.bb(0x49, 0xB8); self.i64(v); } // REX.W+B for r8
     fn add_rax_rcx(&mut self) { self.bbb(0x48, 0x01, 0xC8); }
     fn sub_rax_rcx(&mut self) { self.bbb(0x48, 0x29, 0xC8); }
@@ -898,11 +901,13 @@ impl NativeCodeGenerator {
     fn xor_rax_rcx(&mut self) { self.bbb(0x48, 0x31, 0xC8); }
     fn shl_rax_cl(&mut self) { self.bb(0x48, 0xD3); self.b(0xE0); }
     fn shr_rax_cl(&mut self) { self.bb(0x48, 0xD3); self.b(0xE8); }
+    #[allow(dead_code)]
     fn test_rax_rax(&mut self) { self.bbb(0x48, 0x85, 0xC0); }
     fn test_rcx_rcx(&mut self) { self.bbb(0x48, 0x85, 0xC9); } // FIX (JIT-1): test rcx, rcx
 
     fn jne_label(&mut self, l: usize) { self.rel32_jump(0x0F, 0x85, l); }
     fn jz_label(&mut self, l: usize) { self.rel32_jump(0x0F, 0x84, l); }
+    #[allow(dead_code)]
     fn jz_short(&mut self, l: usize) { self.b(0x74); self.b(0); self.patch_sites.push(PatchSite { buffer_offset: self.code.len()-1, target_label: l, is_short_jump: true }); }
 
     fn rel32_jump(&mut self, p: u8, o: u8, l: usize) { self.b(p); self.b(o); self.i32(0); self.patch_sites.push(PatchSite { buffer_offset: self.code.len()-4, target_label: l, is_short_jump: false }); }
@@ -919,6 +924,7 @@ impl NativeCodeGenerator {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn next_label(&mut self) -> usize { let l = self.next_label_id; self.next_label_id += 1; l }
     fn b(&mut self, v: u8) { self.code.push(v); }
     fn bb(&mut self, a: u8, b: u8) { self.code.extend_from_slice(&[a, b]); }

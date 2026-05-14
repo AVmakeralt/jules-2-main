@@ -22,7 +22,6 @@
 
 #![cfg(feature = "core-superopt")]
 
-use std::collections::HashMap;
 
 #[cfg(feature = "smt-verify")]
 use std::time::Instant;

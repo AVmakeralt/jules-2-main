@@ -400,7 +400,7 @@ pub fn sieve_210_wheel(limit: u64) -> usize {
         let seg_end_cycle = (seg_start_cycle + CYCLES_PER_SEG - 1).min(limit_cycle);
         let seg_n_cycles = (seg_end_cycle - seg_start_cycle + 1) as usize;
         let seg_cands = seg_n_cycles * 48;
-        let seg_u64s = (seg_cands + 63) / 64;
+        let _seg_u64s = (seg_cands + 63) / 64;
 
         // Clear: all bits 0 = all candidates assumed prime
         aligned_seg.zero();
@@ -522,7 +522,7 @@ pub fn sieve_210_wheel_fastcount(limit: u64) -> usize {
         let seg_end_cycle = (seg_start_cycle + CYCLES_PER_SEG - 1).min(limit_cycle);
         let seg_n_cycles = (seg_end_cycle - seg_start_cycle + 1) as usize;
         let seg_cands = seg_n_cycles * 48;
-        let seg_u64s = (seg_cands + 63) / 64;
+        let _seg_u64s = (seg_cands + 63) / 64;
         aligned_seg.zero();
         let segment = aligned_seg.as_mut_slice();
 
@@ -703,7 +703,7 @@ pub fn primes_up_to(limit: u64) -> Vec<u64> {
         let seg_end_cycle = (seg_start_cycle + CYCLES_PER_SEG - 1).min(limit_cycle);
         let seg_n_cycles = (seg_end_cycle - seg_start_cycle + 1) as usize;
         let seg_cands = seg_n_cycles * 48;
-        let seg_u64s = (seg_cands + 63) / 64;
+        let _seg_u64s = (seg_cands + 63) / 64;
         aligned_seg.zero();
         let segment = aligned_seg.as_mut_slice();
 

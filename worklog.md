@@ -7,6 +7,81 @@
 
 ---
 
+## [2026-05-15] - Zero Warnings, Zero Test Failures, IR Split-Brain Fix
+**Status:** 🟢 Completed
+**System Layer:** Cross-cutting (Compiler Pipeline / CLI / Tests / All Modules)
+
+### 1. The Mission
+- [x] Fix all test failures (3 C-style truthiness test mismatches)
+- [x] Fix IR split-brain architecture (AST hard gates demoted to advisory, IR is sole authority)
+- [x] Fix CLI `cmd_run` to use IR pipeline instead of bypassing to AST-based bytecode
+- [x] Fix `has_fatal_errors()` always returning false
+- [x] Fix dead `errors` variable in `ir_borrowck`
+- [x] Fix `drop(table)` on reference in `mcts_core`
+- [x] Fix unreachable `TensorConcat` patterns in `diff_opt`
+- [x] Eliminate ALL compiler warnings (39 in `cargo check`, 16 in test build → 0)
+- [x] Verify no `todo!()` or `unimplemented!()` stubs remain
+- [x] Follow all MD files (workflow.md, agents.md, architecture.md, BENCHMARKS.md)
+- [x] Update worklog.md per workflow discipline
+- [x] Push to GitHub
+
+### 2. Changes Summary
+
+**src/main.rs** — IR pipeline split-brain fix:
+- Pass 3 (AST TypeCk): Demoted from hard gate to advisory-only. Errors become warnings with `[ast-typeck/advisory]` prefix.
+- Pass 4 (AST Sema): Demoted from hard gate to advisory-only. Errors become warnings with `[ast-sema/advisory]` prefix.
+- Pass 5 (AST Borrowck): Removed entirely (was already suppressed/discarded).
+- `cmd_run()`: Restructured to use IR pipeline (`compile_ir_module → load_ir_functions`) as primary path, with tree-walking interpreter as graceful degradation fallback.
+
+**src/compiler/ir_typeck.rs** — C-style truthiness test fix:
+- `test_condbr_non_bool`: Changed to use float condition (which IS rejected). Added `test_condbr_int_condition_ok`.
+
+**src/compiler/typeck.rs** — C-style truthiness test fix:
+- `test_if_expr_non_bool_condition_error`: Changed to use string literal. Added `test_if_expr_int_condition_ok`.
+- Added `#[allow(dead_code)]` to test helper functions `f32_ty`, `bool_ty`, `tensor_ty`.
+
+**src/runtime/interp.rs** — C-style truthiness test fix:
+- `test_interp_binop_compare`: Changed expected value from `Value::Bool(true)` to `Value::I32(1)`.
+
+**src/compiler/ir_to_bytecode.rs** — Critical bug fix:
+- `has_fatal_errors()`: Now detects "block not found", "undefined value", "function not found", "parameter index out of range" instead of always returning false.
+- Prefixed unused fields `_num_params`, `_func_name_to_idx`.
+
+**src/compiler/ir_borrowck.rs** — Dead code removal:
+- Removed dead `errors` variable with inverted filter (was always 0).
+
+**src/compiler/diff_opt.rs** — Unreachable pattern fixes:
+- Removed duplicate `TensorConcat` from leaf-expression groups in `expr_calls`, `expr_mem_ops`, `expr_arith`.
+- Added `TensorConcat` to binary-ops group in `expr_arith`.
+
+**src/optimizer/mcts_core.rs** — No-op removal:
+- Removed `drop(table)` where `table` was `&OpcodeTable` (dropping a reference does nothing).
+
+**Warning elimination (39 → 0 in `cargo check`, 16 → 0 in test build):**
+- Removed unused imports across 10 files (diff_opt, mcts_superoptimizer, smt_verify, superopt_pass, neural_superblock, temporal_fusion, throughput_sanity, main.rs, micro-benchmark, bench_mcts_superopt)
+- Prefixed unused struct fields with `_` (self_repair, tiered_compilation, neural_superblock)
+- Added `#[allow(dead_code)]` for JIT infrastructure (tracing_jit register variants/methods, inline_cache mprotect, self_repair MIN_IMPROVEMENT_RATIO)
+- Converted unused doc comments to regular comments (ir.rs, temporal_fusion.rs)
+- Removed unnecessary `unsafe` blocks (green.rs context_switch calls)
+- Fixed useless comparison (epoch.rs `epoch >= 0` for u64)
+- Removed unused `mut` annotations across multiple files
+
+**BENCHMARKS.md** — Updated:
+- Test count: 1111 passed, 0 failed, 1 ignored
+- Added 7 new bug fix entries (#10-#16)
+
+### 3. Invariants & Guardrails
+- **Invariants Touched:** IR pipeline authority (ONE TRUTH RULE), C-style truthiness semantics, error classification in ir_to_bytecode
+- **Safety Check:** No `todo!()` or `unimplemented!()` stubs found. No JHAL zero-heap violations. Zero compiler warnings. Zero test failures.
+- **Architecture Compliance:** Followed workflow.md Mandatory Verification Loop (`cargo check` + `cargo test --lib`). Followed agents.md Unified IR Doctrine. Followed architecture.md action items for deprecating flat bytecode path.
+
+### 4. Current Save Point
+- **Current State:** 1111 tests pass, 0 failures, 0 compiler warnings. All MD files followed. Commit ccc091f pushed to GitHub.
+- **Next Immediate Step:** Continue with architecture.md action items: deprecate flat bytecode entirely, implement SSA direct interpreter, add NUMA/huge page support, add attribute preservation in lowering.
+- **Deletions:** None (AST borrowck removal was already dead code with discarded results).
+
+---
+
 ## [2026-05-14] - Benchmark Re-run After Dead Code & Heuristic Fixes
 **Status:** 🟢 Completed
 **System Layer:** Cross-cutting (All benchmark suites)

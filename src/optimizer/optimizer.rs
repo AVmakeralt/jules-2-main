@@ -2688,7 +2688,7 @@ mod tests {
     }
 
     /// Run optimizer on 2-parameter Rosenbrock for n steps, return final loss.
-    fn run_rosenbrock(opt: &mut dyn Optimizer, steps: u64, lr: f32) -> f32 {
+    fn run_rosenbrock(opt: &mut dyn Optimizer, steps: u64, _lr: f32) -> f32 {
         let mut w = vec![-1.0_f32, 1.0_f32];
         for step in 0..steps {
             let [gx, gy] = rosenbrock_grad(w[0], w[1]);

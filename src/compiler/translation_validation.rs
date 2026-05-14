@@ -623,7 +623,7 @@ mod tests {
             exit: BlockId(1),
         };
 
-        let mut block0 = BasicBlock {
+        let block0 = BasicBlock {
             id: BlockId(0),
             instructions: vec![
                 Instruction::BinaryOp {

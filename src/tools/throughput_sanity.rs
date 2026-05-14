@@ -12,7 +12,6 @@
 //   - Agner Fog's instruction tables
 // =============================================================================
 
-use std::time::Duration;
 
 /// Physical limits for x86-64 CPUs (conservative values that apply
 /// to all modern x86-64 microarchitectures from 2015+).

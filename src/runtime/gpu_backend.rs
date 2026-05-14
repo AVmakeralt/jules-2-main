@@ -168,7 +168,7 @@ impl ShardedBuffers {
     }
 
     /// Lock a specific shard for operations that need mutable access
-    fn lock_shard(&self, shard_idx: usize) -> std::sync::MutexGuard<HashMap<u64, GpuBuffer>> {
+    fn lock_shard(&self, shard_idx: usize) -> std::sync::MutexGuard<'_, HashMap<u64, GpuBuffer>> {
         self.shards[shard_idx % GPU_SHARD_COUNT].lock().unwrap()
     }
 }

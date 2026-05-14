@@ -195,6 +195,7 @@ impl TypeckCtx {
         self.errors += 1;
     }
 
+    #[allow(dead_code)]
     fn emit_warning(&mut self, span: Span, kind: IrTypeDiagKind, message: String) {
         self.diagnostics.push(IrTypeDiag { span, kind, message });
         self.warnings += 1;

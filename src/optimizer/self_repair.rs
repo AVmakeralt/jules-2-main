@@ -43,6 +43,7 @@ const MAX_REPAIR_ATTEMPTS: u32 = 10;
 /// Cost threshold for E-Graph saturation (max iterations)
 const EGRAPH_MAX_ITERATIONS: usize = 20;
 /// Minimum improvement ratio to accept a patch (e.g., 10% faster)
+#[allow(dead_code)]
 const MIN_IMPROVEMENT_RATIO: f64 = 0.10;
 
 /// Repair strategy configuration
@@ -647,10 +648,10 @@ struct EGraphSynthesizer {
 /// documentation and cost estimation.
 #[derive(Debug, Clone)]
 struct RewriteRule {
-    name: String,
-    description: String,
+    _name: String,
+    _description: String,
     /// Cost delta (negative = improvement)
-    cost_delta: i32,
+    _cost_delta: i32,
 }
 
 impl EGraphSynthesizer {
@@ -695,9 +696,9 @@ impl EGraphSynthesizer {
 
     fn add_rewrite(&mut self, name: &str, desc: &str, cost: i32) {
         self.rewrite_rules.push(RewriteRule {
-            name: name.to_string(),
-            description: desc.to_string(),
-            cost_delta: cost,
+            _name: name.to_string(),
+            _description: desc.to_string(),
+            _cost_delta: cost,
         });
     }
 
@@ -1390,11 +1391,11 @@ pub struct SelfRepairEngine {
 /// Performance profile for a function
 #[derive(Debug, Clone)]
 struct PerformanceProfile {
-    func_name: String,
-    baseline_cycles: u64,
-    repaired_cycles: u64,
-    call_count: u64,
-    failure_count: u64,
+    _func_name: String,
+    _baseline_cycles: u64,
+    _repaired_cycles: u64,
+    _call_count: u64,
+    _failure_count: u64,
 }
 
 impl SelfRepairEngine {
@@ -1889,11 +1890,11 @@ impl SelfRepairEngine {
             // Record performance data from PGO
             if counters.avg_cycles > 0 {
                 self.performance_profiles.insert(func_name.clone(), PerformanceProfile {
-                    func_name: func_name.clone(),
-                    baseline_cycles: counters.avg_cycles,
-                    repaired_cycles: 0,
-                    call_count: counters.call_count,
-                    failure_count: counters.deopt_count as u64,
+                    _func_name: func_name.clone(),
+                    _baseline_cycles: counters.avg_cycles,
+                    _repaired_cycles: 0,
+                    _call_count: counters.call_count,
+                    _failure_count: counters.deopt_count as u64,
                 });
             }
         }
@@ -2152,7 +2153,7 @@ mod tests {
     fn test_egraph_rewrite_rules() {
         let synthesizer = EGraphSynthesizer::new();
         assert!(!synthesizer.rewrite_rules.is_empty());
-        assert!(synthesizer.rewrite_rules.iter().any(|r| r.name == "add_zero"));
-        assert!(synthesizer.rewrite_rules.iter().any(|r| r.name == "mul_pow2_shift"));
+        assert!(synthesizer.rewrite_rules.iter().any(|r| r._name == "add_zero"));
+        assert!(synthesizer.rewrite_rules.iter().any(|r| r._name == "mul_pow2_shift"));
     }
 }

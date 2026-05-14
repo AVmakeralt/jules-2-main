@@ -498,7 +498,7 @@ mod tests {
     fn test_egraph_builder() {
         let mut builder = EGraphBuilder::new();
         let id1 = builder.add_node("add".to_string(), vec![], 10, true);
-        let id2 = builder.add_node("mul".to_string(), vec![id1], 20, true);
+        let _id2 = builder.add_node("mul".to_string(), vec![id1], 20, true);
         
         let egraph = builder.build();
         assert_eq!(egraph.len(), 2);

@@ -910,8 +910,8 @@ impl TieredExecutionManager {
 
 /// A compilation job sent to the background thread.
 struct CompileJob {
-    function_name: String,
-    target_tier: Tier,
+    _function_name: String,
+    _target_tier: Tier,
 }
 
 /// Background compilation thread for async tier promotion.
@@ -964,8 +964,8 @@ impl AsyncCompiler {
     /// actually sends the job to the background thread for processing.
     pub fn enqueue(&self, function_name: &str, target_tier: Tier) {
         let job = CompileJob {
-            function_name: function_name.to_string(),
-            target_tier,
+            _function_name: function_name.to_string(),
+            _target_tier: target_tier,
         };
         if self.sender.send(job).is_ok() {
             self.queued_jobs.fetch_add(1, Ordering::Relaxed);

@@ -1129,7 +1129,7 @@ fn adapt_runtime_error(e: crate::interp::RuntimeError) -> Diag {
 /// unified diagnostic collector.  This bridge allows incremental adoption
 /// of the world-class diagnostic system without rewriting every pass at once.
 fn diag_to_rich(d: &Diag, phase: crate::compiler::diagnostic::Phase) -> crate::compiler::diagnostic::Diagnostic {
-    use crate::compiler::diagnostic::{Diagnostic as RichDiag, Severity as RichSev, DiagCode, Label};
+    use crate::compiler::diagnostic::{Diagnostic as RichDiag, Severity as RichSev};
 
     let severity = match d.severity {
         DiagSeverity::Note => RichSev::Note,
@@ -1143,7 +1143,7 @@ fn diag_to_rich(d: &Diag, phase: crate::compiler::diagnostic::Phase) -> crate::c
 
     let span = d.span.unwrap_or_else(Span::dummy);
 
-    let mut rich = RichDiag::error(code_num, phase, span, &d.message);
+    let rich = RichDiag::error(code_num, phase, span, &d.message);
     // Override severity for warnings/notes
     let rich = match severity {
         RichSev::Warning => RichDiag::warning(code_num, phase, span, &d.message),

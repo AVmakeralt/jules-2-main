@@ -905,7 +905,7 @@ impl PartialEvaluator {
                 Self::collect_writes_block(&body, &mut body_writes);
                 // Save and invalidate env entries for written variables so
                 // the condition is specialized with correct Dynamic bindings.
-                let saved: Vec<(String, Option<BindingTime>, Option<PartialValue>)> = body_writes.iter().filter_map(|v| {
+                let _saved: Vec<(String, Option<BindingTime>, Option<PartialValue>)> = body_writes.iter().filter_map(|v| {
                     env.bindings.remove(v).map(|(bt, pv)| (v.clone(), Some(bt), Some(pv)))
                 }).collect();
                 let cond = self.specialize_expr(cond, env, depth);

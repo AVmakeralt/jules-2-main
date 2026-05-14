@@ -238,8 +238,7 @@ mod tests {
     fn test_participant_pin() {
         let participant = Participant::new();
         let guard = participant.pin();
-        let epoch = guard.epoch();
-        assert!(epoch >= 0);
+        let _epoch = guard.epoch(); // epoch is always >= 0 for u64
     }
 
     #[test]

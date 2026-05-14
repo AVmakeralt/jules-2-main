@@ -62,11 +62,9 @@
 //
 // =============================================================================
 
-use crate::compiler::ast::*;
 #[cfg(feature = "gnn-optimizer")]
 use crate::optimizer::ml_superopt::{MlSuperoptimizer, TilingParams, TilingSearchResult};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use smallvec::{SmallVec, smallvec};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,11 +217,11 @@ struct MicroSequence {
     ops: Vec<MicroOp>,
 }
 
-/// String interner for temporal fusion micro-ops.
-/// Replaces heap-allocated String identifiers with interned u32 indices,
-/// reducing MicroOp from ~80 bytes (String + 2 × HashSet) to ~24 bytes
-/// (u32 + 2 × SmallVec<[u32; 3]>), a 3.3x size reduction for better
-/// cache utilization in the sliding-window detector.
+// String interner for temporal fusion micro-ops.
+// Replaces heap-allocated String identifiers with interned u32 indices,
+// reducing MicroOp from ~80 bytes (String + 2 × HashSet) to ~24 bytes
+// (u32 + 2 × SmallVec<[u32; 3]>), a 3.3x size reduction for better
+// cache utilization in the sliding-window detector.
 std::thread_local! {
     static TF_INTERN_STORAGE: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
 }
@@ -314,7 +312,7 @@ impl MicroSequenceDetector {
     
     fn ir_to_micro_op(&self, instr: &IrInstruction) -> MicroOp {
         match instr {
-            IrInstruction::Load { dst, src, .. } => MicroOp {
+            IrInstruction::Load { dst, src: _, .. } => MicroOp {
                 opcode: intern_str("load"),
                 read_regs: SmallVec::new(),
                 write_regs: smallvec![intern_str(dst)],
@@ -1152,7 +1150,7 @@ mod tests {
         let model = MicroarchitectureModel::for_cpu(CpuType::Generic);
         let load_idx = StringInterner::intern("load");
         let add_idx = StringInterner::intern("add");
-        let ops = vec![
+        let _ops = vec![
             MicroOp {
                 opcode: load_idx,
                 read_regs: smallvec![],

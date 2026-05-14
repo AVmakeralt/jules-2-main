@@ -73,7 +73,7 @@ struct FunctionCompiler {
     /// Next available local slot.
     next_slot: u16,
     /// Number of parameters.
-    num_params: u16,
+    _num_params: u16,
     /// The bytecode function being built.
     output: BytecodeFunction,
     /// Maps BlockId → instruction offset in the bytecode stream.
@@ -86,7 +86,7 @@ struct FunctionCompiler {
     /// Non-fatal errors.
     errors: Vec<String>,
     /// Function name → index mapping (from the module level).
-    func_name_to_idx: HashMap<String, usize>,
+    _func_name_to_idx: HashMap<String, usize>,
 }
 
 impl FunctionCompiler {
@@ -94,13 +94,13 @@ impl FunctionCompiler {
         let mut fc = FunctionCompiler {
             value_map: HashMap::new(),
             next_slot: 0,
-            num_params: ir_func.params.len() as u16,
+            _num_params: ir_func.params.len() as u16,
             output: BytecodeFunction::new(ir_func.name.clone()),
             block_offsets: HashMap::new(),
             pending_jumps: Vec::new(),
             phis_by_block: HashMap::new(),
             errors: Vec::new(),
-            func_name_to_idx: func_name_to_idx.clone(),
+            _func_name_to_idx: func_name_to_idx.clone(),
         };
 
         // Assign slots for parameters (slot 0, 1, ..., N-1).

@@ -1141,7 +1141,7 @@ mod tests {
         }
 
         // Should have a hint now (FixedStride(128))
-        let hint = tracker.get_hint(1);
+        let _hint = tracker.get_hint(1);
         // May or may not have hint depending on exact stability
     }
 
@@ -1231,7 +1231,7 @@ mod tests {
         }
 
         // Should have generated hints for this pointer-chasing pattern
-        let hints = engine.active_hints();
+        let _hints = engine.active_hints();
         // Pointer chase patterns should be targeted
     }
 

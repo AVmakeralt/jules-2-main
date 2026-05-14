@@ -17,8 +17,7 @@
 // than discrete search (Halide, TVM).
 // =============================================================================
 
-use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::collections::VecDeque;
 
 use crate::compiler::ast::*;
 use crate::jit::aot_native::OptConfig;

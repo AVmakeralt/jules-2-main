@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_neural_scheduler() {
-        let mut scheduler = NeuralScheduler::new(5);
+        let scheduler = NeuralScheduler::new(5);
         
         let features = vec![1.0, 0.0, 1.0, 1.0, 0.5];
         let prediction = scheduler.predict(&features);

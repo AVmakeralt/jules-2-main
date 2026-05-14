@@ -28,7 +28,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::compiler::ast::*;
-use crate::optimizer::hardware_cost_model::{HardwareCostModel, Microarchitecture, PortMap};
+use crate::optimizer::hardware_cost_model::{HardwareCostModel, Microarchitecture};
 use crate::Span;
 
 // =============================================================================
@@ -3009,7 +3009,7 @@ impl MctsSuperoptimizer {
                 // Verify pattern and produce verified range-check expression
                 if let Instr::BinOp { op: BinOpKind::BitAnd, lhs, rhs } = instr {
                     if let (Instr::BinOp { op: BinOpKind::Gt, lhs: ref a1, rhs: ref zero },
-                            Instr::BinOp { op: BinOpKind::Lt, lhs: ref a2, rhs: ref n }) = (&**lhs, &**rhs) {
+                            Instr::BinOp { op: BinOpKind::Lt, lhs: ref a2, rhs: _n }) = (&**lhs, &**rhs) {
                         if a1 == a2 && matches!(**zero, Instr::ConstInt(0)) {
                             // a > 0 & a < N — verified range check: produce a & (N-1) < N
                             // as an equivalent but structurally different expression for the cost model

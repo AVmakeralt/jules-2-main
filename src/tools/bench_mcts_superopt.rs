@@ -4,7 +4,6 @@
 // Run: cargo run --release --bin bench-mcts-superopt
 // =============================================================================
 
-use std::hint::black_box;
 use std::time::Instant;
 
 use jules::compiler::ast::*;

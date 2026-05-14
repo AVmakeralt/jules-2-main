@@ -29,8 +29,8 @@ use crate::compiler::ast::{Expr, Item, Program, Stmt, SuperoptMode};
 
 #[cfg(feature = "machine-instr-model")]
 use crate::optimizer::machine_instr_model::{
-    MachineInstrPipeline, MachineCostVector, estimate_machine_cost,
-    lower_instr_to_machine, check_legality, validate_transformation,
+    MachineInstrPipeline, estimate_machine_cost,
+    lower_instr_to_machine, validate_transformation,
 };
 
 // ── Feature-gated imports ──────────────────────────────────────────────────

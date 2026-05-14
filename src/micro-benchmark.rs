@@ -1,7 +1,7 @@
 use std::fs;
 use std::time::{Duration, Instant};
 
-use jules::{CompileUnit, Pipeline, PipelineResult};
+use jules::{CompileUnit, Pipeline};
 
 #[derive(Debug, Clone)]
 struct Sample {

@@ -20,7 +20,6 @@
 // =============================================================================
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -320,9 +319,9 @@ impl CsrAdjacency {
 
 /// Functional GNN with proper weight matrices and IPC readout head
 pub struct MicroArchGNN {
-    embed_dim: usize,
+    _embed_dim: usize,
     hidden_dim: usize,
-    node_embeddings: Vec<Vec<f32>>,
+    _node_embeddings: Vec<Vec<f32>>,
     /// W_self weight matrix (hidden_dim × hidden_dim) per round
     w_self: Vec<Vec<f32>>,
     /// W_msg weight matrix (hidden_dim × hidden_dim) per round
@@ -363,9 +362,9 @@ impl MicroArchGNN {
         let readout_dim = hidden_dim / 4;
 
         Self {
-            embed_dim,
+            _embed_dim: embed_dim,
             hidden_dim,
-            node_embeddings: Vec::new(),
+            _node_embeddings: Vec::new(),
             w_self: make_matrix(hidden_dim, hidden_dim),
             w_msg: make_matrix(hidden_dim, hidden_dim),
             readout_w1: make_matrix(readout_dim, hidden_dim * 2), // mean + max pooling
@@ -710,9 +709,9 @@ impl MicroArchGNN {
     pub fn predict_cache_behavior(&self, graph: &BlockGraph, arch: &MicroArchModel) -> CachePrediction {
         let mut load_count = 0;
         let mut unique_addrs = HashSet::new();
-        let mut stride_detected = false;
-        let mut last_addr = 0i64;
-        let mut stride = 0i64;
+        let stride_detected = false;
+        let last_addr = 0i64;
+        let _stride = 0i64;
 
         for instr in &graph.nodes {
             if instr.is_load {

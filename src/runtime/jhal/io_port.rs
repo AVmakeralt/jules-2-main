@@ -134,7 +134,7 @@ pub fn io_wait() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_io_port_types() {

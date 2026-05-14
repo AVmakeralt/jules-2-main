@@ -1371,7 +1371,7 @@ mod tests {
 
     #[test]
     fn test_jit_observer_check_loop_specialization() {
-        let mut jit = DataDependentJIT::new();
+        let jit = DataDependentJIT::new();
 
         // With explicit trip count
         let result = jit.check_loop_specialization("loop1", 4);
@@ -1442,7 +1442,7 @@ mod tests {
         }
 
         // Check drift was detected (may take multiple observations to trigger)
-        let stats = jit.stats();
+        let _stats = jit.stats();
         // The old specialization should be deprecated
         let old_spec = jit.specializations.iter().find(|s| s.id == spec_id);
         if let Some(s) = old_spec {

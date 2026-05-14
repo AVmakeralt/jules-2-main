@@ -1947,7 +1947,7 @@ impl BytecodeVM {
         // Sampling counter: profile every 256 instructions instead of every one.
         let mut profile_counter: u8 = 0;
         // Pre-compute slot pointer for write-intent prefetch in the dispatch loop.
-        let slot_ptr = slots.as_mut_ptr();
+        let _slot_ptr = slots.as_mut_ptr();
 
         // ── Entropy Watchdog ──────────────────────────────────────────────────
         // Replaces the naive PC-counter safety mechanism. Instead of counting
@@ -4049,7 +4049,7 @@ mod tests {
 
     #[test]
     fn test_vm_while_loop_bytecode() {
-        use crate::compiler::ast::Program;
+        
         // Parse a simple while loop program
         let src = "fn bench() -> i32 { let mut i: i32 = 0; while i < 3 { i = i + 1; } i }";
         let mut unit = crate::CompileUnit::new("<test>".to_string(), src);

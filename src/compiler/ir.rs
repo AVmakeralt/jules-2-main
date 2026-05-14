@@ -2488,7 +2488,7 @@ impl IrOp {
     }
 }
 
-/// Effect flags for flat IR instructions — bitflags.
+// Effect flags for flat IR instructions — bitflags.
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct EffectFlags: u32 {
