@@ -26,7 +26,7 @@ fn bench() -> i32 {
     }
     a
 }
-"#, Some(514229)),
+"#, Some(832040)),
         ("gcd-euclidean", r#"
 fn gcd(a: i32, b: i32) -> i32 {
     let mut x: i32 = a;

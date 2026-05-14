@@ -456,7 +456,6 @@ impl FlatProgram {
             if info.has_dst {
                 defined[instr.dst as usize] = true;
             }
-            drop(table);
         }
 
         true

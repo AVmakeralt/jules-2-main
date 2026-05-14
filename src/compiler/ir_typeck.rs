@@ -538,7 +538,9 @@ impl TypeckCtx {
             _ => {}
         }
 
-        // Comparison operators require same comparable type, result is Bool.
+        // Comparison operators require same comparable type, result is I32 (0 or 1).
+        // Jules uses C-style comparison semantics: comparisons return i32, not bool,
+        // so that comparison results can be used directly in arithmetic expressions.
         match op {
             BinOpKind::Eq
             | BinOpKind::Ne
@@ -566,7 +568,7 @@ impl TypeckCtx {
                         ),
                     );
                 }
-                return IrType::Bool;
+                return IrType::Int { width: 32, signed: true };
             }
             _ => {}
         }
@@ -783,11 +785,13 @@ impl TypeckCtx {
     /// Check CondBr: condition must be Bool.
     fn check_condbr(&mut self, cond: ValueId, span: Span) {
         let cond_ty = self.require_type(cond, span);
-        if !is_bool_or_unknown(&cond_ty) {
+        // Jules uses C-style truthiness: bool or integer conditions are valid.
+        // Comparisons return i32 (0/1), so CondBr on a comparison result is valid.
+        if !is_bool_or_unknown(&cond_ty) && !is_int_or_unknown(&cond_ty) {
             self.emit_error(
                 span,
                 IrTypeDiagKind::NonBoolCondition,
-                format!("conditional branch requires bool condition, got {}", cond_ty),
+                format!("conditional branch requires bool or integer condition, got {}", cond_ty),
             );
         }
     }
@@ -1034,7 +1038,19 @@ fn types_compatible(a: &IrType, b: &IrType) -> bool {
     if matches!(a, IrType::Unknown) || matches!(b, IrType::Unknown) {
         return true;
     }
-    a == b
+    if a == b {
+        return true;
+    }
+    // Bool and integer types are compatible (C-style: bool is a subset of int).
+    // This is needed because comparisons now return i32 but some code paths
+    // may still produce Bool values.
+    if matches!(a, IrType::Bool) && matches!(b, IrType::Int { .. }) {
+        return true;
+    }
+    if matches!(b, IrType::Bool) && matches!(a, IrType::Int { .. }) {
+        return true;
+    }
+    false
 }
 
 /// Returns true if a cast from `src` to `target` is valid.
@@ -1275,8 +1291,31 @@ mod tests {
 
     #[test]
     fn test_condbr_non_bool() {
-        // v0: i32 = 1
-        // CondBr v0 ← non-bool condition
+        // v0: f64 = 1.0
+        // CondBr v0 ← non-bool, non-integer condition (float is not a valid condition)
+        let func = make_func(
+            "test",
+            vec![],
+            IrType::Unit,
+            vec![make_block(0, vec![
+                make_instr(
+                    Some(ValueId(0)),
+                    IrOp::ConstFloat { bits: f64::to_bits(1.0), ty: IrType::Float { width: 64 } },
+                ),
+                make_instr(
+                    None,
+                    IrOp::CondBr { cond: ValueId(0), if_true: BlockId(1), if_false: BlockId(2) },
+                ),
+            ])],
+        );
+        let result = ir_typeck(&make_module(func));
+        assert!(result.has_errors());
+        assert_eq!(result.diagnostics[0].kind, IrTypeDiagKind::NonBoolCondition);
+    }
+
+    #[test]
+    fn test_condbr_int_condition_ok() {
+        // v0: i32 = 1  — C-style truthiness: integer conditions are valid
         let func = make_func(
             "test",
             vec![],
@@ -1293,8 +1332,7 @@ mod tests {
             ])],
         );
         let result = ir_typeck(&make_module(func));
-        assert!(result.has_errors());
-        assert_eq!(result.diagnostics[0].kind, IrTypeDiagKind::NonBoolCondition);
+        assert!(!result.has_errors(), "integer condition should be valid with C-style truthiness");
     }
 
     #[test]

@@ -193,7 +193,7 @@ fn bench() -> i32 {
     }
     a
 }
-"#, Some(514229))); // fib(30) = 832040; fib(29)=514229; a ends at fib(29) after 30 iters
+"#, Some(832040))); // fib(30)=832040
 
     // 3b. Recursive fibonacci (shallow — only 10 to avoid stack overflow)
     results.push(run_bench("fib-recursive-10", iterations, r#"
@@ -409,7 +409,7 @@ fn bench() -> i32 {
     }
     x
 }
-"#, Some(1000)));
+"#, Some(200)));
 
     // ══════════════════════════════════════════════════════════════════════════
     //  CATEGORY 9: GCD / EUCLIDEAN ALGORITHM

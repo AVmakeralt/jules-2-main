@@ -2045,11 +2045,13 @@ impl TypeCk {
                 else_,
             } => {
                 let cond_ty = self.check_expr(cond, env);
-                if !matches!(cond_ty, Ty::Bool) {
+                // Jules uses C-style truthiness: any non-zero integer or bool is valid
+                // as a condition.  Comparisons return i32 (0/1), so `if x < 10` is valid.
+                if !matches!(cond_ty, Ty::Bool | Ty::Scalar(_)) {
                     self.diag.push(
                         Diagnostic::error(
                             *span,
-                            format!("`if` condition must be `bool`, got `{}`", cond_ty.display()),
+                            format!("`if` condition must be `bool` or integer, got `{}`", cond_ty.display()),
                         )
                         .with_code("E2004"),
                     );
@@ -2222,7 +2224,7 @@ impl TypeCk {
         let r = self.check_expr(rhs, env);
 
         match op {
-            // Comparison → bool
+            // Comparison → i32 (C-style: 0 or 1)
             BinOpKind::Eq
             | BinOpKind::Ne
             | BinOpKind::Lt
@@ -2246,7 +2248,7 @@ impl TypeCk {
                         .with_hint("use an explicit cast to a common type before comparing"),
                     );
                 }
-                Ty::Bool
+                Ty::Scalar(ElemType::I32)
             }
 
             // Logical → bool
@@ -3263,11 +3265,13 @@ impl TypeCk {
                 ..
             } => {
                 let ct = self.check_expr(cond, env);
-                if !matches!(ct, Ty::Bool) {
+                // Jules uses C-style truthiness: any non-zero integer or bool is valid
+                // as a while condition.  Comparisons return i32 (0/1), so `while y != 0` is valid.
+                if !matches!(ct, Ty::Bool | Ty::Scalar(_)) {
                     self.diag.push(
                         Diagnostic::error(
                             cond.span(),
-                            format!("`while` condition must be `bool`, got `{}`", ct.display()),
+                            format!("`while` condition must be `bool` or integer, got `{}`", ct.display()),
                         )
                         .with_code("E2004"),
                     );
@@ -4641,16 +4645,35 @@ mod tests {
 
     #[test]
     fn test_if_expr_non_bool_condition_error() {
+        // Use a string literal as condition — neither bool nor integer
         let mut ck = make_checker();
         let mut env = TyEnv::new();
         let expr = Expr::IfExpr {
             span: dummy(),
-            cond: Box::new(int_lit(1)), // not bool
+            cond: Box::new(Expr::StrLit {
+                span: dummy(),
+                value: "hello".into(),
+            }),
             then: Box::new(Block::new(dummy())),
             else_: None,
         };
         ck.check_expr(&expr, &mut env);
         assert!(ck.diag.has_errors());
+    }
+
+    #[test]
+    fn test_if_expr_int_condition_ok() {
+        // C-style truthiness: integer conditions are valid
+        let mut ck = make_checker();
+        let mut env = TyEnv::new();
+        let expr = Expr::IfExpr {
+            span: dummy(),
+            cond: Box::new(int_lit(1)), // integer is valid with C-style truthiness
+            then: Box::new(Block::new(dummy())),
+            else_: None,
+        };
+        ck.check_expr(&expr, &mut env);
+        assert!(!ck.diag.has_errors(), "integer condition should be valid with C-style truthiness");
     }
 
     // ── Grad requires float type ───────────────────────────────────────────────

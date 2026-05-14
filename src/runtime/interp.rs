@@ -3634,12 +3634,12 @@ pub fn vm_exec(
                                 }
                                 Value::I32(a.wrapping_rem(b))
                             }
-                            BinOpKind::Lt => Value::Bool(a < b),
-                            BinOpKind::Le => Value::Bool(a <= b),
-                            BinOpKind::Gt => Value::Bool(a > b),
-                            BinOpKind::Ge => Value::Bool(a >= b),
-                            BinOpKind::Eq => Value::Bool(a == b),
-                            BinOpKind::Ne => Value::Bool(a != b),
+                            BinOpKind::Lt => Value::I32(if a < b { 1 } else { 0 }),
+                            BinOpKind::Le => Value::I32(if a <= b { 1 } else { 0 }),
+                            BinOpKind::Gt => Value::I32(if a > b { 1 } else { 0 }),
+                            BinOpKind::Ge => Value::I32(if a >= b { 1 } else { 0 }),
+                            BinOpKind::Eq => Value::I32(if a == b { 1 } else { 0 }),
+                            BinOpKind::Ne => Value::I32(if a != b { 1 } else { 0 }),
                             _ => return rt_err!("op {:?} not defined for i32", op),
                         }
                     }
@@ -3663,12 +3663,12 @@ pub fn vm_exec(
                                 }
                                 Value::F32((a / b).floor())
                             }
-                            BinOpKind::Lt => Value::Bool(a < b),
-                            BinOpKind::Le => Value::Bool(a <= b),
-                            BinOpKind::Gt => Value::Bool(a > b),
-                            BinOpKind::Ge => Value::Bool(a >= b),
-                            BinOpKind::Eq => Value::Bool(a == b),
-                            BinOpKind::Ne => Value::Bool(a != b),
+                            BinOpKind::Lt => Value::I32(if a < b { 1 } else { 0 }),
+                            BinOpKind::Le => Value::I32(if a <= b { 1 } else { 0 }),
+                            BinOpKind::Gt => Value::I32(if a > b { 1 } else { 0 }),
+                            BinOpKind::Ge => Value::I32(if a >= b { 1 } else { 0 }),
+                            BinOpKind::Eq => Value::I32(if a == b { 1 } else { 0 }),
+                            BinOpKind::Ne => Value::I32(if a != b { 1 } else { 0 }),
                             _ => return rt_err!("op {:?} not defined for f32", op),
                         }
                     }
@@ -3691,12 +3691,12 @@ pub fn vm_exec(
                                 }
                                 Value::I64(a.wrapping_rem(b))
                             }
-                            BinOpKind::Lt => Value::Bool(a < b),
-                            BinOpKind::Le => Value::Bool(a <= b),
-                            BinOpKind::Gt => Value::Bool(a > b),
-                            BinOpKind::Ge => Value::Bool(a >= b),
-                            BinOpKind::Eq => Value::Bool(a == b),
-                            BinOpKind::Ne => Value::Bool(a != b),
+                            BinOpKind::Lt => Value::I32(if a < b { 1 } else { 0 }),
+                            BinOpKind::Le => Value::I32(if a <= b { 1 } else { 0 }),
+                            BinOpKind::Gt => Value::I32(if a > b { 1 } else { 0 }),
+                            BinOpKind::Ge => Value::I32(if a >= b { 1 } else { 0 }),
+                            BinOpKind::Eq => Value::I32(if a == b { 1 } else { 0 }),
+                            BinOpKind::Ne => Value::I32(if a != b { 1 } else { 0 }),
                             _ => return rt_err!("op {:?} not defined for i64", op),
                         }
                     }
@@ -5227,7 +5227,7 @@ impl Interpreter {
                 if let Some(m) = self.models.get(name.as_str()).cloned() {
                     return Ok(Value::Model(m));
                 }
-                rt_err!("undefined variable `{name}`")
+                rt_err!("undefined variable `{}`", name)
             }
 
             Expr::Path { segments, .. } => {
@@ -5238,7 +5238,7 @@ impl Interpreter {
                 if let Some(f) = self.fns.get(name.as_str()).cloned() {
                     return Ok(Value::Fn(f));
                 }
-                rt_err!("undefined path `{name}`")
+                rt_err!("undefined path `{}`", name)
             }
 
             // ── Vector constructors ────────────────────────────────────────────
@@ -5774,7 +5774,7 @@ impl Interpreter {
                 "y" => Ok(Value::F32(q[1])),
                 "z" => Ok(Value::F32(q[2])),
                 "w" => Ok(Value::F32(q[3])),
-                _ => rt_err!("quat has no field `{field}`"),
+                _ => rt_err!("quat has no field `{}`", field),
             },
             Value::Tuple(vs) => {
                 let idx: usize = field
@@ -5782,9 +5782,9 @@ impl Interpreter {
                     .map_err(|_| RuntimeError::new(format!("bad tuple field `{field}`")))?;
                 vs.into_iter()
                     .nth(idx)
-                    .ok_or_else(|| RuntimeError::new(format!("tuple index {idx} out of range")))
+                    .ok_or_else(|| RuntimeError::new(format!("tuple index {} out of range", idx)))
             }
-            other => rt_err!("`{}` has no field `{field}`", other.type_name()),
+            other => rt_err!("`{}` has no field `{}`", other.type_name(), field),
         }
     }
 
@@ -9355,12 +9355,12 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
                     Ok(Value::I32(a % b))
                 }
             }
-            BinOpKind::Lt => Ok(Value::Bool(a < b)),
-            BinOpKind::Le => Ok(Value::Bool(a <= b)),
-            BinOpKind::Gt => Ok(Value::Bool(a > b)),
-            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
-            BinOpKind::Eq => Ok(Value::Bool(a == b)),
-            BinOpKind::Ne => Ok(Value::Bool(a != b)),
+            BinOpKind::Lt => Ok(Value::I32(if a < b { 1 } else { 0 })),
+            BinOpKind::Le => Ok(Value::I32(if a <= b { 1 } else { 0 })),
+            BinOpKind::Gt => Ok(Value::I32(if a > b { 1 } else { 0 })),
+            BinOpKind::Ge => Ok(Value::I32(if a >= b { 1 } else { 0 })),
+            BinOpKind::Eq => Ok(Value::I32(if a == b { 1 } else { 0 })),
+            BinOpKind::Ne => Ok(Value::I32(if a != b { 1 } else { 0 })),
             BinOpKind::BitAnd => Ok(Value::I32(a & b)),
             BinOpKind::BitOr => Ok(Value::I32(a | b)),
             BinOpKind::BitXor => Ok(Value::I32(a ^ b)),
@@ -9394,12 +9394,12 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
                     Ok(Value::F32((a / b).floor()))
                 }
             }
-            BinOpKind::Lt => Ok(Value::Bool(a < b)),
-            BinOpKind::Le => Ok(Value::Bool(a <= b)),
-            BinOpKind::Gt => Ok(Value::Bool(a > b)),
-            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
-            BinOpKind::Eq => Ok(Value::Bool(a == b)),
-            BinOpKind::Ne => Ok(Value::Bool(a != b)),
+            BinOpKind::Lt => Ok(Value::I32(if a < b { 1 } else { 0 })),
+            BinOpKind::Le => Ok(Value::I32(if a <= b { 1 } else { 0 })),
+            BinOpKind::Gt => Ok(Value::I32(if a > b { 1 } else { 0 })),
+            BinOpKind::Ge => Ok(Value::I32(if a >= b { 1 } else { 0 })),
+            BinOpKind::Eq => Ok(Value::I32(if a == b { 1 } else { 0 })),
+            BinOpKind::Ne => Ok(Value::I32(if a != b { 1 } else { 0 })),
             _ => Err(RuntimeError::new(format!(
                 "op {:?} not defined for f32",
                 op
@@ -9427,12 +9427,12 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
                     Ok(Value::I64(a % b))
                 }
             }
-            BinOpKind::Lt => Ok(Value::Bool(a < b)),
-            BinOpKind::Le => Ok(Value::Bool(a <= b)),
-            BinOpKind::Gt => Ok(Value::Bool(a > b)),
-            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
-            BinOpKind::Eq => Ok(Value::Bool(a == b)),
-            BinOpKind::Ne => Ok(Value::Bool(a != b)),
+            BinOpKind::Lt => Ok(Value::I32(if a < b { 1 } else { 0 })),
+            BinOpKind::Le => Ok(Value::I32(if a <= b { 1 } else { 0 })),
+            BinOpKind::Gt => Ok(Value::I32(if a > b { 1 } else { 0 })),
+            BinOpKind::Ge => Ok(Value::I32(if a >= b { 1 } else { 0 })),
+            BinOpKind::Eq => Ok(Value::I32(if a == b { 1 } else { 0 })),
+            BinOpKind::Ne => Ok(Value::I32(if a != b { 1 } else { 0 })),
             BinOpKind::BitAnd => Ok(Value::I64(a & b)),
             BinOpKind::BitOr => Ok(Value::I64(a | b)),
             BinOpKind::BitXor => Ok(Value::I64(a ^ b)),
@@ -9466,12 +9466,12 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
                     Ok(Value::F64((a / b).floor()))
                 }
             }
-            BinOpKind::Lt => Ok(Value::Bool(a < b)),
-            BinOpKind::Le => Ok(Value::Bool(a <= b)),
-            BinOpKind::Gt => Ok(Value::Bool(a > b)),
-            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
-            BinOpKind::Eq => Ok(Value::Bool(a == b)),
-            BinOpKind::Ne => Ok(Value::Bool(a != b)),
+            BinOpKind::Lt => Ok(Value::I32(if a < b { 1 } else { 0 })),
+            BinOpKind::Le => Ok(Value::I32(if a <= b { 1 } else { 0 })),
+            BinOpKind::Gt => Ok(Value::I32(if a > b { 1 } else { 0 })),
+            BinOpKind::Ge => Ok(Value::I32(if a >= b { 1 } else { 0 })),
+            BinOpKind::Eq => Ok(Value::I32(if a == b { 1 } else { 0 })),
+            BinOpKind::Ne => Ok(Value::I32(if a != b { 1 } else { 0 })),
             _ => Err(RuntimeError::new(format!(
                 "op {:?} not defined for f64",
                 op
@@ -10678,7 +10678,7 @@ mod tests {
                 ty: None,
             }),
         };
-        assert!(matches!(eval(&e), Value::Bool(true)));
+        assert!(matches!(eval(&e), Value::I32(1)));
     }
 
     #[test]

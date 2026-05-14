@@ -1812,6 +1812,21 @@ impl BytecodeVM {
     pub fn execute(&mut self, func_idx: usize, args: &[Value]) -> Result<Value, RuntimeError> {
         let start_time = std::time::Instant::now();
 
+        // ── Save caller's slot state ──
+        // When execute() is called recursively (e.g., from the Call handler),
+        // the shared slot array would be wiped by the callee, destroying the
+        // caller's local variables. We save the caller's active slots and
+        // restore them after the callee returns.
+        let is_nested = !self.call_stack.is_empty();
+        let saved_slots: Option<Vec<Value>> = if is_nested {
+            // Save only the slots that were actually used by the caller.
+            let save_len = self.memory_pool.max_slot_used.saturating_add(1);
+            Some(self.memory_pool.slots.iter().take(save_len).cloned().collect())
+        } else {
+            None
+        };
+        let saved_max_slot = self.memory_pool.max_slot_used;
+
         // Initialize slots with arguments
         let needed_slots = self.functions[func_idx].num_locals.max(self.functions[func_idx].num_params) as usize;
         let num_slots = needed_slots.max(64); // Minimum slot size to avoid index-out-of-bounds
@@ -1858,17 +1873,42 @@ impl BytecodeVM {
         // duration of the call because `self.functions` is not reallocated
         // inside `execute_direct_threaded`.
         let func_ptr: *const BytecodeFunction = &self.functions[func_idx];
-        unsafe {
-            self.execute_direct_threaded(&*func_ptr, func_len, arithmetic_mode, watchdog_sensitivity)?;
+        let exec_result = unsafe {
+            self.execute_direct_threaded(&*func_ptr, func_len, arithmetic_mode, watchdog_sensitivity)
+        };
+
+        // Extract the return value from slot 0 before restoring caller's slots.
+        let ret_val = match exec_result {
+            Ok(()) => std::mem::replace(&mut self.memory_pool.slots[0], Value::Unit),
+            Err(e) => {
+                // Even on error, restore caller's slots so the VM state is consistent.
+                if let Some(ref saved) = saved_slots {
+                    for (i, val) in saved.iter().enumerate() {
+                        if i < self.memory_pool.slots.len() {
+                            self.memory_pool.slots[i] = val.clone();
+                        }
+                    }
+                    self.memory_pool.max_slot_used = saved_max_slot;
+                }
+                return Err(e);
+            }
+        };
+
+        // ── Restore caller's slot state ──
+        if let Some(ref saved) = saved_slots {
+            for (i, val) in saved.iter().enumerate() {
+                if i < self.memory_pool.slots.len() {
+                    self.memory_pool.slots[i] = val.clone();
+                }
+            }
+            self.memory_pool.max_slot_used = saved_max_slot;
         }
 
         let elapsed = start_time.elapsed();
         self.total_instructions += func_len as u64;
         self.total_time_ns += elapsed.as_nanos() as u64;
 
-        // Return value is in slot 0. Swap it out instead of cloning —
-        // the slot array is reset on the next call anyway.
-        Ok(std::mem::replace(&mut self.memory_pool.slots[0], Value::Unit))
+        Ok(ret_val)
     }
     
     /// Switch-dispatch execution loop.
@@ -3520,7 +3560,7 @@ impl BytecodeVM {
         let lf = l.as_f64();
         let rf = r.as_f64();
         match (lf, rf) {
-            (Some(lf), Some(rf)) => Ok(Value::Bool(cmp(lf, rf))),
+            (Some(lf), Some(rf)) => Ok(Value::I32(if cmp(lf, rf) { 1 } else { 0 })),
             _ => Err(RuntimeError::new(format!(
                 "{op_name}: cannot compare {} and {}",
                 l.type_name(),

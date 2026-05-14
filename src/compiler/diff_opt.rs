@@ -834,8 +834,7 @@ DiffCompiler::expr_mem_ops(e, c);
             | Expr::BoolLit { .. }
             | Expr::StrLit { .. }
             | Expr::Ident { .. }
-            | Expr::Path { .. }
-            | Expr::TensorConcat { .. } => {}
+            | Expr::Path { .. } => {}
             Expr::Pipeline { stages, .. } => {
                 for s in stages { Self::expr_calls(s, c); }
             }
@@ -926,8 +925,7 @@ DiffCompiler::expr_mem_ops(e, c);
             | Expr::BoolLit { .. }
             | Expr::StrLit { .. }
             | Expr::Ident { .. }
-            | Expr::Path { .. }
-            | Expr::TensorConcat { .. } => {}
+            | Expr::Path { .. } => {}
             Expr::Pipeline { stages, .. } => {
                 for s in stages { Self::expr_mem_ops(s, c); }
             }
@@ -952,6 +950,7 @@ DiffCompiler::expr_mem_ops(e, c);
             Expr::MatMul { lhs, rhs, .. }
             | Expr::HadamardMul { lhs, rhs, .. }
             | Expr::HadamardDiv { lhs, rhs, .. }
+            | Expr::TensorConcat { lhs, rhs, .. }
             | Expr::KronProd { lhs, rhs, .. }
             | Expr::OuterProd { lhs, rhs, .. }
             | Expr::Pow { base: lhs, exp: rhs, .. } => {
@@ -1015,8 +1014,7 @@ DiffCompiler::expr_mem_ops(e, c);
             | Expr::BoolLit { .. }
             | Expr::StrLit { .. }
             | Expr::Ident { .. }
-            | Expr::Path { .. }
-            | Expr::TensorConcat { .. } => {}
+            | Expr::Path { .. } => {}
             Expr::Pipeline { stages, .. } => {
                 for s in stages { Self::expr_arith(s, c); }
             }
@@ -1170,8 +1168,7 @@ DiffCompiler::expr_mem_ops(e, c);
             | Expr::BoolLit { .. }
             | Expr::StrLit { .. }
             | Expr::Ident { .. }
-            | Expr::Path { .. }
-            | Expr::TensorConcat { .. } => {}
+            | Expr::Path { .. } => {}
             Expr::Pipeline { stages, .. } => {
                 for s in stages { Self::expr_calls_self(s, name, flag); }
             }

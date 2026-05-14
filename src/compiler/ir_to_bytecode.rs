@@ -752,14 +752,17 @@ impl IrBytecodeResult {
     }
 
     /// Returns true if there were any fatal errors (errors that would prevent
-    /// correct execution). Currently all errors are treated as warnings since
-    /// unsupported ops are lowered to Nop/Move with a best-effort fallback.
+    /// correct execution). Fatal errors include unknown block references,
+    /// undefined values, and other structural problems. Soft errors (unsupported
+    /// ops lowered to Nop/Move) are not considered fatal since the program
+    /// can still execute with degraded semantics.
     pub fn has_fatal_errors(&self) -> bool {
-        // Currently, no errors are considered fatal — all are best-effort
-        // lowerings. This could be refined to distinguish between hard errors
-        // (e.g. unknown block references) and soft warnings (e.g. unsupported
-        // tensor ops).
-        false
+        self.errors.iter().any(|e| {
+            e.contains("block not found")
+                || e.contains("undefined value")
+                || e.contains("function not found")
+                || e.contains("parameter index out of range")
+        })
     }
 }
 

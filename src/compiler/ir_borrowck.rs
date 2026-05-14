@@ -730,22 +730,6 @@ pub fn ir_borrowck(module: &FlatIrModule) -> IrBorrowckResult {
         checker.check_function(func);
     }
 
-    let errors = checker
-        .diags
-        .iter()
-        .filter(|d| {
-            // All current diagnostics are errors.
-            !matches!(
-                d.kind,
-                IrBorrowDiagKind::UseAfterMove
-                    | IrBorrowDiagKind::DoubleMutBorrow
-                    | IrBorrowDiagKind::AliasViolation
-                    | IrBorrowDiagKind::MoveWhileBorrowed
-                    | IrBorrowDiagKind::BorrowAfterMove
-            ) // This filter keeps all — they're all errors
-        })
-        .count();
-
     // All diagnostic kinds are currently errors.
     let error_count = checker.diags.len();
     let warning_count = 0usize;

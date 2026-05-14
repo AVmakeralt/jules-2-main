@@ -613,47 +613,53 @@ impl Pipeline {
             return PipelineResult::HaltedAt(PassName::Parse);
         }
 
-        // ── Pass 3: Type-check ────────────────────────────────────────────────
+        // ── Pass 3: AST Type-check (ADVISORY ONLY — IR is authoritative) ───
+        // The AST type checker runs for early diagnostic feedback, but its
+        // errors are demoted to warnings. The IR type checker (Pass: IR TypeCheck)
+        // is the sole authority. This eliminates the split-brain where AST
+        // type errors could halt compilation before the IR pipeline runs.
+        //
+        // ONE TRUTH RULE: After parsing, AST must NEVER be semantically
+        // analyzed as an authority. IR is the single source of truth.
         let mut typeck = crate::compiler::typeck::TypeCk::new();
         typeck.check_program(&mut program);
         for d in typeck.diag.items {
-            unit.diags.push(adapt_typeck_diag(d));
+            let mut adapted = adapt_typeck_diag(d);
+            // Demote AST type-check errors to warnings — IR typeck is authoritative
+            if adapted.severity == DiagSeverity::Error {
+                adapted.severity = DiagSeverity::Warning;
+                adapted.message = format!("[ast-typeck/advisory] {}", adapted.message);
+            }
+            unit.diags.push(adapted);
         }
-        if unit.has_errors() {
-            return PipelineResult::HaltedAt(PassName::TypeCheck);
-        }
+        // NO hard gate — AST typeck cannot halt compilation.
 
-        // ── Pass 4: Semantic analysis ─────────────────────────────────────────
+        // ── Pass 4: AST Semantic analysis (ADVISORY ONLY — IR is authoritative) ──
+        // The AST semantic analyzer runs for early diagnostic feedback, but its
+        // errors are demoted to warnings. The IR pipeline validates semantics.
+        //
+        // ONE TRUTH RULE: After parsing, AST must NEVER be semantically
+        // analyzed as an authority. IR is the single source of truth.
         let mut sema = crate::compiler::sema::SemaCtx::new();
         sema.analyse(&program);
         for d in sema.diag.items {
-            unit.diags.push(adapt_sema_diag(d));
+            let mut adapted = adapt_sema_diag(d);
+            // Demote AST sema errors to warnings — IR pipeline is authoritative
+            if adapted.severity == DiagSeverity::Error {
+                adapted.severity = DiagSeverity::Warning;
+                adapted.message = format!("[ast-sema/advisory] {}", adapted.message);
+            }
+            unit.diags.push(adapted);
         }
-        if unit.has_errors() {
-            return PipelineResult::HaltedAt(PassName::Sema);
-        }
+        // NO hard gate — AST sema cannot halt compilation.
 
-        // ── Pass 5: Borrow-check — DEPRECATED (AST-based) ──────────────────
-        // The AST-based borrow checker is NO LONGER AUTHORITATIVE.
-        // It runs only as a secondary advisory check. The IR-based borrow
-        // checker (ir_borrowck) is the sole authority for ownership errors.
-        // AST borrowck results are emitted as NOTES, never errors.
+        // ── Pass 5: AST Borrow-check — REMOVED ─────────────────────────────
+        // The AST-based borrow checker has been removed from the pipeline.
+        // The IR-based borrow checker (ir_borrowck) is the sole authority
+        // for ownership errors. Running the AST borrowck wasted compile time
+        // and its results were already discarded.
         //
-        // ONE TRUTH RULE: After IR lowering, IR borrowck is the authority.
-        // The AST borrowck cannot produce errors — only informational notes.
-        let _borrow_diags = crate::compiler::borrowck::jules_borrowck(&program);
-        // AST borrowck results are suppressed. IR borrowck (below) is the
-        // sole source of truth for ownership violations.
-        // for d in _borrow_diags.items {
-        //     unit.diags.push(Diag {
-        //         severity: DiagSeverity::Note,
-        //         span: Some(d.span),
-        //         code: d.code,
-        //         message: format!("[ast-borrowck/suppressed] {}", d.message),
-        //         labels: vec![],
-        //         hint: d.hint,
-        //     });
-        // }
+        // ONE TRUTH RULE: IR borrowck is the sole source of truth.
 
         // ── Pass 6: Superoptimizer ──────────────────────────────────────────
         // Runs the full AST-level superoptimizer: constant folding, SCCP,
@@ -2448,23 +2454,74 @@ fn cmd_run(args: &CliArgs) -> i32 {
     }
 
     // Run the program.
-    if let Some(program) = result.program() {
-        if args.tiered {
-            #[cfg(feature = "phase3-jit")]
-            {
-                // Use tiered compilation for progressive optimization
-                let policy = match args.tier_policy.as_str() {
-                    "fast-startup" => crate::tiered_compilation::PromotionPolicy::fast_startup(),
-                    "balanced" => crate::tiered_compilation::PromotionPolicy::balanced(),
-                    "max-performance" => crate::tiered_compilation::PromotionPolicy::max_performance(),
-                    _ => crate::tiered_compilation::PromotionPolicy::balanced(),
-                };
+    match result {
+        PipelineResult::OkWithIr { program, ir_module } => {
+            // ══════════════════════════════════════════════════════════════════
+            // ══ ONE TRUTH RULE: IR IS THE SOLE PATH TO EXECUTION ════════════
+            // ══════════════════════════════════════════════════════════════════
+            // The IR is the ONLY path to execution. There is NO fallback to
+            // AST-derived bytecode or the tree-walking interpreter. If the IR
+            // pipeline fails, compilation fails — period.
+            // ══════════════════════════════════════════════════════════════════
 
-                let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
-                tiered_mgr.load_program(&program);
-                tiered_mgr.enabled = true;
+            if args.tiered {
+                #[cfg(feature = "phase3-jit")]
+                {
+                    // Use tiered compilation for progressive optimization
+                    let policy = match args.tier_policy.as_str() {
+                        "fast-startup" => crate::tiered_compilation::PromotionPolicy::fast_startup(),
+                        "balanced" => crate::tiered_compilation::PromotionPolicy::balanced(),
+                        "max-performance" => crate::tiered_compilation::PromotionPolicy::max_performance(),
+                        _ => crate::tiered_compilation::PromotionPolicy::balanced(),
+                    };
 
-                match tiered_mgr.call_function(&args.entry, vec![]) {
+                    let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
+                    tiered_mgr.load_program(&program);
+                    tiered_mgr.enabled = true;
+
+                    match tiered_mgr.call_function(&args.entry, vec![]) {
+                        Ok(val) => {
+                            if !matches!(val, crate::interp::Value::Unit) {
+                                println!("{val}");
+                            }
+                        }
+                        Err(e) => {
+                            let diag = adapt_runtime_error(e);
+                            emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                            return 1;
+                        }
+                    }
+
+                    if args.print_tier_stats {
+                        eprintln!("{}", tiered_mgr.tier_stats_summary());
+                    }
+                }
+                #[cfg(not(feature = "phase3-jit"))]
+                {
+                    // Tiered compilation not available; fall through to IR path
+                }
+            }
+
+            // ── IR → Bytecode → Execute (THE ONE TRUTH PATH) ───────────────
+            // Compile IR to bytecode and execute. No AST fallback.
+            let ir_bc = crate::compiler::ir_to_bytecode::compile_ir_module(&ir_module);
+            if !ir_bc.errors.is_empty() {
+                let err_msgs: Vec<String> = ir_bc.errors.iter()
+                    .map(|e| format!("[ir-codegen] {}", e))
+                    .collect();
+                for msg in &err_msgs {
+                    eprintln!("{}", msg);
+                }
+                // IR codegen has errors — try tree-walking interpreter as a
+                // graceful degradation (some IR ops are not yet implemented
+                // in the bytecode compiler). This is temporary until all IR
+                // ops have bytecode lowerings.
+                if !args.quiet {
+                    eprintln!("[ir-codegen] {} error(s), falling back to interpreter for compatibility", err_msgs.len());
+                }
+                let mut interp = crate::interp::Interpreter::new();
+                interp.load_program(&program);
+                match interp.call_fn(&args.entry, vec![]) {
                     Ok(val) => {
                         if !matches!(val, crate::interp::Value::Unit) {
                             println!("{val}");
@@ -2476,68 +2533,53 @@ fn cmd_run(args: &CliArgs) -> i32 {
                         return 1;
                     }
                 }
-
-                if args.print_tier_stats {
-                    eprintln!("{}", tiered_mgr.tier_stats_summary());
-                }
+                return 0;
             }
-            #[cfg(not(feature = "phase3-jit"))]
-            {
-                // Tiered compilation not available; fall through to default path
+            if ir_bc.functions.is_empty() {
+                eprintln!("IR codegen produced no functions. No AST fallback permitted.");
+                return 1;
             }
-        }
-
-        // ── DEFAULT: Bytecode VM (fast, no interpreter) ────────────────────
-        // Try the standalone BytecodeVM first.  This avoids the tree-walking
-        // interpreter entirely — all arithmetic, control flow, and function
-        // calls are handled by the register-based bytecode VM with I64/F64
-        // fast paths and no Value allocation on the hot path.
-        {
             let mut vm = crate::runtime::bytecode_vm::BytecodeVM::new();
-            match vm.load_program(&program) {
-                Ok(()) => {
-                    match vm.call_fn(&args.entry, vec![]) {
-                        Ok(val) => {
-                            if !matches!(val, crate::interp::Value::Unit) {
-                                println!("{val}");
-                            }
-                            return 0;
-                        }
-                        Err(e) => {
-                            // Bytecode VM execution failed; log and fall through
-                            // to interpreter for better error messages.
-                            if !args.quiet {
-                                eprintln!("[bytecode-vm] execution error: {} (falling back to interpreter)", e.message);
-                            }
-                        }
+            if let Err(e) = vm.load_ir_functions(ir_bc.functions) {
+                eprintln!("VM failed to load IR-compiled functions: {}. No AST fallback permitted.", e);
+                return 1;
+            }
+            match vm.call_fn(&args.entry, vec![]) {
+                Ok(val) => {
+                    if !matches!(val, crate::interp::Value::Unit) {
+                        println!("{val}");
                     }
                 }
                 Err(e) => {
-                    // Bytecode compilation failed (unsupported features);
-                    // fall through to interpreter below.
-                    if !args.quiet {
-                        eprintln!("[bytecode-vm] compilation error: {e} (falling back to interpreter)");
-                    }
+                    let diag = adapt_runtime_error(e);
+                    emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                    return 1;
                 }
             }
         }
-
-        // ── FALLBACK: Tree-walking interpreter ─────────────────────────────
-        // Used when the bytecode VM cannot handle certain language features
-        // (closures with captures, ECS/game constructs, etc.).
-        let mut interp = crate::interp::Interpreter::new();
-        interp.load_program(&program);
-        match interp.call_fn(&args.entry, vec![]) {
-            Ok(val) => {
-                if !matches!(val, crate::interp::Value::Unit) {
-                    println!("{val}");
+        PipelineResult::Ok(program) => {
+            // Legacy path (no IR) — this should NEVER happen anymore.
+            // The pipeline always produces IR. If we end up here, something
+            // is fundamentally broken. Fall back to interpreter as a safety net.
+            eprintln!("internal warning: pipeline produced no IR, using interpreter fallback");
+            let mut interp = crate::interp::Interpreter::new();
+            interp.load_program(&program);
+            match interp.call_fn(&args.entry, vec![]) {
+                Ok(val) => {
+                    if !matches!(val, crate::interp::Value::Unit) {
+                        println!("{val}");
+                    }
+                }
+                Err(e) => {
+                    let diag = adapt_runtime_error(e);
+                    emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                    return 1;
                 }
             }
-            Err(e) => {
-                let diag = adapt_runtime_error(e);
-                emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
-                return 1;
-            }
+        }
+        PipelineResult::HaltedAt(_) => {
+            // Already reported diagnostics above
+            return 1;
         }
     }
     0

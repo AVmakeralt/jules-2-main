@@ -186,7 +186,7 @@ All measurements use `black_box()` to prevent dead code elimination. 100,000 ite
 
 | Category | Total | Passed | Failed | Ignored |
 | :--- | :--- | :--- | :--- | :--- |
-| Library tests (`cargo test --lib`) | 1110 | 1109 | 0 | 1 |
+| Library tests (`cargo test --lib`) | 1112 | 1111 | 0 | 1 |
 | Doc tests (`cargo test --doc`) | 13 | 0 | 0 | 13 |
 
 ---
@@ -232,6 +232,20 @@ All measurements use `black_box()` to prevent dead code elimination. 100,000 ite
 8. **Doc test compilation failures:** Fixed 4 doc tests that couldn't compile in isolation by marking them as `ignore` or `text`.
 
 9. **Test assertion count:** `test_parse_full_program` expected 7 items but the program has 8 (4 components + 1 system + 1 model + 1 agent + 1 train). Fixed assertion.
+
+10. **C-style truthiness test mismatches (3 fixes):** Tests `test_condbr_non_bool`, `test_if_expr_non_bool_condition_error`, and `test_interp_binop_compare` all assumed Rust-style bool-only semantics, but Jules uses C-style truthiness where integers are valid conditions and comparisons return `i32(0/1)`. Fixed `test_condbr_non_bool` to use a float condition (which IS rejected), `test_if_expr_non_bool_condition_error` to use a string literal, and `test_interp_binop_compare` to expect `Value::I32(1)`. Added new tests `test_condbr_int_condition_ok` and `test_if_expr_int_condition_ok` to verify C-style truthiness works correctly.
+
+11. **IR pipeline split-brain fix (ONE TRUTH RULE):** The AST-based type checker and semantic analyzer were hard gates that could halt compilation before the IR pipeline ran. This violated the "AST must NEVER be semantically analyzed as authority after parsing" rule. Fixed by demoting AST typeck and sema errors to warnings (advisory-only), making the IR-based type checker and borrow checker the sole authorities. Also removed the dead AST borrow checker call entirely.
+
+12. **CLI default path bypassing IR pipeline:** The `cmd_run` function used AST-based bytecode compilation (`BytecodeVM::load_program`) as the primary execution path, completely bypassing the IR pipeline. Fixed by restructuring `cmd_run` to use the IR pipeline (`compile_ir_module → load_ir_functions`) as the primary path, with tree-walking interpreter as a graceful degradation fallback when IR codegen has errors (temporary, until all IR ops have bytecode lowerings).
+
+13. **`has_fatal_errors()` always returning false:** `IrBytecodeResult::has_fatal_errors()` unconditionally returned `false`, making it impossible to detect structural compilation errors like unknown block references. Fixed to check for fatal error patterns ("block not found", "undefined value", "function not found", "parameter index out of range").
+
+14. **Dead `errors` variable in `ir_borrowck`:** The `ir_borrowck()` function computed an `errors` count via a filter that was inverted (it excluded all known diagnostic kinds, always yielding 0), then never used the result. The real error count was `checker.diags.len()`. Removed the dead code.
+
+15. **`drop(table)` on reference in `mcts_core`:** `drop(table)` where `table` was `&OpcodeTable` is a no-op (dropping a reference does nothing). Removed the useless `drop()` call.
+
+16. **Unreachable `TensorConcat` patterns in `diff_opt`:** Three functions (`expr_calls`, `expr_mem_ops`, `expr_arith`) had `TensorConcat` matched twice — once in a binary-ops group and again in a leaf-expression group. The second match was unreachable. Fixed by removing the duplicate from the leaf groups and ensuring `TensorConcat` is properly handled as a binary operation.
 
 ---
 
