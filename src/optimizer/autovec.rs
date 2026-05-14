@@ -230,11 +230,13 @@ impl VectorPatternDetector {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[allow(dead_code)]
     fn has_sse42() -> bool {
         is_x86_feature_detected!("sse4.2")
     }
 
     #[cfg(not(target_arch = "x86_64"))]
+    #[allow(dead_code)]
     fn has_sse42() -> bool {
         false
     }
@@ -784,7 +786,7 @@ impl AutoVectorizer {
                     instr = instr,
                 )
             }
-            VectorPattern::Reduce { op, element_type, initial, reduction_type, .. } => {
+            VectorPattern::Reduce { op, element_type, initial: _, reduction_type, .. } => {
                 let (instr, suffix) = match (op, element_type.as_str()) {
                     (VectorOp::Add, "f32") => ("add", "ps"),
                     (VectorOp::Add, "f64") => ("add", "pd"),

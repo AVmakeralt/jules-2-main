@@ -8,6 +8,7 @@ pub mod io_uring;
 #[cfg(feature = "gnn-optimizer")]
 pub mod memory_management;
 pub mod networking;
+pub mod speculative_memory;
 pub mod symbol;
 pub mod threading;
 
@@ -16,3 +17,15 @@ pub mod threading;
 // Uses "Provable Hardware Modeling" — every bit named, Acquire/Release
 // ordering, zero heap allocation, TSX-safe.
 pub mod jhal;
+
+// ── Re-exports for convenient access ─────────────────────────────────────────
+pub use heterogeneous_memory::{
+    AccessPattern as HeteroAccessPattern, AccessPatternClass, Lifetime, MemoryTierId,
+    MigrationCostEstimate, MigrationRequest, MigrationResult, PlacementDistribution,
+    PlacementHintEmitter, TierCharacteristics, ZchmaRuntime,
+};
+pub use speculative_memory::{
+    AccessPattern as SpecAccessPattern, AccessType, AosToSoaConverter, ComponentDescriptor,
+    HtmError, HtmTransaction, LayoutPredictor, MemoryLayout, MemoryReorgOrchestrator,
+    SharedMemoryReorg,
+};

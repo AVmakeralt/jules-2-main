@@ -94,6 +94,22 @@ path = "src/tools/superopt_debug.rs"
 name = "bench-adversarial"
 path = "src/tools/bench_adversarial.rs"
 
+[[bin]]
+name = "bench-ant-colony"
+path = "src/tools/bench_ant_colony.rs"
+
+[[bin]]
+name = "bench-mlp-hard"
+path = "src/tools/bench_mlp_hard.rs"
+
+[[bin]]
+name = "bench-mlp-1m"
+path = "src/tools/bench_mlp_1m.rs"
+
+[[bin]]
+name = "bench-jules-ml-chess"
+path = "src/tools/bench_jules_ml_chess.rs"
+
 [dependencies]
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }

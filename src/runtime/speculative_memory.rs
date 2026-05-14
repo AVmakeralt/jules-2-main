@@ -106,6 +106,7 @@ pub struct ComponentDescriptor {
 }
 
 /// Speculative memory reorganizer
+#[allow(dead_code)] // fields used by future runtime integration
 pub struct SpeculativeMemoryReorg {
     /// HTM lock (simulated for cross-platform)
     htm_available: bool,
@@ -128,6 +129,7 @@ pub struct ReorgTask {
 }
 
 /// Layout predictor using EMA-tracked access pattern metrics
+#[allow(dead_code)] // thresholds used by future ML-based prediction
 pub struct LayoutPredictor {
     /// Historical patterns
     patterns: Vec<AccessPattern>,
@@ -168,11 +170,15 @@ impl LayoutPredictor {
 
     /// Predict optimal layout using EMA-weighted metrics
     pub fn predict(&self, pattern: &AccessPattern) -> MemoryLayout {
-        // Use EMA values for prediction (more stable than raw ratios)
+        // Use EMA values for prediction (more stable than raw ratios),
+        // but only if we have accumulated enough history. When the EMA
+        // values are still at their initial 0.0, fall back to raw ratios
+        // from the current observation so the first prediction is useful.
         let total = pattern.total_accesses.max(1) as f64;
-        let seq_ratio = if total > 100.0 { self.ema_sequential } else { pattern.sequential_count as f64 / total };
-        let rand_ratio = if total > 100.0 { self.ema_random } else { pattern.random_count as f64 / total };
-        let stride_ratio = if total > 100.0 { self.ema_strided } else { pattern.strided_count as f64 / total };
+        let has_ema_history = self.ema_sequential > 0.0 || self.ema_random > 0.0 || self.ema_strided > 0.0;
+        let seq_ratio = if has_ema_history { self.ema_sequential } else { pattern.sequential_count as f64 / total };
+        let rand_ratio = if has_ema_history { self.ema_random } else { pattern.random_count as f64 / total };
+        let stride_ratio = if has_ema_history { self.ema_strided } else { pattern.strided_count as f64 / total };
 
         if pattern.confidence() < 0.5 {
             return MemoryLayout::ArrayOfStructures;
@@ -429,9 +435,13 @@ impl MemoryReorgOrchestrator {
             alignment: components.first().map(|c| c.alignment).unwrap_or(4),
         };
 
-        let new_data = match (self.current_layout, target) {
+        // Perform conversion: both branches produce a flat Vec<u8> buffer.
+        let flat_result: Vec<u8> = match (self.current_layout, target) {
             (MemoryLayout::ArrayOfStructures, MemoryLayout::StructureOfArrays) => {
-                converter.convert(data)
+                // convert() returns Vec<Vec<u8>> (one Vec per component).
+                // Flatten into a single contiguous buffer for write-back.
+                let soa_arrays = converter.convert(data);
+                soa_arrays.iter().flatten().cloned().collect()
             }
             (MemoryLayout::StructureOfArrays, MemoryLayout::ArrayOfStructures) => {
                 // Reconstruct AoS from current SoA data.
@@ -455,19 +465,9 @@ impl MemoryReorgOrchestrator {
         };
 
         // Write reorganized data back to the actual data store.
-        match target {
-            MemoryLayout::StructureOfArrays => {
-                // Flatten Vec<Vec<u8>> SoA arrays back into the flat buffer.
-                let flat: Vec<u8> = new_data.iter().flatten().cloned().collect();
-                let copy_len = flat.len().min(data.len());
-                data[..copy_len].copy_from_slice(&flat[..copy_len]);
-            }
-            MemoryLayout::ArrayOfStructures => {
-                // new_data is Vec<u8> from convert_soa_to_aos.
-                let copy_len = new_data.len().min(data.len());
-                data[..copy_len].copy_from_slice(&new_data[..copy_len]);
-            }
-            _ => {}
+        {
+            let copy_len = flat_result.len().min(data.len());
+            data[..copy_len].copy_from_slice(&flat_result[..copy_len]);
         }
 
         // Try to commit
@@ -509,12 +509,27 @@ pub enum AccessType {
     Strided(usize),
 }
 
-/// Thread-safe wrapper for use in runtime
-pub type SharedMemoryReorg = Arc<MemoryReorgOrchestrator>;
+/// Thread-safe wrapper for use in runtime.
+/// Newtype wrapper around `Arc<MemoryReorgOrchestrator>` so we can add
+/// inherent constructors (Rust forbids inherent impls on bare type aliases).
+pub struct SharedMemoryReorg(pub Arc<MemoryReorgOrchestrator>);
 
 impl SharedMemoryReorg {
     pub fn new() -> Self {
-        Arc::new(MemoryReorgOrchestrator::new())
+        Self(Arc::new(MemoryReorgOrchestrator::new()))
+    }
+}
+
+impl Default for SharedMemoryReorg {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for SharedMemoryReorg {
+    type Target = MemoryReorgOrchestrator;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 

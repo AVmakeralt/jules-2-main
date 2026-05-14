@@ -42,6 +42,8 @@ pub use ml::chess_ml;
 pub use tools::frame_debugger;
 pub use tools::hot_reload;
 pub use runtime::networking;
+pub use runtime::ZchmaRuntime;
+pub use runtime::MemoryReorgOrchestrator;
 pub use tools::profiling_tools;
 pub use game::scene_editor;
 pub use tools::shader_tooling;
