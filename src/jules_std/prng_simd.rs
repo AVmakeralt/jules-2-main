@@ -145,7 +145,6 @@ impl SquaresRng {
 /// Marked `#[inline(always)]` so the compiler can see the full computation
 /// across all 8 lanes and exploit instruction-level parallelism (ILP).
 #[inline(always)]
-#[allow(unused_assignments)]
 fn squares_hash(key: u64, counter: u64) -> u64 {
     let mut x = key;
     let mut y = counter;
@@ -180,7 +179,7 @@ fn squares_hash(key: u64, counter: u64) -> u64 {
     x ^= x >> 17;
     y ^= y >> 17;
 
-    y
+    x ^ y
 }
 
 // ─── Shishiua Counter-Based PRNG (Scalar) ───────────────────────────────────
@@ -749,33 +748,33 @@ pub fn test_prng_quality() -> bool {
     for _ in 0..n {
         sum += rng.next_f64();
     }
-    let mean = sum / n as f64;
-    let pass_squares = (mean - 0.5).abs() < 0.005;
+    let mean_squares = sum / n as f64;
+    let pass_squares = (mean_squares - 0.5).abs() < 0.005;
 
     let mut rng = ShishiuaRng::new(42);
     let mut sum = 0.0f64;
     for _ in 0..n {
         sum += rng.next_f64();
     }
-    let mean = sum / n as f64;
-    let pass_shishiua = (mean - 0.5).abs() < 0.005;
+    let mean_shishiua = sum / n as f64;
+    let pass_shishiua = (mean_shishiua - 0.5).abs() < 0.005;
 
     let mut rng = SimdPrng8::new(42);
     let mut sum = 0.0f64;
     for _ in 0..n {
         sum += rng.next_f64();
     }
-    let mean = sum / n as f64;
-    let pass_simd8 = (mean - 0.5).abs() < 0.005;
+    let mean_simd8 = sum / n as f64;
+    let pass_simd8 = (mean_simd8 - 0.5).abs() < 0.005;
 
     if !pass_squares {
-        eprintln!("Squares PRNG quality test FAILED: mean = {}", mean);
+        eprintln!("Squares PRNG quality test FAILED: mean = {}", mean_squares);
     }
     if !pass_shishiua {
-        eprintln!("Shishiua PRNG quality test FAILED: mean = {}", mean);
+        eprintln!("Shishiua PRNG quality test FAILED: mean = {}", mean_shishiua);
     }
     if !pass_simd8 {
-        eprintln!("SIMD8 PRNG quality test FAILED: mean = {}", mean);
+        eprintln!("SIMD8 PRNG quality test FAILED: mean = {}", mean_simd8);
     }
 
     pass_squares && pass_shishiua && pass_simd8

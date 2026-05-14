@@ -43,12 +43,9 @@
 // =============================================================================
 
 #![allow(dead_code)]
-#![allow(unused_imports)]
 
 use crate::interp::{RuntimeError, Value};
-use crate::compiler::lexer::Span;
-use crate::jules_std::morton::{encode_2d, decode_2d, encode_3d, decode_3d};
-use crate::jules_std::prng_simd::SimdPrng8;
+use crate::jules_std::morton::{encode_2d, decode_2d, encode_3d};
 
 // ─── Dispatch for stdlib integration ────────────────────────────────────────
 
@@ -634,7 +631,7 @@ impl SimdSpritePacket {
             let bloom_bits = ((packets[i] >> 96) & 0xFFFF) as u16;
 
             batch.scales[i]     = u16_to_f32(scale_bits, SCALE_MAX_F32);
-            batch.rotations[i]  = (rot_bits as f32 / 65535.0) * ROTATION_MAX_F32;
+            batch.rotations[i]  = u16_to_f32(rot_bits, ROTATION_MAX_F32);
             batch.blooms[i]     = u16_to_f32(bloom_bits, BLOOM_MAX_F32);
         }
 
@@ -668,14 +665,13 @@ impl SimdSpritePacket {
             let scale_bits = (f32_to_u16(batch.scales[i], SCALE_MAX_F32) as u128) << 64;
 
             // Bits 80–95: Rotation as f16-like u16
-            let rot_normalized = ((batch.rotations[i] % ROTATION_MAX_F32) / ROTATION_MAX_F32).clamp(0.0, 1.0);
-            let rot_bits = ((rot_normalized * 65535.0).round() as u16) as u128;
-            let rot_shifted = rot_bits << 80;
+            let rot_normalized = (wrap_mod(batch.rotations[i], ROTATION_MAX_F32) / ROTATION_MAX_F32).clamp(0.0, 1.0);
+            let rot_bits = (f32_to_u16(rot_normalized * ROTATION_MAX_F32, ROTATION_MAX_F32) as u128) << 80;
 
             // Bits 96–111: Bloom as f16-like u16
             let bloom_bits = (f32_to_u16(batch.blooms[i], BLOOM_MAX_F32) as u128) << 96;
 
-            packets[i] = morton_xy | (atlas_palette << 32) | anim_frame | scale_bits | rot_shifted | bloom_bits;
+            packets[i] = morton_xy | (atlas_palette << 32) | anim_frame | scale_bits | rot_bits | bloom_bits;
         }
 
         packets
@@ -699,8 +695,8 @@ impl SimdSpritePacket {
         let atlas_palette = (((atlas_id as u16) << 8) | palette_offset as u16) as u128;
         let anim = (anim_frame as u128) << 48;
         let scale_bits = (f32_to_u16(scale, SCALE_MAX_F32) as u128) << 64;
-        let rot_normalized = ((rotation % ROTATION_MAX_F32) / ROTATION_MAX_F32).clamp(0.0, 1.0);
-        let rot_bits = (((rot_normalized * 65535.0).round() as u16) as u128) << 80;
+        let rot_normalized = (wrap_mod(rotation, ROTATION_MAX_F32) / ROTATION_MAX_F32).clamp(0.0, 1.0);
+        let rot_bits = (f32_to_u16(rot_normalized * ROTATION_MAX_F32, ROTATION_MAX_F32) as u128) << 80;
         let bloom_bits = (f32_to_u16(bloom, BLOOM_MAX_F32) as u128) << 96;
 
         morton_xy | (atlas_palette << 32) | anim | scale_bits | rot_bits | bloom_bits
@@ -708,6 +704,22 @@ impl SimdSpritePacket {
 }
 
 // ─── f16-like Quantization Helpers ──────────────────────────────────────────
+
+/// Correct modular wrap for f32: always returns a value in [0, max).
+///
+/// Unlike the `%` (remainder) operator, which can return negative values
+/// when the dividend is negative, this function ensures the result is
+/// always in [0, max). For example, with max = 2π:
+///   - `(-π) % 2π = -π`  (wrong: negative)
+///   - `wrap_mod(-π, 2π) = π`  (correct: wraps to positive)
+#[inline(always)]
+fn wrap_mod(val: f32, max: f32) -> f32 {
+    if max <= 0.0 {
+        return val;
+    }
+    let r = val % max;
+    if r < 0.0 { r + max } else { r }
+}
 
 /// Convert f32 in [0, max] to u16 in [0, 65535].
 #[inline(always)]
@@ -928,12 +940,16 @@ fn max_branchless(a: f64, b: f64) -> f64 {
 /// When mask is true, return a; when false, return b.
 /// Uses the bitmask approach:
 ///   - Convert bool to u64 mask: true → 0xFFFFFFFFFFFFFFFF, false → 0
+///     via arithmetic negation: -(mask as i64) as u64 (truly branchless)
 ///   - result_bits = (a_bits & mask) | (b_bits & !mask)
 ///
 /// This compiles to a single BLENDV instruction on AVX2.
 #[inline(always)]
 fn select_branchless(mask: bool, a: f64, b: f64) -> f64 {
-    let mask_bits = if mask { u64::MAX } else { 0u64 };
+    // Truly branchless: bool → u64 mask using arithmetic negation.
+    // mask=true  → -(1i64) as u64 = 0xFFFFFFFFFFFFFFFF
+    // mask=false → -(0i64) as u64 = 0x0000000000000000
+    let mask_bits = (-(mask as i64)) as u64;
     let a_bits = a.to_bits();
     let b_bits = b.to_bits();
     let result_bits = (a_bits & mask_bits) | (b_bits & !mask_bits);

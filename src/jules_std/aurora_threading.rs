@@ -586,7 +586,7 @@ impl AuroraFiberPool {
                         local_processed += fiber.len();
                         local_simd_batches += fiber_result.batches;
 
-                        completed.fetch_add(fiber.len(), Ordering::Relaxed);
+                        completed.fetch_add(fiber.len(), Ordering::AcqRel);
                     } else {
                         // Work-stealing: try to steal from another worker
                         let stolen = {
@@ -626,11 +626,11 @@ impl AuroraFiberPool {
                             let fiber_result = process_fiber_simd(&fiber, seed);
                             local_processed += fiber.len();
                             local_simd_batches += fiber_result.batches;
-                            completed.fetch_add(fiber.len(), Ordering::Relaxed);
+                            completed.fetch_add(fiber.len(), Ordering::AcqRel);
                         } else {
                             // No work anywhere — check if we're done
                             let idle_start = Instant::now();
-                            if completed.load(Ordering::Relaxed) >= total {
+                            if completed.load(Ordering::Acquire) >= total {
                                 break;
                             }
                             // Brief spin-wait
@@ -640,7 +640,7 @@ impl AuroraFiberPool {
                     }
 
                     // Check completion
-                    if completed.load(Ordering::Relaxed) >= total {
+                    if completed.load(Ordering::Acquire) >= total {
                         break;
                     }
                 }
