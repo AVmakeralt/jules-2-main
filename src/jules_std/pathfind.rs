@@ -276,8 +276,9 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
     match name {
         "path::astar" => {
             if args.len() < 5 { return Some(Err(rt_err!("path::astar() requires grid, w, h, start, goal"))); }
-            if let (Value::Array(grid_arr), Some(w), Some(h), Some(sx), Some(sy), Some(gx), Some(gy)) =
-                (&args[0], i64_arg(args,1), i64_arg(args,2), i64_arg(args,3), i64_arg(args,4), i64_arg(args,5), i64_arg(args,6)) {
+            let grid_arg = array_arg(args, 0);
+            if let (Some(grid_arr), Some(w), Some(h), Some(sx), Some(sy), Some(gx), Some(gy)) =
+                (grid_arg.as_ref(), i64_arg(args,1), i64_arg(args,2), i64_arg(args,3), i64_arg(args,4), i64_arg(args,5), i64_arg(args,6)) {
                 let grid = grid_arr.borrow();
                 let bool_grid: Vec<bool> = grid.iter().map(|v| v.is_truthy()).collect();
                 let w = w as usize;
@@ -293,8 +294,9 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         }
         "path::dijkstra" => {
             if args.len() < 5 { return Some(Err(rt_err!("path::dijkstra() requires grid, w, h, start, goal"))); }
-            if let (Value::Array(grid_arr), Some(w), Some(h), Some(sx), Some(sy), Some(gx), Some(gy)) =
-                (&args[0], i64_arg(args,1), i64_arg(args,2), i64_arg(args,3), i64_arg(args,4), i64_arg(args,5), i64_arg(args,6)) {
+            let grid_arg = array_arg(args, 0);
+            if let (Some(grid_arr), Some(w), Some(h), Some(sx), Some(sy), Some(gx), Some(gy)) =
+                (grid_arg.as_ref(), i64_arg(args,1), i64_arg(args,2), i64_arg(args,3), i64_arg(args,4), i64_arg(args,5), i64_arg(args,6)) {
                 let grid = grid_arr.borrow();
                 let bool_grid: Vec<bool> = grid.iter().map(|v| v.is_truthy()).collect();
                 let path = dijkstra_grid(&bool_grid, w as usize, h as usize, (sx as i32, sy as i32), (gx as i32, gy as i32), true);
@@ -309,8 +311,9 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         }
         "path::flow_field" => {
             if args.len() < 4 { return Some(Err(rt_err!("path::flow_field() requires grid, w, h, goal"))); }
-            if let (Value::Array(grid_arr), Some(w), Some(h), Some(gx), Some(gy)) =
-                (&args[0], i64_arg(args,1), i64_arg(args,2), i64_arg(args,3), i64_arg(args,4)) {
+            let grid_arg = array_arg(args, 0);
+            if let (Some(grid_arr), Some(w), Some(h), Some(gx), Some(gy)) =
+                (grid_arg.as_ref(), i64_arg(args,1), i64_arg(args,2), i64_arg(args,3), i64_arg(args,4)) {
                 let grid = grid_arr.borrow();
                 let bool_grid: Vec<bool> = grid.iter().map(|v| v.is_truthy()).collect();
                 let flow = flow_field(&bool_grid, w as usize, h as usize, (gx as i32, gy as i32));

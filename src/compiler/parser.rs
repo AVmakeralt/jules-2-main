@@ -820,24 +820,24 @@ impl Parser {
         let mut ensures = Vec::new();
         let mut effect = None;
 
-        while self.is(&TokenKind::KwRequires) || self.is(&TokenKind::KwEnsures) {
-            if self.is(&TokenKind::KwRequires) {
+        while self.check(&TokenKind::KwRequires) || self.check(&TokenKind::KwEnsures) {
+            if self.check(&TokenKind::KwRequires) {
                 self.advance();
                 requires.push(self.parse_expr(0)?);
-            } else if self.is(&TokenKind::KwEnsures) {
+            } else if self.check(&TokenKind::KwEnsures) {
                 self.advance();
                 ensures.push(self.parse_expr(0)?);
             }
         }
 
         // Parse optional `effect <name>` clause
-        if self.is(&TokenKind::KwEffect) {
+        if self.check(&TokenKind::KwEffect) {
             self.advance();
             let (_, effect_name) = self.expect_ident()?;
             effect = Some(effect_name);
         }
 
-        let body = if self.is(&TokenKind::LBrace) {
+        let body = if self.check(&TokenKind::LBrace) {
             let mut body = self.parse_block()?;
             if ret_ty.is_some() && body.tail.is_none() {
                 if let Some(stmt) = body.stmts.last().cloned() {

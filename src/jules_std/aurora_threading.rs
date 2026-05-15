@@ -88,6 +88,21 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 Value::F64(plan.estimated_throughput),
             ])))))
         }
+        "aurora_threading::fiber_pool_info" => {
+            // Create a fiber pool and return info including plan details
+            let seed = args.first().and_then(|v| v.as_i64()).unwrap_or(42) as u64;
+            let entity_start = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u64;
+            let entity_end = args.get(2).and_then(|v| v.as_i64()).unwrap_or(1000) as u64;
+            let director = AuroraDirector::new();
+            let plan = director.plan(entity_end - entity_start);
+            let pool = AuroraFiberPool::new(seed, entity_start, entity_end, plan.clone());
+            Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![
+                Value::U64(pool.total_entities),
+                Value::I64(pool.plan.workload_level as i64),
+                Value::I64(pool.plan.active_workers as i64),
+                Value::I64(pool.plan.total_cores as i64),
+            ])))))
+        }
         _ => None,
     }
 }
@@ -1168,9 +1183,10 @@ impl AsyncMaterializer {
 impl Drop for AsyncMaterializer {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Wake workers by dropping (they'll check shutdown flag)
-        // Note: We can't join handles here because they may be stuck in sleep,
-        // but the shutdown flag will cause them to exit on next iteration.
+        // Join all worker thread handles to ensure clean shutdown
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 

@@ -782,10 +782,20 @@ impl TypeckCtx {
                 // In Jules' C-style semantics, this is acceptable — the
                 // function may still be correct if all control flow paths
                 // produce a value before reaching this implicit return.
-                // We skip emitting a hard error here because the IR pipeline
+                // We emit a warning (not a hard error) because the IR pipeline
                 // should not block valid programs with exhaustive if-else chains.
                 // The actual runtime behavior is that the function returns
                 // a zero/default value for the type if this path is reached.
+                if ret_ty != IrType::Unit {
+                    self.emit_warning(
+                        span,
+                        IrTypeDiagKind::ReturnTypeMismatch,
+                        format!(
+                            "implicit return with no value in function with return type {}",
+                            ret_ty
+                        ),
+                    );
+                }
             }
         }
     }

@@ -337,13 +337,18 @@ impl SerialPort {
             // Step 4: Disable DLAB, set 8-N-1
             outb(port + REG_LCR, LCR_8BITS | LCR_NO_PARITY | LCR_ONE_STOP);
 
-            // Step 5: Enable FIFO, clear both, 14-byte trigger
-            outb(port + REG_FCR, FCR_ENABLE | FCR_CLEAR_RX | FCR_CLEAR_TX | FCR_TRIGGER_14);
+            // Step 5: Enable FIFO, clear both, 14-byte trigger, DMA mode
+            outb(port + REG_FCR, FCR_ENABLE | FCR_CLEAR_RX | FCR_CLEAR_TX | FCR_TRIGGER_14 | FCR_DMA_MODE);
 
-            // Step 6: Set MCR (DTR + RTS + OUT2 for IRQ gate)
-            outb(port + REG_MCR, MCR_DTR | MCR_RTS | MCR_OUT2);
+            // Step 6: Set MCR (DTR + RTS + OUT1 + OUT2)
+            // OUT1 is used as an interrupt gate on some systems,
+            // OUT2 enables IRQ on PC-compatible UARTs.
+            outb(port + REG_MCR, MCR_DTR | MCR_RTS | MCR_OUT1 | MCR_OUT2);
 
-            // Step 7: Verify by writing/reading scratch register
+            // Step 7: Enable interrupts for RX, TX empty, line status, and modem status
+            outb(port + REG_IER, IER_RX_ENABLE | IER_TX_ENABLE | IER_RX_LINE_STATUS | IER_MODEM_STATUS);
+
+            // Step 8: Verify by writing/reading scratch register
             outb(port + REG_SCR, 0xAE);
             let readback = inb(port + REG_SCR);
             if readback != 0xAE {
@@ -351,6 +356,9 @@ impl SerialPort {
                 // or the port doesn't exist.  Continue anyway; the driver
                 // will work but without FIFO benefits.
             }
+
+            // Step 9: Read modem status register to clear any pending status
+            let _msr = inb(port + REG_MSR);
         }
 
         self.initialized.store(true, Ordering::Release);

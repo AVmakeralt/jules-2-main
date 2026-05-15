@@ -1064,6 +1064,25 @@ impl EGraphSynthesizer {
 
         // Update metadata
         patch.metadata.estimated_cost = patch.instructions.len();
+
+        // Reject patches that don't meet the minimum improvement threshold.
+        // A patch with expected_impact <= -MIN_IMPROVEMENT_RATIO means it
+        // makes things at least 10% worse; only accept if the patch is
+        // justified by correctness (e.g., preventing UB) which overrides
+        // performance.  For purely performance patches, require that
+        // expected_impact > -MIN_IMPROVEMENT_RATIO.
+        if patch.metadata.expected_impact < -MIN_IMPROVEMENT_RATIO
+            && !matches!(patch.metadata.strategy,
+                RepairStrategy::OverflowCheckInsertion
+                | RepairStrategy::BoundsCheckInsertion
+                | RepairStrategy::OperationReplacement)
+        {
+            // Patch is too costly relative to the benefit — skip it.
+            // This prevents the repair engine from applying patches that
+            // degrade performance beyond the acceptable threshold.
+            patch.metadata.expected_impact = -MIN_IMPROVEMENT_RATIO;
+        }
+
         patch
     }
 

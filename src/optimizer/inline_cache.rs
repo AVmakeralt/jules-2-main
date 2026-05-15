@@ -166,6 +166,10 @@ impl CodeArena {
                 let end = (offset + code.len()).min(len);
                 let write_len = end - offset;
                 unsafe {
+                    // Switch page to writable (RW) before writing if it was
+                    // set to read+execute (RX) by a prior lockdown call.
+                    // This is necessary for incremental code patching.
+                    Self::ensure_writable(ptr, len);
                     std::ptr::copy_nonoverlapping(
                         code.as_ptr(),
                         ptr.add(offset),
@@ -192,6 +196,40 @@ impl CodeArena {
             let write_len = end - page_offset;
             page[page_offset..page_offset + write_len].copy_from_slice(&code[..write_len]);
         }
+    }
+
+    /// Lock down a code page to read+execute only (no write).
+    ///
+    /// After JIT code has been written and is ready to execute, calling
+    /// this switches the page from RWX to RX, hardening against runtime
+    /// code-injection attacks.  Subsequent `write_code` calls will
+    /// temporarily re-enable write access via `ensure_writable`.
+    #[cfg(unix)]
+    pub fn lockdown_page(&self, address: usize) {
+        for &(ptr, len) in &self.pages {
+            let base = ptr as usize;
+            if address >= base && address < base + len {
+                unsafe {
+                    mprotect(ptr as *mut c_void, len, IC_PROT_READ | IC_PROT_EXEC);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Ensure a page is writable (RWX) so code can be written to it.
+    /// This is called before writing code to a page that may have been
+    /// locked down to RX by `lockdown_page`.
+    #[cfg(unix)]
+    fn ensure_writable(ptr: *mut u8, len: usize) {
+        unsafe {
+            mprotect(ptr as *mut c_void, len, IC_PROT_READ | IC_PROT_WRITE | IC_PROT_EXEC);
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn lockdown_page(&self, _address: usize) {
+        // No-op on non-Unix: simulated pages are always writable
     }
 }
 
@@ -734,6 +772,9 @@ impl CallSite {
         }
 
         arena.lock().unwrap().write_code(entry_addr, &code);
+        // Lock down the page to RX after writing — the code is now executable
+        // and shouldn't be modified until a cache miss triggers patching.
+        arena.lock().unwrap().lockdown_page(entry_addr);
         entry_addr
     }
 

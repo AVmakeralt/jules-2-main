@@ -171,6 +171,19 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             let ok = verify_aurora_flux();
             Some(Ok(Value::Bool(ok)))
         }
+        "aurora_flux::dither" => {
+            // Apply Bayer dithering to a color at pixel coordinates
+            let x = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            let y = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            let r = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let g = args.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let b = args.get(4).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let a = args.get(5).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let strength = args.get(6).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let color = [r, g, b, a];
+            let dithered = bayer_dither(x, y, color, strength);
+            Some(Ok(Value::Vec3([dithered[0], dithered[1], dithered[2]])))
+        }
         _ => None,
     }
 }

@@ -110,6 +110,10 @@ path = "src/tools/bench_mlp_1m.rs"
 name = "bench-jules-ml-chess"
 path = "src/tools/bench_jules_ml_chess.rs"
 
+[[bin]]
+name = "bench-optimizations"
+path = "src/tools/bench_optimizations.rs"
+
 [[example]]
 name = "dump-ir"
 path = "examples/dump_ir.rs"

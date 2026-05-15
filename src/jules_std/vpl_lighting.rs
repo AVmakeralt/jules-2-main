@@ -133,6 +133,50 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             let ok = verify_vpl_lighting();
             Some(Ok(Value::Bool(ok)))
         }
+        "vpl_lighting::vec3_reflect" => {
+            // Reflect incident vector around a normal
+            let ix = args.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let iy = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let iz = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let nx = args.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ny = args.get(4).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let nz = args.get(5).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let incident = Vec3::new(ix, iy, iz);
+            let normal = Vec3::new(nx, ny, nz).normalize();
+            let reflected = incident.reflect(&normal);
+            Some(Ok(Value::Vec3([reflected.x as f32, reflected.y as f32, reflected.z as f32])))
+        }
+        "vpl_lighting::vec3_lerp" => {
+            // Linear interpolation between two vectors
+            let ax = args.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ay = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let az = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let bx = args.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let by = args.get(4).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let bz = args.get(5).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let t = args.get(6).and_then(|v| v.as_f64()).unwrap_or(0.5);
+            let a = Vec3::new(ax, ay, az);
+            let b = Vec3::new(bx, by, bz);
+            let result = Vec3::lerp(&a, &b, t);
+            Some(Ok(Value::Vec3([result.x as f32, result.y as f32, result.z as f32])))
+        }
+        "vpl_lighting::vec3_cmul" => {
+            // Component-wise multiplication of two vectors
+            let ax = args.get(0).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let ay = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let az = args.get(2).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let bx = args.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let by = args.get(4).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let bz = args.get(5).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let a = Vec3::new(ax, ay, az);
+            let b = Vec3::new(bx, by, bz);
+            let result = a.cmul(&b);
+            Some(Ok(Value::Vec3([result.x as f32, result.y as f32, result.z as f32])))
+        }
+        "vpl_lighting::mie_beta" => {
+            // Return the Mie scattering coefficient
+            Some(Ok(Value::F32(MIE_BETA)))
+        }
         _ => None,
     }
 }

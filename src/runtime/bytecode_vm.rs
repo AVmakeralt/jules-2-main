@@ -322,8 +322,6 @@ impl InlineCache {
 pub struct MemoryPool {
     /// Bump allocator for fast allocation during execution
     bump: Bump,
-    /// Pre-allocated value cache for common values
-    value_cache: [Option<Value>; 256],
     /// Slot array (pre-allocated to avoid reallocation)
     slots: Vec<Value>,
     /// Highest slot index written in the current frame (for partial reset)
@@ -334,7 +332,6 @@ impl MemoryPool {
     pub fn with_capacity(slots: usize) -> Self {
         Self {
             bump: Bump::with_capacity(4096),
-            value_cache: std::array::from_fn(|_| None),
             slots: (0..slots).map(|_| Value::Unit).collect(),
             max_slot_used: 0,
         }
@@ -392,8 +389,12 @@ impl AdaptiveProfiler {
             instruction_counters: (0..num_instructions)
                 .map(|_| AtomicU64::new(0))
                 .collect(),
-            function_counters: Vec::new(),
-            backedge_counters: Vec::new(),
+            function_counters: (0..256)  // Pre-allocate for up to 256 functions
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            backedge_counters: (0..num_instructions)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             hot_loops: Vec::new(),
         }
     }
@@ -403,6 +404,40 @@ impl AdaptiveProfiler {
         if pc < self.instruction_counters.len() {
             self.instruction_counters[pc].fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Record a function call for adaptive profiling.
+    /// Called on each Call instruction to track per-function execution frequency.
+    #[inline(always)]
+    pub fn record_function_call(&self, func_idx: usize) {
+        if func_idx < self.function_counters.len() {
+            self.function_counters[func_idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a backward jump (backedge) for loop detection.
+    /// Called when a Jump with negative offset is executed.
+    #[inline(always)]
+    pub fn record_backedge(&self, pc: usize) {
+        if pc < self.backedge_counters.len() {
+            self.backedge_counters[pc].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Check if a function is hot enough for tier promotion based on
+    /// its function counter and backedge profile.
+    pub fn should_promote_function(&self, func_idx: usize) -> bool {
+        let func_count = if func_idx < self.function_counters.len() {
+            self.function_counters[func_idx].load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        let total_backedges: u64 = self.backedge_counters.iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum();
+        // Promote if the function has been called many times AND has
+        // significant backedge activity (loops).
+        func_count > 1_000 && total_backedges > 10_000
     }
     
     /// Check if this location is "hot" (executed > 10000 times)
@@ -882,6 +917,7 @@ impl BytecodeCompiler {
     /// Emit a `JumpFalse` with a placeholder offset. Returns the instruction
     /// position so the offset can be patched later once the target is known.
     fn emit_jump_false(&mut self, cond: u16) -> usize {
+        let _label = self.new_label(); // Reserve a label ID for this branch target
         let pos = self.current_function.instructions.len();
         self.current_function.instructions.push(Instr::JumpFalse { cond, offset: 0 });
         pos
@@ -890,6 +926,7 @@ impl BytecodeCompiler {
     /// Emit a `JumpTrue` with a placeholder offset. Returns the instruction
     /// position so the offset can be patched later.
     fn emit_jump_true(&mut self, cond: u16) -> usize {
+        let _label = self.new_label(); // Reserve a label ID for this branch target
         let pos = self.current_function.instructions.len();
         self.current_function.instructions.push(Instr::JumpTrue { cond, offset: 0 });
         pos
@@ -898,6 +935,7 @@ impl BytecodeCompiler {
     /// Emit an unconditional `Jump` with a placeholder offset. Returns the
     /// instruction position so the offset can be patched later.
     fn emit_jump(&mut self) -> usize {
+        let _label = self.new_label(); // Reserve a label ID for this jump target
         let pos = self.current_function.instructions.len();
         self.current_function.instructions.push(Instr::Jump { offset: 0 });
         pos
@@ -947,6 +985,7 @@ impl BytecodeCompiler {
 
     /// Emit a backward `Jump` to the given `target` position.
     fn emit_backward_jump(&mut self, target: usize) {
+        let _label = self.new_label(); // Reserve a label ID for this loop backedge
         let current = self.current_function.instructions.len();
         let offset = (target as i32) - (current as i32);
         self.current_function.instructions.push(Instr::Jump { offset });
@@ -1764,6 +1803,12 @@ pub struct BytecodeVM {
     /// the OSR engine swaps execution to the safe interpreter path
     /// instead of panicking.
     osr_engine: OsrEngine,
+
+    /// Pre-allocated value cache for fast-path constant value lookups.
+    /// Maps slot indices to their last known constant value, allowing
+    /// LoadConstInt/LoadConstFloat to skip redundant cloning when the
+    /// cached value matches the instruction's immediate.
+    value_cache: [Option<Value>; 256],
 }
 
 impl BytecodeVM {
@@ -1785,6 +1830,7 @@ impl BytecodeVM {
             data_dependent_jit: DataDependentJIT::new(),
             global_arithmetic_mode: None,
             osr_engine: OsrEngine::new(true),
+            value_cache: std::array::from_fn(|_| None),
         }
     }
 
@@ -1803,6 +1849,20 @@ impl BytecodeVM {
         let idx = self.native_functions.len() as u32;
         self.native_functions.push(f);
         idx
+    }
+    
+    /// Compute a binary arithmetic operation on two values using the
+    /// instance method helpers. This is the external API for arithmetic
+    /// computation, used by the REPL and debugger for evaluating expressions
+    /// outside the bytecode dispatch loop.
+    pub fn compute_binary_op(&self, op: &str, l: &Value, r: &Value) -> Result<Value, RuntimeError> {
+        match op {
+            "+" => self.add_values(l, r),
+            "-" => self.sub_values(l, r),
+            "*" => self.mul_values(l, r),
+            "/" => self.div_values(l, r),
+            _ => Err(RuntimeError::new(format!("unknown binary op: {op}"))),
+        }
     }
     
     /// Load compiled functions into VM
@@ -1828,6 +1888,29 @@ impl BytecodeVM {
         let needed = (max_profile_id as usize).saturating_add(1);
         if self.profile_points.len() < needed {
             self.profile_points.resize_with(needed, || AtomicU64::new(0));
+        }
+
+        // Build the global constant pool by merging all function-local
+        // constants. This enables shared constant access across function
+        // boundaries via LoadConst instructions.
+        self.constants.clear();
+        for f in &functions {
+            for c in &f.constants {
+                // Deduplicate: only add constants not already in the global pool.
+                // Use shallow comparison for common scalar types.
+                let already_exists = self.constants.iter().any(|existing| {
+                    match (existing, c) {
+                        (Value::I64(a), Value::I64(b)) => a == b,
+                        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
+                        (Value::Bool(a), Value::Bool(b)) => a == b,
+                        (Value::Str(a), Value::Str(b)) => a == b,
+                        _ => false,
+                    }
+                });
+                if !already_exists {
+                    self.constants.push(c.clone());
+                }
+            }
         }
 
         self.functions = functions;
@@ -1976,7 +2059,9 @@ impl BytecodeVM {
         let vm_ptr: *mut BytecodeVM = self;
 
         let instructions = &func.instructions;
-        let constants = &func.constants;
+        // Use the global constant pool if available (populated by load_functions),
+        // otherwise fall back to the function-local constant pool.
+        let constants = if !self.constants.is_empty() { &self.constants } else { &func.constants };
         let slots = &mut self.memory_pool.slots;
         let mut pc: usize = 0;
         #[cfg(feature = "gnn-optimizer")]
@@ -2073,11 +2158,34 @@ impl BytecodeVM {
                     pc += 1;
                 }
                 Instr::LoadConstInt { dst, value } => {
-                    slots[*dst as usize] = Value::I64(*value);
+                    // Fast path: check the value cache first
+                    let d = *dst as usize;
+                    if let Some(Some(Value::I64(v))) = self.value_cache.get(*dst as usize) {
+                        if *v == *value {
+                            slots[d] = Value::I64(*value);
+                            pc += 1;
+                            continue;
+                        }
+                    }
+                    slots[d] = Value::I64(*value);
+                    if (*dst as usize) < self.value_cache.len() {
+                        self.value_cache[*dst as usize] = Some(Value::I64(*value));
+                    }
                     pc += 1;
                 }
                 Instr::LoadConstFloat { dst, value } => {
-                    slots[*dst as usize] = Value::F64(*value);
+                    let d = *dst as usize;
+                    if let Some(Some(Value::F64(v))) = self.value_cache.get(*dst as usize) {
+                        if (*v - *value).abs() < f64::EPSILON {
+                            slots[d] = Value::F64(*value);
+                            pc += 1;
+                            continue;
+                        }
+                    }
+                    slots[d] = Value::F64(*value);
+                    if (*dst as usize) < self.value_cache.len() {
+                        self.value_cache[*dst as usize] = Some(Value::F64(*value));
+                    }
                     pc += 1;
                 }
                 Instr::LoadConstBool { dst, value } => {
@@ -2103,6 +2211,10 @@ impl BytecodeVM {
                         // (e.g. Move temp=slot2 followed by Add slot2=a+slot2).
                         // Clone is safe and correct for all Value variants.
                         slots[d] = slots[s].clone();
+                    }
+                    // Invalidate cache for the destination slot since it may have changed
+                    if (*dst as usize) < self.value_cache.len() {
+                        self.value_cache[*dst as usize] = None;
                     }
                     pc += 1;
                 }
@@ -2291,6 +2403,11 @@ impl BytecodeVM {
                             jit_key,
                             loop_len as i64,
                         );
+
+                        // Record backedge for adaptive profiling
+                        if let Some(ref profiler) = self.profiler {
+                            profiler.record_backedge(pc);
+                        }
 
                         // Tier 2 Fix: Feed the backedge to the entropy watchdog.
                         // The watchdog checks if the state is mutating (making progress)
@@ -2782,6 +2899,11 @@ impl BytecodeVM {
                             let callee_idx = self.function_index.get(&fn_name).copied();
                             match callee_idx {
                                 Some(idx) => {
+                                    // Record function call for adaptive profiling
+                                    if let Some(ref profiler) = self.profiler {
+                                        profiler.record_function_call(idx);
+                                    }
+
                                     // Push call frame (return to next instruction)
                                     self.call_stack.push(CallFrame {
                                         return_pc: pc + 1,

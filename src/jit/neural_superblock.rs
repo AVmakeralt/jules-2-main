@@ -431,8 +431,10 @@ impl MicroArchGNN {
         }
     }
 
-    /// Forward pass with proper weight matrices and CSR adjacency
-    pub fn predict_ipc(&self, graph: &BlockGraph, arch: &MicroArchModel) -> f32 {
+    /// Forward pass with proper weight matrices and CSR adjacency.
+    /// Uses pre-allocated scratch buffers (hidden_buffer, message_buffer, output_buffer)
+    /// to avoid per-prediction heap allocations.
+    pub fn predict_ipc(&mut self, graph: &BlockGraph, arch: &MicroArchModel) -> f32 {
         let node_feats = graph.node_features();
         if node_feats.is_empty() { return 0.0; }
 
@@ -461,35 +463,39 @@ impl MicroArchGNN {
                 let neighbors = csr.neighbors(i);
                 let h_i = &hidden[i * hd..(i + 1) * hd];
                 let self_contrib = self.mat_vec_flat(&self.w_self, h_i, hd);
-                // FIX A: Reuse pre-allocated message_buffer
-                let mut msg = vec![0.0f32; hd];
+                // FIX A: Reuse pre-allocated message_buffer instead of allocating
+                // a new Vec each iteration. Clear it first, then fill with messages.
+                self.message_buffer.iter_mut().for_each(|v| *v = 0.0);
                 if !neighbors.is_empty() {
                     for &j in neighbors {
                         let h_j = &hidden[j * hd..(j + 1) * hd];
                         let w_msg_h = self.mat_vec_flat(&self.w_msg, h_j, hd);
-                        for k in 0..hd { msg[k] += w_msg_h[k]; }
+                        for k in 0..hd { self.message_buffer[k] += w_msg_h[k]; }
                     }
                     let n = neighbors.len() as f32;
-                    for k in 0..hd { msg[k] /= n; }
+                    for k in 0..hd { self.message_buffer[k] /= n; }
                 }
 
                 let out = &mut new_hidden[i * hd..(i + 1) * hd];
                 for k in 0..hd {
-                    out[k] = (self_contrib[k] + msg[k]).max(0.0);
+                    out[k] = (self_contrib[k] + self.message_buffer[k]).max(0.0);
                 }
             }
 
             hidden = new_hidden;
         }
 
-        // FIX A: Flat-vector pooling
-        let mean_pool: Vec<f32> = (0..hd).map(|j| {
+        // FIX A: Flat-vector pooling — use hidden_buffer and output_buffer
+        // as scratch space instead of allocating new vectors.
+        self.hidden_buffer.clear();
+        self.hidden_buffer.extend((0..hd).map(|j| {
             (0..n_nodes).map(|i| hidden[i * hd + j]).sum::<f32>() / n_nodes as f32
-        }).collect();
-        let max_pool: Vec<f32> = (0..hd).map(|j| {
+        }));
+        self.output_buffer.clear();
+        self.output_buffer.extend((0..hd).map(|j| {
             (0..n_nodes).map(|i| hidden[i * hd + j]).fold(f32::NEG_INFINITY, f32::max)
-        }).collect();
-        let pooled: Vec<f32> = mean_pool.iter().chain(max_pool.iter()).cloned().collect();
+        }));
+        let pooled: Vec<f32> = self.hidden_buffer.iter().chain(self.output_buffer.iter()).cloned().collect();
 
         // Layer 1: hidden_dim*2 → hidden_dim/4
         let readout_dim = self.hidden_dim / 4;
@@ -618,24 +624,23 @@ impl MicroArchGNN {
 
             let h_final = &all_hidden[n_rounds];
 
-            // Pooling: mean || max
+            // Pooling: mean || max — use mean_pool and max_pool methods
+            // to compute graph-level readout features from node hidden states.
             let n_nodes_f = n_nodes as f32;
-            let mean_pool: Vec<f32> = (0..self.hidden_dim).map(|j| {
-                h_final.iter().map(|h| h[j]).sum::<f32>() / n_nodes_f
-            }).collect();
+            let mean_pool_result = self.mean_pool(h_final);
 
-            let mut max_pool = vec![f32::NEG_INFINITY; self.hidden_dim];
+            let max_pool_result = self.max_pool(h_final);
+            // Also compute max_indices for gradient backpropagation
             let mut max_indices = vec![0usize; self.hidden_dim];
             for (i, h) in h_final.iter().enumerate() {
                 for j in 0..self.hidden_dim {
-                    if h[j] > max_pool[j] {
-                        max_pool[j] = h[j];
+                    if h[j] > max_pool_result[j] {
                         max_indices[j] = i;
                     }
                 }
             }
 
-            let pooled: Vec<f32> = mean_pool.iter().chain(max_pool.iter()).cloned().collect();
+            let pooled: Vec<f32> = mean_pool_result.iter().chain(max_pool_result.iter()).cloned().collect();
 
             // Readout layer 1: hidden_dim*2 → readout_dim
             let mut h1_pre = vec![0.0f32; readout_dim];
@@ -905,7 +910,7 @@ impl NeuralSuperblockPredictor {
     }
 
     /// Analyze a basic block and make superblock decisions
-    pub fn analyze_block(&self, graph: &BlockGraph) -> SuperblockDecision {
+    pub fn analyze_block(&mut self, graph: &BlockGraph) -> SuperblockDecision {
         let predicted_ipc = self.gnn.predict_ipc(graph, &self.arch);
         let reg_pressure = self.gnn.predict_register_pressure(graph);
         let cache_pred = self.gnn.predict_cache_behavior(graph, &self.arch);
@@ -983,7 +988,7 @@ impl NeuralTracingJIT {
     }
 
     /// Check if a trace should be compiled
-    pub fn should_compile(&self, graph: &BlockGraph) -> bool {
+    pub fn should_compile(&mut self, graph: &BlockGraph) -> bool {
         let decision = self.predictor.analyze_block(graph);
         decision.should_trace && decision.confidence > 0.5
     }
@@ -1066,7 +1071,7 @@ mod tests {
 
     #[test]
     fn test_gnn_ipc_prediction() {
-        let gnn = MicroArchGNN::new(16, 32);
+        let mut gnn = MicroArchGNN::new(16, 32);
         let arch = MicroArchModel::default();
 
         let mut graph = BlockGraph::new();

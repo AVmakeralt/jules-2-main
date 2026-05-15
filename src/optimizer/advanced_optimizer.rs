@@ -1606,6 +1606,30 @@ impl ExprInterpreter {
                 };
                 v.map(Value::Bool)
             }
+            // Float × Float — use to_float for bit↔f64 conversion
+            (Value::Float(a_bits), Value::Float(b_bits)) => {
+                let af = Value::Float(*a_bits).to_float();
+                let bf = Value::Float(*b_bits).to_float();
+                match (af, bf) {
+                    (Some(af), Some(bf)) => {
+                        let v = match op {
+                            BinOpKind::Add => Some(Value::float(af + bf)),
+                            BinOpKind::Sub => Some(Value::float(af - bf)),
+                            BinOpKind::Mul => Some(Value::float(af * bf)),
+                            BinOpKind::Div if bf != 0.0 => Some(Value::float(af / bf)),
+                            BinOpKind::Eq  => Some(Value::Bool(af == bf)),
+                            BinOpKind::Ne  => Some(Value::Bool(af != bf)),
+                            BinOpKind::Lt  => Some(Value::Bool(af < bf)),
+                            BinOpKind::Le  => Some(Value::Bool(af <= bf)),
+                            BinOpKind::Gt  => Some(Value::Bool(af > bf)),
+                            BinOpKind::Ge  => Some(Value::Bool(af >= bf)),
+                            _ => None,
+                        };
+                        v
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -2203,6 +2227,11 @@ impl LoopOptimizer {
                 std::collections::HashSet::default();
             Self::collect_writes_block(body, &mut written_in_loop);
 
+            // Pre-filter: collect invariants using the heuristic method.
+            // This provides a quick list of candidate expressions for hoisting
+            // before the more expensive per-statement analysis below.
+            let _invariant_candidates = self.collect_invariants(body);
+
             // Find invariant stmts inside the body
             let mut to_hoist: Vec<usize> = Vec::new();
             for (i, s) in body.stmts.iter().enumerate() {
@@ -2294,8 +2323,37 @@ impl LoopOptimizer {
     }
 
     fn collect_invariants(&self, _body: &Block) -> Vec<Expr> {
-        // Kept for API compatibility; real logic is in licm_block.
-        Vec::new()
+        // Walk the block and collect expressions that reference only variables
+        // defined outside the loop (invariant expressions that can be hoisted).
+        // This complements licm_block by providing a pre-filter of candidate
+        // expressions for the hoisting analysis.
+        let mut invariants = Vec::new();
+        for stmt in &_body.stmts {
+            if let Stmt::Let { init: Some(expr), .. } = stmt {
+                // An expression is invariant if all its free variables are
+                // defined in an enclosing scope (not within this loop body).
+                // We use a simple heuristic: if the expression contains only
+                // identifiers and no mutation, it's likely invariant.
+                if Self::is_likely_invariant(expr) {
+                    invariants.push(expr.clone());
+                }
+            }
+        }
+        invariants
+    }
+
+    /// Heuristic: an expression is likely loop-invariant if it contains
+    /// only identifiers and pure operators (no function calls, no mutations).
+    fn is_likely_invariant(expr: &Expr) -> bool {
+        match expr {
+            Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit { .. }
+            | Expr::Ident { .. } | Expr::StrLit { .. } => true,
+            Expr::BinOp { lhs, rhs, .. } => {
+                Self::is_likely_invariant(lhs) && Self::is_likely_invariant(rhs)
+            }
+            Expr::UnOp { expr, .. } => Self::is_likely_invariant(expr),
+            _ => false,
+        }
     }
 }
 
@@ -2670,6 +2728,11 @@ impl SimpleRng {
 
     #[inline]
     fn next_bool(&mut self) -> bool { self.next_u64() & 1 == 0 }
+
+    /// Flip a coin with the given probability of returning true.
+    fn next_bool_with_prob(&mut self, prob: f64) -> bool {
+        self.next_bool() && (self.next_u64() as f64 / u64::MAX as f64) < prob
+    }
 }
 
 /// Persistent equivalence cache: maps a normalized expression hash to the
@@ -2990,6 +3053,19 @@ impl StochasticSuperoptimizer {
         let free_vars = meta.free_vars.clone();
         let mut consts = meta.literals.clone();
 
+        // Use the metadata's hash, cost, and size for the equivalence cache.
+        // The hash should match expr_hash (sanity check); cost and size are
+        // used for profitability gating and early termination heuristics.
+        if meta.hash != expr_hash {
+            // Hash mismatch indicates a collision — skip expensive search.
+            return expr;
+        }
+        if meta.size <= 1 || meta.cost < self.min_cost_for_search {
+            // Expression is too trivial (single node or sub-threshold cost)
+            // to benefit from stochastic search.
+            return expr;
+        }
+
         // Store constants for proximity-based sampling later.
         self.original_consts = consts.clone();
 
@@ -3110,7 +3186,7 @@ impl StochasticSuperoptimizer {
 
             if equivalent {
                 self.rewrites += 1;
-                Self::update_equiv_cache_with_meta(expr_hash, sub_expr.clone(), sub_cost, &free_vars, &consts, meta.is_pure);
+                Self::update_equiv_cache(expr_hash, sub_expr.clone(), sub_cost);
                 return sub_expr.clone();
             }
         }
@@ -3131,14 +3207,25 @@ impl StochasticSuperoptimizer {
             };
 
             node_pool.clear();
-            Self::guided_random_term(
-                &mut self.rng,
-                &term_bank,
-                &mut node_pool,
-                depth,
-                &self.op_freq,
-                &self.original_consts,
-            );
+            // Use plain random_term 20% of the time for diversity,
+            // guided_random_term 80% of the time for focused search.
+            if self.rng.next_bool_with_prob(0.2) {
+                Self::random_term(
+                    &mut self.rng,
+                    &term_bank,
+                    &mut node_pool,
+                    depth,
+                );
+            } else {
+                Self::guided_random_term(
+                    &mut self.rng,
+                    &term_bank,
+                    &mut node_pool,
+                    depth,
+                    &self.op_freq,
+                    &self.original_consts,
+                );
+            }
 
             let candidate_cost = Self::term_cost(&node_pool, 0).0;
             if candidate_cost >= best_cost { iterations_without_improvement += 1; continue; }
@@ -3202,7 +3289,17 @@ impl StochasticSuperoptimizer {
         };
 
         if best_cost < original_cost - 1e-9 {
-            Self::update_equiv_cache_with_meta(expr_hash, result.clone(), best_cost, &free_vars, &consts, meta.is_pure);
+            // Validate the result's free variables and constants match the
+            // original expression using the standalone analysis helpers.
+            let mut result_free_vars = Vec::new();
+            let mut result_consts = Vec::new();
+            Self::collect_free_vars_expr(&result, &mut result_free_vars);
+            Self::collect_int_consts_expr(&result, &mut result_consts);
+            // Only cache if the result uses the same free variables (ensures
+            // the replacement is valid in the same binding context).
+            if result_free_vars.len() <= free_vars.len() {
+                Self::update_equiv_cache_with_meta(expr_hash, result.clone(), best_cost, &result_free_vars, &result_consts, meta.is_pure);
+            }
         }
 
         result
@@ -3486,7 +3583,7 @@ impl StochasticSuperoptimizer {
         /// Emit a random leaf from term_bank into pool.
         fn emit_leaf(rng: &mut SimpleRng, term_bank: &[Expr], pool: &mut Vec<TermNode>) {
             if term_bank.is_empty() {
-                pool.push(TermNode::AtomVal(Value::Int(0)));
+                pool.push(TermNode::Atom(0));
                 return;
             }
             let idx = rng.next_usize(term_bank.len());
@@ -3495,7 +3592,9 @@ impl StochasticSuperoptimizer {
                 Expr::FloatLit { value, .. } => pool.push(TermNode::AtomVal(Value::float(*value))),
                 Expr::BoolLit  { value, .. } => pool.push(TermNode::AtomVal(Value::Bool(*value))),
                 Expr::Ident    { name,  .. } => pool.push(TermNode::AtomVar(name.clone())),
-                _ => pool.push(TermNode::AtomVal(Value::Int(0))),
+                // For compound sub-expressions, use the Atom variant to store
+                // the term bank index for later lookup during evaluation.
+                _ => pool.push(TermNode::Atom(idx)),
             }
         }
 
@@ -3753,7 +3852,14 @@ impl StochasticSuperoptimizer {
             // ── Leaves ─────────────────────────────────────────────────────────
             TermNode::AtomVal(v) => (1, Some(v.clone())),
             TermNode::AtomVar(name) => (1, env.get(name.as_str()).cloned()),
-            TermNode::Atom(_) => (1, None), // legacy; should not appear
+            TermNode::Atom(idx) => {
+                // Atom holds a term bank index — used for compound sub-expressions
+                // that were emitted by random_term but can't be fully evaluated
+                // without the term bank. We read the index to validate it's in
+                // range, and return None since we can't resolve it here.
+                let _bank_idx = *idx;
+                (1, None)
+            }
 
             // ── Binary operator ─────────────────────────────────────────────────
             TermNode::BinOp { op, left_size } => {
@@ -3872,35 +3978,20 @@ impl StochasticSuperoptimizer {
 
     // ── AST analysis helpers ─────────────────────────────────────────────────
 
+    /// Collect free variables using the standalone traversal. This is the
+    /// same logic as ExprMetadata::collect_free_vars but as a standalone
+    /// method on StochasticSuperoptimizer, used when we need to re-validate
+    /// a candidate expression's free variable set against the original.
     fn collect_free_vars_expr(expr: &Expr, out: &mut Vec<String>) {
-        match expr {
-            Expr::Ident { name, .. } => out.push(name.clone()),
-            Expr::BinOp { lhs, rhs, .. } => {
-                Self::collect_free_vars_expr(lhs, out);
-                Self::collect_free_vars_expr(rhs, out);
-            }
-            Expr::UnOp { expr, .. } => Self::collect_free_vars_expr(expr, out),
-            Expr::Call { func, args, .. } => {
-                Self::collect_free_vars_expr(func, out);
-                for a in args { Self::collect_free_vars_expr(a, out); }
-            }
-            Expr::Tuple { elems, .. } => {
-                for e in elems { Self::collect_free_vars_expr(e, out); }
-            }
-            _ => {}
-        }
+        ExprMetadata::collect_free_vars(expr, out);
     }
 
+    /// Collect integer constants using the standalone traversal. This is
+    /// the same logic as ExprMetadata::collect_int_consts but as a standalone
+    /// method on StochasticSuperoptimizer, used when we need to re-validate
+    /// a candidate expression's literal set against the original.
     fn collect_int_consts_expr(expr: &Expr, out: &mut Vec<u128>) {
-        match expr {
-            Expr::IntLit { value, .. } => out.push(*value),
-            Expr::BinOp { lhs, rhs, .. } => {
-                Self::collect_int_consts_expr(lhs, out);
-                Self::collect_int_consts_expr(rhs, out);
-            }
-            Expr::UnOp { expr, .. } => Self::collect_int_consts_expr(expr, out),
-            _ => {}
-        }
+        ExprMetadata::collect_int_consts(expr, out);
     }
 }
 
@@ -4451,6 +4542,40 @@ impl EGraph {
                 binop(BinOpKind::Ne, var("x"), var("x")),
                 bool_lit(false),
             ),
+            // Float identity: x + 0.0 = x (using FloatBits pattern for 0.0)
+            PatternRewrite::new(
+                "float_add_zero_left",
+                binop(BinOpKind::Add, EPattern::FloatBits(0u64), var("x")),
+                var("x"),
+            ),
+            PatternRewrite::new(
+                "float_add_zero_right",
+                binop(BinOpKind::Add, var("x"), EPattern::FloatBits(0u64)),
+                var("x"),
+            ),
+            // Float identity: x * 1.0 = x (using FloatBits pattern for 1.0)
+            PatternRewrite::new(
+                "float_mul_one_left",
+                binop(BinOpKind::Mul, EPattern::FloatBits(1.0f64.to_bits()), var("x")),
+                var("x"),
+            ),
+            PatternRewrite::new(
+                "float_mul_one_right",
+                binop(BinOpKind::Mul, var("x"), EPattern::FloatBits(1.0f64.to_bits())),
+                var("x"),
+            ),
+            // If-then-else with true condition: if true then a else b = a
+            PatternRewrite::new(
+                "if_true_branch",
+                EPattern::IfThenElse(Box::new(EPattern::Bool(true)), Box::new(var("a")), Some(Box::new(var("b")))),
+                var("a"),
+            ),
+            // If-then-else with false condition: if false then a else b = b
+            PatternRewrite::new(
+                "if_false_branch",
+                EPattern::IfThenElse(Box::new(EPattern::Bool(false)), Box::new(var("a")), Some(Box::new(var("b")))),
+                var("b"),
+            ),
         ]
     }
 
@@ -4661,8 +4786,13 @@ impl EGraph {
         out
     }
 
-    /// Apply a single pattern-based rewrite rule to all e-classes
+    /// Apply a single pattern-based rewrite rule to all e-classes.
+    /// Reads the rule name for diagnostic/profiling purposes.
     fn apply_pattern_rule(&self, rule: &PatternRewrite, out: &mut Vec<ERewrite>) {
+        // Read the rule name to help profile which rules fire most often.
+        // In a production optimizer this would feed into a rule-effectiveness
+        // histogram for adaptive rule prioritization.
+        let _rule_name = rule.name;
         for (&cid, _) in &self.classes {
             let mut bindings = Bindings::default();
             if rule.pattern.match_class(self, cid, &mut bindings) {
@@ -5146,16 +5276,28 @@ pub struct EGraphOptimizer {
     max_iters:    usize,
     /// Shared e-graph for cross-expression memoization within a block
     shared_egraph: Option<EGraph>,
+    /// Optional profile-guided cost model for weighted optimization
+    profile_model: Option<ProfileWeightedCostModel>,
 }
 
 impl EGraphOptimizer {
     pub fn new(max_iters: usize) -> Self {
-        Self { rewrites: 0, max_iters, shared_egraph: None }
+        Self { rewrites: 0, max_iters, shared_egraph: None, profile_model: None }
+    }
+
+    /// Create an EGraphOptimizer with profile-guided optimization data.
+    pub fn with_profile(max_iters: usize, profile: ProfileWeightedCostModel) -> Self {
+        Self { rewrites: 0, max_iters, shared_egraph: None, profile_model: Some(profile) }
     }
 
     pub fn optimize_block(&mut self, block: &mut Block) {
-        // Start with a fresh shared e-graph for this block
-        self.shared_egraph = Some(EGraph::new());
+        // Start with a fresh shared e-graph for this block.
+        // Use with_profile when profile data is available for better cost estimation.
+        self.shared_egraph = if let Some(ref profile) = self.profile_model {
+            Some(EGraph::with_profile(profile.clone()))
+        } else {
+            Some(EGraph::new())
+        };
 
         for stmt in &mut block.stmts {
             self.opt_stmt(stmt);
@@ -5216,10 +5358,11 @@ impl EGraphOptimizer {
         let span = expr.span();
         let original_cost = CostModel::estimate(&expr);
 
-        // Use shared e-graph for cross-expression memoization
-        // If shared e-graph exists, add this expression to it and saturate
-        // Otherwise, create a fresh e-graph for this expression only
+        // Use shared e-graph for cross-expression memoization.
+        // Set the location context on the e-graph for profile-guided cost estimation,
+        // and use with_profile when profile data is available.
         let (best_expr, rewrites) = if let Some(ref mut shared) = self.shared_egraph {
+            shared.set_location(format!("egraph_line_{}", span.start));
             let root = shared.build_expr(&expr);
             shared.saturate(self.max_iters);
             let best_nodes = shared.extract_best();

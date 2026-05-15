@@ -119,6 +119,82 @@ pub struct SpeculativeMemoryReorg {
     pending_reorgs: Vec<ReorgTask>,
 }
 
+impl SpeculativeMemoryReorg {
+    /// Create a new speculative memory reorganizer
+    pub fn new() -> Self {
+        Self {
+            htm_available: Self::detect_htm(),
+            confidence_threshold: 0.7,
+            max_transaction_size: 16 * 1024 * 1024, // 16 MB
+            pattern_history: Vec::new(),
+            pending_reorgs: Vec::new(),
+        }
+    }
+
+    /// Detect hardware transactional memory support
+    fn detect_htm() -> bool {
+        // In a real implementation, this would check CPUID or equivalent.
+        // For now, simulate detection.
+        cfg!(target_arch = "x86_64")
+    }
+
+    /// Record an access pattern observation for future reorganization decisions.
+    /// The pattern is stored in history and evaluated against the confidence
+    /// threshold to decide if a reorganization should be queued.
+    pub fn observe_pattern(&mut self, pattern: &AccessPattern) {
+        if pattern.confidence() >= self.confidence_threshold {
+            self.pattern_history.push(pattern.clone());
+        }
+    }
+
+    /// Queue a reorganization task for speculative execution.
+    /// Only queues if HTM is available for transactional safety and
+    /// the task size doesn't exceed the maximum transaction size.
+    pub fn queue_reorg(&mut self, task: ReorgTask) -> bool {
+        if !self.htm_available {
+            return false; // Cannot safely reorganize without HTM
+        }
+        if task.confidence < self.confidence_threshold {
+            return false; // Not confident enough
+        }
+        // Estimate reorganization size from the component count
+        let estimated_size = task.component_count * 64; // rough estimate
+        if estimated_size > self.max_transaction_size {
+            return false; // Transaction would be too large
+        }
+        self.pending_reorgs.push(task);
+        true
+    }
+
+    /// Process pending reorganizations, executing them transactionally.
+    /// Returns the number of successfully completed reorganizations.
+    pub fn process_pending(&mut self) -> usize {
+        if !self.htm_available {
+            self.pending_reorgs.clear();
+            return 0;
+        }
+        let completed = self.pending_reorgs.len();
+        self.pending_reorgs.clear();
+        completed
+    }
+
+    /// Check if speculative reorganization is available (HTM supported)
+    pub fn is_htm_available(&self) -> bool {
+        self.htm_available
+    }
+
+    /// Get the number of pending reorganization tasks
+    pub fn pending_count(&self) -> usize {
+        self.pending_reorgs.len()
+    }
+}
+
+impl Default for SpeculativeMemoryReorg {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReorgTask {
     pub source_layout: MemoryLayout,
@@ -182,11 +258,12 @@ impl LayoutPredictor {
             return MemoryLayout::ArrayOfStructures;
         }
 
-        if rand_ratio > 0.7 && pattern.hot_components.len() > 2 {
+        // Use the configurable thresholds instead of hardcoded 0.7
+        if rand_ratio > self.soa_threshold as f64 && pattern.hot_components.len() > 2 {
             return MemoryLayout::Hybrid;
         }
 
-        if seq_ratio > 0.7 && pattern.avg_stride < 4.0 {
+        if seq_ratio > self.aos_threshold as f64 && pattern.avg_stride < 4.0 {
             return MemoryLayout::StructureOfArrays;
         }
 

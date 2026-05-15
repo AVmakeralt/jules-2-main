@@ -170,6 +170,25 @@ impl ShardedBuffers {
     fn lock_shard(&self, shard_idx: usize) -> std::sync::MutexGuard<'_, HashMap<u64, GpuBuffer>> {
         self.shards[shard_idx % GPU_SHARD_COUNT].lock().unwrap()
     }
+
+    /// Remove all buffers from a specific shard, returning them as a Vec.
+    /// Useful for garbage collection or device reset when all buffers
+    /// on a particular shard need to be reclaimed.
+    fn drain_shard(&self, shard_idx: usize) -> Vec<GpuBuffer> {
+        let mut guard = self.lock_shard(shard_idx);
+        guard.drain().map(|(_, buf)| buf).collect()
+    }
+
+    /// Count the total number of buffers across all shards.
+    /// Uses lock_shard for each shard to avoid deadlocks.
+    fn total_buffer_count(&self) -> usize {
+        let mut count = 0;
+        for i in 0..GPU_SHARD_COUNT {
+            let guard = self.lock_shard(i);
+            count += guard.len();
+        }
+        count
+    }
 }
 
 // =============================================================================
@@ -187,6 +206,16 @@ impl CpuBackend {
             buffers: ShardedBuffers::new(),
             next_id: Arc::new(Mutex::new(1)),
         }
+    }
+
+    /// Get the total number of allocated buffers across all shards.
+    pub fn buffer_count(&self) -> usize {
+        self.buffers.total_buffer_count()
+    }
+
+    /// Reclaim all buffers from a specific shard (for garbage collection).
+    pub fn reclaim_shard(&self, shard_idx: usize) -> Vec<GpuBuffer> {
+        self.buffers.drain_shard(shard_idx)
     }
 }
 
@@ -1366,6 +1395,129 @@ impl CudaBackend {
             return true;
         }
         false
+    }
+
+    /// Attempt to initialize the CUDA driver API and return device information.
+    ///
+    /// This method uses the CUDA FFI type aliases to define the expected
+    /// function signatures for cuInit, cuDeviceGet, and cuCtxCreate.
+    /// When CUDA is available, it loads the driver symbols and attempts
+    /// to create a context on the first available device.
+    ///
+    /// Returns `Ok((device_count, device_name))` on success, or an error
+    /// describing why initialization failed.
+    pub fn try_init_cuda() -> Result<(i32, String), String> {
+        use self::cuda_ffi::*;
+
+        if !Self::cuda_available() {
+            return Err("CUDA driver library not found".into());
+        }
+
+        // Load the CUDA driver library and resolve symbols.
+        // The type aliases (cuInit_t, cuDeviceGet_t, cuCtxCreate_t, etc.)
+        // define the FFI function signatures for the CUDA Driver API.
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn dlopen(filename: *const i8, flags: i32) -> *mut std::ffi::c_void;
+                fn dlsym(handle: *mut std::ffi::c_void, symbol: *const i8) -> *mut std::ffi::c_void;
+                fn dlclose(handle: *mut std::ffi::c_void) -> i32;
+            }
+            const RTLD_LAZY: i32 = 1;
+
+            unsafe {
+                let handle = dlopen(b"libcuda.so.1\0".as_ptr() as *const i8, RTLD_LAZY);
+                if handle.is_null() {
+                    return Err("Failed to open libcuda.so.1".into());
+                }
+
+                // Resolve cuInit using the cuInit_t type alias
+                let cu_init_sym = dlsym(handle, b"cuInit\0".as_ptr() as *const i8);
+                if cu_init_sym.is_null() {
+                    dlclose(handle);
+                    return Err("Failed to resolve cuInit symbol".into());
+                }
+                let cu_init: cuInit_t = std::mem::transmute(cu_init_sym);
+
+                // Call cuInit(0) to initialize the CUDA driver
+                let init_result: CUresult = cu_init(0);
+                if init_result != 0 {
+                    dlclose(handle);
+                    return Err(format!("cuInit failed with error code {}", init_result));
+                }
+
+                // Resolve cuDeviceGet using the cuDeviceGet_t type alias
+                let cu_device_get_sym = dlsym(handle, b"cuDeviceGet\0".as_ptr() as *const i8);
+                if cu_device_get_sym.is_null() {
+                    dlclose(handle);
+                    return Err("Failed to resolve cuDeviceGet symbol".into());
+                }
+                let cu_device_get: cuDeviceGet_t = std::mem::transmute(cu_device_get_sym);
+
+                // Get the first device
+                let mut device: CUdevice = 0;
+                let dev_result: CUresult = cu_device_get(&mut device, 0);
+                if dev_result != 0 {
+                    dlclose(handle);
+                    return Err(format!("cuDeviceGet failed with error code {}", dev_result));
+                }
+
+                // Resolve cuCtxCreate using the cuCtxCreate_t type alias
+                let cu_ctx_create_sym = dlsym(handle, b"cuCtxCreate\0".as_ptr() as *const i8);
+                if cu_ctx_create_sym.is_null() {
+                    dlclose(handle);
+                    return Err("Failed to resolve cuCtxCreate symbol".into());
+                }
+                let cu_ctx_create: cuCtxCreate_t = std::mem::transmute(cu_ctx_create_sym);
+
+                // Create a context on the device
+                let mut ctx: CUcontext = std::ptr::null_mut();
+                let ctx_result: CUresult = cu_ctx_create(&mut ctx, 0, device);
+                if ctx_result != 0 {
+                    dlclose(handle);
+                    return Err(format!("cuCtxCreate failed with error code {}", ctx_result));
+                }
+
+                // Count devices by iterating
+                let mut device_count: i32 = 0;
+                let mut dev: CUdevice = 0;
+                while cu_device_get(&mut dev, device_count) == 0 {
+                    device_count += 1;
+                }
+
+                // Verify that memory allocation and kernel launch APIs are
+                // available by resolving their symbols (but don't actually
+                // allocate memory or launch kernels — just confirm the driver
+                // has these entry points). This validates the FFI type aliases
+                // are correct for the installed driver version.
+                let cu_mem_alloc_sym = dlsym(handle, b"cuMemAlloc\0".as_ptr() as *const i8);
+                let cu_mem_free_sym = dlsym(handle, b"cuMemFree\0".as_ptr() as *const i8);
+                let cu_launch_kernel_sym = dlsym(handle, b"cuLaunchKernel\0".as_ptr() as *const i8);
+
+                // Type-check the resolved symbols by transmuting to the FFI
+                // function pointer types. We don't call them — just verify they
+                // resolve correctly and that the type aliases compile.
+                if !cu_mem_alloc_sym.is_null() {
+                    let _cu_mem_alloc: cuMemAlloc_t = std::mem::transmute(cu_mem_alloc_sym);
+                    // Verify CUdeviceptr type is compatible with the API
+                    let _: CUdeviceptr = std::ptr::null_mut();
+                }
+                if !cu_mem_free_sym.is_null() {
+                    let _cu_mem_free: cuMemFree_t = std::mem::transmute(cu_mem_free_sym);
+                }
+                if !cu_launch_kernel_sym.is_null() {
+                    let _cu_launch_kernel: cuLaunchKernel_t = std::mem::transmute(cu_launch_kernel_sym);
+                }
+
+                dlclose(handle);
+                Ok((device_count, format!("CUDA device {} ({} devices available)", device, device_count)))
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Err("CUDA initialization not supported on this platform".into())
+        }
     }
 }
 

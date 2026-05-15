@@ -2766,6 +2766,84 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
         }
 
+        // ── Fusion: BinOp(cmp, Lt/Le/Gt/Ge, a, b) + BinOp(d, Mul, cmp, val)
+        //    → branchless conditional select using CMOV/min/max.
+        //
+        //    Pattern: d = (a cmp b) * val = if a cmp b { val } else { 0 }
+        //    When val == a or val == b, this computes min(a,b) or max(a,b).
+        //    Uses emit_branchless_min/max for the min/max patterns, and
+        //    emit_cmovcc_rr for the general conditional select.
+        if pc + 1 < instrs.len() {
+            if let (Instr::BinOp(cmp, op_cmp, a, b), Instr::BinOp(d, BinOpKind::Mul, l, r)) =
+                (&instrs[pc], &instrs[pc + 1])
+            {
+                let is_cmp = matches!(op_cmp, BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge);
+                if is_cmp {
+                    let val_slot = if *l == *cmp { Some(*r) } else if *r == *cmp { Some(*l) } else { None };
+                    if let Some(val) = val_slot {
+                        // Determine the CMOV condition code and min/max patterns
+                        let (cmov_cc, is_min_pattern, is_max_pattern) = match op_cmp {
+                            BinOpKind::Lt => (0x4Cu8, val == *a, val == *b), // CMOVL
+                            BinOpKind::Le => (0x4Eu8, val == *a, val == *b), // CMOVLE
+                            BinOpKind::Gt => (0x4Fu8, val == *b, val == *a), // CMOVG
+                            BinOpKind::Ge => (0x4Du8, val == *b, val == *a), // CMOVGE
+                            _ => (0x4C, false, false),
+                        };
+
+                        if is_min_pattern {
+                            // (a < b) * a = if a < b { a } else { 0 } → min(a, b) when a,b ≥ 0
+                            load_rax(&mut em, *a, &ra);
+                            load_rcx(&mut em, *b, &ra);
+                            let rax_reg = match ra.location(*a) { RegLoc::Reg(r) => r, _ => 0 };
+                            let rcx_reg = match ra.location(*b) { RegLoc::Reg(r) => r, _ => 1 };
+                            em.emit_branchless_min(rax_reg, rcx_reg);
+                        } else if is_max_pattern {
+                            // (a < b) * b = if a < b { b } else { 0 } → max(a, b) when a,b ≥ 0
+                            load_rax(&mut em, *a, &ra);
+                            load_rcx(&mut em, *b, &ra);
+                            let rax_reg = match ra.location(*a) { RegLoc::Reg(r) => r, _ => 0 };
+                            let rcx_reg = match ra.location(*b) { RegLoc::Reg(r) => r, _ => 1 };
+                            em.emit_branchless_max(rax_reg, rcx_reg);
+                        } else {
+                            // General conditional select: d = (a cmp b) ? val : 0
+                            // Use CMOV: compare a,b → load val → conditionally zero it.
+                            // Strategy: load val into rax, compare a and b, then CMOVcc
+                            // to zero rax when the condition is NOT met.
+                            // Use inverse CC: if NOT (a cmp b), zero rax.
+                            let inv_cc = match cmov_cc {
+                                0x4C => 0x4Du8, // CMOVL → CMOVGE
+                                0x4D => 0x4C,   // CMOVGE → CMOVL
+                                0x4E => 0x4F,   // CMOVLE → CMOVG
+                                0x4F => 0x4E,   // CMOVG → CMOVLE
+                                other => other,
+                            };
+                            // Compare a and b using cmp_rax_rcx after loading them
+                            // into rax and rcx via the stack. The push/pop sequence
+                            // preserves val in rax while we compare.
+                            em.push_reg(0);                 // save rax (val) on stack
+                            load_rax(&mut em, *a, &ra);    // rax = a
+                            load_rcx(&mut em, *b, &ra);    // rcx = b
+                            em.cmp_rax_rcx();               // CMP rax, rcx — compare a, b (sets flags)
+                            em.pop_reg(0);                  // restore rax = val (doesn't affect flags!)
+                            // Now flags are set from comparing a and b.
+                            // rax still holds val. Use PUSH imm8 0 + POP to get zero
+                            // in rcx without affecting flags.
+                            em.b(0x6A); em.b(0x00);         // PUSH imm8 0
+                            em.pop_reg(1);                  // rcx = 0 (doesn't affect flags!)
+                            em.emit_cmovcc_rr(inv_cc, 0, 1); // CMOVcc rax, rcx — if NOT cond, rax = 0
+                        }
+                        if !is_straight_line_dead_def(instrs, pc, *d) {
+                            store_rax(&mut em, *d, &ra);
+                        }
+                        const_at.remove(*d);
+                        pc_to_off[pc + 1] = em.pos();
+                        pc += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+
         // ════════════════════════════════════════════════════════════════════
         // CONSTANT FOLDING (single BinOp with both operands known)
         // ════════════════════════════════════════════════════════════════════

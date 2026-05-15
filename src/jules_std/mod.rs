@@ -134,6 +134,8 @@ pub fn modules_value() -> Value {
     );
 
     let geom_fns = vec![
+        "vec2",
+        "vec2_x",
         "ray",
         "ray_at",
         "aabb",
@@ -187,6 +189,10 @@ pub fn modules_value() -> Value {
         "pcg32_next",
         "pcg32_next_f32",
         "pcg32_range",
+        "splitmix64",
+        "splitmix64_next",
+        "splitmix64_next_u32",
+        "splitmix64_next_f64",
     ];
     out.insert(
         "random".into(),
@@ -271,13 +277,17 @@ pub fn modules_value() -> Value {
         "arrive",
         "pursue",
         "evade",
+        "wander",
+        "avoid",
         "boid_separation",
         "boid_cohesion",
         "boid_alignment",
         "boid_update",
         "utility_score",
+        "utility_pick",
         "bt_sequence",
         "bt_selector",
+        "bt_evaluate",
     ];
     out.insert(
         "ai".into(),
@@ -301,6 +311,7 @@ pub fn modules_value() -> Value {
         "udp_recv",
         "url_encode",
         "url_decode",
+        "serialize",
         "parse_url",
     ];
     out.insert(
@@ -316,18 +327,35 @@ pub fn modules_value() -> Value {
     let alloc_fns = vec![
         "arena_new",
         "arena_alloc",
+        "arena_alloc_zero",
         "arena_reset",
         "arena_used",
+        "arena_capacity",
+        "arena_free",
+        "arena_write_u8",
+        "arena_write_u16",
+        "arena_write_u32",
+        "arena_write_u64",
         "arena_write_f32",
+        "arena_write_f64",
+        "arena_read_u8",
+        "arena_read_u32",
         "arena_read_f32",
+        "arena_read_f64",
         "pool_new",
         "pool_alloc",
         "pool_free",
         "pool_used",
+        "pool_block_size",
+        "pool_capacity",
+        "pool_write",
+        "pool_read",
         "slab_new",
         "slab_insert",
         "slab_remove",
         "slab_len",
+        "slab_get",
+        "slab_capacity",
     ];
     out.insert(
         "alloc".into(),
@@ -344,21 +372,30 @@ pub fn modules_value() -> Value {
         "mpsc_push",
         "mpsc_try_pop",
         "mpsc_is_empty",
+        "mpsc_clear",
         "ring_new",
         "ring_push",
         "ring_pop",
         "ring_len",
+        "ring_peek",
+        "ring_capacity",
+        "ring_is_empty",
+        "ring_is_full",
         "pq_new",
         "pq_push",
         "pq_pop",
         "pq_len",
+        "pq_peek",
+        "pq_is_empty",
         "sorted_set_new",
         "sorted_set_insert",
         "sorted_set_remove",
         "sorted_set_contains",
         "sorted_set_len",
+        "sorted_set_is_empty",
         "sorted_set_to_array",
         "par_map",
+        "par_filter",
         "par_reduce",
     ];
     out.insert(
@@ -496,6 +533,10 @@ pub fn modules_value() -> Value {
         "shadow",
         "ao",
         "god_rays",
+        "vec3_reflect",
+        "vec3_lerp",
+        "vec3_cmul",
+        "mie_beta",
         "verify",
     ];
     out.insert(
@@ -561,6 +602,7 @@ pub fn modules_value() -> Value {
         "verify",
         "benchmark",
         "director_info",
+        "fiber_pool_info",
     ];
     out.insert(
         "aurora_threading".into(),

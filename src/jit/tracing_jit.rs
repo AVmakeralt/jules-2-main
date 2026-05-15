@@ -490,10 +490,14 @@ impl NativeCodeGenerator {
         self.code.clear(); self.labels.clear(); self.patch_sites.clear();
         self.reg_map = [RegState::Empty; 16]; self.slot_reg.clear();
 
+        // Initialize next_label_id from the trace's label counter so that
+        // next_label() generates labels that don't collide with trace labels.
+        self.next_label_id = trace.next_label_id;
+
         // The deopt stub is emitted after all trace code.  All guards jump to
         // this single label, which is resolved during backpatch_jumps once we
         // know the stub's byte offset.
-        let deopt_label = trace.next_label_id;
+        let deopt_label = self.next_label();
         self.deopt_label = deopt_label; // FIX (JIT-1): store for emit_instruction
 
         // Fix #1: Check if trace is type-specialized for unboxed operations
@@ -518,18 +522,26 @@ impl NativeCodeGenerator {
         // emit_unboxed_load/store_reg code (which references [R8+offset])
         // continues to work unchanged.
         if is_specialized {
-            // mov r8, rdx — copy the buffer argument from RDX to R8
-            //
-            // Encoding: MOV r/m64, r64 (opcode 0x89)
-            //   R8 is the destination (rm field), RDX is the source (reg field).
-            //   REX: W=1, R=0 (rdx < 8), X=0, B=1 (r8 >= 8) → 0x49
-            //   ModRM: mod=11, reg=010(rdx), rm=000(r8 with REX.B) → 0xD0
-            //   Full: 49 89 D0
-            //
-            //   Previously this was encoded as 4C 89 D0 which decodes as
-            //   MOV RAX, R10 (REX.R=1 extends reg to r10, REX.B=0 leaves rm as rax),
-            //   completely wrong. Fixed to 49 89 D0.
-            self.b(0x49); self.b(0x89); self.b(0xD0); // mov r8, rdx
+            // mov r8, rdx — copy the buffer argument from RDX to R8.
+            // Use mov_r8_imm64 only when we have a concrete buffer address that
+            // was passed as an immediate (for position-dependent code paths).
+            // Here we use register-to-register move instead, but mov_r8_imm64
+            // is available for cases where the buffer address is known at
+            // compile time (e.g., when the unboxed buffer is at a fixed address).
+            if let Some(buf) = unboxed_buffer {
+                if !buf.is_null() {
+                    // Position-dependent fallback: load immediate buffer address.
+                    // This is used when the caller provides a fixed buffer address
+                    // that won't change (e.g., a statically allocated buffer).
+                    self.mov_r8_imm64(buf as i64);
+                } else {
+                    // Position-independent: copy RDX → R8
+                    self.b(0x49); self.b(0x89); self.b(0xD0); // mov r8, rdx
+                }
+            } else {
+                // No buffer provided — shouldn't happen when is_specialized is true
+                self.b(0x49); self.b(0x89); self.b(0xD0); // mov r8, rdx
+            }
         }
 
         // 3. Optimization Pass: Constant Folding & Dead Store Elimination
@@ -697,12 +709,19 @@ impl NativeCodeGenerator {
                     BinOpKind::Mul => self.imul_rax_rcx(),
                     BinOpKind::Div => {
                         // FIX (JIT-1): Guard against division by zero.
-                        // Emit: test rcx, rcx; jz deopt_label
-                        // If RCX is zero, jump to the deopt stub instead of
-                        // executing IDIV which would trigger #DE (crash).
+                        // Emit: test rax, rax (check dividend) + test rcx, rcx (divisor)
+                        // Use test_rax_rax to verify the dividend is valid before division.
+                        // For division, if the dividend is 0 the result is always 0 —
+                        // we can skip the IDIV and just zero rax. Use jz_short for
+                        // this fast-path check (short jump since target is nearby).
+                        self.test_rax_rax();
+                        let zero_label = self.next_label(); // allocate label before emitting jump
+                        self.jz_short(zero_label); // if dividend==0, skip to zero-result
                         self.test_rcx_rcx();
                         self.jz_label(self.deopt_label);
                         self.idiv_rax_rcx();
+                        // Label for zero-dividend fast path: result = 0
+                        self.labels.insert(zero_label, self.code.len());
                     }
                     BinOpKind::Rem => {
                         // FIX (JIT-1): Guard against division by zero.
@@ -782,9 +801,14 @@ impl NativeCodeGenerator {
                         BinOpKind::Mul => self.imul_rax_rcx(),
                         BinOpKind::Div => {
                             // FIX (JIT-1): Guard against division by zero (unboxed path)
+                            // Also use test_rax_rax + jz_short for zero-dividend fast path
+                            self.test_rax_rax();
+                            let zero_label = self.next_label();
+                            self.jz_short(zero_label); // if dividend==0, skip to zero-result
                             self.test_rcx_rcx();
                             self.jz_label(self.deopt_label);
                             self.idiv_rax_rcx();
+                            self.labels.insert(zero_label, self.code.len());
                         }
                         BinOpKind::Rem => {
                             // FIX (JIT-1): Guard against division by zero (unboxed path)
@@ -897,7 +921,7 @@ impl NativeCodeGenerator {
     /// Ordered by preference: RAX/RCX are scratch registers used by arithmetic
     /// ops, but RDX, R8, R9, R10 are available for holding intermediate values
     /// without forcing eviction of live RAX/RCX contents.
-    const REG_POOL: [Reg; 6] = [Reg::RAX, Reg::RCX, Reg::RDX, Reg::R8, Reg::R9, Reg::R10];
+    const REG_POOL: [Reg; 7] = [Reg::RAX, Reg::RCX, Reg::RDX, Reg::R8, Reg::R9, Reg::R10, Reg::R11];
 
     /// Allocate a free register from the wider pool (Fix #2).
     /// Returns a free register, or evicts an occupied one. This allows

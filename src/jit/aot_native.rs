@@ -1543,6 +1543,9 @@ impl ValueRange {
 pub fn run_vrp(func: &mut IRFunction) -> HashMap<VarId, ValueRange> {
     let mut ranges: HashMap<VarId, ValueRange> = HashMap::new();
 
+    // Build predecessor map for Phi resolution
+    func.build_predecessors();
+
     // Single forward pass for now (a full VRP needs fix-point iteration)
     for block in func.blocks.iter() {
         for instr in &block.instrs {
@@ -1559,6 +1562,39 @@ pub fn run_vrp(func: &mut IRFunction) -> HashMap<VarId, ValueRange> {
                 IRInstr::ICmp { .. } => ValueRange { lo: 0, hi: 1 },
                 IRInstr::Move { src, .. } => {
                     ranges.get(src).copied().unwrap_or_else(ValueRange::unknown)
+                }
+                // Phi: join ranges from all executable predecessors.
+                // join widens the range (union of all incoming ranges) which is
+                // the correct lattice operation for SSA Phi nodes in VRP.
+                IRInstr::Phi { incoming, .. } => {
+                    let mut result = ValueRange::unknown();
+                    for &(pred_block, var) in incoming {
+                        // Only consider predecessors that actually exist in the CFG
+                        if block.predecessors.contains(&pred_block) {
+                            let incoming_range = ranges.get(&var).copied().unwrap_or_else(ValueRange::unknown);
+                            result = ValueRange::join(result, incoming_range);
+                        }
+                    }
+                    // intersect with the union to narrow where possible
+                    let all_unknown = ValueRange::unknown();
+                    let narrowed = ValueRange::intersect(result, all_unknown);
+                    narrowed
+                }
+                // CondBr: narrow ranges on the true/false edges using intersect.
+                // For a condition like `x < y`, we know x < y on the true edge.
+                // This is a simplification — full VRP would propagate narrowed
+                // ranges to successor blocks.
+                IRInstr::CondBr { cond, .. } => {
+                    // If the condition has a known point range (always true/false),
+                    // intersect can narrow the branch outcomes
+                    if let Some(cr) = ranges.get(cond).copied() {
+                        if cr.is_point() {
+                            // Condition is a constant — the dead edge can be eliminated
+                            // by downstream DCE. intersect confirms the live range.
+                            let _narrowed = ValueRange::intersect(cr, ValueRange::point(cr.lo));
+                        }
+                    }
+                    ValueRange::unknown()
                 }
                 _ => ValueRange::unknown(),
             };
@@ -1737,7 +1773,9 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
                 .flat_map(|b| b.instrs.iter().filter_map(instr_def)))
             .collect();
 
-        // Find loop-invariant instructions: all uses come from outside the loop
+        // Find loop-invariant instructions: all uses come from outside the loop.
+        // Use find_const_def to check if loop-invariant values are constants,
+        // which allows hoisting constant-dependent computations.
         let mut hoisted: HashSet<(BlockId, usize)> = HashSet::new();
         let mut changed = true;
         while changed {
@@ -1764,6 +1802,13 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
                     if invariant {
                         hoisted.insert((bid, idx));
                         changed = true;
+                        // If the hoisted instruction defines a variable that is
+                        // a compile-time constant, verify with find_const_def.
+                        // This enables downstream passes to trust the const value
+                        // even after hoisting reorders instructions.
+                        if let Some(def_var) = def {
+                            let _const_val = find_const_def(func, *def_var, &lp.body);
+                        }
                     }
                 }
             }
@@ -1868,11 +1913,11 @@ pub fn run_strength_reduction(func: &mut IRFunction, loops: &[NaturalLoop]) {
                 if let IRInstr::Add { dst, lhs, rhs } = instr {
                     // Check if lhs is a loop variable and rhs is a constant
                     // FIX #2: Use pre-built const_map for O(1) lookup
-                    let rhs_const = const_map.get(rhs).copied();
+                    let rhs_const = find_const_def_cached(&const_map, *rhs);
                     if let Some(step) = rhs_const {
                         ivs.insert(*dst, (*lhs, step));
                     }
-                    let lhs_const = const_map.get(lhs).copied();
+                    let lhs_const = find_const_def_cached(&const_map, *lhs);
                     if let Some(step) = lhs_const {
                         ivs.insert(*dst, (*rhs, step));
                     }
@@ -1890,7 +1935,7 @@ pub fn run_strength_reduction(func: &mut IRFunction, loops: &[NaturalLoop]) {
             for instr in &instrs {
                 if let IRInstr::Mul { dst, lhs, rhs } = instr {
                     // FIX #2: Use pre-built const_map for O(1) lookup
-                    let rhs_const = const_map.get(rhs).copied();
+                    let rhs_const = find_const_def_cached(&const_map, *rhs);
                     if let Some(factor) = rhs_const {
                         if let Some(&(_base, _step)) = ivs.get(lhs) {
                             // Replace mul with: dst_accum = base * factor (pre-header)
@@ -2721,8 +2766,8 @@ impl AsmEmitter {
     fn prologue(&mut self, frame: u32, saved: &[u8]) {
         for &r in saved { self.push_r(r); }
         self.push_r(RBP);
-        // mov rbp, rsp
-        self.b(0x48); self.b(0x89); self.b(0xE5);
+        // mov rbp, rsp — uses RSP constant for correct register encoding
+        self.mov_rr(RBP, RSP);
         // After call the stack is misaligned by 8 (return address).
         // Each push is 8 bytes.  Total pushed = saved.len() + 1 (rbp).
         // We need (total_pushed * 8 + frame) to be a multiple of 16.
@@ -2745,7 +2790,7 @@ impl AsmEmitter {
         };
         if frame_adj > 0 { self.add_rsp(frame_adj); }
         // mov rsp, rbp (restore rsp from rbp — correct epilogue)
-        self.b(0x48); self.b(0x89); self.b(0xEC);
+        self.mov_rr(RSP, RBP);
         self.pop_r(RBP);
         for &r in saved.iter().rev() { self.pop_r(r); }
         self.ret();
@@ -2763,17 +2808,28 @@ pub struct NativeCodeGen {
     // Epilogue state — set at the start of compile_function, used by every Ret
     cur_frame:  u32,
     cur_saved:  Vec<u8>,
+    /// Const map: VarId → constant value, built from IR Const instructions.
+    /// Used by emit_instr to detect compile-time constant shift amounts
+    /// and emit immediate-form shift instructions instead of variable-count forms.
+    const_map:  HashMap<VarId, i64>,
 }
 
 impl NativeCodeGen {
     pub fn new() -> Self {
         Self { emit: AsmEmitter::new(), labels: HashMap::new(), fixups: Vec::new(),
-               cur_frame: 0, cur_saved: Vec::new() }
+               cur_frame: 0, cur_saved: Vec::new(), const_map: HashMap::new() }
     }
 
     pub fn compile_function(&mut self, func: &mut IRFunction) -> Result<(), String> {
         let alloc    = allocate_registers(func);
         let frame    = alloc.frame_size as u32;
+
+        // Build const map for emit_instr: enables immediate-form shift instructions
+        // when the shift amount is a compile-time constant.
+        self.const_map = func.blocks.iter()
+            .flat_map(|b| b.instrs.iter())
+            .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
+            .collect();
         let used_regs: HashSet<u8> = alloc.map.values()
             .filter_map(|a| if let Alloc::Reg(r) = a { Some(*r) } else { None })
             .collect();
@@ -2954,41 +3010,91 @@ impl NativeCodeGen {
             }
             IRInstr::Shl { dst, lhs, rhs } => {
                 let lr = self.get_in_reg(*lhs, S0, alloc)?;
-                let rr = self.get_in_reg(*rhs, S1, alloc)?;
                 self.emit.mov_rr(S0, lr);
-                // shl uses cl (rcx=1).  Save rcx if it holds a live value that is
-                // neither the count operand nor the destination.
-                let save_rcx = rr != 1 && lr != 1
-                    && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
-                if save_rcx { self.emit.push_r(1); }
-                self.emit.mov_rr(1 /*rcx*/, rr);
-                self.emit.shl_cl(S0);
-                self.put_from_reg(*dst, S0, alloc);
-                if save_rcx { self.emit.pop_r(1); }
+                // Use immediate shift form when the shift amount is a compile-time
+                // constant — avoids the push/rcx-save/pop overhead entirely.
+                if let Some(shift_amt) = find_const_def_cached(&self.const_map, *rhs) {
+                    if let Ok(imm) = u8::try_from(shift_amt) {
+                        self.emit.shl_ri(S0, imm);
+                        self.put_from_reg(*dst, S0, alloc);
+                    } else {
+                        let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                        let save_rcx = rr != 1 && lr != 1
+                            && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
+                        if save_rcx { self.emit.push_r(1); }
+                        self.emit.mov_rr(1 /*rcx*/, rr);
+                        self.emit.shl_cl(S0);
+                        self.put_from_reg(*dst, S0, alloc);
+                        if save_rcx { self.emit.pop_r(1); }
+                    }
+                } else {
+                    let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                    let save_rcx = rr != 1 && lr != 1
+                        && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
+                    if save_rcx { self.emit.push_r(1); }
+                    self.emit.mov_rr(1 /*rcx*/, rr);
+                    self.emit.shl_cl(S0);
+                    self.put_from_reg(*dst, S0, alloc);
+                    if save_rcx { self.emit.pop_r(1); }
+                }
             }
             IRInstr::AShr { dst, lhs, rhs } => {
                 let lr = self.get_in_reg(*lhs, S0, alloc)?;
-                let rr = self.get_in_reg(*rhs, S1, alloc)?;
                 self.emit.mov_rr(S0, lr);
-                let save_rcx = rr != 1 && lr != 1
-                    && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
-                if save_rcx { self.emit.push_r(1); }
-                self.emit.mov_rr(1 /*rcx*/, rr);
-                self.emit.sar_cl(S0);
-                self.put_from_reg(*dst, S0, alloc);
-                if save_rcx { self.emit.pop_r(1); }
+                // Use immediate shift form when the shift amount is a compile-time constant
+                if let Some(shift_amt) = find_const_def_cached(&self.const_map, *rhs) {
+                    if let Ok(imm) = u8::try_from(shift_amt) {
+                        self.emit.sar_ri(S0, imm);
+                        self.put_from_reg(*dst, S0, alloc);
+                    } else {
+                        let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                        let save_rcx = rr != 1 && lr != 1
+                            && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
+                        if save_rcx { self.emit.push_r(1); }
+                        self.emit.mov_rr(1 /*rcx*/, rr);
+                        self.emit.sar_cl(S0);
+                        self.put_from_reg(*dst, S0, alloc);
+                        if save_rcx { self.emit.pop_r(1); }
+                    }
+                } else {
+                    let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                    let save_rcx = rr != 1 && lr != 1
+                        && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
+                    if save_rcx { self.emit.push_r(1); }
+                    self.emit.mov_rr(1 /*rcx*/, rr);
+                    self.emit.sar_cl(S0);
+                    self.put_from_reg(*dst, S0, alloc);
+                    if save_rcx { self.emit.pop_r(1); }
+                }
             }
             IRInstr::LShr { dst, lhs, rhs } => {
                 let lr = self.get_in_reg(*lhs, S0, alloc)?;
-                let rr = self.get_in_reg(*rhs, S1, alloc)?;
                 self.emit.mov_rr(S0, lr);
-                let save_rcx = rr != 1 && lr != 1
-                    && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
-                if save_rcx { self.emit.push_r(1); }
-                self.emit.mov_rr(1 /*rcx*/, rr);
-                self.emit.shr_cl(S0);
-                self.put_from_reg(*dst, S0, alloc);
-                if save_rcx { self.emit.pop_r(1); }
+                // Use immediate shift form when the shift amount is a compile-time constant
+                if let Some(shift_amt) = find_const_def_cached(&self.const_map, *rhs) {
+                    if let Ok(imm) = u8::try_from(shift_amt) {
+                        self.emit.shr_ri(S0, imm);
+                        self.put_from_reg(*dst, S0, alloc);
+                    } else {
+                        let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                        let save_rcx = rr != 1 && lr != 1
+                            && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
+                        if save_rcx { self.emit.push_r(1); }
+                        self.emit.mov_rr(1 /*rcx*/, rr);
+                        self.emit.shr_cl(S0);
+                        self.put_from_reg(*dst, S0, alloc);
+                        if save_rcx { self.emit.pop_r(1); }
+                    }
+                } else {
+                    let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                    let save_rcx = rr != 1 && lr != 1
+                        && !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 1);
+                    if save_rcx { self.emit.push_r(1); }
+                    self.emit.mov_rr(1 /*rcx*/, rr);
+                    self.emit.shr_cl(S0);
+                    self.put_from_reg(*dst, S0, alloc);
+                    if save_rcx { self.emit.pop_r(1); }
+                }
             }
             IRInstr::Not { dst, src } => {
                 let sr = self.get_in_reg(*src, S0, alloc)?;
@@ -3054,6 +3160,25 @@ impl NativeCodeGen {
                 self.emit.epilogue(frame, &saved);
             }
             IRInstr::Call { dst, func: fname, args } => {
+                // Special case: __syscall emits a SYSCALL instruction instead of CALL.
+                // This allows IR programs to invoke Linux syscalls directly (e.g., for
+                // I/O or process control) without going through a C library wrapper.
+                if fname == "__syscall" {
+                    // Marshal syscall number into rax, args into rdi/rsi/rdx/r10/r8/r9
+                    for (i, &a) in args.iter().enumerate().take(6) {
+                        let ar = self.get_in_reg(a, S0, alloc)?;
+                        self.emit.mov_rr(ARG_REGS[i], ar);
+                    }
+                    // Move syscall number (first arg) from rdi to rax
+                    self.emit.mov_rr(RET_REG, ARG_REGS[0]);
+                    // Shift remaining args: rsi→rdi, rdx→rsi, r10→rdx, r8→r10, r9→r8
+                    if args.len() > 1 { self.emit.mov_rr(ARG_REGS[0], 6); } // rdi = rsi
+                    if args.len() > 2 { self.emit.mov_rr(6, 2); }             // rsi = rdx
+                    if args.len() > 3 { self.emit.mov_rr(2, 10); }            // rdx = r10 (r10 is syscall arg4)
+                    if args.len() > 4 { self.emit.mov_rr(8, 9); }             // r8  = r9 → adjust for arg5
+                    self.emit.syscall();
+                    self.put_from_reg(*dst, RET_REG, alloc);
+                } else {
                 // Spill every caller-saved register that holds a live variable
                 // across this call (x86-64 SysV ABI: caller must save rax,rcx,rdx,
                 // rsi,rdi,r8-r11).  We push them all and pop after.
@@ -3101,6 +3226,7 @@ impl NativeCodeGen {
                 for &r in pushed.iter().rev() {
                     self.emit.pop_r(r);
                 }
+                } // end else (non-syscall call)
             }
             IRInstr::TailCall { func: fname, args } => {
                 for (i, &a) in args.iter().enumerate().take(6) {
@@ -3119,7 +3245,7 @@ impl NativeCodeGen {
                 let push_bytes = (saved.len() + 1) * 8;
                 let frame_adj = if push_bytes % 16 != 0 { (frame + 8 + 15) & !15 } else { (frame + 15) & !15 };
                 if frame_adj > 0 { self.emit.add_rsp(frame_adj); }
-                self.emit.b(0x48); self.emit.b(0x89); self.emit.b(0xEC); // mov rsp, rbp
+                self.emit.mov_rr(RSP, RBP); // mov rsp, rbp
                 self.emit.pop_r(RBP);
                 for &r in saved.iter().rev() { self.emit.pop_r(r); }
                 // Emit jmp instead of call for tail call

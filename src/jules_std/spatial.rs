@@ -345,9 +345,11 @@ thread_local! {
     static BVHS: std::cell::RefCell<Vec<Bvh>> = std::cell::RefCell::new(Vec::new());
 }
 
-fn new_handle<T>(_tl: &impl Fn(&std::cell::RefCell<Vec<T>>) -> std::cell::RefCell<Vec<T>>, _value: T) -> u64 {
-    // We can't pass closures like this. Use direct access.
-    0
+/// Helper: push a value to a thread-local Vec and return the 1-based handle.
+fn new_handle<T>(registry: &std::cell::RefCell<Vec<T>>, value: T) -> u64 {
+    let mut v = registry.borrow_mut();
+    v.push(value);
+    v.len() as u64
 }
 
 pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError>> {
@@ -356,11 +358,9 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         "spatial::hash_new" => {
             let cs = f64_arg(args, 0).unwrap_or(1.0) as f32;
             SPATIAL_HASHES.with(|v| {
-                let mut v = v.borrow_mut();
-                v.push(SpatialHash::new(cs));
-                Value::U64(v.len() as u64)
-            });
-            Some(Ok(Value::U64(SPATIAL_HASHES.with(|v| v.borrow().len() as u64))))
+                let handle = new_handle(v, SpatialHash::new(cs));
+                Some(Ok(Value::U64(handle)))
+            })
         }
         "spatial::hash_insert" => {
             if args.len() < 5 { return Some(Err(rt_err!("hash_insert() requires handle, id, x, y, z"))); }

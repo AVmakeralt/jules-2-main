@@ -33,9 +33,22 @@ fn vec2_arg(args: &[Value], i: usize) -> Option<[f32; 2]> {
     }
 }
 
+/// Construct a Vec2 value from two floats.
 /// Dispatch a geometry:: builtin. Returns None if not a geometry builtin.
 pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError>> {
     let v = match name {
+        // ── Vec2 constructor ─────────────────────────────────────────────
+        "geom::vec2" => {
+            let x = f64_arg(args, 0).unwrap_or(0.0) as f32;
+            let y = f64_arg(args, 1).unwrap_or(0.0) as f32;
+            Some(Ok(Value::Vec2([x, y])))
+        }
+        // ── Vec2 helper: extract x component using vec2_arg ─────────────
+        "geom::vec2_x" => {
+            if let Some(v) = vec2_arg(args, 0) {
+                Some(Ok(Value::F32(v[0])))
+            } else { Some(Err(rt_err!("vec2_x() requires a Vec2"))) }
+        }
         // ── Ray ──────────────────────────────────────────────────────────
         "geom::ray" => {
             if args.len() < 6 {

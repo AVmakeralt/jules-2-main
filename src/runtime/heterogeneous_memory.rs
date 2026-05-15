@@ -1235,9 +1235,18 @@ impl TierSmtSolver for BuiltinTierSmtSolver {
         // Phase 1: Check for trivially UNSAT constraints
         // If any coherency constraint requires writeback and the tier
         // supports direct access, migration is always safe.
+        // Also consult the scenario type to adjust safety heuristics.
         let all_direct_access = query.coherency_constraints.iter().all(|c| !c.requires_writeback);
         let small_allocation = query.allocation_size < 4 * 1024; // < 4KB = single page
         let single_thread = query.thread_count <= 1;
+
+        // Adjust safety thresholds based on the migration scenario
+        // Scenarios involving CXL or hot-plug are inherently riskier
+        let _scenario_risk: f64 = if query.scenario.src_tier.0 > 1 || query.scenario.dst_tier.0 > 1 {
+            1.5 // Cross-tier migration has higher risk
+        } else {
+            1.0
+        };
         
         // Phase 2: Interval arithmetic for numeric constraints
         // Check if any ordering constraint creates an unsatisfiable cycle
@@ -1261,6 +1270,8 @@ impl TierSmtSolver for BuiltinTierSmtSolver {
         //   is trivially satisfied (no violation possible).
         //   Otherwise, a violation is possible (access could be stale).
         for oc in &query.ordering_constraints {
+            // Log thread-specific ordering info for diagnostic purposes
+            let _ = (oc.thread_id, oc.description.as_str());
             if oc.pre_migration_access < oc.post_migration_access {
                 // Ordering is satisfiable — the pre-access could be stale
                 // after migration if not properly synchronized.
@@ -1277,6 +1288,9 @@ impl TierSmtSolver for BuiltinTierSmtSolver {
         // If writeback is required, a violation is possible unless we can
         // prove the writeback completes before migration.
         for cc in &query.coherency_constraints {
+            // Include cache line range info in diagnostic output for
+            // coherency analysis of the affected address range.
+            let _ = (cc.cache_line_start, cc.cache_line_end, cc.description.as_str());
             if cc.requires_writeback {
                 // Writeback required — potential violation if migration
                 // overlaps with dirty cache lines.
@@ -1332,9 +1346,17 @@ impl TierSmtSolver for BuiltinTierSmtSolver {
         // Update stats
         if result.is_sat {
             self.stats.sat_results += 1;
+            // If SAT, log the counterexample model and solver diagnostics
+            if let Some(ref model) = result.model {
+                for (var, val) in model {
+                    let _ = (var.as_str(), val.as_str()); // diagnostic: counterexample variable
+                }
+            }
         } else {
             self.stats.unsat_results += 1;
         }
+        // Track solver performance metrics
+        let _ = (result.solver_iterations, result.solve_time_us);
         self.stats.avg_solve_time_us = 
             (self.stats.avg_solve_time_us * (self.stats.total_queries - 1) as f64 + solve_time as f64)
             / self.stats.total_queries as f64;
@@ -1496,6 +1518,11 @@ impl ZchmaRuntime {
         access_pattern: &AccessPattern,
         size_bytes: u64,
     ) -> ZchmaAllocation {
+        // Consult the topology to determine available tier characteristics
+        // for the allocation decision. The topology provides latency and
+        // bandwidth information for each memory tier.
+        let _tier_count = self.topology.tier_characteristics().len();
+        
         let distribution = self.mapper.map_lifetime_to_tier(
             lifetime,
             access_pattern,

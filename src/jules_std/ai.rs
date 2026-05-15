@@ -313,7 +313,13 @@ pub fn bt_evaluate(node: &BtNode, conditions: &std::collections::HashMap<&str, b
                 BtStatus::Failure
             }
         }
-        BtNode::Action { .. } => BtStatus::Success, // Actions always succeed immediately in this model
+        BtNode::Action { name } => {
+            // Actions are leaf nodes that always succeed in this simplified model.
+            // The action name is read here for potential logging/debugging — in a
+            // real behavior tree, this would trigger the actual action execution.
+            let _action_name = name.as_str();
+            BtStatus::Success
+        }
         BtNode::Inverter(child) => {
             match bt_evaluate(child, conditions) {
                 BtStatus::Success => BtStatus::Failure,
@@ -352,6 +358,54 @@ fn rand_f32() -> f32 {
 }
 
 // ─── Builtin dispatch ───────────────────────────────────────────────────────
+
+/// Parse a behavior tree from a flat Value array (recursive descent).
+/// Format: ["type", ...children_or_args...]
+/// Supported: "sequence", "selector", "parallel:required", "condition:name", "action:name", "inverter", "repeater:count"
+fn parse_bt_node(arr: &[Value], idx: &mut usize) -> BtNode {
+    let type_str = arr.get(*idx).and_then(|v| match v { Value::Str(s) => Some(s.as_str()), _ => None }).unwrap_or("action");
+    *idx += 1;
+    match type_str {
+        "sequence" => {
+            let child_count = arr.get(*idx).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            *idx += 1;
+            let children: Vec<BtNode> = (0..child_count).map(|_| parse_bt_node(arr, idx)).collect();
+            BtNode::Sequence(children)
+        }
+        "selector" => {
+            let child_count = arr.get(*idx).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            *idx += 1;
+            let children: Vec<BtNode> = (0..child_count).map(|_| parse_bt_node(arr, idx)).collect();
+            BtNode::Selector(children)
+        }
+        "parallel" => {
+            let required = arr.get(*idx).and_then(|v| v.as_i64()).unwrap_or(1) as usize;
+            *idx += 1;
+            let child_count = arr.get(*idx).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            *idx += 1;
+            let nodes: Vec<BtNode> = (0..child_count).map(|_| parse_bt_node(arr, idx)).collect();
+            BtNode::Parallel { nodes, required }
+        }
+        s if s.starts_with("condition:") => {
+            let name = s.strip_prefix("condition:").unwrap_or("true").to_string();
+            BtNode::Condition { name }
+        }
+        s if s.starts_with("action:") => {
+            let name = s.strip_prefix("action:").unwrap_or("idle").to_string();
+            BtNode::Action { name }
+        }
+        "inverter" => {
+            let child = parse_bt_node(arr, idx);
+            BtNode::Inverter(Box::new(child))
+        }
+        s if s.starts_with("repeater:") => {
+            let count = s.strip_prefix("repeater:").and_then(|n| n.parse::<usize>().ok()).unwrap_or(1);
+            let child = parse_bt_node(arr, idx);
+            BtNode::Repeater { node: Box::new(child), count }
+        }
+        _ => BtNode::Action { name: type_str.to_string() },
+    }
+}
 
 pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError>> {
     match name {
@@ -458,6 +512,31 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
             } else { Some(Err(rt_err!("boid_update() requires at least pos and vel"))) }
         }
 
+        // ── Wander & Avoid ──────────────────────────────────────────────
+        "ai::wander" => {
+            if args.len() < 6 { return Some(Err(rt_err!("ai::wander() requires pos, heading, wander_radius, wander_dist, wander_jitter, max_speed, max_force"))); }
+            if let (Some(px), Some(py), Some(hx), Some(hy), Some(wr), Some(wd), Some(wj), Some(ms), Some(mf)) =
+                (f64_arg(args,0), f64_arg(args,1), f64_arg(args,2), f64_arg(args,3), f64_arg(args,4), f64_arg(args,5), f64_arg(args,6), f64_arg(args,7), f64_arg(args,8)) {
+                let mut theta = f64_arg(args, 9).unwrap_or(0.0) as f32;
+                let s = steer_wander([px as f32, py as f32], [hx as f32, hy as f32], wr as f32, wd as f32, wj as f32, ms as f32, mf as f32, &mut theta);
+                Some(Ok(Value::Vec2(s)))
+            } else { Some(Err(rt_err!("ai::wander() requires 9-10 floats"))) }
+        }
+        "ai::avoid" => {
+            if args.len() < 4 { return Some(Err(rt_err!("ai::avoid() requires pos, vel, obstacles, avoidance_radius, max_force"))); }
+            if let (Some(px), Some(py), Some(vx), Some(vy), Some(ar), Some(mf)) =
+                (f64_arg(args,0), f64_arg(args,1), f64_arg(args,2), f64_arg(args,3), f64_arg(args,4), f64_arg(args,5)) {
+                // Parse obstacles from array argument: each obstacle is [x, y, r]
+                let obstacles: Vec<[f32; 3]> = if let Some(Value::Array(arr)) = args.get(6) {
+                    arr.try_borrow().ok().map(|a| a.iter().filter_map(|v| {
+                        if let Value::Vec3(v) = v { Some(*v) } else { None }
+                    }).map(|[x,y,r]| [x,y,r]).collect()).unwrap_or_default()
+                } else { vec![] };
+                let s = steer_avoid([px as f32, py as f32], [vx as f32, vy as f32], &obstacles, ar as f32, mf as f32);
+                Some(Ok(Value::Vec2(s)))
+            } else { Some(Err(rt_err!("ai::avoid() requires 6 floats + obstacles array"))) }
+        }
+
         // ── Utility AI ───────────────────────────────────────────────────
         "ai::utility_score" => {
             if args.len() < 3 { return Some(Err(rt_err!("utility_score() requires values[], weights[], curves[]"))); }
@@ -467,6 +546,16 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 let crv: Vec<u8> = ca.try_borrow().ok().map(|a| a.iter().filter_map(|v| v.as_i64().map(|x| x as u8)).collect()).unwrap_or_default();
                 Some(Ok(Value::F32(utility_ai_score(&vals, &wts, &crv))))
             } else { Some(Err(rt_err!("utility_score() requires 3 arrays"))) }
+        }
+
+        // ── Utility AI Pick ─────────────────────────────────────────────
+        "ai::utility_pick" => {
+            if args.len() < 1 { return Some(Err(rt_err!("utility_pick() requires scores[]"))); }
+            if let Value::Array(sa) = &args[0] {
+                let scores: Vec<f32> = sa.try_borrow().ok().map(|a| a.iter().filter_map(|v| v.as_f64().map(|x| x as f32)).collect()).unwrap_or_default();
+                let idx = utility_ai_pick(&scores);
+                Some(Ok(Value::I64(idx as i64)))
+            } else { Some(Err(rt_err!("utility_pick() requires scores array"))) }
         }
 
         // ── Behavior Trees ───────────────────────────────────────────────
@@ -491,6 +580,37 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 else if all_failure { Some(Ok(Value::Str("failure".into()))) }
                 else { Some(Ok(Value::Str("running".into()))) }
             } else { Some(Err(rt_err!("bt_selector() requires array"))) }
+        }
+        "ai::bt_evaluate" => {
+            // Build a behavior tree from a serialized description and evaluate it.
+            // args: tree_description (array of nodes), conditions (map of condition names to bools)
+            // Tree description: each node is a tuple (type, children_or_name)
+            //   type: "sequence", "selector", "parallel:N", "condition:name", "action:name", "inverter", "repeater:N"
+            if args.len() < 2 { return Some(Err(rt_err!("bt_evaluate() requires tree, conditions"))); }
+            let (tree_arr, cond_arr) = match (&args[0], &args[1]) {
+                (Value::Array(t), Value::Array(c)) => (t.clone(), c.clone()),
+                _ => return Some(Err(rt_err!("bt_evaluate() requires two arrays"))),
+            };
+            let tree_arr = tree_arr.borrow();
+            let cond_arr = cond_arr.borrow();
+            // Build conditions map from alternating key-value pairs
+            let mut conditions = std::collections::HashMap::new();
+            let mut i = 0;
+            while i + 1 < cond_arr.len() {
+                if let (Value::Str(k), Value::Bool(v)) = (&cond_arr[i], &cond_arr[i + 1]) {
+                    conditions.insert(k.as_str(), *v);
+                }
+                i += 2;
+            }
+            // Parse tree from array (simple recursive descent)
+            let node = parse_bt_node(&tree_arr, &mut 0);
+            let status = bt_evaluate(&node, &conditions);
+            let status_str = match status {
+                BtStatus::Success => "success",
+                BtStatus::Failure => "failure",
+                BtStatus::Running => "running",
+            };
+            Some(Ok(Value::Str(status_str.into())))
         }
 
         _ => None,

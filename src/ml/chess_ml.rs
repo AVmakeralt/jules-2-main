@@ -7,6 +7,24 @@ const MAX_ABS_WEIGHT: f32 = 1_000_000.0;
 const MAX_ABS_REWARD: f32 = 2.0;
 const TACTICAL_LANES: [f32; 4] = [0.00, 0.02, 0.06, 0.10];
 
+/// Clamp a feature value to the valid range [-MAX_ABS_FEATURE, MAX_ABS_FEATURE].
+#[inline]
+fn clamp_feature(v: f32) -> f32 {
+    v.clamp(-MAX_ABS_FEATURE, MAX_ABS_FEATURE)
+}
+
+/// Clamp a weight value to the valid range [-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT].
+#[inline]
+fn clamp_weight(v: f32) -> f32 {
+    v.clamp(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
+}
+
+/// Clamp a reward value to the valid range [-MAX_ABS_REWARD, MAX_ABS_REWARD].
+#[inline]
+fn clamp_reward(v: f32) -> f32 {
+    v.clamp(-MAX_ABS_REWARD, MAX_ABS_REWARD)
+}
+
 #[derive(Clone, Debug)]
 struct GradBuffer {
     acc: [f32; FEAT_DIM],
@@ -25,14 +43,16 @@ impl GradBuffer {
     #[inline]
     fn push(&mut self, features: &[f32; FEAT_DIM], reward: f32) {
         // unrolled update keeps this tiny hot path branch-light and bounds-check free.
-        self.acc[0] += reward * features[0];
-        self.acc[1] += reward * features[1];
-        self.acc[2] += reward * features[2];
-        self.acc[3] += reward * features[3];
-        self.acc[4] += reward * features[4];
-        self.acc[5] += reward * features[5];
-        self.acc[6] += reward * features[6];
-        self.acc[7] += reward * features[7];
+        // Clamp values to safe ranges before accumulation to prevent gradient explosion.
+        let r = clamp_reward(reward);
+        self.acc[0] += r * clamp_feature(features[0]);
+        self.acc[1] += r * clamp_feature(features[1]);
+        self.acc[2] += r * clamp_feature(features[2]);
+        self.acc[3] += r * clamp_feature(features[3]);
+        self.acc[4] += r * clamp_feature(features[4]);
+        self.acc[5] += r * clamp_feature(features[5]);
+        self.acc[6] += r * clamp_feature(features[6]);
+        self.acc[7] += r * clamp_feature(features[7]);
         self.count += 1;
     }
 
@@ -42,14 +62,14 @@ impl GradBuffer {
             return;
         }
         let scale = lr / self.count as f32;
-        weights[0] += self.acc[0] * scale;
-        weights[1] += self.acc[1] * scale;
-        weights[2] += self.acc[2] * scale;
-        weights[3] += self.acc[3] * scale;
-        weights[4] += self.acc[4] * scale;
-        weights[5] += self.acc[5] * scale;
-        weights[6] += self.acc[6] * scale;
-        weights[7] += self.acc[7] * scale;
+        weights[0] = clamp_weight(weights[0] + self.acc[0] * scale);
+        weights[1] = clamp_weight(weights[1] + self.acc[1] * scale);
+        weights[2] = clamp_weight(weights[2] + self.acc[2] * scale);
+        weights[3] = clamp_weight(weights[3] + self.acc[3] * scale);
+        weights[4] = clamp_weight(weights[4] + self.acc[4] * scale);
+        weights[5] = clamp_weight(weights[5] + self.acc[5] * scale);
+        weights[6] = clamp_weight(weights[6] + self.acc[6] * scale);
+        weights[7] = clamp_weight(weights[7] + self.acc[7] * scale);
         self.acc = [0.0; FEAT_DIM];
         self.count = 0;
     }

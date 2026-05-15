@@ -130,6 +130,7 @@ thread_local! {
     static GLOBAL_PCG: std::cell::RefCell<Pcg32> = std::cell::RefCell::new(
         Pcg32::new(42, 54)
     );
+    static SPLITMIX_REGISTRY: std::cell::RefCell<Vec<SplitMix64>> = std::cell::RefCell::new(Vec::new());
 }
 
 /// Dispatch a random:: builtin.
@@ -331,6 +332,46 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 });
                 v.map(Ok).or_else(|| Some(Err(rt_err!("pcg32_range(): invalid handle"))))
             } else { Some(Err(rt_err!("pcg32_range() requires handle, lo, hi"))) }
+        }
+
+        // ── SplitMix64 ────────────────────────────────────────────────────
+        "random::splitmix64" => {
+            let seed = i64_arg(args, 0).unwrap_or(42) as u64;
+            SPLITMIX_REGISTRY.with(|r| {
+                let mut r = r.borrow_mut();
+                r.push(SplitMix64::new(seed));
+                Some(Ok(Value::U64(r.len() as u64)))
+            })
+        }
+        "random::splitmix64_next" => {
+            if let Some(h) = i64_arg(args, 0) {
+                SPLITMIX_REGISTRY.with(|r| {
+                    let mut r = r.borrow_mut();
+                    if let Some(rng) = r.get_mut(h as usize - 1) {
+                        Some(Ok(Value::U64(rng.next_u64())))
+                    } else { Some(Err(rt_err!("splitmix64_next(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("splitmix64_next() requires handle"))) }
+        }
+        "random::splitmix64_next_u32" => {
+            if let Some(h) = i64_arg(args, 0) {
+                SPLITMIX_REGISTRY.with(|r| {
+                    let mut r = r.borrow_mut();
+                    if let Some(rng) = r.get_mut(h as usize - 1) {
+                        Some(Ok(Value::U32(rng.next_u32())))
+                    } else { Some(Err(rt_err!("splitmix64_next_u32(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("splitmix64_next_u32() requires handle"))) }
+        }
+        "random::splitmix64_next_f64" => {
+            if let Some(h) = i64_arg(args, 0) {
+                SPLITMIX_REGISTRY.with(|r| {
+                    let mut r = r.borrow_mut();
+                    if let Some(rng) = r.get_mut(h as usize - 1) {
+                        Some(Ok(Value::F64(rng.next_f64())))
+                    } else { Some(Err(rt_err!("splitmix64_next_f64(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("splitmix64_next_f64() requires handle"))) }
         }
 
         _ => None,

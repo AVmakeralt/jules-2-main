@@ -94,6 +94,18 @@ impl MpscQueue {
         let next = unsafe { (*head).next.load(Ordering::Acquire) };
         next.is_null()
     }
+
+    /// Clear all items from the queue, resetting to the stub node.
+    pub fn clear(&mut self) {
+        // Drain existing items
+        while self.try_pop().is_some() {}
+        // Reset head and tail to the stub node
+        let stub_ptr: *mut QueueNode = &*self.stub as *const QueueNode as *mut QueueNode;
+        self.head.store(stub_ptr, Ordering::Release);
+        self.tail.store(stub_ptr, Ordering::Release);
+        // Reset stub's next pointer
+        self.stub.next.store(std::ptr::null_mut(), Ordering::Release);
+    }
 }
 
 impl Drop for MpscQueue {
@@ -337,6 +349,20 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 })
             } else { Some(Err(rt_err!("mpsc_is_empty() requires handle"))) }
         }
+        "collections::mpsc_clear" => {
+            if let Some(h) = i64_arg(args, 0) {
+                MPSC_QUEUES.with(|q| {
+                    let mut q = q.borrow_mut();
+                    // Get exclusive access by removing and re-adding
+                    if let Some(queue) = Arc::get_mut(q.get_mut(h as usize - 1).unwrap_or(&mut Arc::new(MpscQueue::new()))) {
+                        queue.clear();
+                        Some(Ok(Value::Unit))
+                    } else {
+                        Some(Err(rt_err!("mpsc_clear(): queue is shared, cannot clear")))
+                    }
+                })
+            } else { Some(Err(rt_err!("mpsc_clear() requires handle"))) }
+        }
 
         // ── Ring Buffer ──────────────────────────────────────────────────
         "collections::ring_new" => {
@@ -382,6 +408,49 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 })
             } else { Some(Err(rt_err!("ring_len() requires handle"))) }
         }
+        "collections::ring_peek" => {
+            if let Some(h) = i64_arg(args, 0) {
+                RING_BUFFERS.with(|r| {
+                    let r = r.borrow();
+                    if let Some(rb) = r.get(h as usize - 1) {
+                        match rb.peek() {
+                            Some(v) => Some(Ok(v.clone())),
+                            None => Some(Ok(Value::None)),
+                        }
+                    } else { Some(Err(rt_err!("ring_peek(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("ring_peek() requires handle"))) }
+        }
+        "collections::ring_capacity" => {
+            if let Some(h) = i64_arg(args, 0) {
+                RING_BUFFERS.with(|r| {
+                    let r = r.borrow();
+                    if let Some(rb) = r.get(h as usize - 1) {
+                        Some(Ok(Value::U64(rb.capacity() as u64)))
+                    } else { Some(Err(rt_err!("ring_capacity(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("ring_capacity() requires handle"))) }
+        }
+        "collections::ring_is_empty" => {
+            if let Some(h) = i64_arg(args, 0) {
+                RING_BUFFERS.with(|r| {
+                    let r = r.borrow();
+                    if let Some(rb) = r.get(h as usize - 1) {
+                        Some(Ok(Value::Bool(rb.is_empty())))
+                    } else { Some(Err(rt_err!("ring_is_empty(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("ring_is_empty() requires handle"))) }
+        }
+        "collections::ring_is_full" => {
+            if let Some(h) = i64_arg(args, 0) {
+                RING_BUFFERS.with(|r| {
+                    let r = r.borrow();
+                    if let Some(rb) = r.get(h as usize - 1) {
+                        Some(Ok(Value::Bool(rb.is_full())))
+                    } else { Some(Err(rt_err!("ring_is_full(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("ring_is_full() requires handle"))) }
+        }
 
         // ── Priority Queue ───────────────────────────────────────────────
         "collections::pq_new" => Some(Ok(Value::U64({
@@ -422,6 +491,29 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                     } else { Some(Err(rt_err!("pq_len(): invalid handle"))) }
                 })
             } else { Some(Err(rt_err!("pq_len() requires handle"))) }
+        }
+        "collections::pq_peek" => {
+            if let Some(h) = i64_arg(args, 0) {
+                PRIORITY_QUEUES.with(|p| {
+                    let p = p.borrow();
+                    if let Some(pq) = p.get(h as usize - 1) {
+                        match pq.peek() {
+                            Some(v) => Some(Ok(v.clone())),
+                            None => Some(Ok(Value::None)),
+                        }
+                    } else { Some(Err(rt_err!("pq_peek(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("pq_peek() requires handle"))) }
+        }
+        "collections::pq_is_empty" => {
+            if let Some(h) = i64_arg(args, 0) {
+                PRIORITY_QUEUES.with(|p| {
+                    let p = p.borrow();
+                    if let Some(pq) = p.get(h as usize - 1) {
+                        Some(Ok(Value::Bool(pq.is_empty())))
+                    } else { Some(Err(rt_err!("pq_is_empty(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("pq_is_empty() requires handle"))) }
         }
 
         // ── Sorted Set ───────────────────────────────────────────────────
@@ -473,6 +565,16 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 })
             } else { Some(Err(rt_err!("sorted_set_len() requires handle"))) }
         }
+        "collections::sorted_set_is_empty" => {
+            if let Some(h) = i64_arg(args, 0) {
+                SORTED_SETS.with(|s| {
+                    let s = s.borrow();
+                    if let Some(ss) = s.get(h as usize - 1) {
+                        Some(Ok(Value::Bool(ss.is_empty())))
+                    } else { Some(Err(rt_err!("sorted_set_is_empty(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("sorted_set_is_empty() requires handle"))) }
+        }
         "collections::sorted_set_to_array" => {
             if let Some(h) = i64_arg(args, 0) {
                 SORTED_SETS.with(|s| {
@@ -488,18 +590,33 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
         // ── Parallel iterators ───────────────────────────────────────────
         "collections::par_map" => {
             if args.len() < 2 { return Some(Err(rt_err!("par_map() requires array, fn_name"))); }
-            // Simplified: just map with identity since we can't call Jules functions from here
-            if let Value::Array(arr) = &args[0] {
+            let input = if let Some(arr) = array_arg(args, 0) {
                 let arr = arr.borrow();
-                Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(arr.clone())))))
-            } else { Some(Err(rt_err!("par_map() requires array"))) }
+                arr.clone()
+            } else { return Some(Err(rt_err!("par_map() requires array"))); };
+            let _fn_name = args.get(1).and_then(|v| match v { Value::Str(s) => Some(s.as_str()), _ => None }).unwrap_or("identity");
+            let result = par_map(input, _fn_name);
+            Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(result)))))
+        }
+        "collections::par_filter" => {
+            if args.len() < 2 { return Some(Err(rt_err!("par_filter() requires array, pred_name"))); }
+            let input = if let Some(arr) = array_arg(args, 0) {
+                let arr = arr.borrow();
+                arr.clone()
+            } else { return Some(Err(rt_err!("par_filter() requires array"))); };
+            let _pred_name = args.get(1).and_then(|v| match v { Value::Str(s) => Some(s.as_str()), _ => None }).unwrap_or("all");
+            let result = par_filter(input, _pred_name);
+            Some(Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(result)))))
         }
         "collections::par_reduce" => {
-            if let Value::Array(arr) = &args[0] {
+            if let Some(arr) = array_arg(args, 0) {
                 let arr = arr.borrow();
                 if arr.is_empty() { return Some(Ok(Value::Unit)); }
-                let sum: f64 = arr.iter().filter_map(|v| v.as_f64()).sum();
-                Some(Ok(Value::F64(sum)))
+                let result = par_reduce(arr.clone());
+                match result {
+                    Some(v) => Some(Ok(v)),
+                    None => Some(Ok(Value::Unit)),
+                }
             } else { Some(Err(rt_err!("par_reduce() requires array"))) }
         }
 

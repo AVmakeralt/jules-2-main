@@ -138,6 +138,16 @@ pub struct ProfileWeightedCostModel {
     profile_weight: f64,
 }
 
+impl Clone for ProfileWeightedCostModel {
+    fn clone(&self) -> Self {
+        Self {
+            profiles: self.profiles.clone(),
+            base_cost_multiplier: self.base_cost_multiplier,
+            profile_weight: self.profile_weight,
+        }
+    }
+}
+
 impl ProfileWeightedCostModel {
     pub fn new(profiles: SharedProfileDatabase) -> Self {
         Self {

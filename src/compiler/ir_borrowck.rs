@@ -481,32 +481,32 @@ impl IrBorrowChecker {
     fn merge_phi_states(&mut self, block: &FlatBlock) {
         // Find any Phi instructions at the start of the block.
         for instr in &block.instrs {
-            if let IrOp::Phi { incoming } = &instr.op {
-                if let Some(dst) = instr.dst {
-                    // Merge states from all incoming values.
-                    let mut merged_state = ValueState::Available;
-                    for &(pred_block, pred_value) in incoming {
-                        // Check if the predecessor has a recorded state.
-                        let pred_state = self.block_states
-                            .get(&pred_block)
-                            .and_then(|states| states.get(&pred_value))
-                            .map(|info| info.state)
-                            .unwrap_or(ValueState::Available);
-
-                        merged_state = merge_states(merged_state, pred_state);
-                    }
-
-                    self.values.insert(dst, ValueInfo {
-                        state: merged_state,
-                        ownership: instr.ownership,
-                        imm_borrows: 0,
-                        mut_borrows: 0,
-                    });
-                }
-            } else {
+            let incoming = Self::phi_incoming(&instr.op);
+            if incoming.is_empty() {
                 // Phis must be at the top of the block; stop when we hit
                 // a non-phi instruction.
                 break;
+            }
+            if let Some(dst) = instr.dst {
+                // Merge states from all incoming values.
+                let mut merged_state = ValueState::Available;
+                for &(pred_block, pred_value) in incoming {
+                    // Check if the predecessor has a recorded state.
+                    let pred_state = self.block_states
+                        .get(&pred_block)
+                        .and_then(|states| states.get(&pred_value))
+                        .map(|info| info.state)
+                        .unwrap_or(ValueState::Available);
+
+                    merged_state = merge_states(merged_state, pred_state);
+                }
+
+                self.values.insert(dst, ValueInfo {
+                    state: merged_state,
+                    ownership: instr.ownership,
+                    imm_borrows: 0,
+                    mut_borrows: 0,
+                });
             }
         }
     }

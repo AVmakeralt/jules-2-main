@@ -647,7 +647,8 @@ impl PciEnumerator {
     fn enumerate_function(&mut self, bus: u8, device: u8, function: u8, header_type: u8) {
         let dword0 = self.read_config(bus, device, function, REG_VENDOR_DEVICE);
         let vendor_id = (dword0 & 0xFFFF) as u16;
-        let device_id = ((dword0 >> 16) & 0xFFFF) as u16;
+        // Extract device ID using the standard shift offset
+        let device_id = ((dword0 >> REG_DEVICE_ID_SHIFT as u32) & 0xFFFF) as u16;
 
         if vendor_id == VENDOR_ID_NONE {
             return;
@@ -659,6 +660,10 @@ impl PciEnumerator {
         let prog_if = ((class_rev >> 8) & 0xFF) as u8;
         let subclass = ((class_rev >> 16) & 0xFF) as u8;
         let class_code = ((class_rev >> 24) & 0xFF) as u8;
+
+        // Read header type from the correct offset within the cache line size/latency/header/BIST DWORD
+        let header_dword = self.read_config(bus, device, function, REG_HEADER_TYPE);
+        let _header_type_byte = ((header_dword >> (HEADER_TYPE_OFFSET as u32 - REG_HEADER_TYPE as u32) * 8) & 0xFF) as u8;
 
         // Parse header type
         let pci_header_type = match header_type {
@@ -703,11 +708,16 @@ impl PciEnumerator {
             i += 1;
         }
 
-        // For PCI bridges, read secondary/subordinate bus numbers
+        // For PCI bridges, read secondary/subordinate bus numbers using
+        // the well-known config space offsets for Type 1 headers.
         let (secondary_bus, subordinate_bus) = if pci_header_type == PciHeaderType::PciBridge {
+            // Read the DWORD at REG_PRIMARY_BUS which contains:
+            //   byte 0: Primary Bus Number
+            //   byte 1 (REG_SECONDARY_BUS): Secondary Bus Number
+            //   byte 2 (REG_SUBORDINATE_BUS): Subordinate Bus Number
             let bus_info = self.read_config(bus, device, function, REG_PRIMARY_BUS);
-            let sec = ((bus_info >> 8) & 0xFF) as u8;
-            let sub = ((bus_info >> 16) & 0xFF) as u8;
+            let sec = ((bus_info >> ((REG_SECONDARY_BUS - REG_PRIMARY_BUS) as u32) * 8) & 0xFF) as u8;
+            let sub = ((bus_info >> ((REG_SUBORDINATE_BUS - REG_PRIMARY_BUS) as u32) * 8) & 0xFF) as u8;
             (Some(sec), Some(sub))
         } else {
             (None, None)

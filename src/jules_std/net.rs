@@ -281,6 +281,13 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 Some(Ok(Value::Str(decoded)))
             } else { Some(Err(rt_err!("net::url_decode() requires string"))) }
         }
+        "net::serialize" => {
+            // Serialize a value to bytes using value_to_bytes
+            if args.is_empty() { return Some(Err(rt_err!("net::serialize() requires a value"))); }
+            let bytes = value_to_bytes(&args[0]);
+            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            Some(Ok(Value::Str(hex)))
+        }
         "net::parse_url" => {
             if let Some(url) = str_arg(args, 0) {
                 // Simple URL parser

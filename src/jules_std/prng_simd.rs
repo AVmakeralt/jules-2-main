@@ -178,6 +178,10 @@ fn squares_hash(key: u64, counter: u64) -> u64 {
     x ^= x >> 17;
     y ^= y >> 17;
 
+    // Additional right-rotation diffusion for improved avalanche
+    x = rotr64(x, 23);
+    y = rotr64(y, 23);
+
     x ^ y
 }
 

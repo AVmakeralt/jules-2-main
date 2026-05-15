@@ -289,6 +289,142 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 })
             } else { Some(Err(rt_err!("arena_read_f32() requires handle, offset"))) }
         }
+        "alloc::arena_alloc_zero" => {
+            if args.len() < 2 { return Some(Err(rt_err!("arena_alloc_zero() requires handle, size"))); }
+            if let (Some(h), Some(size)) = (i64_arg(args,0), i64_arg(args,1)) {
+                ARENAS.with(|a| {
+                    let mut a = a.borrow_mut();
+                    if let Some(arena) = a.get_mut(h as usize - 1) {
+                        match arena.alloc_zero(size as usize) {
+                            Some(offset) => Some(Ok(Value::U64(offset as u64))),
+                            None => Some(Err(rt_err!("arena_alloc_zero(): out of memory"))),
+                        }
+                    } else { Some(Err(rt_err!("arena_alloc_zero(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_alloc_zero() requires handle, size"))) }
+        }
+        "alloc::arena_capacity" => {
+            if let Some(h) = i64_arg(args, 0) {
+                ARENAS.with(|a| {
+                    let a = a.borrow();
+                    if let Some(arena) = a.get(h as usize - 1) {
+                        Some(Ok(Value::U64(arena.capacity() as u64)))
+                    } else { Some(Err(rt_err!("arena_capacity(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_capacity() requires handle"))) }
+        }
+        "alloc::arena_free" => {
+            if let Some(h) = i64_arg(args, 0) {
+                ARENAS.with(|a| {
+                    let a = a.borrow();
+                    if let Some(arena) = a.get(h as usize - 1) {
+                        Some(Ok(Value::U64(arena.free() as u64)))
+                    } else { Some(Err(rt_err!("arena_free(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_free() requires handle"))) }
+        }
+        "alloc::arena_write_u8" => {
+            if args.len() < 3 { return Some(Err(rt_err!("arena_write_u8() requires handle, offset, value"))); }
+            if let (Some(h), Some(off), Some(val)) = (i64_arg(args,0), i64_arg(args,1), i64_arg(args,2)) {
+                ARENAS.with(|a| {
+                    let mut a = a.borrow_mut();
+                    if let Some(arena) = a.get_mut(h as usize - 1) {
+                        if arena.write_u8(off as usize, val as u8) { Some(Ok(Value::Unit)) }
+                        else { Some(Err(rt_err!("arena_write_u8(): out of bounds"))) }
+                    } else { Some(Err(rt_err!("arena_write_u8(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_write_u8() requires handle, offset, value"))) }
+        }
+        "alloc::arena_write_u16" => {
+            if args.len() < 3 { return Some(Err(rt_err!("arena_write_u16() requires handle, offset, value"))); }
+            if let (Some(h), Some(off), Some(val)) = (i64_arg(args,0), i64_arg(args,1), i64_arg(args,2)) {
+                ARENAS.with(|a| {
+                    let mut a = a.borrow_mut();
+                    if let Some(arena) = a.get_mut(h as usize - 1) {
+                        if arena.write_u16(off as usize, val as u16) { Some(Ok(Value::Unit)) }
+                        else { Some(Err(rt_err!("arena_write_u16(): out of bounds"))) }
+                    } else { Some(Err(rt_err!("arena_write_u16(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_write_u16() requires handle, offset, value"))) }
+        }
+        "alloc::arena_write_u32" => {
+            if args.len() < 3 { return Some(Err(rt_err!("arena_write_u32() requires handle, offset, value"))); }
+            if let (Some(h), Some(off), Some(val)) = (i64_arg(args,0), i64_arg(args,1), i64_arg(args,2)) {
+                ARENAS.with(|a| {
+                    let mut a = a.borrow_mut();
+                    if let Some(arena) = a.get_mut(h as usize - 1) {
+                        if arena.write_u32(off as usize, val as u32) { Some(Ok(Value::Unit)) }
+                        else { Some(Err(rt_err!("arena_write_u32(): out of bounds"))) }
+                    } else { Some(Err(rt_err!("arena_write_u32(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_write_u32() requires handle, offset, value"))) }
+        }
+        "alloc::arena_write_u64" => {
+            if args.len() < 3 { return Some(Err(rt_err!("arena_write_u64() requires handle, offset, value"))); }
+            if let (Some(h), Some(off), Some(val)) = (i64_arg(args,0), i64_arg(args,1), i64_arg(args,2)) {
+                ARENAS.with(|a| {
+                    let mut a = a.borrow_mut();
+                    if let Some(arena) = a.get_mut(h as usize - 1) {
+                        if arena.write_u64(off as usize, val as u64) { Some(Ok(Value::Unit)) }
+                        else { Some(Err(rt_err!("arena_write_u64(): out of bounds"))) }
+                    } else { Some(Err(rt_err!("arena_write_u64(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_write_u64() requires handle, offset, value"))) }
+        }
+        "alloc::arena_write_f64" => {
+            if args.len() < 3 { return Some(Err(rt_err!("arena_write_f64() requires handle, offset, value"))); }
+            if let (Some(h), Some(off), Some(val)) = (i64_arg(args,0), i64_arg(args,1), f64_arg(args,2)) {
+                ARENAS.with(|a| {
+                    let mut a = a.borrow_mut();
+                    if let Some(arena) = a.get_mut(h as usize - 1) {
+                        if arena.write_f64(off as usize, val) { Some(Ok(Value::Unit)) }
+                        else { Some(Err(rt_err!("arena_write_f64(): out of bounds"))) }
+                    } else { Some(Err(rt_err!("arena_write_f64(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_write_f64() requires handle, offset, value"))) }
+        }
+        "alloc::arena_read_u8" => {
+            if args.len() < 2 { return Some(Err(rt_err!("arena_read_u8() requires handle, offset"))); }
+            if let (Some(h), Some(off)) = (i64_arg(args,0), i64_arg(args,1)) {
+                ARENAS.with(|a| {
+                    let a = a.borrow();
+                    if let Some(arena) = a.get(h as usize - 1) {
+                        match arena.read_u8(off as usize) {
+                            Some(v) => Some(Ok(Value::I64(v as i64))),
+                            None => Some(Err(rt_err!("arena_read_u8(): out of bounds"))),
+                        }
+                    } else { Some(Err(rt_err!("arena_read_u8(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_read_u8() requires handle, offset"))) }
+        }
+        "alloc::arena_read_u32" => {
+            if args.len() < 2 { return Some(Err(rt_err!("arena_read_u32() requires handle, offset"))); }
+            if let (Some(h), Some(off)) = (i64_arg(args,0), i64_arg(args,1)) {
+                ARENAS.with(|a| {
+                    let a = a.borrow();
+                    if let Some(arena) = a.get(h as usize - 1) {
+                        match arena.read_u32(off as usize) {
+                            Some(v) => Some(Ok(Value::I64(v as i64))),
+                            None => Some(Err(rt_err!("arena_read_u32(): out of bounds"))),
+                        }
+                    } else { Some(Err(rt_err!("arena_read_u32(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_read_u32() requires handle, offset"))) }
+        }
+        "alloc::arena_read_f64" => {
+            if args.len() < 2 { return Some(Err(rt_err!("arena_read_f64() requires handle, offset"))); }
+            if let (Some(h), Some(off)) = (i64_arg(args,0), i64_arg(args,1)) {
+                ARENAS.with(|a| {
+                    let a = a.borrow();
+                    if let Some(arena) = a.get(h as usize - 1) {
+                        match arena.read_f64(off as usize) {
+                            Some(v) => Some(Ok(Value::F64(v))),
+                            None => Some(Err(rt_err!("arena_read_f64(): out of bounds"))),
+                        }
+                    } else { Some(Err(rt_err!("arena_read_f64(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("arena_read_f64() requires handle, offset"))) }
+        }
 
         // ── Pool ─────────────────────────────────────────────────────────
         "alloc::pool_new" => {
@@ -335,6 +471,52 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 })
             } else { Some(Err(rt_err!("pool_used() requires handle"))) }
         }
+        "alloc::pool_block_size" => {
+            if let Some(h) = i64_arg(args, 0) {
+                POOLS.with(|p| {
+                    let p = p.borrow();
+                    if let Some(pool) = p.get(h as usize - 1) {
+                        Some(Ok(Value::U64(pool.block_size as u64)))
+                    } else { Some(Err(rt_err!("pool_block_size(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("pool_block_size() requires handle"))) }
+        }
+        "alloc::pool_capacity" => {
+            if let Some(h) = i64_arg(args, 0) {
+                POOLS.with(|p| {
+                    let p = p.borrow();
+                    if let Some(pool) = p.get(h as usize - 1) {
+                        Some(Ok(Value::U64(pool.capacity() as u64)))
+                    } else { Some(Err(rt_err!("pool_capacity(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("pool_capacity() requires handle"))) }
+        }
+        "alloc::pool_write" => {
+            if args.len() < 3 { return Some(Err(rt_err!("pool_write() requires handle, index, data"))); }
+            if let (Some(h), Some(idx), Value::Str(data)) = (i64_arg(args,0), i64_arg(args,1), &args[2]) {
+                POOLS.with(|p| {
+                    let mut p = p.borrow_mut();
+                    if let Some(pool) = p.get_mut(h as usize - 1) {
+                        if pool.write(idx as usize, 0, data.as_bytes()) { Some(Ok(Value::Unit)) }
+                        else { Some(Err(rt_err!("pool_write(): out of bounds"))) }
+                    } else { Some(Err(rt_err!("pool_write(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("pool_write() requires handle, index, string"))) }
+        }
+        "alloc::pool_read" => {
+            if args.len() < 2 { return Some(Err(rt_err!("pool_read() requires handle, index"))); }
+            if let (Some(h), Some(idx)) = (i64_arg(args,0), i64_arg(args,1)) {
+                POOLS.with(|p| {
+                    let p = p.borrow();
+                    if let Some(pool) = p.get(h as usize - 1) {
+                        match pool.read(idx as usize, 0, pool.block_size) {
+                            Some(data) => Some(Ok(Value::Str(String::from_utf8_lossy(&data).to_string()))),
+                            None => Some(Err(rt_err!("pool_read(): out of bounds"))),
+                        }
+                    } else { Some(Err(rt_err!("pool_read(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("pool_read() requires handle, index"))) }
+        }
 
         // ── Slab ─────────────────────────────────────────────────────────
         "alloc::slab_new" => Some(Ok(Value::U64({
@@ -372,6 +554,30 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                     } else { Some(Err(rt_err!("slab_len(): invalid handle"))) }
                 })
             } else { Some(Err(rt_err!("slab_len() requires handle"))) }
+        }
+        "alloc::slab_get" => {
+            if args.len() < 2 { return Some(Err(rt_err!("slab_get() requires handle, key"))); }
+            if let (Some(h), Some(k)) = (i64_arg(args,0), i64_arg(args,1)) {
+                SLABS.with(|s| {
+                    let s = s.borrow();
+                    if let Some(slab) = s.get(h as usize - 1) {
+                        match slab.get(k as usize) {
+                            Some(data) => Some(Ok(Value::Str(String::from_utf8_lossy(data).to_string()))),
+                            None => Some(Ok(Value::None)),
+                        }
+                    } else { Some(Err(rt_err!("slab_get(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("slab_get() requires handle, key"))) }
+        }
+        "alloc::slab_capacity" => {
+            if let Some(h) = i64_arg(args, 0) {
+                SLABS.with(|s| {
+                    let s = s.borrow();
+                    if let Some(slab) = s.get(h as usize - 1) {
+                        Some(Ok(Value::U64(slab.capacity() as u64)))
+                    } else { Some(Err(rt_err!("slab_capacity(): invalid handle"))) }
+                })
+            } else { Some(Err(rt_err!("slab_capacity() requires handle"))) }
         }
 
         _ => None,
