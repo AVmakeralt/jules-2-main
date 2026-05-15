@@ -83,107 +83,14 @@ use crate::compiler::ast::{
 use crate::compiler::lexer::Span;
 
 // =============================================================================
-// §0  DIAGNOSTICS  (re-used from typeck; re-declared here for standalone use)
+// §0  DIAGNOSTICS  (issue #33 — consolidated into compiler::SimpleDiagnostic)
 // =============================================================================
 
-/// Severity of a semantic diagnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Error,
-    Warning,
-    Note,
-}
+// Re-export shared types from the parent module.
+pub use crate::compiler::{SimpleDiagnostic as Diagnostic, SimpleDiagnostics as Diagnostics, SimpleSeverity as Severity};
 
-/// A single span-aware diagnostic produced by the semantic pass.
-#[derive(Debug, Clone)]
-pub struct Diagnostic {
-    pub severity: Severity,
-    pub span: Span,
-    pub message: String,
-    /// Secondary labels pointing at related source locations.
-    pub labels: Vec<(Span, String)>,
-    /// Error code (e.g. "E3001") from the error_codes module.
-    pub code: Option<&'static str>,
-    /// Suggested fix hint (optional, displayed as `help:` in the renderer).
-    pub hint: Option<String>,
-}
-
-impl Diagnostic {
-    pub fn error(span: Span, msg: impl Into<String>) -> Self {
-        Diagnostic {
-            severity: Severity::Error,
-            span,
-            message: msg.into(),
-            labels: vec![],
-            code: None,
-            hint: None,
-        }
-    }
-    pub fn warning(span: Span, msg: impl Into<String>) -> Self {
-        Diagnostic {
-            severity: Severity::Warning,
-            span,
-            message: msg.into(),
-            labels: vec![],
-            code: None,
-            hint: None,
-        }
-    }
-    pub fn note(span: Span, msg: impl Into<String>) -> Self {
-        Diagnostic {
-            severity: Severity::Note,
-            span,
-            message: msg.into(),
-            labels: vec![],
-            code: None,
-            hint: None,
-        }
-    }
-    /// Attach a secondary label to a different source location.
-    pub fn with_label(mut self, span: Span, msg: impl Into<String>) -> Self {
-        self.labels.push((span, msg.into()));
-        self
-    }
-    /// Attach an error code (e.g. `"E3001"`).
-    pub fn with_code(mut self, code: &'static str) -> Self {
-        self.code = Some(code);
-        self
-    }
-    /// Attach a suggested fix hint.
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
-    pub fn is_fatal(&self) -> bool {
-        self.severity == Severity::Error
-    }
-}
-
-/// Collects all diagnostics emitted during the semantic pass.
-#[derive(Debug, Default)]
-pub struct Diagnostics {
-    pub items: Vec<Diagnostic>,
-}
-
+/// Extended Diagnostics with sema-specific helpers.
 impl Diagnostics {
-    pub fn push(&mut self, d: Diagnostic) {
-        self.items.push(d);
-    }
-    pub fn error(&mut self, span: Span, msg: impl Into<String>) {
-        self.push(Diagnostic::error(span, msg));
-    }
-    pub fn warning(&mut self, span: Span, msg: impl Into<String>) {
-        self.push(Diagnostic::warning(span, msg));
-    }
-    pub fn note(&mut self, span: Span, msg: impl Into<String>) {
-        self.push(Diagnostic::note(span, msg));
-    }
-    pub fn has_errors(&self) -> bool {
-        self.items.iter().any(|d| d.is_fatal())
-    }
-    pub fn error_count(&self) -> usize {
-        self.items.iter().filter(|d| d.is_fatal()).count()
-    }
     pub fn warning_count(&self) -> usize {
         self.items
             .iter()

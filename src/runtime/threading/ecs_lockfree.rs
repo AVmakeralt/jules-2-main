@@ -1,7 +1,24 @@
 // =========================================================================
-// Lock-Free ECS Component Storage
-// Epoch-protected sparse sets for lock-free entity-component system
-// Implements crossbeam-style atomic operations for thread safety
+// ECS Component Storage
+// Epoch-protected sparse sets for thread-safe entity-component system
+//
+// DESIGN NOTE (Issue #75): Despite the historical "lock-free" name, the
+// thread-safe wrappers (ComponentStorageData, ComponentStorageWrapper,
+// LockFreeComponentStorage) use RwLock<SparseSet>. This is intentional:
+//
+//   1. The inner SparseSet itself uses no locks — it is a pure data structure
+//      with O(1) lookup via sparse→dense indirection.
+//   2. The RwLock is only needed at the ComponentStorageData boundary to
+//      allow concurrent readers while serializing writers. In a read-heavy
+//      ECS workload (90%+ reads), RwLock contention is minimal.
+//   3. A truly lock-free concurrent sparse set would require epoch-based
+//      reclamation of dense array segments, double-buffering, or
+//      hazard pointers — all significantly more complex and with higher
+//      per-operation overhead than RwLock for typical workloads.
+//   4. The EntityGenerator IS lock-free (uses AtomicU64::fetch_add).
+//
+// If write contention becomes a bottleneck, consider per-CPU sparse sets
+// with epoch-protected merging (similar to PerCpuDeque).
 // =========================================================================
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,6 +150,10 @@ impl SparseSet {
 
 /// Thread-safe component storage data (the struct, not the trait)
 /// Renamed from ComponentStorage to avoid collision with the trait
+///
+/// NOTE (Issue #75): Uses RwLock rather than lock-free atomics.
+/// See module-level comment for rationale. The RwLock is read-optimized
+/// for typical ECS access patterns (many reads, few writes).
 pub struct ComponentStorageData {
     inner: std::sync::RwLock<SparseSet>,
 }
@@ -145,7 +166,34 @@ impl ComponentStorageData {
         }
     }
 
-    /// Get component data for an entity
+    /// Get component data for an entity (zero-copy).
+    ///
+    /// Returns a guard that derefs to `&[u8]`, avoiding the Vec<u8> copy
+    /// that the old `get() -> Option<Vec<u8>>` performed on every call.
+    /// The copy was unnecessary since the read lock already keeps the
+    /// data alive for the duration of the guard.
+    ///
+    /// Issue #76: Previously this method returned `Option<Vec<u8>>` by
+    /// calling `.to_vec()` on the slice, allocating a heap buffer on
+    /// every lookup. In read-heavy ECS workloads (thousands of component
+    /// lookups per frame), this caused significant allocation pressure.
+    #[inline]
+    pub fn get_zero_copy(&self, entity: EntityId) -> Option<ComponentReadGuard<'_>> {
+        let guard = self.inner.read().unwrap();
+        if guard.get(entity).is_some() {
+            Some(ComponentReadGuard { _guard: guard, entity })
+        } else {
+            None
+        }
+    }
+
+    /// Get component data for an entity, copying into a Vec.
+    ///
+    /// NOTE (Issue #76): This copies data into a new Vec<u8> allocation.
+    /// For hot-path lookups, prefer `get_zero_copy()` which returns a
+    /// borrowed reference behind the read lock guard. This method exists
+    /// for backward compatibility and for cases where the caller needs
+    /// an owned copy that outlives the lock guard.
     pub fn get(&self, entity: EntityId) -> Option<Vec<u8>> {
         let guard = self.inner.read().unwrap();
         guard.get(entity).map(|s| s.to_vec())
@@ -175,6 +223,7 @@ impl ComponentStorageData {
     }
 
     /// Check if entity has this component
+    #[inline]
     pub fn has(&self, entity: EntityId) -> bool {
         let guard = self.inner.read().unwrap();
         guard.has(entity)
@@ -184,6 +233,25 @@ impl ComponentStorageData {
     pub fn len(&self) -> usize {
         let guard = self.inner.read().unwrap();
         guard.len()
+    }
+}
+
+/// RAII guard that holds the RwLock read lock and provides zero-copy
+/// access to a component's byte data. Derefs to `&[u8]`.
+///
+/// Issue #76: This avoids the `.to_vec()` allocation that the old
+/// `get() -> Option<Vec<u8>>` performed on every component lookup.
+pub struct ComponentReadGuard<'a> {
+    _guard: std::sync::RwLockReadGuard<'a, SparseSet>,
+    entity: EntityId,
+}
+
+impl<'a> std::ops::Deref for ComponentReadGuard<'a> {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self._guard.get(self.entity).expect("entity was present at construction time")
     }
 }
 
@@ -201,7 +269,20 @@ impl ComponentStorageWrapper {
         }
     }
 
-    /// Get component data for an entity
+    /// Get component data for an entity (zero-copy).
+    /// See `ComponentStorageData::get_zero_copy` for rationale (Issue #76).
+    #[inline]
+    pub fn get_zero_copy(&self, entity: EntityId) -> Option<ComponentReadGuard<'_>> {
+        let guard = self.inner.read().unwrap();
+        if guard.get(entity).is_some() {
+            Some(ComponentReadGuard { _guard: guard, entity })
+        } else {
+            None
+        }
+    }
+
+    /// Get component data for an entity, copying into a Vec.
+    /// NOTE (Issue #76): Prefer `get_zero_copy()` for hot paths.
     pub fn get(&self, entity: EntityId) -> Option<Vec<u8>> {
         let guard = self.inner.read().unwrap();
         guard.get(entity).map(|s| s.to_vec())
@@ -231,6 +312,7 @@ impl ComponentStorageWrapper {
     }
 
     /// Check if entity has this component
+    #[inline]
     pub fn has(&self, entity: EntityId) -> bool {
         let guard = self.inner.read().unwrap();
         guard.has(entity)
@@ -243,7 +325,11 @@ impl ComponentStorageWrapper {
     }
 }
 
-/// Legacy LockFreeComponentStorage for backward compatibility
+/// Thread-safe component storage wrapper (historically named "LockFree").
+///
+/// NOTE (Issue #75): This is NOT lock-free — it uses RwLock internally.
+/// Renaming would break the public API; instead, this comment documents
+/// the reality. See module-level comment for the design rationale.
 pub struct LockFreeComponentStorage {
     inner: ComponentStorageData,
 }

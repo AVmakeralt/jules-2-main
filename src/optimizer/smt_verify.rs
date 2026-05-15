@@ -31,6 +31,8 @@ use z3::ast::{Ast, Bool, BV};
 #[cfg(feature = "smt-verify")]
 use z3::{Config, Context, SatResult, Solver};
 
+use std::collections::HashSet;
+
 use crate::compiler::ast::{BinOpKind, UnOpKind};
 use crate::optimizer::mcts_superoptimizer::Instr;
 
@@ -276,20 +278,18 @@ impl CegisVerifier {
     }
 
     /// Collect the sorted union of variable names from both programs.
+    /// Uses HashSet for O(1) dedup instead of Vec::contains() O(V) lookups.
     pub(crate) fn collect_all_variables(src: &Instr, candidate: &Instr) -> Vec<String> {
-        let mut vars: Vec<String> = Vec::new();
+        let mut vars: HashSet<String> = HashSet::new();
         for v in src.variables() {
-            if !vars.contains(&v) {
-                vars.push(v);
-            }
+            vars.insert(v);
         }
         for v in candidate.variables() {
-            if !vars.contains(&v) {
-                vars.push(v);
-            }
+            vars.insert(v);
         }
-        vars.sort();
-        vars
+        let mut result: Vec<String> = vars.into_iter().collect();
+        result.sort();
+        result
     }
 
     /// Generate an initial set of test vectors exercising edge cases.

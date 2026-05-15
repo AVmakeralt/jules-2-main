@@ -198,8 +198,8 @@ impl AotOptLevel {
                 jump_threading: true,
                 inlining: true,
                 max_inline_size: 128,      // Aggressive: inline larger functions
-                loop_unrolling: true,
-                max_unroll: 8,              // Full unroll for small loops
+                loop_unrolling: true,     // TODO: not yet implemented
+                max_unroll: 8,              // Full unroll for small loops (TODO: not yet implemented)
                 sched: true,
                 max_passes: 2,              // FIX #3: Reduced from 4 — early-termination makes extra passes wasteful
                 algebra_simplify: true,    // Algebraic identities
@@ -244,6 +244,8 @@ pub struct OptConfig {
     pub jump_threading:   bool,
     pub inlining:         bool,
     pub max_inline_size:  usize,
+    // TODO: implement loop unrolling — flag is accepted but currently does nothing.
+    //       See §5o (after LICM) for the intended insertion point.
     pub loop_unrolling:   bool,
     pub max_unroll:       usize,
     pub sched:            bool,
@@ -1134,14 +1136,17 @@ pub fn run_sccp(func: &mut IRFunction) {
     }
 
     // Rewrite: replace constant defs with Const instructions
+    // FIX #46: Use drain() instead of cloning each instruction. Instructions that
+    // are not being replaced are moved into new_instrs directly (zero-copy),
+    // avoiding O(n) clones in the rewrite phase.
     for (bid, block) in func.blocks.iter_mut().enumerate() {
         if !executable.contains(&bid) {
             block.instrs = vec![IRInstr::Br { target: func.entry_block }];
             continue;
         }
         let mut new_instrs = Vec::with_capacity(block.instrs.len());
-        for instr in &block.instrs {
-            if let Some(dst) = instr_def(instr) {
+        for instr in block.instrs.drain(..) {
+            if let Some(dst) = instr_def(&instr) {
                 if let Some(&LatticeVal::Constant(c)) = vals.get(&dst) {
                     if !instr.has_side_effects() {
                         new_instrs.push(IRInstr::Const { dst, value: c });
@@ -1149,7 +1154,7 @@ pub fn run_sccp(func: &mut IRFunction) {
                     }
                 }
             }
-            new_instrs.push(instr.clone());
+            new_instrs.push(instr); // move, no clone
         }
         block.instrs = new_instrs;
     }
@@ -1987,65 +1992,70 @@ pub fn run_peephole(func: &mut IRFunction) {
         let mut const_map: HashMap<VarId, i64> = block.instrs.iter()
             .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
             .collect();
+
+        // FIX #42: Use swap-based double-buffering instead of creating a new Vec
+        // every iteration. `instrs` holds the current instructions; `buf` is the
+        // output buffer. After each pass they are swapped, reusing allocations.
+        // Also avoids per-instruction clone by taking ownership via drain().
+        let mut instrs = std::mem::take(&mut block.instrs);
+        let mut buf    = Vec::with_capacity(instrs.len());
+
         while changed {
             changed = false;
-            let mut new: Vec<IRInstr> = Vec::with_capacity(block.instrs.len());
-            let mut i = 0;
-            while i < block.instrs.len() {
-                let instr = block.instrs[i].clone();
+            for instr in instrs.drain(..) {
                 let mut did_replace = false;
 
                 match &instr {
                     // ── sub x, x → 0 ────────────────────────────────────
                     IRInstr::Sub { dst, lhs, rhs } if lhs == rhs => {
-                        new.push(IRInstr::Const { dst: *dst, value: 0 });
+                        buf.push(IRInstr::Const { dst: *dst, value: 0 });
                         const_map.insert(*dst, 0); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
                     // ── xor x, x → 0 ────────────────────────────────────
                     IRInstr::Xor { dst, lhs, rhs } if lhs == rhs => {
-                        new.push(IRInstr::Const { dst: *dst, value: 0 });
+                        buf.push(IRInstr::Const { dst: *dst, value: 0 });
                         const_map.insert(*dst, 0); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
                     // ── and x, x → x ────────────────────────────────────
                     IRInstr::And { dst, lhs, rhs } if lhs == rhs => {
-                        new.push(IRInstr::Move { dst: *dst, src: *lhs });
+                        buf.push(IRInstr::Move { dst: *dst, src: *lhs });
                         changed = true; did_replace = true;
                     }
                     // ── or x, x → x ─────────────────────────────────────
                     IRInstr::Or { dst, lhs, rhs } if lhs == rhs => {
-                        new.push(IRInstr::Move { dst: *dst, src: *lhs });
+                        buf.push(IRInstr::Move { dst: *dst, src: *lhs });
                         changed = true; did_replace = true;
                     }
                     // ── add x, 0 → x ────────────────────────────────────
                     IRInstr::Add { dst, lhs, rhs }
                         if const_map.get(rhs) == Some(&0) => {
-                        new.push(IRInstr::Move { dst: *dst, src: *lhs });
+                        buf.push(IRInstr::Move { dst: *dst, src: *lhs });
                         changed = true; did_replace = true;
                     }
                     IRInstr::Add { dst, lhs, rhs }
                         if const_map.get(lhs) == Some(&0) => {
-                        new.push(IRInstr::Move { dst: *dst, src: *rhs });
+                        buf.push(IRInstr::Move { dst: *dst, src: *rhs });
                         changed = true; did_replace = true;
                     }
                     // ── mul x, 0 → 0 ────────────────────────────────────
                     IRInstr::Mul { dst, lhs, rhs }
                         if const_map.get(rhs) == Some(&0)
                         || const_map.get(lhs) == Some(&0) => {
-                        new.push(IRInstr::Const { dst: *dst, value: 0 });
+                        buf.push(IRInstr::Const { dst: *dst, value: 0 });
                         const_map.insert(*dst, 0); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
                     // ── mul x, 1 → x ────────────────────────────────────
                     IRInstr::Mul { dst, lhs, rhs }
                         if const_map.get(rhs) == Some(&1) => {
-                        new.push(IRInstr::Move { dst: *dst, src: *lhs });
+                        buf.push(IRInstr::Move { dst: *dst, src: *lhs });
                         changed = true; did_replace = true;
                     }
                     IRInstr::Mul { dst, lhs, rhs }
                         if const_map.get(lhs) == Some(&1) => {
-                        new.push(IRInstr::Move { dst: *dst, src: *rhs });
+                        buf.push(IRInstr::Move { dst: *dst, src: *rhs });
                         changed = true; did_replace = true;
                     }
                     // ── mul x, 2^n → shl x, n ───────────────────────────
@@ -2053,38 +2063,39 @@ pub fn run_peephole(func: &mut IRFunction) {
                         if let Some(&v) = const_map.get(rhs) {
                             if v > 0 && (v as u64).is_power_of_two() {
                                 let sv = func.next_var; func.next_var += 1;
-                                new.push(IRInstr::Const { dst: sv, value: v.trailing_zeros() as i64 });
-                                new.push(IRInstr::Shl { dst: *dst, lhs: *lhs, rhs: sv });
+                                buf.push(IRInstr::Const { dst: sv, value: v.trailing_zeros() as i64 });
+                                buf.push(IRInstr::Shl { dst: *dst, lhs: *lhs, rhs: sv });
                                 changed = true; did_replace = true;
                             }
                         } else if let Some(&v) = const_map.get(lhs) {
                             if v > 0 && (v as u64).is_power_of_two() {
                                 let sv = func.next_var; func.next_var += 1;
-                                new.push(IRInstr::Const { dst: sv, value: v.trailing_zeros() as i64 });
-                                new.push(IRInstr::Shl { dst: *dst, lhs: *rhs, rhs: sv });
+                                buf.push(IRInstr::Const { dst: sv, value: v.trailing_zeros() as i64 });
+                                buf.push(IRInstr::Shl { dst: *dst, lhs: *rhs, rhs: sv });
                                 changed = true; did_replace = true;
                             }
                         }
-                        if !did_replace { new.push(instr.clone()); }
+                        // FIX #42: Removed inner `if !did_replace { push(instr.clone()) }`
+                        // — the outer `if !did_replace` at the end of the loop handles this.
                     }
                     // ── sdiv x, 2^n → sar x, n ──────────────────────────
                     IRInstr::SDiv { dst, lhs, rhs } => {
                         if let Some(&v) = const_map.get(rhs) {
                             if v > 0 && (v as u64).is_power_of_two() {
                                 let sv = func.next_var; func.next_var += 1;
-                                new.push(IRInstr::Const { dst: sv, value: v.trailing_zeros() as i64 });
-                                new.push(IRInstr::AShr { dst: *dst, lhs: *lhs, rhs: sv });
+                                buf.push(IRInstr::Const { dst: sv, value: v.trailing_zeros() as i64 });
+                                buf.push(IRInstr::AShr { dst: *dst, lhs: *lhs, rhs: sv });
                                 changed = true; did_replace = true;
                             }
                         }
-                        if !did_replace { new.push(instr.clone()); }
+                        // FIX #42: Same as Mul — removed inner push, outer handles it.
                     }
                     // ── shl x, 0 → x ────────────────────────────────────
                     IRInstr::Shl { dst, lhs, rhs }
                     | IRInstr::AShr { dst, lhs, rhs }
                     | IRInstr::LShr { dst, lhs, rhs }
                         if const_map.get(rhs) == Some(&0) => {
-                        new.push(IRInstr::Move { dst: *dst, src: *lhs });
+                        buf.push(IRInstr::Move { dst: *dst, src: *lhs });
                         changed = true; did_replace = true;
                     }
                     // ── not(not(x)) → x (detect back-to-back Not) ───────
@@ -2092,24 +2103,24 @@ pub fn run_peephole(func: &mut IRFunction) {
                     // ── and x, -1 → x ───────────────────────────────────
                     IRInstr::And { dst, lhs, rhs }
                         if const_map.get(rhs) == Some(&-1) => {
-                        new.push(IRInstr::Move { dst: *dst, src: *lhs });
+                        buf.push(IRInstr::Move { dst: *dst, src: *lhs });
                         changed = true; did_replace = true;
                     }
                     // ── or x, 0 → x ─────────────────────────────────────
                     IRInstr::Or { dst, lhs, rhs }
                         if const_map.get(rhs) == Some(&0) => {
-                        new.push(IRInstr::Move { dst: *dst, src: *lhs });
+                        buf.push(IRInstr::Move { dst: *dst, src: *lhs });
                         changed = true; did_replace = true;
                     }
                     // ── icmp eq x, x → 1 ────────────────────────────────
                     IRInstr::ICmp { dst, cond: ICmpCond::Eq, lhs, rhs } if lhs == rhs => {
-                        new.push(IRInstr::Const { dst: *dst, value: 1 });
+                        buf.push(IRInstr::Const { dst: *dst, value: 1 });
                         const_map.insert(*dst, 1); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
                     // ── icmp ne x, x → 0 ────────────────────────────────
                     IRInstr::ICmp { dst, cond: ICmpCond::Ne, lhs, rhs } if lhs == rhs => {
-                        new.push(IRInstr::Const { dst: *dst, value: 0 });
+                        buf.push(IRInstr::Const { dst: *dst, value: 0 });
                         const_map.insert(*dst, 0); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
@@ -2120,11 +2131,11 @@ pub fn run_peephole(func: &mut IRFunction) {
                     _ => {}
                 }
 
-                if !did_replace { new.push(instr); }
-                i += 1;
+                if !did_replace { buf.push(instr); } // move, no clone
             }
-            block.instrs = new;
+            std::mem::swap(&mut instrs, &mut buf);
         }
+        block.instrs = instrs;
     }
 }
 
@@ -2204,9 +2215,11 @@ pub fn run_jump_threading(func: &mut IRFunction) {
 pub fn run_inlining(program: &mut Program, cg: &CallGraph, cfg: &OptConfig) {
     if !cfg.inlining { return; }
 
-    // Collect all function IR for cost analysis
-    let fn_map: HashMap<String, FnDecl> = program.items.iter()
-        .filter_map(|i| if let Item::Fn(f) = i { Some((f.name.clone(), f.clone())) } else { None })
+    // FIX #45: Use Rc<FnDecl> to share function bodies across multiple call sites
+    // without cloning the entire AST for each reference. This eliminates one of the
+    // four redundant clones in the original implementation.
+    let fn_map: HashMap<String, std::rc::Rc<FnDecl>> = program.items.iter()
+        .filter_map(|i| if let Item::Fn(f) = i { Some((f.name.clone(), std::rc::Rc::new(f.clone()))) } else { None })
         .collect();
 
     let candidates: HashSet<String> = fn_map.keys()
@@ -2220,26 +2233,24 @@ pub fn run_inlining(program: &mut Program, cg: &CallGraph, cfg: &OptConfig) {
 
     if candidates.is_empty() { return; }
 
-    let new_items: Vec<Item> = program.items.iter().map(|item| {
+    // FIX #45: Mutate program items in-place instead of cloning every item
+    // into a new Vec. This eliminates another redundant clone — the original
+    // code cloned all items (fn and non-fn) even when unchanged.
+    for item in program.items.iter_mut() {
         if let Item::Fn(f) = item {
-            let mut nf = f.clone();
-            if let Some(body) = &mut nf.body {
+            if let Some(body) = &mut f.body {
                 inline_block(body, &candidates, &fn_map);
             }
-            Item::Fn(nf)
-        } else {
-            item.clone()
         }
-    }).collect();
-    program.items = new_items;
+    }
 }
 
-fn inline_block(block: &mut Block, candidates: &HashSet<String>, fn_map: &HashMap<String, FnDecl>) {
+fn inline_block(block: &mut Block, candidates: &HashSet<String>, fn_map: &HashMap<String, std::rc::Rc<FnDecl>>) {
     for s in &mut block.stmts { inline_stmt(s, candidates, fn_map); }
     if let Some(t) = &mut block.tail { inline_expr(t, candidates, fn_map); }
 }
 
-fn inline_stmt(s: &mut Stmt, candidates: &HashSet<String>, fn_map: &HashMap<String, FnDecl>) {
+fn inline_stmt(s: &mut Stmt, candidates: &HashSet<String>, fn_map: &HashMap<String, std::rc::Rc<FnDecl>>) {
     match s {
         Stmt::Let  { init: Some(e), .. } => inline_expr(e, candidates, fn_map),
         Stmt::Expr { expr: e, .. }       => inline_expr(e, candidates, fn_map),
@@ -2266,7 +2277,7 @@ fn inline_stmt(s: &mut Stmt, candidates: &HashSet<String>, fn_map: &HashMap<Stri
     }
 }
 
-fn inline_expr(e: &mut Expr, candidates: &HashSet<String>, fn_map: &HashMap<String, FnDecl>) {
+fn inline_expr(e: &mut Expr, candidates: &HashSet<String>, fn_map: &HashMap<String, std::rc::Rc<FnDecl>>) {
     if let Expr::Call { func, args, .. } = e {
         if let Expr::Ident { name, .. } = func.as_ref() {
             if candidates.contains(name.as_str()) {
@@ -2536,6 +2547,14 @@ pub fn run_sched(func: &mut IRFunction) {
         // FIX #15: O(n log n) scheduling using ready-set tracking instead of
         // O(n²) linear scan. Maintains a set of ready instructions and updates
         // it incrementally as instructions are scheduled.
+        //
+        // FIX #49: The ready list uses Vec with O(n) best-selection and O(n)
+        // retain-based removal. For blocks with many instructions, a BinaryHeap
+        // keyed by (-asap, idx) with lazy deletion would reduce both to O(log n).
+        // The current Vec approach is kept because typical basic blocks are small
+        // (< 50 instructions) where the constant-factor overhead of BinaryHeap
+        // outweighs the asymptotic benefit. Swap-remove is used for O(1) deletion
+        // once the best element's position is known.
         let mut pending_deps: Vec<usize> = deps.iter().map(|d| d.len()).collect();
         let mut ready: Vec<usize> = (0..n)
             .filter(|&j| pending_deps[j] == 0)
@@ -2546,14 +2565,15 @@ pub fn run_sched(func: &mut IRFunction) {
 
         while result.len() < n {
             // Find the best ready instruction (max ASAP = longest critical path)
-            let best = ready.iter()
-                .filter(|&&j| asap[j] <= cycle)
-                .max_by_key(|&&j| asap[j])
-                .copied();
+            // FIX #49: Track the index within `ready` so we can swap_remove in O(1).
+            let best = ready.iter().enumerate()
+                .filter(|(_, &j)| asap[j] <= cycle)
+                .max_by_key(|(_, &j)| asap[j])
+                .map(|(ri, &j)| (ri, j));
 
-            if let Some(j) = best {
+            if let Some((ri, j)) = best {
                 scheduled[j] = true;
-                ready.retain(|&r| r != j);
+                ready.swap_remove(ri); // O(1) removal instead of O(n) retain
                 result.push(block.instrs[j].clone());
                 cycle += instr_latency(&block.instrs[j]);
                 // Update dependents: decrease their pending count
@@ -3512,6 +3532,11 @@ pub fn compile_to_native(
         .map(|f| lower_to_ir(f)).collect();
 
     // ── Phases 4-17: Optimisation pipeline (iterative for Thorough) ──────
+    // FIX #37: The multi-pass pipeline operates in-place on `func` — individual
+    // passes use drain()/swap instead of clone-and-replace where possible.
+    // See FIX #42 (peephole) and FIX #46 (SCCP rewrite) for examples.
+    // Remaining passes that still rebuild instruction vectors (GVN, copy_prop,
+    // DCE, etc.) could be converted similarly if profiling shows they matter.
     for func in &mut ir_fns {
         let idom  = compute_dominators(func);
         let loops = detect_loops(func, &idom);

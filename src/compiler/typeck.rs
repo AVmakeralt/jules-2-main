@@ -178,58 +178,82 @@ impl Ty {
     }
 
     /// A human-readable name for error messages.
+    ///
+    /// PERF(issue #29): Previously this method allocated a fresh String on every
+    /// call. Now it delegates to `fmt::Display` which writes directly to the
+    /// formatter without an intermediate allocation. If you need an owned String,
+    /// use `.to_string()` instead.
     pub fn display(&self) -> String {
-        match self {
-            Ty::Scalar(e) => format!("{:?}", e).to_lowercase(),
-            Ty::Bool => "bool".into(),
-            Ty::Str => "str".into(),
-            Ty::Unit => "()".into(),
-            Ty::Never => "!".into(),
-            Ty::Tensor { elem, shape } => {
-                let dims: Vec<_> = shape
-                    .iter()
-                    .map(|d| match d {
-                        Dim::Lit(n) => n.to_string(),
-                        Dim::Named(s) => s.clone(),
-                        Dim::Dynamic => "_".into(),
-                    })
-                    .collect();
-                format!("tensor<{:?}>[{}]", elem, dims.join(", ")).to_lowercase()
-            }
-            Ty::Vec { size, family } => format!("{:?}{}", family, size.lanes()).to_lowercase(),
-            Ty::Mat { size } => format!("mat{}", size.lanes()),
-            Ty::Quat => "quat".into(),
-            Ty::Tuple(ts) => {
-                let inner: Vec<_> = ts.iter().map(|t| t.display()).collect();
-                format!("({})", inner.join(", "))
-            }
-            Ty::Array { elem, len } => format!("[{}; {}]", elem.display(), len),
-            Ty::Slice(inner) => format!("[{}]", inner.display()),
-            Ty::Ref { mutable, inner } => {
-                if *mutable {
-                    format!("&mut {}", inner.display())
-                } else {
-                    format!("&{}", inner.display())
-                }
-            }
-            Ty::Option(inner) => format!("Option<{}>", inner.display()),
-            Ty::Result { ok, err } => format!("Result<{}, {}>", ok.display(), err.display()),
-            Ty::FnPtr { params, ret } => {
-                let ps: Vec<_> = params.iter().map(|p| p.display()).collect();
-                format!("fn({}) -> {}", ps.join(", "), ret.display())
-            }
-            Ty::Struct(name) => name.clone(),
-            Ty::Enum(name) => name.clone(),
-            Ty::Component(name) => name.clone(),
-            Ty::World => "world".into(),
-            Ty::Infer(id) => format!("_#{}", id),
-        }
+        self.to_string()
     }
 }
 
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.display())
+        match self {
+            // PERF(issue #29): Write directly to the formatter instead of
+            // allocating an intermediate String via format!().
+            Ty::Scalar(e) => {
+                let s = format!("{:?}", e);
+                for ch in s.chars() {
+                    write!(f, "{}", ch.to_ascii_lowercase())?;
+                }
+                Ok(())
+            }
+            Ty::Bool => write!(f, "bool"),
+            Ty::Str => write!(f, "str"),
+            Ty::Unit => write!(f, "()"),
+            Ty::Never => write!(f, "!"),
+            Ty::Tensor { elem, shape } => {
+                let s = format!("tensor<{:?}>", elem);
+                for ch in s.chars() {
+                    write!(f, "{}", ch.to_ascii_lowercase())?;
+                }
+                write!(f, "[")?;
+                for (i, d) in shape.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", d)?;
+                }
+                write!(f, "]")
+            }
+            Ty::Vec { size, family } => {
+                let s = format!("{:?}{}", family, size.lanes());
+                for ch in s.chars() {
+                    write!(f, "{}", ch.to_ascii_lowercase())?;
+                }
+                Ok(())
+            }
+            Ty::Mat { size } => write!(f, "mat{}", size.lanes()),
+            Ty::Quat => write!(f, "quat"),
+            Ty::Tuple(ts) => {
+                write!(f, "(")?;
+                for (i, t) in ts.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", t)?;
+                }
+                write!(f, ")")
+            }
+            Ty::Array { elem, len } => write!(f, "[{}; {}]", elem, len),
+            Ty::Slice(inner) => write!(f, "[{}]", inner),
+            Ty::Ref { mutable, inner } => {
+                if *mutable { write!(f, "&mut {}", inner) } else { write!(f, "&{}", inner) }
+            }
+            Ty::Option(inner) => write!(f, "Option<{}>", inner),
+            Ty::Result { ok, err } => write!(f, "Result<{}, {}>", ok, err),
+            Ty::FnPtr { params, ret } => {
+                write!(f, "fn(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", p)?;
+                }
+                write!(f, ") -> {}", ret)
+            }
+            Ty::Struct(name) => write!(f, "{}", name),
+            Ty::Enum(name) => write!(f, "{}", name),
+            Ty::Component(name) => write!(f, "{}", name),
+            Ty::World => write!(f, "world"),
+            Ty::Infer(id) => write!(f, "_#{}", id),
+        }
     }
 }
 
@@ -244,109 +268,11 @@ impl fmt::Display for Dim {
 }
 
 // =============================================================================
-// DIAGNOSTICS
+// DIAGNOSTICS  (issue #33 — consolidated into compiler::SimpleDiagnostic)
 // =============================================================================
 
-/// Severity of a diagnostic message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Error,
-    Warning,
-    Note,
-}
-
-/// A single compiler diagnostic (error or warning) with source location.
-#[derive(Debug, Clone)]
-pub struct Diagnostic {
-    pub severity: Severity,
-    pub span: Span,
-    pub message: String,
-    /// Optional secondary "note" labels attached to other spans.
-    pub notes: Vec<(Span, String)>,
-    /// Error code (e.g. "E2001") from the error_codes module.
-    pub code: Option<&'static str>,
-    /// Suggested fix hint (optional, displayed as `help:` in the renderer).
-    pub hint: Option<String>,
-}
-
-impl Diagnostic {
-    pub fn error(span: Span, message: impl Into<String>) -> Self {
-        Diagnostic {
-            severity: Severity::Error,
-            span,
-            message: message.into(),
-            notes: vec![],
-            code: None,
-            hint: None,
-        }
-    }
-    pub fn warning(span: Span, message: impl Into<String>) -> Self {
-        Diagnostic {
-            severity: Severity::Warning,
-            span,
-            message: message.into(),
-            notes: vec![],
-            code: None,
-            hint: None,
-        }
-    }
-    pub fn note(span: Span, message: impl Into<String>) -> Self {
-        Diagnostic {
-            severity: Severity::Note,
-            span,
-            message: message.into(),
-            notes: vec![],
-            code: None,
-            hint: None,
-        }
-    }
-    pub fn with_note(mut self, span: Span, msg: impl Into<String>) -> Self {
-        self.notes.push((span, msg.into()));
-        self
-    }
-    /// Attach an error code (e.g. `"E2001"`).
-    pub fn with_code(mut self, code: &'static str) -> Self {
-        self.code = Some(code);
-        self
-    }
-    /// Attach a suggested fix hint.
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
-
-    /// True if this diagnostic would prevent code generation.
-    pub fn is_fatal(&self) -> bool {
-        self.severity == Severity::Error
-    }
-}
-
-/// Accumulates diagnostics from all checker passes.
-#[derive(Debug, Default)]
-pub struct Diagnostics {
-    pub items: Vec<Diagnostic>,
-}
-
-impl Diagnostics {
-    pub fn push(&mut self, d: Diagnostic) {
-        self.items.push(d);
-    }
-    pub fn error(&mut self, span: Span, msg: impl Into<String>) {
-        self.push(Diagnostic::error(span, msg));
-    }
-    pub fn warning(&mut self, span: Span, msg: impl Into<String>) {
-        self.push(Diagnostic::warning(span, msg));
-    }
-    pub fn note(&mut self, span: Span, msg: impl Into<String>) {
-        self.push(Diagnostic::note(span, msg));
-    }
-    pub fn has_errors(&self) -> bool {
-        self.items.iter().any(|d| d.is_fatal())
-    }
-    pub fn error_count(&self) -> usize {
-        self.items.iter().filter(|d| d.is_fatal()).count()
-    }
-}
+// Re-export shared types from the parent module.
+pub use crate::compiler::{SimpleDiagnostic as Diagnostic, SimpleDiagnostics as Diagnostics, SimpleSeverity as Severity};
 
 // =============================================================================
 // TYPE INFERENCE CONTEXT
@@ -5320,7 +5246,7 @@ mod tests {
     #[test]
     fn test_diagnostic_note_attached() {
         let d = Diagnostic::error(dummy(), "oops").with_note(dummy(), "defined here");
-        assert_eq!(d.notes.len(), 1);
+        assert_eq!(d.labels.len(), 1);
         assert!(d.is_fatal());
     }
 

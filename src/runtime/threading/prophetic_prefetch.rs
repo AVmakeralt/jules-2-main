@@ -791,6 +791,63 @@ impl PrefetchEmitter {
 /// This is the main integration point with Jules's compilation pipeline.
 /// The Phase3 JIT and Phase6 SIMD JIT query this engine when recompiling
 /// hot traces to determine if prefetch instructions should be injected.
+///
+/// Issue #91: DISCONNECTED FROM HOT PATHS
+///
+/// The PropheticPrefetchEngine is currently only wired into the JIT
+/// recompilation pipeline (Phase3/Phase6), which means it only benefits
+/// code that has been JIT-compiled. The following hot paths do NOT yet
+/// use the prefetch engine and would benefit from it:
+///
+/// 1. **Frame variable lookups** (`interp.rs::Env::get`):
+///    The `name_to_slot` FxHashMap lookup is a random-access pattern
+///    (GatherScatter) that the hardware prefetcher cannot predict.
+///    After a few observations, the PHP could prefetch the next
+///    `values[slot]` entry while the hash is being computed.
+///    NOT CONNECTED because: Env::get is single-threaded interpreted
+///    code, not JIT-compiled; the overhead of PHP instrumentation
+///    would exceed the prefetch benefit for single-lookups.
+///
+/// 2. **SparseSet probes** (`ecs_lockfree.rs::SparseSet::get`):
+///    The sparse→dense indirection is a dependent load chain:
+///    `sparse[eid]` → `dense[sparse[eid] * stride]`. The second
+///    load depends on the first, creating a stall of ~4 cycles on
+///    L1 hit. PHP could prefetch the dense entry based on the
+///    predicted sparse index.
+///    NOT CONNECTED because: SparseSet::get is on the inner loop of
+///    ECS queries, which may access thousands of entities per frame;
+///    connecting PHP would require tracking per-query access patterns,
+///    which is not yet implemented.
+///
+/// 3. **ECS archetype iteration** (`interp.rs::EcsWorld` archetype scan):
+///    Iterating archetypes involves chasing `FxHashMap` buckets and
+///    then walking the `dense_ids`/`dense_vals` arrays. The bucket
+///    lookup is pointer-chasing (prime PHP target).
+///    NOT CONNECTED because: Archetype iteration is infrequent compared
+///    to component access within an archetype; the ROI is unclear.
+///
+/// 4. **WorkStealingDeque steal operations** (`deque.rs`):
+///    The steal path reads the bottom and top indices, then accesses
+///    the circular buffer. The buffer access is random (dependent on
+///    the index values read).
+///    NOT CONNECTED because: Steal operations are relatively rare
+///    compared to local push/pop, and the dequeue buffer is typically
+///    in L1/L2 cache already.
+///
+/// To connect PHP to any of these hot paths, the general pattern is:
+///   1. Call `observe_cache_miss(instruction_id, accessed_addr, false)`
+///      from the hot path after each access.
+///   2. Before the next access in the same hot path, check
+///      `should_inject_prefetch(instruction_id)` and, if a hint exists,
+///      call `execute_prefetch(...)` to emit the prefetch.
+///   3. After the actual access, call `record_correct()` or
+///      `record_wrong()` to update confidence.
+///
+/// This is NOT done in this change because it would require modifying
+/// the hot paths themselves (interp.rs, ecs_lockfree.rs), which is
+/// too invasive for a performance audit fix. A future change should
+/// add PHP integration behind a runtime feature flag so it can be
+/// enabled/disabled without affecting the default build.
 pub struct PropheticPrefetchEngine {
     /// The stride/pattern tracker fed by PEBS cache-miss observations.
     tracker: PrefetchTracker,

@@ -452,7 +452,7 @@ impl<'src> DiagRenderer<'src> {
 
         // Squiggle line: "     | ^^^^"
         let col = (span.col as usize).saturating_sub(1);
-        let width = (span.end.saturating_sub(span.start)).max(1);
+        let width = (span.end.saturating_sub(span.start)).max(1) as usize;
         let pad = self.expand_tabs(line_str, col);
         let squig = self.paint(squiggle_color, &"^".repeat(width));
         writeln!(
@@ -1379,7 +1379,7 @@ fn adapt_typeck_diag(d: crate::compiler::typeck::Diagnostic) -> Diag {
         labels: vec![],
         hint: d.hint,
     };
-    for (s, m) in d.notes {
+    for (s, m) in d.labels {
         out.labels.push((s, m));
     }
     out
@@ -2372,21 +2372,21 @@ fn apply_safe_syntax_fixes(source: &str, diags: &[Diag]) -> Option<String> {
             continue;
         };
         if hint.contains("add `;` to end this statement") {
-            semicolon_lines.insert(span.line);
+            semicolon_lines.insert(span.line as u32);
         } else if hint.contains("close this expression with `)`") {
-            insertions.push((span.start, ')'));
+            insertions.push((span.start as usize, ')'));
         } else if hint.contains("close this index/type with `]`") {
-            insertions.push((span.start, ']'));
+            insertions.push((span.start as usize, ']'));
         } else if hint.contains("close this block with `}`") {
-            insertions.push((span.start, '}'));
+            insertions.push((span.start as usize, '}'));
         } else if hint.contains("start a block with `{ ... }`") {
-            block_open_insertions.push(span.start);
+            block_open_insertions.push(span.start as usize);
         } else if hint.contains("separate items with `,`") {
-            comma_insertions.push(span.start);
+            comma_insertions.push(span.start as usize);
         } else if hint.contains("use `=` to assign a value") {
-            replacements.push((span.start, span.end, "=".into()));
+            replacements.push((span.start as usize, span.end as usize, "=".into()));
         } else if hint.contains("use `->` before a return type") {
-            replacements.push((span.start, span.end, "->".into()));
+            replacements.push((span.start as usize, span.end as usize, "->".into()));
         }
     }
 
@@ -2491,8 +2491,8 @@ fn detect_silent_issues(source: &str) -> Vec<Diag> {
             continue;
         }
         let span = Span {
-            line: (idx + 1) as u32,
-            col: (line.find(trimmed).unwrap_or(0) + 1) as u32,
+            line: (idx + 1) as u16,
+            col: (line.find(trimmed).unwrap_or(0) + 1) as u16,
             start: 0,
             end: 0,
         };
@@ -4423,10 +4423,10 @@ mod tests {
 
     fn sp(line: u32, col: u32, start: usize, end: usize) -> Span {
         Span {
-            line,
-            col,
-            start,
-            end,
+            line: line as u16,
+            col: col as u16,
+            start: start as u32,
+            end: end as u32,
         }
     }
 

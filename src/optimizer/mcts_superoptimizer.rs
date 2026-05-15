@@ -62,7 +62,7 @@ impl Default for MctsConfig {
     fn default() -> Self {
         Self {
             max_simulations: 200,
-            max_depth: 6,
+            max_depth: 2,
             exploration_constant: 1.414, // c_puct
             time_budget_ms: 50,
             min_improvement: 1,
@@ -79,7 +79,7 @@ impl MctsConfig {
     pub fn fast() -> Self {
         Self {
             max_simulations: 50,
-            max_depth: 3,
+            max_depth: 2,
             time_budget_ms: 10,
             ..Default::default()
         }
@@ -89,7 +89,7 @@ impl MctsConfig {
     pub fn thorough() -> Self {
         Self {
             max_simulations: 1000,
-            max_depth: 8,
+            max_depth: 2,
             time_budget_ms: 200,
             ..Default::default()
         }
@@ -99,7 +99,7 @@ impl MctsConfig {
     pub fn maximum() -> Self {
         Self {
             max_simulations: 5000,
-            max_depth: 12,
+            max_depth: 2,
             time_budget_ms: 1000,
             max_tree_size: 100_000,
             ..Default::default()
@@ -110,7 +110,7 @@ impl MctsConfig {
     pub fn local_only() -> Self {
         Self {
             max_simulations: 100,
-            max_depth: 4,
+            max_depth: 2,
             exploration_constant: 1.414,
             time_budget_ms: 20,
             min_improvement: 2,
@@ -125,7 +125,7 @@ impl MctsConfig {
     pub fn hotpath() -> Self {
         Self {
             max_simulations: 200,
-            max_depth: 6,
+            max_depth: 2,
             exploration_constant: 1.414,
             time_budget_ms: 50,
             min_improvement: 1,
@@ -166,9 +166,31 @@ pub enum SearchMode {
 
 // =============================================================================
 // §2a  String Interner for Var(u32) — eliminates heap allocation per variable
+//
+// Issue #90: This is one of three separate string interners in the codebase:
+//   1. src/tools/string_intern.rs — now delegates to symbol.rs (canonical)
+//   2. src/runtime/symbol.rs — CANONICAL interner (Symbol = u32)
+//   3. THIS FILE — MCTS-specific StringInterner (thread-local, Box::leak)
+//
+// This MCTS interner is NOT yet delegating to symbol.rs because:
+//   - It uses thread-local RefCell (lock-free) while symbol.rs uses global Mutex
+//   - It returns &'static str via Box::leak, while symbol.rs returns borrowed &str
+//   - Merging would require changing the return type of get() from &'static str
+//     to String or adding a Mutex in symbol.rs, both with performance trade-offs
+//
+// TODO (Issue #90 follow-up): Migrate to symbol.rs by:
+//   1. Having intern() delegate to symbol::global_intern() and return Symbol
+//   2. Having get() call symbol::global_resolve() and return a Cow or String
+//   3. Changing Instr::Var to store Symbol instead of bare u32
+// This would unify the ID space across the entire codebase, enabling O(1)
+// cross-module string comparisons. Blocked on API impact analysis.
 // =============================================================================
 
-/// S2 fix: A simple string interner that maps variable names to u32 indices.
+/// MCTS-local string interner that maps variable names to u32 indices.
+///
+/// NOTE (Issue #90): This is a duplicate of the canonical interner in
+/// `crate::runtime::symbol::StringInterner`. See module comment above for
+/// the migration plan.
 ///
 /// Fix 1: Eliminates the UB from `transmute::<&str, &'static str>`.
 /// The old `get()` used transmute which was UB because the thread-local
@@ -1780,6 +1802,9 @@ pub struct MctsNode {
     pub policy_prior: Option<f64>,
     /// Virtual loss for parallel MCTS (AtomicU32 for thread-safe access)
     pub virtual_loss: AtomicU32,
+    /// False-sharing padding: ensures virtual_loss doesn't share a cache line
+    /// with the next node's fields in a Vec<MctsNode>.
+    _pad: [u32; 15],
 }
 
 impl Clone for MctsNode {
@@ -1795,6 +1820,7 @@ impl Clone for MctsNode {
             cached_cost: self.cached_cost,
             policy_prior: self.policy_prior,
             virtual_loss: AtomicU32::new(self.virtual_loss.load(Ordering::Relaxed)),
+            _pad: [0u32; 15],
         }
     }
 }
@@ -1812,6 +1838,7 @@ impl MctsNode {
             cached_cost: None,
             policy_prior: None,
             virtual_loss: AtomicU32::new(0),
+            _pad: [0u32; 15],
         }
     }
 
@@ -2135,6 +2162,7 @@ impl MctsSuperoptimizer {
                                 cached_cost: None,
                                 policy_prior,
                                 virtual_loss: AtomicU32::new(0),
+                                _pad: [0u32; 15],
                             });
                         }
                     }
@@ -2160,6 +2188,7 @@ impl MctsSuperoptimizer {
                             cached_cost: None,
                             policy_prior,
                             virtual_loss: AtomicU32::new(0),
+                            _pad: [0u32; 15],
                         });
                     }
                 }
@@ -2221,6 +2250,7 @@ impl MctsSuperoptimizer {
                             cached_cost: None,
                             policy_prior,
                             virtual_loss: AtomicU32::new(0),
+                            _pad: [0u32; 15],
                         });
                     }
                 }
@@ -3993,7 +4023,7 @@ mod tests {
     fn test_mcts_config_defaults() {
         let config = MctsConfig::default();
         assert_eq!(config.max_simulations, 200);
-        assert_eq!(config.max_depth, 6);
+        assert_eq!(config.max_depth, 2);
         assert!(config.use_hardware_cost);
     }
 
@@ -4163,6 +4193,7 @@ mod tests {
             cached_cost: None,
             policy_prior: Some(0.7), // Higher prior
             virtual_loss: AtomicU32::new(0),
+            _pad: [0u32; 15],
         });
         root.children.push(MctsNode {
             program: Instr::ConstInt(2),
@@ -4175,6 +4206,7 @@ mod tests {
             cached_cost: None,
             policy_prior: Some(0.3), // Lower prior
             virtual_loss: AtomicU32::new(0),
+            _pad: [0u32; 15],
         });
         // With equal visits but different priors, PUCT should prefer higher prior
         let best = root.best_child(1.414);

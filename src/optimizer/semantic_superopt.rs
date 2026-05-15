@@ -63,12 +63,37 @@ pub struct SemanticOptResult {
     pub estimated_speedup: f64,
 }
 
+/// Classification of which Expr variant a rule applies to.
+/// Used to skip rules that cannot match the current expression shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExprShape {
+    BinOp,
+    UnOp,
+    Call,
+    IfExpr,
+    Pow,
+    Any,
+}
+
+/// Classify an expression into its shape category for rule pre-filtering.
+fn classify_expr(expr: &Expr) -> ExprShape {
+    match expr {
+        Expr::BinOp { .. } => ExprShape::BinOp,
+        Expr::UnOp { .. } => ExprShape::UnOp,
+        Expr::Call { .. } | Expr::MethodCall { .. } => ExprShape::Call,
+        Expr::IfExpr { .. } => ExprShape::IfExpr,
+        Expr::Pow { .. } => ExprShape::Pow,
+        _ => ExprShape::Any,
+    }
+}
+
 /// A single rewrite rule: a named (matcher, rewriter) pair.
 /// The matcher extracts a `RuleCapture` from an expression, and the
 /// rewriter turns that capture into an optimized expression.
 struct RewriteRule {
     name: &'static str,
     speedup: f64,
+    shape: ExprShape,
     apply: fn(&SemanticSuperoptimizer, &Expr) -> Option<Expr>,
 }
 
@@ -141,269 +166,269 @@ impl SemanticSuperoptimizer {
         // Each entry is:  ( "name", speedup_factor, apply_fn )
         // apply_fn returns Some(optimized_expr) or None.
         macro_rules! rule {
-            ($name:expr, $speedup:expr, $fn:expr) => {
-                RewriteRule { name: $name, speedup: $speedup, apply: $fn }
+            ($name:expr, $speedup:expr, $shape:expr, $fn:expr) => {
+                RewriteRule { name: $name, speedup: $speedup, shape: $shape, apply: $fn }
             };
         }
 
         vec![
             // ── §1 Constant folding ──────────────────────────────────────────
             // R1  lit + lit
-            rule!("cf_add",      1.1, |s, e| s.cf_binop(e, BinOpKind::Add,  |a,b| a.wrapping_add(b))),
+            rule!("cf_add",      1.1, ExprShape::BinOp, |s, e| s.cf_binop(e, BinOpKind::Add,  |a,b| a.wrapping_add(b))),
             // R2  lit - lit
-            rule!("cf_sub",      1.1, |s, e| s.cf_binop(e, BinOpKind::Sub,  |a,b| a.wrapping_sub(b))),
+            rule!("cf_sub",      1.1, ExprShape::BinOp, |s, e| s.cf_binop(e, BinOpKind::Sub,  |a,b| a.wrapping_sub(b))),
             // R3  lit * lit
-            rule!("cf_mul",      1.1, |s, e| s.cf_binop(e, BinOpKind::Mul,  |a,b| a.wrapping_mul(b))),
+            rule!("cf_mul",      1.1, ExprShape::BinOp, |s, e| s.cf_binop(e, BinOpKind::Mul,  |a,b| a.wrapping_mul(b))),
             // R4  lit / lit  (non-zero divisor)
-            rule!("cf_div",      1.1, |s, e| s.cf_binop_guard(e, BinOpKind::Div,  |a,b| if b != 0 { Some(a/b) } else { None })),
+            rule!("cf_div",      1.1, ExprShape::BinOp, |s, e| s.cf_binop_guard(e, BinOpKind::Div,  |a,b| if b != 0 { Some(a/b) } else { None })),
             // R5  lit % lit  (non-zero divisor)
-            rule!("cf_rem",      1.1, |s, e| s.cf_binop_guard(e, BinOpKind::Rem,  |a,b| if b != 0 { Some(a%b) } else { None })),
+            rule!("cf_rem",      1.1, ExprShape::BinOp, |s, e| s.cf_binop_guard(e, BinOpKind::Rem,  |a,b| if b != 0 { Some(a%b) } else { None })),
             // R6  lit ** lit  (small exponent only to avoid huge constants)
-            rule!("cf_pow",      1.1, |s, e| s.cf_pow(e)),
+            rule!("cf_pow",      1.1, ExprShape::Pow, |s, e| s.cf_pow(e)),
             // R7  lit & lit
-            rule!("cf_bitand",   1.1, |s, e| s.cf_binop(e, BinOpKind::BitAnd, |a,b| a & b)),
+            rule!("cf_bitand",   1.1, ExprShape::BinOp, |s, e| s.cf_binop(e, BinOpKind::BitAnd, |a,b| a & b)),
             // R8  lit | lit
-            rule!("cf_bitor",    1.1, |s, e| s.cf_binop(e, BinOpKind::BitOr,  |a,b| a | b)),
+            rule!("cf_bitor",    1.1, ExprShape::BinOp, |s, e| s.cf_binop(e, BinOpKind::BitOr,  |a,b| a | b)),
             // R9  lit ^ lit
-            rule!("cf_bitxor",   1.1, |s, e| s.cf_binop(e, BinOpKind::BitXor, |a,b| a ^ b)),
+            rule!("cf_bitxor",   1.1, ExprShape::BinOp, |s, e| s.cf_binop(e, BinOpKind::BitXor, |a,b| a ^ b)),
             // R10 lit << lit  (bounded shift)
-            rule!("cf_shl",      1.1, |s, e| s.cf_shift(e, BinOpKind::Shl)),
+            rule!("cf_shl",      1.1, ExprShape::BinOp, |s, e| s.cf_shift(e, BinOpKind::Shl)),
             // R11 lit >> lit
-            rule!("cf_shr",      1.1, |s, e| s.cf_shift(e, BinOpKind::Shr)),
+            rule!("cf_shr",      1.1, ExprShape::BinOp, |s, e| s.cf_shift(e, BinOpKind::Shr)),
             // R12 -lit
-            rule!("cf_neg",      1.1, |s, e| s.cf_neg(e)),
+            rule!("cf_neg",      1.1, ExprShape::UnOp, |s, e| s.cf_neg(e)),
             // R13 !lit  (boolean)
-            rule!("cf_not_bool", 1.1, |s, e| s.cf_not(e)),
+            rule!("cf_not_bool", 1.1, ExprShape::UnOp, |s, e| s.cf_not(e)),
             // R14 lit == lit
-            rule!("cf_eq",       1.1, |s, e| s.cf_cmp(e, BinOpKind::Eq,  |a,b| a==b)),
+            rule!("cf_eq",       1.1, ExprShape::BinOp, |s, e| s.cf_cmp(e, BinOpKind::Eq,  |a,b| a==b)),
             // R15 lit != lit
-            rule!("cf_ne",       1.1, |s, e| s.cf_cmp(e, BinOpKind::Ne,  |a,b| a!=b)),
+            rule!("cf_ne",       1.1, ExprShape::BinOp, |s, e| s.cf_cmp(e, BinOpKind::Ne,  |a,b| a!=b)),
             // R16 lit < lit
-            rule!("cf_lt",       1.1, |s, e| s.cf_cmp(e, BinOpKind::Lt,  |a,b| a<b)),
+            rule!("cf_lt",       1.1, ExprShape::BinOp, |s, e| s.cf_cmp(e, BinOpKind::Lt,  |a,b| a<b)),
             // R17 lit <= lit
-            rule!("cf_le",       1.1, |s, e| s.cf_cmp(e, BinOpKind::Le,  |a,b| a<=b)),
+            rule!("cf_le",       1.1, ExprShape::BinOp, |s, e| s.cf_cmp(e, BinOpKind::Le,  |a,b| a<=b)),
             // R18 lit > lit
-            rule!("cf_gt",       1.1, |s, e| s.cf_cmp(e, BinOpKind::Gt,  |a,b| a>b)),
+            rule!("cf_gt",       1.1, ExprShape::BinOp, |s, e| s.cf_cmp(e, BinOpKind::Gt,  |a,b| a>b)),
             // R19 lit >= lit
-            rule!("cf_ge",       1.1, |s, e| s.cf_cmp(e, BinOpKind::Ge,  |a,b| a>=b)),
+            rule!("cf_ge",       1.1, ExprShape::BinOp, |s, e| s.cf_cmp(e, BinOpKind::Ge,  |a,b| a>=b)),
             // R20 true && true, false || false, etc.
-            rule!("cf_bool_and_or", 1.1, |s, e| s.cf_bool_binop(e)),
+            rule!("cf_bool_and_or", 1.1, ExprShape::BinOp, |s, e| s.cf_bool_binop(e)),
 
             // ── §2 Identity / annihilator / absorbing elements ────────────────
             // R21 x + 0  →  x
-            rule!("add_zero_r",   1.0, |s, e| s.identity_right(e, BinOpKind::Add, 0)),
+            rule!("add_zero_r",   1.0, ExprShape::BinOp, |s, e| s.identity_right(e, BinOpKind::Add, 0)),
             // R22 0 + x  →  x
-            rule!("add_zero_l",   1.0, |s, e| s.identity_left(e, BinOpKind::Add, 0)),
+            rule!("add_zero_l",   1.0, ExprShape::BinOp, |s, e| s.identity_left(e, BinOpKind::Add, 0)),
             // R23 x - 0  →  x
-            rule!("sub_zero",     1.0, |s, e| s.identity_right(e, BinOpKind::Sub, 0)),
+            rule!("sub_zero",     1.0, ExprShape::BinOp, |s, e| s.identity_right(e, BinOpKind::Sub, 0)),
             // R24 x * 1  →  x
-            rule!("mul_one_r",    1.0, |s, e| s.identity_right(e, BinOpKind::Mul, 1)),
+            rule!("mul_one_r",    1.0, ExprShape::BinOp, |s, e| s.identity_right(e, BinOpKind::Mul, 1)),
             // R25 1 * x  →  x
-            rule!("mul_one_l",    1.0, |s, e| s.identity_left(e, BinOpKind::Mul, 1)),
+            rule!("mul_one_l",    1.0, ExprShape::BinOp, |s, e| s.identity_left(e, BinOpKind::Mul, 1)),
             // R26 x * 0  →  0
-            rule!("mul_zero_r",   1.0, |s, e| s.annihilator_right(e, BinOpKind::Mul, 0)),
+            rule!("mul_zero_r",   1.0, ExprShape::BinOp, |s, e| s.annihilator_right(e, BinOpKind::Mul, 0)),
             // R27 0 * x  →  0
-            rule!("mul_zero_l",   1.0, |s, e| s.annihilator_left(e, BinOpKind::Mul, 0)),
+            rule!("mul_zero_l",   1.0, ExprShape::BinOp, |s, e| s.annihilator_left(e, BinOpKind::Mul, 0)),
             // R28 x / 1  →  x
-            rule!("div_one",      1.0, |s, e| s.identity_right(e, BinOpKind::Div, 1)),
+            rule!("div_one",      1.0, ExprShape::BinOp, |s, e| s.identity_right(e, BinOpKind::Div, 1)),
             // R29 0 / x  →  0  (x ≠ 0)
-            rule!("zero_div",     1.0, |s, e| s.zero_div(e)),
+            rule!("zero_div",     1.0, ExprShape::BinOp, |s, e| s.zero_div(e)),
             // R30 x ^ 0  →  1  (pow)
-            rule!("pow_zero",     1.0, |s, e| s.pow_zero(e)),
+            rule!("pow_zero",     1.0, ExprShape::Pow, |s, e| s.pow_zero(e)),
             // R31 x ^ 1  →  x  (pow)
-            rule!("pow_one",      1.0, |s, e| s.pow_one(e)),
+            rule!("pow_one",      1.0, ExprShape::Pow, |s, e| s.pow_one(e)),
             // R32 1 ^ x  →  1  (pow)
-            rule!("one_pow",      1.0, |s, e| s.one_pow(e)),
+            rule!("one_pow",      1.0, ExprShape::Pow, |s, e| s.one_pow(e)),
             // R33 x | 0  →  x
-            rule!("bitor_zero",   1.0, |s, e| s.identity_right(e, BinOpKind::BitOr, 0)),
+            rule!("bitor_zero",   1.0, ExprShape::BinOp, |s, e| s.identity_right(e, BinOpKind::BitOr, 0)),
             // R34 x & !0  →  x  (all-ones mask identity, represented as x & MAX_U128)
-            rule!("bitand_allones", 1.0, |s, e| s.bitand_allones(e)),
+            rule!("bitand_allones", 1.0, ExprShape::BinOp, |s, e| s.bitand_allones(e)),
             // R35 x ^ 0  →  x  (bitxor)
-            rule!("bitxor_zero",  1.0, |s, e| s.identity_right(e, BinOpKind::BitXor, 0)),
+            rule!("bitxor_zero",  1.0, ExprShape::BinOp, |s, e| s.identity_right(e, BinOpKind::BitXor, 0)),
 
             // ── §3 Algebraic normalisation ─────────────────────────────────────
             // R36 x - x  →  0
-            rule!("sub_self",     1.0, |s, e| s.sub_self(e)),
+            rule!("sub_self",     1.0, ExprShape::BinOp, |s, e| s.sub_self(e)),
             // R37 x / x  →  1  (x ≠ 0)
-            rule!("div_self",     1.0, |s, e| s.div_self(e)),
+            rule!("div_self",     1.0, ExprShape::BinOp, |s, e| s.div_self(e)),
             // R38 x ^ x  →  0  (bitxor self = 0)
-            rule!("xor_self",     1.0, |s, e| s.xor_self(e)),
+            rule!("xor_self",     1.0, ExprShape::BinOp, |s, e| s.xor_self(e)),
             // R39 x & x  →  x
-            rule!("and_self",     1.0, |s, e| s.idempotent(e, BinOpKind::BitAnd)),
+            rule!("and_self",     1.0, ExprShape::BinOp, |s, e| s.idempotent(e, BinOpKind::BitAnd)),
             // R40 x | x  →  x
-            rule!("or_self",      1.0, |s, e| s.idempotent(e, BinOpKind::BitOr)),
+            rule!("or_self",      1.0, ExprShape::BinOp, |s, e| s.idempotent(e, BinOpKind::BitOr)),
             // R41 (x + y) + z  →  x + (y + z)  (right-associativity for canonicalisation)
-            rule!("assoc_add",    1.0, |s, e| s.reassoc(e, BinOpKind::Add)),
+            rule!("assoc_add",    1.0, ExprShape::BinOp, |s, e| s.reassoc(e, BinOpKind::Add)),
             // R42 (x * y) * z  →  x * (y * z)
-            rule!("assoc_mul",    1.0, |s, e| s.reassoc(e, BinOpKind::Mul)),
+            rule!("assoc_mul",    1.0, ExprShape::BinOp, |s, e| s.reassoc(e, BinOpKind::Mul)),
             // R43 x * (y + z) → x*y + x*z  (distribute mul over add — useful to expose constants)
-            rule!("distrib_mul_add", 1.0, |s, e| s.distribute_mul_add(e)),
+            rule!("distrib_mul_add", 1.0, ExprShape::BinOp, |s, e| s.distribute_mul_add(e)),
             // R44 (x + y) * z → x*z + y*z
-            rule!("distrib_add_mul", 1.0, |s, e| s.distribute_add_mul(e)),
+            rule!("distrib_add_mul", 1.0, ExprShape::BinOp, |s, e| s.distribute_add_mul(e)),
             // R45 -(x + y)  →  (-x) + (-y)  (push negation inward for constant folding)
-            rule!("neg_push_add", 1.0, |s, e| s.neg_push(e, BinOpKind::Add)),
+            rule!("neg_push_add", 1.0, ExprShape::BinOp, |s, e| s.neg_push(e, BinOpKind::Add)),
             // R46 -(x * y)  →  (-x) * y
-            rule!("neg_push_mul", 1.0, |s, e| s.neg_push(e, BinOpKind::Mul)),
+            rule!("neg_push_mul", 1.0, ExprShape::BinOp, |s, e| s.neg_push(e, BinOpKind::Mul)),
             // R47 x - y  →  x + (-y)  (normalise subtraction)
-            rule!("sub_to_add_neg", 1.0, |s, e| s.sub_to_add_neg(e)),
+            rule!("sub_to_add_neg", 1.0, ExprShape::BinOp, |s, e| s.sub_to_add_neg(e)),
             // R48 --x  →  x  (double negation)
-            rule!("double_neg",   1.0, |s, e| s.double_neg(e)),
+            rule!("double_neg",   1.0, ExprShape::UnOp, |s, e| s.double_neg(e)),
             // R49 x + x  →  2 * x
-            rule!("add_self_to_mul2", 1.0, |s, e| s.add_self(e)),
+            rule!("add_self_to_mul2", 1.0, ExprShape::BinOp, |s, e| s.add_self(e)),
             // R50 x * 2  →  x + x  (sometimes cheaper; separate from shift)
-            rule!("mul2_to_add",  1.0, |s, e| s.mul2_to_add(e)),
+            rule!("mul2_to_add",  1.0, ExprShape::BinOp, |s, e| s.mul2_to_add(e)),
             // R51 (x * a) + (x * b)  →  x * (a + b)  (factor out common term)
-            rule!("factor_common_mul", 1.0, |s, e| s.factor_common(e, BinOpKind::Add, BinOpKind::Mul)),
+            rule!("factor_common_mul", 1.0, ExprShape::BinOp, |s, e| s.factor_common(e, BinOpKind::Add, BinOpKind::Mul)),
             // R52 (x + a) - (x + b)  →  a - b
-            rule!("cancel_add",   1.0, |s, e| s.cancel_add(e)),
+            rule!("cancel_add",   1.0, ExprShape::BinOp, |s, e| s.cancel_add(e)),
             // R53 x % 1  →  0
-            rule!("rem_one",      1.0, |s, e| s.rem_one(e)),
+            rule!("rem_one",      1.0, ExprShape::BinOp, |s, e| s.rem_one(e)),
             // R54 x % x  →  0
-            rule!("rem_self",     1.0, |s, e| s.rem_self(e)),
+            rule!("rem_self",     1.0, ExprShape::BinOp, |s, e| s.rem_self(e)),
             // R55 (x % m) % m  →  x % m  (idempotent modulo)
-            rule!("rem_idem",     1.0, |s, e| s.rem_idem(e)),
+            rule!("rem_idem",     1.0, ExprShape::BinOp, |s, e| s.rem_idem(e)),
 
             // ── §4 Bit tricks & strength reduction ───────────────────────────
             // R56 x * 2^k  →  x << k
-            rule!("mul_pow2_to_shl",  1.5, |s, e| s.mul_pow2_to_shl(e)),
+            rule!("mul_pow2_to_shl",  1.5, ExprShape::BinOp, |s, e| s.mul_pow2_to_shl(e)),
             // R57 x / 2^k  →  x >> k  (unsigned)
-            rule!("div_pow2_to_shr",  1.5, |s, e| s.div_pow2_to_shr(e)),
+            rule!("div_pow2_to_shr",  1.5, ExprShape::BinOp, |s, e| s.div_pow2_to_shr(e)),
             // R58 x % 2^k  →  x & (2^k - 1)
-            rule!("rem_pow2_to_and",  1.5, |s, e| s.rem_pow2_to_and(e)),
+            rule!("rem_pow2_to_and",  1.5, ExprShape::BinOp, |s, e| s.rem_pow2_to_and(e)),
             // R59 x * 3  →  (x << 1) + x
-            rule!("mul3_strength",    1.3, |s, e| s.mul_small_const_strength(e, 3)),
+            rule!("mul3_strength",    1.3, ExprShape::BinOp, |s, e| s.mul_small_const_strength(e, 3)),
             // R60 x * 5  →  (x << 2) + x
-            rule!("mul5_strength",    1.3, |s, e| s.mul_small_const_strength(e, 5)),
+            rule!("mul5_strength",    1.3, ExprShape::BinOp, |s, e| s.mul_small_const_strength(e, 5)),
             // R61 x * 6  →  (x << 2) + (x << 1)
-            rule!("mul6_strength",    1.3, |s, e| s.mul6_strength(e)),
+            rule!("mul6_strength",    1.3, ExprShape::BinOp, |s, e| s.mul6_strength(e)),
             // R62 x * 7  →  (x << 3) - x
-            rule!("mul7_strength",    1.3, |s, e| s.mul7_strength(e)),
+            rule!("mul7_strength",    1.3, ExprShape::BinOp, |s, e| s.mul7_strength(e)),
             // R63 x * 9  →  (x << 3) + x
-            rule!("mul9_strength",    1.3, |s, e| s.mul_small_const_strength(e, 9)),
+            rule!("mul9_strength",    1.3, ExprShape::BinOp, |s, e| s.mul_small_const_strength(e, 9)),
             // R64 x * 10 →  (x << 3) + (x << 1)
-            rule!("mul10_strength",   1.3, |s, e| s.mul10_strength(e)),
+            rule!("mul10_strength",   1.3, ExprShape::BinOp, |s, e| s.mul10_strength(e)),
             // R65 x << 0 →  x
-            rule!("shl_zero",         1.0, |s, e| s.shift_zero(e, BinOpKind::Shl)),
+            rule!("shl_zero",         1.0, ExprShape::BinOp, |s, e| s.shift_zero(e, BinOpKind::Shl)),
             // R66 x >> 0 →  x
-            rule!("shr_zero",         1.0, |s, e| s.shift_zero(e, BinOpKind::Shr)),
+            rule!("shr_zero",         1.0, ExprShape::BinOp, |s, e| s.shift_zero(e, BinOpKind::Shr)),
             // R67 (x << a) << b  →  x << (a + b)
-            rule!("merge_shl",        1.2, |s, e| s.merge_shifts(e, BinOpKind::Shl)),
+            rule!("merge_shl",        1.2, ExprShape::BinOp, |s, e| s.merge_shifts(e, BinOpKind::Shl)),
             // R68 (x >> a) >> b  →  x >> (a + b)
-            rule!("merge_shr",        1.2, |s, e| s.merge_shifts(e, BinOpKind::Shr)),
+            rule!("merge_shr",        1.2, ExprShape::BinOp, |s, e| s.merge_shifts(e, BinOpKind::Shr)),
             // R69 x & (x - 1)  →  x with lowest bit cleared (zero if power of two)
-            rule!("clear_lowest_bit", 1.2, |s, e| s.clear_lowest_bit(e)),
+            rule!("clear_lowest_bit", 1.2, ExprShape::BinOp, |s, e| s.clear_lowest_bit(e)),
             // R70 (x | y) & ~y  →  x & ~y  (simplify mask combination)
-            rule!("mask_simplify",    1.1, |s, e| s.mask_simplify(e)),
+            rule!("mask_simplify",    1.1, ExprShape::BinOp, |s, e| s.mask_simplify(e)),
 
             // ── §5 Boolean algebra & De Morgan ───────────────────────────────
             // R71  !(a && b)  →  !a || !b
-            rule!("demorgan_and",  1.0, |s, e| s.demorgan(e, BinOpKind::And, BinOpKind::Or)),
+            rule!("demorgan_and",  1.0, ExprShape::UnOp, |s, e| s.demorgan(e, BinOpKind::And, BinOpKind::Or)),
             // R72  !(a || b)  →  !a && !b
-            rule!("demorgan_or",   1.0, |s, e| s.demorgan(e, BinOpKind::Or,  BinOpKind::And)),
+            rule!("demorgan_or",   1.0, ExprShape::UnOp, |s, e| s.demorgan(e, BinOpKind::Or,  BinOpKind::And)),
             // R73  a && true  →  a
-            rule!("and_true_r",    1.0, |s, e| s.bool_identity_right(e, BinOpKind::And, true)),
+            rule!("and_true_r",    1.0, ExprShape::BinOp, |s, e| s.bool_identity_right(e, BinOpKind::And, true)),
             // R74  true && a  →  a
-            rule!("and_true_l",    1.0, |s, e| s.bool_identity_left(e, BinOpKind::And, true)),
+            rule!("and_true_l",    1.0, ExprShape::BinOp, |s, e| s.bool_identity_left(e, BinOpKind::And, true)),
             // R75  a || false  →  a
-            rule!("or_false_r",    1.0, |s, e| s.bool_identity_right(e, BinOpKind::Or, false)),
+            rule!("or_false_r",    1.0, ExprShape::BinOp, |s, e| s.bool_identity_right(e, BinOpKind::Or, false)),
             // R76  false || a  →  a
-            rule!("or_false_l",    1.0, |s, e| s.bool_identity_left(e, BinOpKind::Or, false)),
+            rule!("or_false_l",    1.0, ExprShape::BinOp, |s, e| s.bool_identity_left(e, BinOpKind::Or, false)),
             // R77  a && false  →  false
-            rule!("and_false",     1.0, |s, e| s.bool_absorb(e, BinOpKind::And, false)),
+            rule!("and_false",     1.0, ExprShape::BinOp, |s, e| s.bool_absorb(e, BinOpKind::And, false)),
             // R78  a || true   →  true
-            rule!("or_true",       1.0, |s, e| s.bool_absorb(e, BinOpKind::Or,  true)),
+            rule!("or_true",       1.0, ExprShape::BinOp, |s, e| s.bool_absorb(e, BinOpKind::Or,  true)),
             // R79  a && a  →  a  (idempotent)
-            rule!("and_idem",      1.0, |s, e| s.bool_idem(e, BinOpKind::And)),
+            rule!("and_idem",      1.0, ExprShape::BinOp, |s, e| s.bool_idem(e, BinOpKind::And)),
             // R80  a || a  →  a
-            rule!("or_idem",       1.0, |s, e| s.bool_idem(e, BinOpKind::Or)),
+            rule!("or_idem",       1.0, ExprShape::BinOp, |s, e| s.bool_idem(e, BinOpKind::Or)),
             // R81  !!a  →  a
-            rule!("double_not",    1.0, |s, e| s.double_not(e)),
+            rule!("double_not",    1.0, ExprShape::UnOp, |s, e| s.double_not(e)),
             // R82  a && !a  →  false  (contradiction)
-            rule!("contradiction", 1.0, |s, e| s.contradiction(e)),
+            rule!("contradiction", 1.0, ExprShape::BinOp, |s, e| s.contradiction(e)),
 
             // ── §6 Comparison normalisation ──────────────────────────────────
             // R83  x < y  ≡  !(x >= y)  (but only simplify when one side is 0/1)
-            rule!("cmp_zero_l",    1.0, |s, e| s.cmp_zero(e)),
+            rule!("cmp_zero_l",    1.0, ExprShape::BinOp, |s, e| s.cmp_zero(e)),
             // R84  x <= y  →  x < y + 1  (if y is a literal; avoids fenceposts)
-            rule!("le_to_lt",      1.0, |s, e| s.le_to_lt(e)),
+            rule!("le_to_lt",      1.0, ExprShape::BinOp, |s, e| s.le_to_lt(e)),
             // R85  x == x  →  true
-            rule!("eq_self",       1.0, |s, e| s.eq_self(e)),
+            rule!("eq_self",       1.0, ExprShape::BinOp, |s, e| s.eq_self(e)),
             // R86  x != x  →  false
-            rule!("ne_self",       1.0, |s, e| s.ne_self(e)),
+            rule!("ne_self",       1.0, ExprShape::BinOp, |s, e| s.ne_self(e)),
             // R87  x < x  →  false
-            rule!("lt_self",       1.0, |s, e| s.lt_self(e)),
+            rule!("lt_self",       1.0, ExprShape::BinOp, |s, e| s.lt_self(e)),
             // R88  x > x  →  false
-            rule!("gt_self",       1.0, |s, e| s.gt_self(e)),
+            rule!("gt_self",       1.0, ExprShape::BinOp, |s, e| s.gt_self(e)),
             // R89  x >= x  →  true
-            rule!("ge_self",       1.0, |s, e| s.ge_self(e)),
+            rule!("ge_self",       1.0, ExprShape::BinOp, |s, e| s.ge_self(e)),
             // R90  x <= x  →  true
-            rule!("le_self",       1.0, |s, e| s.le_self(e)),
+            rule!("le_self",       1.0, ExprShape::BinOp, |s, e| s.le_self(e)),
 
             // ── §7 Closed-form series ─────────────────────────────────────────
             // R91  1 + 2 + … + n  (BinOp chain)  →  n*(n+1)/2
-            rule!("triangular_sum",    1_000.0, |s, e| s.rule_triangular_sum(e)),
+            rule!("triangular_sum",    1_000.0, ExprShape::Any, |s, e| s.rule_triangular_sum(e)),
             // R92  1² + 2² + … + n²  →  n*(n+1)*(2n+1)/6
-            rule!("sum_of_squares",    1_000.0, |s, e| s.rule_sum_of_squares(e)),
+            rule!("sum_of_squares",    1_000.0, ExprShape::Any, |s, e| s.rule_sum_of_squares(e)),
             // R93  1³ + 2³ + … + n³  →  (n*(n+1)/2)²
-            rule!("sum_of_cubes",      1_000.0, |s, e| s.rule_sum_of_cubes(e)),
+            rule!("sum_of_cubes",      1_000.0, ExprShape::Any, |s, e| s.rule_sum_of_cubes(e)),
             // R94  a + (a+d) + (a+2d) + …  →  n*(2a+(n-1)d)/2
-            rule!("arithmetic_series", 1_000.0, |s, e| s.rule_arithmetic_series(e)),
+            rule!("arithmetic_series", 1_000.0, ExprShape::Any, |s, e| s.rule_arithmetic_series(e)),
             // R95  1 + r + r² + …  →  (r^n - 1)/(r - 1)
-            rule!("geometric_series",  1_000.0, |s, e| s.rule_geometric_series(e)),
+            rule!("geometric_series",  1_000.0, ExprShape::Any, |s, e| s.rule_geometric_series(e)),
             // R96  a₀ + a₁x + a₂x² + …  →  Horner form
-            rule!("horner_method",     2.0,     |s, e| s.rule_horner(e)),
+            rule!("horner_method",     2.0, ExprShape::Any, |s, e| s.rule_horner(e)),
             // R97  (n*(n+1)/2) + n + 1  →  (n+1)*(n+2)/2  (extend triangular)
-            rule!("extend_triangular", 1.5,     |s, e| s.rule_extend_triangular(e)),
+            rule!("extend_triangular", 1.5, ExprShape::Any, |s, e| s.rule_extend_triangular(e)),
             // R98  (n*(n+1)/2)^2 + (n+1)^3  →  ((n+1)*(n+2)/2)^2  (extend cubes)
-            rule!("extend_cubes",      1.5,     |s, e| s.rule_extend_cubes(e)),
+            rule!("extend_cubes",      1.5, ExprShape::Any, |s, e| s.rule_extend_cubes(e)),
 
             // ── §8 Special-function call rewrites ────────────────────────────
             // R99   fib(n) / fibonacci(n)  →  fib_fast(n)
-            rule!("fib_to_fast",       100_000.0, |s, e| s.rule_fib_call(e)),
+            rule!("fib_to_fast",       100_000.0, ExprShape::Call, |s, e| s.rule_fib_call(e)),
             // R100  factorial(0)  →  1
-            rule!("factorial_zero",    1.0,       |s, e| s.rule_factorial_const(e, 0, 1)),
+            rule!("factorial_zero",    1.0, ExprShape::Call, |s, e| s.rule_factorial_const(e, 0, 1)),
             // R101  factorial(1)  →  1
-            rule!("factorial_one",     1.0,       |s, e| s.rule_factorial_const(e, 1, 1)),
+            rule!("factorial_one",     1.0, ExprShape::Call, |s, e| s.rule_factorial_const(e, 1, 1)),
             // R102  factorial(n) where n < 13  →  lookup table constant
-            rule!("factorial_small",   1_000.0,   |s, e| s.rule_factorial_small(e)),
+            rule!("factorial_small",   1_000.0, ExprShape::Call, |s, e| s.rule_factorial_small(e)),
             // R103  gcd(x, 0) / gcd(0, x)  →  x
-            rule!("gcd_zero",          1.0,       |s, e| s.rule_gcd_zero(e)),
+            rule!("gcd_zero",          1.0, ExprShape::Call, |s, e| s.rule_gcd_zero(e)),
             // R104  gcd(x, x)  →  x
-            rule!("gcd_self",          1.0,       |s, e| s.rule_gcd_self(e)),
+            rule!("gcd_self",          1.0, ExprShape::Call, |s, e| s.rule_gcd_self(e)),
             // R105  lcm(x, x)  →  x
-            rule!("lcm_self",          1.0,       |s, e| s.rule_lcm_self(e)),
+            rule!("lcm_self",          1.0, ExprShape::Call, |s, e| s.rule_lcm_self(e)),
             // R106  abs(abs(x))  →  abs(x)
-            rule!("abs_idem",          1.0,       |s, e| s.rule_abs_idem(e)),
+            rule!("abs_idem",          1.0, ExprShape::Call, |s, e| s.rule_abs_idem(e)),
             // R107  min(x, x)  →  x
-            rule!("min_self",          1.0,       |s, e| s.rule_minmax_self(e, "min")),
+            rule!("min_self",          1.0, ExprShape::Call, |s, e| s.rule_minmax_self(e, "min")),
             // R108  max(x, x)  →  x
-            rule!("max_self",          1.0,       |s, e| s.rule_minmax_self(e, "max")),
+            rule!("max_self",          1.0, ExprShape::Call, |s, e| s.rule_minmax_self(e, "max")),
             // R109  min(min(x,y),z) / max(max(x,y),z)  →  min/max(x,y,z)  (flatten)
-            rule!("minmax_flatten",    1.2,       |s, e| s.rule_minmax_flatten(e)),
+            rule!("minmax_flatten",    1.2, ExprShape::Call, |s, e| s.rule_minmax_flatten(e)),
 
             // ── §9 Redundant-operation elimination ──────────────────────────
             // R110  (x + y) - y  →  x
-            rule!("add_sub_cancel",    1.0, |s, e| s.rule_add_sub_cancel(e)),
+            rule!("add_sub_cancel",    1.0, ExprShape::BinOp, |s, e| s.rule_add_sub_cancel(e)),
             // R111  (x - y) + y  →  x
-            rule!("sub_add_cancel",    1.0, |s, e| s.rule_sub_add_cancel(e)),
+            rule!("sub_add_cancel",    1.0, ExprShape::BinOp, |s, e| s.rule_sub_add_cancel(e)),
             // R112  (x * y) / y  →  x  — REMOVED: unsound for integer overflow
             // R113  (x / y) * y  →  x  — REMOVED: unsound for integer truncation
             // R114  (x << k) >> k  →  x & ((1<<k)-1)^MAX  (mask, unsigned)
-            rule!("shl_shr_cancel",    1.1, |s, e| s.rule_shl_shr_cancel(e)),
+            rule!("shl_shr_cancel",    1.1, ExprShape::BinOp, |s, e| s.rule_shl_shr_cancel(e)),
             // R115  if true { e1 } else { e2 }  →  e1
-            rule!("if_true",           1.0, |s, e| s.rule_if_const(e, true)),
+            rule!("if_true",           1.0, ExprShape::IfExpr, |s, e| s.rule_if_const(e, true)),
             // R116  if false { e1 } else { e2 }  →  e2
-            rule!("if_false",          1.0, |s, e| s.rule_if_const(e, false)),
+            rule!("if_false",          1.0, ExprShape::IfExpr, |s, e| s.rule_if_const(e, false)),
 
             // ── §10 Loop-invariant & annotation markers ──────────────────────
             // R117  prefix_sum(arr) pattern detected in expression
-            rule!("prefix_sum_expr",   8.0,  |s, e| s.rule_prefix_sum_expr(e)),
+            rule!("prefix_sum_expr",   8.0, ExprShape::Any, |s, e| s.rule_prefix_sum_expr(e)),
             // R118  reduce(f, acc, x) annotation
-            rule!("reduce_annot",      4.0,  |s, e| s.rule_reduce_annot(e)),
+            rule!("reduce_annot",      4.0, ExprShape::Any, |s, e| s.rule_reduce_annot(e)),
             // R119  fib(n) add pattern (a+b where names suggest fib)
-            rule!("fib_add_pattern",   10.0, |s, e| s.rule_fib_add(e)),
+            rule!("fib_add_pattern",   10.0, ExprShape::BinOp, |s, e| s.rule_fib_add(e)),
             // R120  pow(x, n) via exponentiation-by-squaring marker
-            rule!("pow_exp_squaring",  8.0,  |s, e| s.rule_pow_by_squaring(e)),
+            rule!("pow_exp_squaring",  8.0, ExprShape::Pow, |s, e| s.rule_pow_by_squaring(e)),
         ]
     }
 
@@ -500,10 +525,17 @@ impl SemanticSuperoptimizer {
             changed = false;
             iters += 1;
 
+            // Classify the expression once to skip rules with non-matching shapes.
+            let expr_shape = classify_expr(&expr);
+
             // We need to iterate over rules without borrowing self mutably,
             // so we collect (name, speedup, result) before updating counters.
             let mut best: Option<(usize, f64, Expr)> = None;
             for (i, rule) in self.rules.iter().enumerate() {
+                // Skip rules whose shape doesn't match the expression.
+                if rule.shape != ExprShape::Any && rule.shape != expr_shape {
+                    continue;
+                }
                 if let Some(new_expr) = (rule.apply)(self, &expr) {
                     // Take the first matching rule (rules are in priority order).
                     if best.is_none() {

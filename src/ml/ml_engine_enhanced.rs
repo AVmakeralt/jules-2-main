@@ -4,6 +4,7 @@
 // =========================================================================
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 // =========================================================================
 // TENSOR STRUCTURE - Foundation of all ML operations
@@ -1004,45 +1005,157 @@ impl Tensor {
 // OPTIMIZATION TECHNIQUES
 // =========================================================================
 
+/// Gradient accumulator with thread-local accumulation for reduced lock contention.
+///
+/// Issue #78: Previously, all gradient accumulation went through a single
+/// global HashMap, causing lock contention during parallel training when
+/// multiple data-parallel threads accumulate gradients simultaneously.
+///
+/// Architecture:
+///   - Each training thread accumulates gradients into a thread-local
+///     `LocalGradientAccumulator` (no locking needed).
+///   - When `should_update()` returns true, each thread's local gradients
+///     are merged into the global accumulator under a single lock acquisition.
+///   - This reduces lock acquisitions from O(N_gradients * N_steps) to
+///     O(N_threads) per update cycle.
+///
+/// Usage in a data-parallel training loop:
+///   1. Each worker thread calls `local_accumulate()` on its own
+///      `LocalGradientAccumulator` (no synchronization).
+///   2. When `should_update()` is true, each worker calls `merge_local()`
+///      to push its local gradients into this global accumulator.
+///   3. The optimizer reads from this global accumulator to update weights.
+///   4. Call `clear()` to reset both global and local accumulators.
 pub struct GradientAccumulator {
-    accumulated: HashMap<u64, Tensor>,
+    /// Global accumulated gradients (merged from all thread-local accumulators).
+    accumulated: Mutex<HashMap<u64, Tensor>>,
+    /// Number of accumulation steps before an optimizer update.
     accumulation_steps: u64,
-    current_step: u64,
+    /// Current global step counter (incremented on each merge).
+    current_step: std::sync::atomic::AtomicU64,
 }
 
 impl GradientAccumulator {
     pub fn new(accumulation_steps: u64) -> Self {
         GradientAccumulator {
-            accumulated: HashMap::new(),
+            accumulated: Mutex::new(HashMap::new()),
             accumulation_steps,
-            current_step: 0,
+            current_step: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    pub fn accumulate(&mut self, param_id: u64, gradient: Tensor) {
-        if let Some(acc_grad) = self.accumulated.get_mut(&param_id) {
+    /// Accumulate a gradient into the global map.
+    /// For single-threaded usage or backward compatibility.
+    /// For parallel training, prefer `local_accumulate()` + `merge_local()`.
+    pub fn accumulate(&self, param_id: u64, gradient: Tensor) {
+        let mut acc = self.accumulated.lock().unwrap();
+        if let Some(acc_grad) = acc.get_mut(&param_id) {
             *acc_grad = acc_grad.add(&gradient);
         } else {
-            self.accumulated.insert(param_id, gradient);
+            acc.insert(param_id, gradient);
         }
-        self.current_step += 1;
+        drop(acc);
+        self.current_step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn step(&mut self) {
-        self.current_step = 0;
+    /// Merge a thread-local accumulator into this global one.
+    /// Called once per worker when `should_update()` returns true.
+    /// This reduces lock contention from per-gradient locking to
+    /// per-merge locking (one lock acquisition per worker per update cycle).
+    pub fn merge_local(&self, local: &LocalGradientAccumulator) {
+        let mut acc = self.accumulated.lock().unwrap();
+        for (param_id, gradient) in local.gradients.iter() {
+            if let Some(acc_grad) = acc.get_mut(param_id) {
+                *acc_grad = acc_grad.add(gradient);
+            } else {
+                acc.insert(*param_id, gradient.clone());
+            }
+        }
+        drop(acc);
+        self.current_step.fetch_add(local.step_count, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Reset the step counter (called by the optimizer after an update).
+    pub fn step(&self) {
+        self.current_step.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check if enough accumulation steps have been performed.
     pub fn should_update(&self) -> bool {
-        self.current_step >= self.accumulation_steps
+        self.current_step.load(std::sync::atomic::Ordering::Relaxed) >= self.accumulation_steps
     }
 
+    /// Get an accumulated gradient (cloned). Used by the optimizer.
     pub fn get_accumulated(&self, param_id: u64) -> Option<Tensor> {
-        self.accumulated.get(&param_id).cloned()
+        self.accumulated.lock().unwrap().get(&param_id).cloned()
     }
 
+    /// Get a snapshot of all accumulated gradients. Used by the optimizer
+    /// to apply updates for all parameters at once.
+    pub fn get_all_accumulated(&self) -> HashMap<u64, Tensor> {
+        self.accumulated.lock().unwrap().clone()
+    }
+
+    /// Clear all accumulated gradients and reset the step counter.
+    pub fn clear(&self) {
+        self.accumulated.lock().unwrap().clear();
+        self.current_step.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Thread-local gradient accumulator for use in data-parallel training.
+///
+/// Each worker thread owns one of these and accumulates gradients without
+/// any locking. When the accumulation threshold is reached, the worker
+/// merges its local gradients into the global `GradientAccumulator` via
+/// `merge_local()`, which requires only a single lock acquisition.
+///
+/// Issue #78: This eliminates per-gradient lock contention during parallel
+/// training. Previously, every `accumulate()` call on the shared global
+/// accumulator required a lock acquisition, causing contention when N
+/// training threads all tried to accumulate simultaneously.
+pub struct LocalGradientAccumulator {
+    /// Per-parameter accumulated gradients (no synchronization needed).
+    gradients: HashMap<u64, Tensor>,
+    /// Number of accumulation steps taken since last merge.
+    step_count: u64,
+}
+
+impl LocalGradientAccumulator {
+    /// Create a new thread-local accumulator.
+    pub fn new() -> Self {
+        LocalGradientAccumulator {
+            gradients: HashMap::new(),
+            step_count: 0,
+        }
+    }
+
+    /// Accumulate a gradient for a parameter. No locking — this is
+    /// only called from the owning thread.
+    pub fn accumulate(&mut self, param_id: u64, gradient: Tensor) {
+        if let Some(acc_grad) = self.gradients.get_mut(&param_id) {
+            *acc_grad = acc_grad.add(&gradient);
+        } else {
+            self.gradients.insert(param_id, gradient);
+        }
+        self.step_count += 1;
+    }
+
+    /// Clear local gradients after merging into the global accumulator.
     pub fn clear(&mut self) {
-        self.accumulated.clear();
-        self.current_step = 0;
+        self.gradients.clear();
+        self.step_count = 0;
+    }
+
+    /// Number of accumulation steps taken since the last merge.
+    pub fn step_count(&self) -> u64 {
+        self.step_count
+    }
+}
+
+impl Default for LocalGradientAccumulator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

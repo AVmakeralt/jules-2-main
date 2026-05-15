@@ -1,119 +1,72 @@
 // =============================================================================
-// jules/src/string_intern.rs
+// jules/src/tools/string_intern.rs
 //
-// STRING INTERNING SYSTEM
+// STRING INTERNING SYSTEM — delegates to the canonical interner in symbol.rs
 //
-// Eliminates repeated string allocations for field names, component names,
-// variable names, etc. Converts string comparisons to pointer comparisons.
+// Issue #90: This module previously maintained its own separate StringId(u32)
+// interner, duplicating the functionality already in runtime::symbol::Symbol(u32).
+// Having three separate interners (tools::string_intern, runtime::symbol,
+// optimizer::mcts_superoptimizer) meant that the same string could be interned
+// with three different IDs across the codebase, preventing O(1) cross-module
+// comparisons and wasting memory.
 //
-// Performance benefits:
-// - String comparisons: O(n) -> O(1) (pointer equality)
-// - HashMap lookups: eliminated hash computation for interned strings
-// - Memory usage: shared strings stored once globally
+// This module now delegates to runtime::symbol::StringInterner, which is the
+// canonical (single) interner. The StringId type is a newtype wrapper around
+// Symbol for backward compatibility with any code that references StringId.
 // =============================================================================
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{LazyLock, Mutex};
 
-/// Global string interning arena (thread-safe via Mutex)
-pub static GLOBAL_INTERNER: LazyLock<Mutex<StringInterner>> = 
-    LazyLock::new(|| Mutex::new(StringInterner::default()));
-
-/// Global string interning arena
-pub struct StringInterner {
-    strings: Vec<String>,
-    lookup: HashMap<String, StringId>,
-}
-
-/// Opaque handle to an interned string
+/// Opaque handle to an interned string.
+///
+/// Internally wraps `crate::runtime::symbol::Symbol` so that all interners
+/// across the codebase share the same ID space. Two StringIds are equal
+/// iff they refer to the same interned string (via the canonical Symbol).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
-pub struct StringId(u32);
+pub struct StringId(pub crate::runtime::symbol::Symbol);
 
 impl StringId {
     /// Reserved ID for empty/missing strings
-    pub const NONE: Self = StringId(0);
+    pub const NONE: Self = StringId(crate::runtime::symbol::Symbol::EMPTY);
 
     #[inline(always)]
     pub fn as_u32(self) -> u32 {
+        self.0.as_u32()
+    }
+
+    /// Convert to the underlying Symbol (canonical interner handle).
+    #[inline(always)]
+    pub fn as_symbol(self) -> crate::runtime::symbol::Symbol {
         self.0
     }
 }
 
-impl Default for StringInterner {
-    fn default() -> Self {
-        Self {
-            // Reserve index 0 for NONE
-            strings: vec![String::new()],
-            lookup: HashMap::new(),
-        }
-    }
-}
+// Re-export the canonical global interner functions under the old names
+// so any code using `string_intern::global_intern` etc. continues to work.
 
-impl StringInterner {
-    /// Intern a string, returning its ID
-    #[inline(always)]
-    pub fn intern(&mut self, s: &str) -> StringId {
-        if let Some(&id) = self.lookup.get(s) {
-            return id;
-        }
-        let id = StringId(self.strings.len() as u32);
-        self.strings.push(s.to_string());
-        self.lookup.insert(s.to_string(), id);
-        id
-    }
-
-    /// Resolve a StringId back to &str
-    #[inline(always)]
-    pub fn resolve(&self, id: StringId) -> &str {
-        &self.strings[id.0 as usize]
-    }
-
-    /// Intern a string from an owned String (avoids double allocation)
-    #[inline(always)]
-    pub fn intern_owned(&mut self, s: String) -> StringId {
-        if let Some(&id) = self.lookup.get(&s) {
-            return id;
-        }
-        let id = StringId(self.strings.len() as u32);
-        self.lookup.insert(s.clone(), id);
-        self.strings.push(s);
-        id
-    }
-}
-
-// Thread-local string interning for hot paths (no locking overhead)
-thread_local! {
-    static THREAD_LOCAL_INTERNER: std::cell::RefCell<StringInterner> =
-        std::cell::RefCell::new(StringInterner::default());
-}
-
-/// Fast thread-local string interning
+/// Intern a string using the canonical global interner.
+/// Returns a Symbol that can be used for fast comparisons.
+/// Thread-safe but should be avoided in ultra-hot paths.
 #[inline(always)]
-pub fn intern_thread_local(s: &str) -> StringId {
-    THREAD_LOCAL_INTERNER.with(|cell| {
-        cell.borrow_mut().intern(s)
-    })
+pub fn global_intern(s: &str) -> StringId {
+    StringId(crate::runtime::symbol::global_intern(s))
 }
 
-/// Fast thread-local string interning with owned string
+/// Resolve a StringId back to its string using the canonical global interner.
 #[inline(always)]
-pub fn intern_thread_local_owned(s: String) -> StringId {
-    THREAD_LOCAL_INTERNER.with(|cell| {
-        cell.borrow_mut().intern_owned(s)
-    })
+pub fn global_resolve(id: StringId) -> String {
+    crate::runtime::symbol::global_resolve(id.0)
 }
 
-/// Resolve a StringId using thread-local interner
+/// Look up a string in the canonical global interner.
 #[inline(always)]
-pub fn resolve_thread_local(id: StringId) -> String {
-    THREAD_LOCAL_INTERNER.with(|cell| {
-        cell.borrow().resolve(id).to_string()
-    })
+pub fn global_get(s: &str) -> Option<StringId> {
+    crate::runtime::symbol::global_get(s).map(StringId)
 }
 
 // Atomic counter for generating unique IDs without interning
+// (kept for backward compatibility with any code using generate_id)
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
 #[inline(always)]
@@ -126,14 +79,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_interning() {
-        let mut interner = StringInterner::default();
-        let id1 = interner.intern("hello");
-        let id2 = interner.intern("hello");
-        let id3 = interner.intern("world");
+    fn test_interning_via_symbol() {
+        let id1 = global_intern("hello");
+        let id2 = global_intern("hello");
+        let id3 = global_intern("world");
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
-        assert_eq!(interner.resolve(id1), "hello");
-        assert_eq!(interner.resolve(id3), "world");
+        assert_eq!(global_resolve(id1), "hello");
+        assert_eq!(global_resolve(id3), "world");
+    }
+
+    #[test]
+    fn test_cross_module_compatibility() {
+        // StringId should be compatible with Symbol from the canonical interner
+        let string_id = global_intern("test_cross");
+        let symbol = crate::runtime::symbol::global_intern("test_cross");
+        // Both should resolve to the same string
+        assert_eq!(global_resolve(string_id), crate::runtime::symbol::global_resolve(symbol));
     }
 }

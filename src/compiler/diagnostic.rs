@@ -721,7 +721,7 @@ pub struct DiagnosticCollector {
     /// Symbols that have been flagged as errors — suppress further errors about them.
     suppressed_symbols: Vec<String>,
     /// Seen (code_number, span.start, span.end) for deduplication.
-    seen: Vec<(u16, usize, usize)>,
+    seen: Vec<(u16, u32, u32)>,
     /// Total error count.
     error_count: usize,
     /// Total warning count.
@@ -1091,7 +1091,7 @@ impl<'src> DiagnosticRenderer<'src> {
                     for _ in 0..col_chars {
                         buf.push(' ');
                     }
-                    let len = (label.span.end - label.span.start).max(1);
+                    let len = (label.span.end - label.span.start).max(1) as usize;
                     match label.style {
                         LabelStyle::Primary => {
                             let underline = "^".repeat(len);
@@ -1225,8 +1225,8 @@ impl<'src> DiagnosticRenderer<'src> {
                 let line_idx = (fixit.span.line as usize).saturating_sub(1);
                 let original = self.expand_tabs(self.lines[line_idx]);
                 // Build the fixed line by replacing the span region.
-                let byte_start = fixit.span.start.min(self.source.len());
-                let byte_end = fixit.span.end.min(self.source.len());
+                let byte_start = fixit.span.start as usize;  let byte_start = byte_start.min(self.source.len());
+                let byte_end = fixit.span.end as usize;  let byte_end = byte_end.min(self.source.len());
                 if byte_start < byte_end && byte_end <= self.source.len() {
                     let fixed = format!(
                         "{}{}{}",
@@ -1304,7 +1304,7 @@ impl<'src> DiagnosticRenderer<'src> {
         for _ in 0..col_chars {
             buf.push(' ');
         }
-        let len = (span.end - span.start).max(1);
+        let len = (span.end - span.start).max(1) as usize;
         match style {
             LabelStyle::Primary => {
                 let underline = "^".repeat(len);
@@ -2120,91 +2120,23 @@ impl From<crate::compiler::parser::ParseError> for Diagnostic {
     }
 }
 
-impl From<crate::compiler::typeck::Diagnostic> for Diagnostic {
-    fn from(d: crate::compiler::typeck::Diagnostic) -> Self {
-        let code_num = d.code.and_then(|c| c[1..].parse::<u16>().ok()).unwrap_or(2001);
+// issue #33: All three passes now share SimpleDiagnostic, so we need only
+// one From impl.  The individual From impls for typeck/sema/borrowck
+// were removed to avoid conflicts.
+
+impl From<crate::compiler::SimpleDiagnostic> for Diagnostic {
+    fn from(d: crate::compiler::SimpleDiagnostic) -> Self {
+        let code_num = d.code.and_then(|c| c[1..].parse::<u16>().ok()).unwrap_or(9999);
         let sev = match d.severity {
-            crate::compiler::typeck::Severity::Error => Severity::Error,
-            crate::compiler::typeck::Severity::Warning => Severity::Warning,
-            crate::compiler::typeck::Severity::Note => Severity::Note,
+            crate::compiler::SimpleSeverity::Error => Severity::Error,
+            crate::compiler::SimpleSeverity::Warning => Severity::Warning,
+            crate::compiler::SimpleSeverity::Note => Severity::Note,
         };
         let mut diag = Diagnostic {
             id: DiagnosticId::fresh(),
             severity: sev,
             code: DiagCode::error(code_num),
             phase: Phase::TypeCheck,
-            message: d.message,
-            span: d.span,
-            labels: vec![],
-            fixits: vec![],
-            cause_chain: vec![],
-            why_explanation: None,
-            teaching_note: None,
-            suppress_cascade: false,
-            suppressed_symbol: None,
-            dataflow: None,
-            type_constraint: None,
-        };
-        // Convert notes to secondary labels.
-        for (span, msg) in d.notes {
-            diag = diag.secondary_label(span, msg);
-        }
-        // Convert hint to a fix-it.
-        if let Some(ref hint) = d.hint {
-            diag = diag.fix_likely(d.span, "", hint);
-        }
-        diag
-    }
-}
-
-impl From<crate::compiler::sema::Diagnostic> for Diagnostic {
-    fn from(d: crate::compiler::sema::Diagnostic) -> Self {
-        let code_num = d.code.and_then(|c| c[1..].parse::<u16>().ok()).unwrap_or(3001);
-        let sev = match d.severity {
-            crate::compiler::sema::Severity::Error => Severity::Error,
-            crate::compiler::sema::Severity::Warning => Severity::Warning,
-            crate::compiler::sema::Severity::Note => Severity::Note,
-        };
-        let mut diag = Diagnostic {
-            id: DiagnosticId::fresh(),
-            severity: sev,
-            code: DiagCode::error(code_num),
-            phase: Phase::SemanticAnalysis,
-            message: d.message,
-            span: d.span,
-            labels: vec![],
-            fixits: vec![],
-            cause_chain: vec![],
-            why_explanation: None,
-            teaching_note: None,
-            suppress_cascade: false,
-            suppressed_symbol: None,
-            dataflow: None,
-            type_constraint: None,
-        };
-        for (span, msg) in d.labels {
-            diag = diag.secondary_label(span, msg);
-        }
-        if let Some(ref hint) = d.hint {
-            diag = diag.fix_likely(d.span, "", hint);
-        }
-        diag
-    }
-}
-
-impl From<crate::compiler::borrowck::Diagnostic> for Diagnostic {
-    fn from(d: crate::compiler::borrowck::Diagnostic) -> Self {
-        let code_num = d.code.and_then(|c| c[1..].parse::<u16>().ok()).unwrap_or(4001);
-        let sev = match d.severity {
-            crate::compiler::borrowck::Severity::Error => Severity::Error,
-            crate::compiler::borrowck::Severity::Warning => Severity::Warning,
-            crate::compiler::borrowck::Severity::Note => Severity::Note,
-        };
-        let mut diag = Diagnostic {
-            id: DiagnosticId::fresh(),
-            severity: sev,
-            code: DiagCode::error(code_num),
-            phase: Phase::BorrowCheck,
             message: d.message,
             span: d.span,
             labels: vec![],
@@ -2299,7 +2231,7 @@ mod tests {
     use super::*;
 
     fn test_span(line: u32, col: u32) -> Span {
-        Span { start: 0, end: 5, line, col }
+        Span { start: 0, end: 5, line: line as u16, col: col as u16 }
     }
 
     // ── Label rendering ────────────────────────────────────────────────────

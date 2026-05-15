@@ -34,6 +34,20 @@ struct MpmcNode {
 /// buffer would pre-allocate all slots and use sequence numbers for
 /// coordination, similar to the Disruptor pattern already implemented
 /// in disruptor.rs.
+///
+/// Issue #80: The per-push heap allocation (Box::new(MpmcNode) in push())
+/// costs ~50ns per task submission on modern x86-64 (allocator fast path).
+/// For high-throughput workloads (millions of tasks/sec), this becomes
+/// the dominant cost. Alternatives:
+///   1. Bounded MPMC ring buffer: pre-allocate N slots, use sequence
+///      numbers for coordination (Dmitry Vyukov's bounded MPMC queue).
+///      Pro: zero allocation on push. Con: bounded capacity, requires
+///      backpressure or overflow handling.
+///   2. Object pool: pre-allocate a pool of MpmcNodes and recycle them
+///      from try_pop() back into the pool. Pro: unbounded, zero alloc
+///      after warmup. Con: pool management complexity, ABA problem.
+///   3. Disruptor-style: already implemented in disruptor.rs; migrate
+///      the injector to use it. This is the preferred long-term fix.
 struct MpmcQueue {
     head: AtomicPtr<MpmcNode>,
     tail: AtomicPtr<MpmcNode>,

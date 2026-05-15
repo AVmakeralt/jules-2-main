@@ -27,6 +27,34 @@ pub struct NumaTopology {
     pub total_cores: usize,
     /// Number of NUMA nodes
     pub num_nodes: usize,
+    /// Issue #81: Cached CPU→NUMA-node-index mapping for O(1) lookup.
+    /// `cpu_to_node[cpu_id]` returns the index into `nodes` for that CPU,
+    /// or `CPU_NOT_FOUND` if the CPU is not present in any node.
+    /// Built once during `detect()` / `detect_from_sysfs()` to avoid the
+    /// O(N×M) linear scan that the old `get_node_for_cpu()` performed
+    /// (iterating all nodes and calling `cpus.contains(&cpu)` on each).
+    cpu_to_node: Vec<usize>,
+}
+
+/// Sentinel value in `cpu_to_node` indicating the CPU is not in any node.
+const CPU_NOT_FOUND: usize = usize::MAX;
+
+/// Build the cpu_to_node cache from the list of NUMA nodes.
+fn build_cpu_to_node_cache(nodes: &[NumaNode]) -> Vec<usize> {
+    // Find the maximum CPU ID to size the cache vector.
+    let max_cpu = nodes.iter()
+        .flat_map(|n| n.cpus.iter().copied())
+        .max()
+        .unwrap_or(0);
+    let mut cache = vec![CPU_NOT_FOUND; max_cpu + 1];
+    for (node_idx, node) in nodes.iter().enumerate() {
+        for &cpu in &node.cpus {
+            if cpu < cache.len() {
+                cache[cpu] = node_idx;
+            }
+        }
+    }
+    cache
 }
 
 impl NumaTopology {
@@ -43,14 +71,18 @@ impl NumaTopology {
             let num_cores = num_cpus::get();
             let cpus: Vec<usize> = (0..num_cores).collect();
             
+            let nodes = vec![NumaNode { 
+                id: 0, 
+                cpus,
+                distances: vec![10],
+            }];
+            let cpu_to_node = build_cpu_to_node_cache(&nodes);
+            
             Self {
-                nodes: vec![NumaNode { 
-                    id: 0, 
-                    cpus,
-                    distances: vec![10],
-                }],
+                nodes,
                 total_cores: num_cores,
                 num_nodes: 1,
+                cpu_to_node,
             }
         }
     }
@@ -100,23 +132,29 @@ impl NumaTopology {
             let num_cores = num_cpus::get();
             let cpus: Vec<usize> = (0..num_cores).collect();
             
+            let nodes = vec![NumaNode { 
+                id: 0, 
+                cpus,
+                distances: vec![10],
+            }];
+            let cpu_to_node = build_cpu_to_node_cache(&nodes);
+            
             return Self {
-                nodes: vec![NumaNode { 
-                    id: 0, 
-                    cpus,
-                    distances: vec![10],
-                }],
+                nodes,
                 total_cores: num_cores,
                 num_nodes: 1,
+                cpu_to_node,
             };
         }
         
         let num_nodes = nodes.len();
+        let cpu_to_node = build_cpu_to_node_cache(&nodes);
         
         Self {
             nodes,
             total_cores,
             num_nodes,
+            cpu_to_node,
         }
     }
 
@@ -127,14 +165,18 @@ impl NumaTopology {
         let num_cores = num_cpus::get();
         let cpus: Vec<usize> = (0..num_cores).collect();
         
+        let nodes = vec![NumaNode { 
+            id: 0, 
+            cpus,
+            distances: vec![10],
+        }];
+        let cpu_to_node = build_cpu_to_node_cache(&nodes);
+        
         Self {
-            nodes: vec![NumaNode { 
-                id: 0, 
-                cpus,
-                distances: vec![10],
-            }],
+            nodes,
             total_cores: num_cores,
             num_nodes: 1,
+            cpu_to_node,
         }
     }
 
@@ -197,14 +239,20 @@ impl NumaTopology {
         distances
     }
 
-    /// Get the NUMA node for a given CPU core
+    /// Get the NUMA node for a given CPU core.
+    ///
+    /// Issue #81: Previously this performed an O(N×M) linear scan
+    /// (iterating all nodes and calling `cpus.contains(&cpu)` which
+    /// is O(M) per node). Now uses a pre-built `cpu_to_node` Vec for
+    /// O(1) lookup: index by CPU ID, get the node index directly.
+    #[inline]
     pub fn get_node_for_cpu(&self, cpu: usize) -> Option<&NumaNode> {
-        for node in &self.nodes {
-            if node.cpus.contains(&cpu) {
-                return Some(node);
-            }
+        let node_idx = *self.cpu_to_node.get(cpu).unwrap_or(&CPU_NOT_FOUND);
+        if node_idx == CPU_NOT_FOUND {
+            None
+        } else {
+            self.nodes.get(node_idx)
         }
-        None
     }
 
     /// Get all CPUs in a given NUMA node
@@ -288,5 +336,25 @@ mod tests {
         let is_numa = topology.is_numa();
         // Should work regardless of NUMA or UMA
         let _ = is_numa;
+    }
+
+    #[test]
+    fn test_cpu_to_node_cache_o1_lookup() {
+        // Issue #81: Verify that get_node_for_cpu returns correct results
+        // using the O(1) cached lookup instead of linear scan.
+        let topology = NumaTopology::detect();
+        // Every CPU listed in a node should be found by get_node_for_cpu
+        for node in &topology.nodes {
+            for &cpu in &node.cpus {
+                let found = topology.get_node_for_cpu(cpu);
+                assert!(found.is_some(), "CPU {} not found in cache", cpu);
+                assert_eq!(found.unwrap().id, node.id,
+                    "CPU {} mapped to wrong node (expected {}, got {})",
+                    cpu, node.id, found.unwrap().id);
+            }
+        }
+        // A CPU ID beyond the max should return None
+        let beyond = topology.cpu_to_node.len() + 100;
+        assert!(topology.get_node_for_cpu(beyond).is_none());
     }
 }

@@ -17,20 +17,31 @@ use std::iter::Peekable;
 
 // ─── Source Span ─────────────────────────────────────────────────────────────
 
-/// A half-open byte range [start, end) inside the source string, plus
-/// the originating line/column for human-readable error messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Source span — compact 12-byte representation.
+/// PERF(issue #28): Reduced from 24 bytes by using u32 offsets and u16 line/col.
+/// This halves the size of every Token and AST node that embeds a Span.
+/// Source files exceeding 4GB or lines exceeding 65535 are not supported,
+/// which is acceptable for all practical use cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Span {
-    pub start: usize,
-    pub end: usize,
-    pub line: u32,
-    pub col: u32,
+    pub start: u32,
+    pub end: u32,
+    pub line: u16,
+    pub col: u16,
 }
 
 impl Span {
     pub fn new(start: usize, end: usize, line: u32, col: u32) -> Self {
-        Span { start, end, line, col }
+        Span { start: start as u32, end: end as u32, line: line as u16, col: col as u16 }
     }
+
+    /// Start offset as usize for slice indexing
+    #[inline]
+    pub fn lo(&self) -> usize { self.start as usize }
+
+    /// End offset as usize for slice indexing
+    #[inline]
+    pub fn hi(&self) -> usize { self.end as usize }
 
     /// A dummy span used for synthetic tokens.
     pub fn dummy() -> Self {
@@ -511,12 +522,12 @@ pub struct Token {
     pub span: Span,
     /// The original source text that produced this token, useful for
     /// diagnostics and source-map generation.
-    pub raw: String,
+    pub raw: Box<str>,
 }
 
 impl Token {
     pub fn new(kind: TokenKind, span: Span, raw: impl Into<String>) -> Self {
-        Token { kind, span, raw: raw.into() }
+        Token { kind, span, raw: raw.into().into_boxed_str() }
     }
 
     pub fn is_eof(&self) -> bool {
@@ -844,7 +855,7 @@ impl<'src> Lexer<'src> {
 
     /// Get the raw source slice for a span.
     fn raw_slice(&self, span: &Span) -> &str {
-        &self.src[span.start..span.end]
+        &self.src[span.lo()..span.hi()]
     }
 
     // ── Whitespace & Comments ─────────────────────────────────────────────
@@ -1147,7 +1158,7 @@ impl<'src> Lexer<'src> {
             self.advance();
         }
         let span = self.span_from(start, line, col);
-        let s = &self.src[span.start..span.end];
+        let s = &self.src[span.lo()..span.hi()];
         // Check if it's a keyword first to avoid String allocation
         if let Some(kw) = keyword(s) {
             Token::new(kw, span, s)  // keyword: move &str into raw

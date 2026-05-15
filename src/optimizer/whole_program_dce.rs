@@ -545,8 +545,8 @@ impl DependencyGraphBuilder {
                         callee: name.clone(),
                         location: CodeLocation {
                             file: PathBuf::new(),
-                            line: span.line,
-                            column: span.col,
+                            line: span.line as u32,
+                            column: span.col as u32,
                             function: caller.to_string(),
                             module: String::new(),
                         },
@@ -566,8 +566,8 @@ impl DependencyGraphBuilder {
                     callee: format!("method:{}", method),
                     location: CodeLocation {
                         file: PathBuf::new(),
-                        line: span.line,
-                        column: span.col,
+                        line: span.line as u32,
+                        column: span.col as u32,
                         function: method.clone(),
                         module: String::new(),
                     },
@@ -591,8 +591,8 @@ impl DependencyGraphBuilder {
                     method_name: method.clone(),
                     location: CodeLocation {
                         file: PathBuf::new(),
-                        line: span.line,
-                        column: span.col,
+                        line: span.line as u32,
+                        column: span.col as u32,
                         function: caller.to_string(),
                         module: String::new(),
                     },
@@ -1235,8 +1235,8 @@ impl SymbolicExecutor {
                     eliminated_regions.push(EliminatedRegion {
                         location: CodeLocation {
                             file: PathBuf::new(),
-                            line: use_path.span.line,
-                            column: use_path.span.col,
+                            line: use_path.span.line as u32,
+                            column: use_path.span.col as u32,
                             function: String::new(),
                             module: String::new(),
                         },
@@ -1785,10 +1785,10 @@ impl SymbolicExecutor {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { pattern, span, .. } => {
-                    self.collect_pattern_bindings(pattern, span.line, bindings);
+                    self.collect_pattern_bindings(pattern, span.line as u32, bindings);
                 }
                 Stmt::ForIn { pattern, span, body, .. } => {
-                    self.collect_pattern_bindings(pattern, span.line, bindings);
+                    self.collect_pattern_bindings(pattern, span.line as u32, bindings);
                     self.collect_bindings(body, bindings);
                 }
                 Stmt::If { then, else_, .. } => {
@@ -1798,7 +1798,7 @@ impl SymbolicExecutor {
                             IfOrBlock::Block(b) => self.collect_bindings(b, bindings),
                             IfOrBlock::If(s) => {
                                 if let Stmt::Let { pattern, span, .. } = s {
-                                    self.collect_pattern_bindings(pattern, span.line, bindings);
+                                    self.collect_pattern_bindings(pattern, span.line as u32, bindings);
                                 }
                             }
                         }
@@ -1809,7 +1809,7 @@ impl SymbolicExecutor {
                 }
                 Stmt::Match { arms, .. } => {
                     for arm in arms {
-                        self.collect_pattern_bindings(&arm.pat, arm.span.line, bindings);
+                        self.collect_pattern_bindings(&arm.pat, arm.span.line as u32, bindings);
                         self.collect_expr_bindings(&arm.body, bindings);
                     }
                 }
@@ -2504,7 +2504,7 @@ impl DeadCodeEliminator {
         let before = program.items.len();
         program.items.retain(|item| {
             if let Item::Use(u) = item {
-                u.span.line != line
+                u.span.line as u32 != line
             } else {
                 true
             }

@@ -10,64 +10,13 @@ use rustc_hash::FxHashMap;
 use crate::compiler::ast::{AssignOpKind, Block, Expr, Item, Pattern, Program, Stmt, UnOpKind};
 use crate::compiler::lexer::Span;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Error,
-    Warning,
-    Note,
-}
+// issue #33 — consolidated types from compiler parent module
+pub use crate::compiler::{SimpleDiagnostic as Diagnostic, SimpleDiagnostics as Diagnostics, SimpleSeverity as Severity};
 
-#[derive(Debug, Clone)]
-pub struct Diagnostic {
-    pub severity: Severity,
-    pub span: Span,
-    pub message: String,
-    pub labels: Vec<(Span, String)>,
-    /// Error code (e.g. "E4001") from the error_codes module.
-    pub code: Option<&'static str>,
-    /// Suggested fix hint (optional, displayed as `help:` in the renderer).
-    pub hint: Option<String>,
-}
-
-impl Diagnostic {
-    /// Attach an error code (e.g. `"E4001"`).
-    pub fn with_code(mut self, code: &'static str) -> Self {
-        self.code = Some(code);
-        self
-    }
-    /// Attach a suggested fix hint.
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct Diagnostics {
-    pub items: Vec<Diagnostic>,
-}
-
+/// Extended Diagnostics with borrow-check-specific helpers.
 impl Diagnostics {
-    fn error(&mut self, span: Span, message: impl Into<String>) {
-        self.items.push(Diagnostic {
-            severity: Severity::Error,
-            span,
-            message: message.into(),
-            labels: vec![],
-            code: None,
-            hint: None,
-        });
-    }
-
     fn error_with_fix(&mut self, span: Span, message: impl Into<String>, fix: impl Into<String>) {
-        self.items.push(Diagnostic {
-            severity: Severity::Error,
-            span,
-            message: message.into(),
-            labels: vec![],
-            code: None,
-            hint: Some(fix.into()),
-        });
+        self.push(Diagnostic::error(span, message).with_hint(fix));
     }
 
     /// Push a fully-constructed diagnostic (with code and hint already set).
@@ -90,6 +39,13 @@ struct VarState {
 
 #[derive(Debug)]
 struct BorrowChecker {
+    // PERF(issue #31): These maps use `String` keys, requiring heap allocation
+    // and full string hashing on every lookup. They should be changed to
+    // `FxHashMap<Symbol, ...>` using `crate::runtime::symbol::global_intern`
+    // to reduce per-access cost from O(n) string hash to O(1) u32 comparison.
+    // This is invasive because every call site (bind_var, mark_moved,
+    // try_borrow, check_read, check_write, move_ident, etc.) passes `struct BorrowChecker {str`
+    // parameters that would need to be interned first.
     diag: Diagnostics,
     loans_by_target: FxHashMap<String, LoanState>,
     ref_binding_to_target: FxHashMap<String, (String, bool)>, // ref_var -> (target, mut?)
