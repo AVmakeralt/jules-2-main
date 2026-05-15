@@ -91,7 +91,7 @@ fn jules_segmented_sieve(limit: usize) -> Result<usize, String> {
     let out = interp
         .eval_builtin(
             "math::prime_count_segmented",
-            vec![Value::I64(limit as i64), Value::I64(seg_size as i64)],
+            &[Value::I64(limit as i64), Value::I64(seg_size as i64)],
         )
         .map_err(|e| e.message)?;
 

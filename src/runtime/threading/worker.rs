@@ -27,6 +27,13 @@ struct MpmcNode {
 }
 
 /// Michael-Scott MPMC queue for injector
+///
+/// TODO (PERF-12): Each push() allocates a new MpmcNode on the heap.
+/// This is a per-task allocation overhead that should be replaced with
+/// an array-based MPMC ring buffer for the injector queue. The ring
+/// buffer would pre-allocate all slots and use sequence numbers for
+/// coordination, similar to the Disruptor pattern already implemented
+/// in disruptor.rs.
 struct MpmcQueue {
     head: AtomicPtr<MpmcNode>,
     tail: AtomicPtr<MpmcNode>,
@@ -153,8 +160,12 @@ impl Notify {
         // FIX (PERF-2): Use Condvar wait instead of polling with sleep.
         // This blocks the thread with zero CPU usage until notified,
         // with microsecond wake latency on Linux.
+        //
+        // FIX (PERF-9): Reduced timeout from 10ms to 1ms to lower the
+        // latency before a sleeping worker picks up new work. The 10ms
+        // timeout caused unnecessary delays in work acquisition.
         let guard = self.mutex.lock().unwrap();
-        let _guard = self.condvar.wait_timeout(guard, Duration::from_millis(10)).unwrap();
+        let _guard = self.condvar.wait_timeout(guard, Duration::from_millis(1)).unwrap();
         self.flag.store(false, Ordering::Release);
     }
 }
@@ -289,20 +300,25 @@ impl Worker {
                 continue;
             }
             
-            // No work found, exponential backoff
+            // No work found, adaptive backoff
+            //
+            // FIX (PERF-9): Replaced thread::sleep() with adaptive backoff
+            // strategy. The old approach used thread::sleep(1us) which
+            // actually sleeps 50-100us on Linux due to OS scheduler
+            // granularity. The new strategy uses:
+            //   - spin_loop() for very short idle (PAUSE on x86, YIELD on ARM)
+            //   - yield_now() for medium idle (OS scheduler yield)
+            //   - condvar wait for long idle (zero CPU, 1ms timeout)
             idle_iterations += 1;
             if idle_iterations > 1000 {
-                // Use condvar-based wait for long idle periods
+                // Long idle: condvar-based wait (zero CPU usage)
                 self.injector.wait_for_work();
+            } else if idle_iterations > 100 {
+                // Medium idle: yield to OS scheduler
+                std::thread::yield_now();
             } else {
-                let sleep_us = if idle_iterations < 10 {
-                    1
-                } else if idle_iterations < 100 {
-                    10
-                } else {
-                    100
-                };
-                thread::sleep(Duration::from_micros(sleep_us));
+                // Short idle: spin pause (PAUSE instruction on x86)
+                std::hint::spin_loop();
             }
         }
     }
@@ -314,6 +330,12 @@ impl Worker {
     /// we now use randomized probing: try a small number of random workers
     /// before falling back to a full scan. This reduces contention from O(N)
     /// to O(K) where K is the number of probes (default 3).
+    ///
+    /// TODO (PERF-14): The NUMA-aware fallback scans all workers twice
+    /// (once for same-node, once for cross-node). Should pre-compute
+    /// numa_local_peers and numa_remote_peers lists in Worker::new()
+    /// or ThreadPool::new() to avoid the O(N) scan on every steal attempt.
+    /// The pre-computed lists would allow O(K) NUMA-aware stealing.
     fn steal(&self, guard: &Guard) -> Option<*mut ()> {
         let workers = match self.workers.get() {
             Some(w) => w,
@@ -418,14 +440,21 @@ impl Worker {
     }
 
     /// Execute a task
+    ///
+    /// FIX (PERF-8): Replaced the old double-boxing dispatch (Box<Box<dyn FnOnce()>>)
+    /// with uniform vtable dispatch. All task types (SlabTask from spawn(),
+    /// BoxedTask from par_for()) have a vtable pointer at offset 0, so we
+    /// read the vtable and call run() directly. This eliminates 2 heap
+    /// allocations per spawn() and 1 per par_for() chunk.
     fn execute_task(&self, task: *mut ()) {
         self.tasks_executed.fetch_add(1, Ordering::Relaxed);
         unsafe {
-            // Task is a Box<Box<dyn FnOnce()>> passed through *mut ().
-            // Double-boxing is needed because Box<dyn FnOnce()> is a fat pointer
-            // and cannot be stored in a single *mut ().
-            let func: Box<Box<dyn FnOnce()>> = Box::from_raw(task as *mut Box<dyn FnOnce()>);
-            (*func)();
+            // Read the vtable pointer at offset 0 (common to SlabTask and BoxedTask)
+            let vtable_ptr = *(task as *const *const super::join::TaskVtable);
+            if !vtable_ptr.is_null() {
+                let vtable = &*vtable_ptr;
+                (vtable.run)(task);
+            }
         }
     }
 

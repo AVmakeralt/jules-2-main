@@ -40,6 +40,11 @@ impl<T> RingEntry<T> {
 }
 
 /// Disruptor-style ring buffer
+///
+/// FIX (PERF-6): Added cache-line padding between producer_sequence and
+/// consumer_sequence to prevent false sharing. On x86-64, a cache line is
+/// 64 bytes. Without padding, both atomics share the same line, causing
+/// unnecessary cache invalidation traffic between producer and consumer.
 pub struct DisruptorRing<T> {
     /// Ring buffer entries
     entries: Vec<RingEntry<T>>,
@@ -47,10 +52,14 @@ pub struct DisruptorRing<T> {
     capacity: usize,
     /// Mask for modulo operation
     mask: usize,
-    /// Producer sequence
+    /// Producer sequence (padded to avoid false sharing with consumer)
     producer_sequence: AtomicU64,
-    /// Consumer sequence
+    /// Padding to separate producer and consumer onto different cache lines
+    _pad1: [u8; 56],  // 64 - size_of::<AtomicU64>() = 56
+    /// Consumer sequence (on its own cache line)
     consumer_sequence: AtomicU64,
+    /// Padding to avoid false sharing with next struct
+    _pad2: [u8; 56],
 }
 
 impl<T> DisruptorRing<T> {
@@ -68,7 +77,9 @@ impl<T> DisruptorRing<T> {
             capacity,
             mask: capacity - 1,
             producer_sequence: AtomicU64::new(0),
+            _pad1: [0; 56],
             consumer_sequence: AtomicU64::new(0),
+            _pad2: [0; 56],
         }
     }
     

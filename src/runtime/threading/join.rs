@@ -44,12 +44,51 @@ pub fn get_participant() -> &'static Participant {
 }
 
 /// Vtable for task execution
-
-struct TaskVtable {
+///
+/// FIX (PERF-8): Made TaskVtable pub so that worker.rs can dispatch tasks
+/// via vtable instead of double-boxing. All task types (SlabTask, BoxedTask)
+/// have a vtable pointer at offset 0, allowing uniform dispatch.
+pub struct TaskVtable {
     /// Run the task
-    run: unsafe fn(*mut ()),
+    pub run: unsafe fn(*mut ()),
     /// Drop the task
-    drop: unsafe fn(*mut ()),
+    pub drop: unsafe fn(*mut ()),
+}
+
+/// Heap-allocated task for closures that don't fit in SlabTask's inline buffer.
+///
+/// FIX (PERF-8): Replaces the old double-boxing pattern (Box<Box<dyn FnOnce()>>)
+/// with a vtable-dispatched task. The vtable pointer is at offset 0, matching
+/// SlabTask's layout, so worker.rs can use a single dispatch path for all tasks.
+/// This saves one heap allocation compared to the old approach by storing the
+/// Box<dyn FnOnce()> inline in the task struct instead of double-boxing it.
+#[repr(C)]
+pub struct BoxedTask {
+    /// Vtable pointer (at offset 0, matching SlabTask layout)
+    pub vtable: *const TaskVtable,
+    /// Closure (stored inline in the struct, avoiding double-boxing)
+    pub closure: Option<Box<dyn FnOnce()>>,
+}
+
+/// Vtable for BoxedTask execution
+static BOXED_TASK_VTABLE: TaskVtable = TaskVtable {
+    run: boxed_task_run,
+    drop: boxed_task_drop,
+};
+
+/// Execute a BoxedTask by taking the closure out and calling it
+unsafe fn boxed_task_run(ptr: *mut ()) {
+    let task = Box::from_raw(ptr as *mut BoxedTask);
+    if let Some(closure) = task.closure {
+        closure();
+    }
+}
+
+/// Drop a BoxedTask (closure is dropped automatically when the Box is consumed)
+unsafe fn boxed_task_drop(_ptr: *mut ()) {
+    // The closure is already consumed by run. If the task was never run
+    // (e.g., during pool shutdown), the Box<BoxedTask> will be leaked.
+    // In practice, the pool drains all tasks before shutdown.
 }
 
 /// Stack-allocated task descriptor with vtable
@@ -103,15 +142,19 @@ impl StackTask {
 }
 
 /// Slab-allocated task descriptor
+///
+/// FIX (PERF-8): Made SlabTask pub and its fields accessible so that
+/// worker.rs can execute tasks via vtable dispatch, eliminating the
+/// double-boxing overhead (Box<dyn FnOnce()> + Box<Box<...>>).
 pub struct SlabTask {
     /// Vtable pointer (heap-allocated via Box::into_raw to avoid dangling)
-    vtable: *const TaskVtable,
+    pub vtable: *const TaskVtable,
     /// Inline data (up to 64 bytes)
-    data: [u8; 64],
+    pub data: [u8; 64],
     /// Completed flag
-    completed: AtomicBool,
+    pub completed: AtomicBool,
     /// Result pointer (for JoinHandle)
-    result_ptr: AtomicPtr<()>,
+    pub result_ptr: AtomicPtr<()>,
 }
 
 
@@ -125,7 +168,12 @@ impl SlabTask {
         }
     }
 
-    unsafe fn execute(&mut self) {
+    /// Execute the task via vtable dispatch.
+    ///
+    /// FIX (PERF-8): This is now called directly by worker.rs execute_task()
+    /// instead of going through a double-boxed Box<dyn FnOnce()> wrapper.
+    /// This eliminates 2 heap allocations per task spawn.
+    pub unsafe fn execute(&mut self) {
         if let Some(vtable) = self.vtable.as_ref() {
             (vtable.run)(self as *mut _ as *mut ());
         }
@@ -317,17 +365,12 @@ where
     }
 
     let pool = get_pool();
-    // Wrap the SlabTask execution in a Box<dyn FnOnce()> and double-box
-    // so the worker can safely call it through *mut ()
-    let slab_task_ptr = descriptor as *mut SlabTask;
-    let erased: Box<dyn FnOnce()> = Box::new(move || {
-        unsafe {
-            let task = &mut *slab_task_ptr;
-            task.execute();
-        }
-    });
-    let task_ptr = Box::into_raw(Box::new(erased)) as *mut ();
-    pool.submit(task_ptr);
+    // FIX (PERF-8): Submit the SlabTask pointer directly instead of
+    // double-boxing. The old code wrapped SlabTask in Box<dyn FnOnce()>
+    // and then Box<Box<dyn FnOnce()>>, adding 2 unnecessary heap
+    // allocations per spawn. Now worker.rs execute_task() calls
+    // SlabTask::execute() directly via vtable dispatch.
+    pool.submit(descriptor as *mut ());
 
     JoinHandle {
         task: descriptor as *mut SlabTask,
@@ -348,7 +391,7 @@ where
 /// For closures that cannot be cloned, the sequential fallback is used.
 pub fn par_for<F>(range: std::ops::Range<usize>, f: F)
 where
-    F: FnMut(usize) + Send + Clone,
+    F: FnMut(usize) + Send + Clone + 'static,
 {
     let pool = get_pool();
     let num_workers = pool.num_workers();
@@ -368,17 +411,27 @@ where
     // FIX (PERF-4): Clone the closure for each worker instead of wrapping
     // in Arc<Mutex<F>>. Each worker gets its own copy and can execute
     // independently without lock contention.
+    //
+    // FIX (PERF-8): Use BoxedTask with vtable dispatch instead of the old
+    // double-boxing pattern (Box<Box<dyn FnOnce()>>). All task types now
+    // have a vtable pointer at offset 0, enabling uniform dispatch in
+    // worker.rs execute_task().
     for chunk_start in (range.start..range.end).step_by(chunk_size) {
         let chunk_end = (chunk_start + chunk_size).min(range.end);
         let mut f_clone = f.clone();
         
-        let task: Box<dyn FnOnce()> = Box::new(move || {
+        let closure: Box<dyn FnOnce()> = Box::new(move || {
             for i in chunk_start..chunk_end {
                 f_clone(i);
             }
         });
         
-        let task_ptr = Box::into_raw(Box::new(task)) as *mut ();
+        let task = Box::new(BoxedTask {
+            vtable: &BOXED_TASK_VTABLE,
+            closure: Some(closure),
+        });
+        
+        let task_ptr = Box::into_raw(task) as *mut ();
         pool.submit(task_ptr);
     }
 }

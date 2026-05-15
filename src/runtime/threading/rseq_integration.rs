@@ -85,6 +85,12 @@ pub fn init_current_thread() -> bool {
 ///
 /// Uses per-CPU flags to avoid CAS operations. In the uncontended case,
 /// acquisition is just a flag check (no atomic operation).
+///
+/// FIX (PERF-10): Added epoch-based retry of rseq fast path after falling
+/// back to std::Mutex. The original code permanently degraded to the mutex
+/// path after a single contention event, even if the contention was transient.
+/// Now, every 1024 successful mutex acquisitions, we reset use_fallback to
+/// false and try the rseq fast path again.
 pub struct RseqMutex<T> {
     /// Per-CPU lock flags (0 = unlocked, 1 = locked)
     lock_flags: PerCpu<AtomicUsize>,
@@ -94,6 +100,8 @@ pub struct RseqMutex<T> {
     fallback: Mutex<()>,
     /// Fallback to standard mutex if rseq unavailable
     use_fallback: AtomicBool,
+    /// Count of successful fallback acquisitions (for periodic rseq retry)
+    fallback_count: AtomicUsize,
 }
 
 impl<T> RseqMutex<T> {
@@ -103,12 +111,22 @@ impl<T> RseqMutex<T> {
             data: UnsafeCell::new(data),
             fallback: Mutex::new(()),
             use_fallback: AtomicBool::new(false),
+            fallback_count: AtomicUsize::new(0),
         }
     }
 
     /// Lock the mutex
     pub fn lock(&self) -> RseqMutexGuard<'_, T> {
         if self.use_fallback.load(Ordering::Acquire) {
+            // FIX (PERF-10): Periodically retry rseq after falling back to mutex.
+            // After 1024 successful fallback acquisitions, reset use_fallback
+            // to try the rseq fast path again. This recovers from transient
+            // contention without permanently degrading to the slow path.
+            let count = self.fallback_count.fetch_add(1, Ordering::Relaxed);
+            if count % 1024 == 0 && count > 0 {
+                self.use_fallback.store(false, Ordering::Release);
+            }
+
             // Fallback path: use std::Mutex for exclusion
             let guard = self.fallback.lock().unwrap();
             let data = unsafe { &mut *self.data.get() };

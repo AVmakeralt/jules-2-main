@@ -1115,10 +1115,12 @@ pub fn run_gvn(func: &mut IRFunction) {
 
     let mut table: HashMap<VNKey, VarId> = HashMap::new();
     // Per-block pass (a full inter-block GVN would need dominator tree walk)
+    // FIX #6: Use in-place mutation instead of clone for non-replaced instructions.
+    // Only instructions replaced by Move need to be mutated; others stay in place.
     for block in func.blocks.values_mut() {
         let mut new = Vec::with_capacity(block.instrs.len());
-        for instr in &block.instrs {
-            let key = match instr {
+        for instr in block.instrs.drain(..) {
+            let key = match &instr {
                 IRInstr::Add { lhs, rhs, .. } =>
                     Some(VNKey::Add((*lhs).min(*rhs), (*lhs).max(*rhs))),
                 IRInstr::Mul { lhs, rhs, .. } =>
@@ -1135,7 +1137,7 @@ pub fn run_gvn(func: &mut IRFunction) {
                     Some(VNKey::ICmp(*cond, *lhs, *rhs)),
                 _ => None,
             };
-            if let (Some(k), Some(dst)) = (key, instr_def(instr)) {
+            if let (Some(k), Some(dst)) = (key, instr_def(&instr)) {
                 if let Some(&existing) = table.get(&k) {
                     // Replace with Move (proper copy semantics)
                     new.push(IRInstr::Move { dst, src: existing });
@@ -1143,7 +1145,7 @@ pub fn run_gvn(func: &mut IRFunction) {
                 }
                 table.insert(k, dst);
             }
-            new.push(instr.clone());
+            new.push(instr); // FIX #6: Move instead of clone — drain() already took ownership
         }
         block.instrs = new;
     }
@@ -1262,7 +1264,7 @@ pub fn run_dce(func: &mut IRFunction) {
             if !dead {
                 if let Some(d) = instr_def(instr) { live_now.remove(&d); }
                 live_now.extend(instr_uses(instr));
-                new_instrs.push(instr.clone());
+                new_instrs.push(instr.clone()); // FIX #6: clone still needed — reverse iteration requires immutable borrow
             }
         }
         new_instrs.reverse();
@@ -1288,95 +1290,100 @@ pub fn run_algebra_simplify(func: &mut IRFunction) {
         .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
         .collect();
 
+    // FIX #6: Use in-place mutation with std::mem::replace instead of
+    // cloning every instruction. In the common case (no simplification),
+    // we avoid the clone entirely by leaving the instruction in place.
+    // Only simplified instructions create a new value.
     for block in func.blocks.values_mut() {
-        let mut new_instrs = Vec::with_capacity(block.instrs.len());
-        for instr in &block.instrs {
+        for instr in &mut block.instrs {
             let simplified = match instr {
                 // x + 0 = x
                 IRInstr::Add { dst, lhs, rhs } => {
                     if const_map.get(rhs) == Some(&0) {
-                        IRInstr::Move { dst: *dst, src: *lhs }
+                        Some(IRInstr::Move { dst: *dst, src: *lhs })
                     } else if const_map.get(lhs) == Some(&0) {
-                        IRInstr::Move { dst: *dst, src: *rhs }
+                        Some(IRInstr::Move { dst: *dst, src: *rhs })
                     } else {
-                        instr.clone()
+                        None
                     }
                 }
                 // x - 0 = x
                 IRInstr::Sub { dst, lhs, rhs } => {
                     if const_map.get(rhs) == Some(&0) {
-                        IRInstr::Move { dst: *dst, src: *lhs }
+                        Some(IRInstr::Move { dst: *dst, src: *lhs })
                     } else {
-                        instr.clone()
+                        None
                     }
                 }
                 // x * 1 = x
                 IRInstr::Mul { dst, lhs, rhs } => {
                     if const_map.get(rhs) == Some(&1) {
-                        IRInstr::Move { dst: *dst, src: *lhs }
+                        Some(IRInstr::Move { dst: *dst, src: *lhs })
                     } else if const_map.get(lhs) == Some(&1) {
-                        IRInstr::Move { dst: *dst, src: *rhs }
+                        Some(IRInstr::Move { dst: *dst, src: *rhs })
                     } else {
-                        instr.clone()
+                        None
                     }
                 }
                 // x / 1 = x
                 IRInstr::SDiv { dst, lhs, rhs } => {
                     if const_map.get(rhs) == Some(&1) {
-                        IRInstr::Move { dst: *dst, src: *lhs }
+                        Some(IRInstr::Move { dst: *dst, src: *lhs })
                     } else {
-                        instr.clone()
+                        None
                     }
                 }
                 // x & x = x, x & 0 = 0
                 IRInstr::And { dst, lhs, rhs } => {
                     if const_map.get(rhs) == Some(&0) || const_map.get(lhs) == Some(&0) {
-                        IRInstr::Const { dst: *dst, value: 0 }
+                        Some(IRInstr::Const { dst: *dst, value: 0 })
                     } else if lhs == rhs {
-                        IRInstr::Move { dst: *dst, src: *lhs }
+                        Some(IRInstr::Move { dst: *dst, src: *lhs })
                     } else {
-                        instr.clone()
+                        None
                     }
                 }
                 // x | x = x
                 IRInstr::Or { dst, lhs, rhs } => {
                     if lhs == rhs {
-                        IRInstr::Move { dst: *dst, src: *lhs }
+                        Some(IRInstr::Move { dst: *dst, src: *lhs })
                     } else {
-                        instr.clone()
+                        None
                     }
                 }
                 // x ^ 0 = x
                 IRInstr::Xor { dst, lhs, rhs } => {
                     if const_map.get(rhs) == Some(&0) {
-                        IRInstr::Move { dst: *dst, src: *lhs }
+                        Some(IRInstr::Move { dst: *dst, src: *lhs })
                     } else if const_map.get(lhs) == Some(&0) {
-                        IRInstr::Move { dst: *dst, src: *rhs }
+                        Some(IRInstr::Move { dst: *dst, src: *rhs })
                     } else {
-                        instr.clone()
+                        None
                     }
                 }
                 // x << 0 = x, x >> 0 = x
                 IRInstr::Shl { dst, lhs, rhs } => {
                     if const_map.get(rhs) == Some(&0) {
-                        IRInstr::Move { dst: *dst, src: *lhs }
+                        Some(IRInstr::Move { dst: *dst, src: *lhs })
                     } else {
-                        instr.clone()
+                        None
                     }
                 }
                 IRInstr::AShr { dst, lhs, rhs } |
                 IRInstr::LShr { dst, lhs, rhs } => {
                     if const_map.get(rhs) == Some(&0) {
-                        IRInstr::Move { dst: *dst, src: *lhs }
+                        Some(IRInstr::Move { dst: *dst, src: *lhs })
                     } else {
-                        instr.clone()
+                        None
                     }
                 }
-                _ => instr.clone(),
+                _ => None, // No simplification — skip clone entirely (Fix #6)
             };
-            new_instrs.push(simplified);
+            // Only replace if we found a simplification; otherwise leave in place.
+            if let Some(new_instr) = simplified {
+                *instr = new_instr;
+            }
         }
-        block.instrs = new_instrs;
     }
 }
 

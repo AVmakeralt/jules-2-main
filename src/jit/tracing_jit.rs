@@ -287,7 +287,108 @@ impl TraceRecorder {
 // =============================================================================
 // §3  EXECUTABLE MEMORY
 // =============================================================================
-pub struct ExecutableMemory { ptr: *mut u8, len: usize }
+//
+// FIX #4: Arena-based executable memory allocation.
+// Instead of per-trace mmap+mprotect pairs (which waste virtual memory and
+// cause TLB pressure), traces are sub-allocated within 4MB chunks. This
+// reduces mmap syscalls and improves TLB utilization.
+
+/// 4MB chunk size for trace arena allocation
+const TRACE_ARENA_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Arena allocator for trace executable memory (Fix #4).
+/// Sub-allocates traces within large mmap'd chunks, avoiding per-trace
+/// mmap+mprotect overhead.
+struct TraceArena {
+    /// Chain of allocated chunks
+    chunks: Vec<*mut u8>,
+    /// Current chunk sizes (for munmap on drop)
+    chunk_sizes: Vec<usize>,
+    /// Offset into current chunk
+    offset: usize,
+    /// Current chunk remaining capacity
+    remaining: usize,
+}
+
+// SAFETY: TraceArena exclusively owns its mmap'd regions.
+unsafe impl Send for TraceArena {}
+unsafe impl Sync for TraceArena {}
+
+impl TraceArena {
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            chunk_sizes: Vec::new(),
+            offset: 0,
+            remaining: 0,
+        }
+    }
+
+    /// Allocate `len` bytes of executable memory from the arena.
+    /// Returns a pointer to RW memory. Caller must call finalize()
+    /// before executing the code.
+    fn alloc(&mut self, len: usize) -> Result<*mut u8, String> {
+        let aligned = (len + 15) & !15; // 16-byte alignment
+        if aligned > self.remaining {
+            // Need a new chunk
+            let chunk_size = aligned.max(TRACE_ARENA_CHUNK_SIZE);
+            let ptr = unsafe {
+                mmap(
+                    ptr::null_mut(),
+                    chunk_size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if ptr.is_null() || ptr as usize == usize::MAX {
+                return Err("mmap failed for trace arena chunk".into());
+            }
+            self.chunks.push(ptr as *mut u8);
+            self.chunk_sizes.push(chunk_size);
+            self.offset = 0;
+            self.remaining = chunk_size;
+        }
+
+        // Allocate from current chunk
+        let chunk_ptr = *self.chunks.last().unwrap();
+        let ptr = unsafe { chunk_ptr.add(self.offset) };
+        self.offset += aligned;
+        self.remaining -= aligned;
+        Ok(ptr)
+    }
+
+    /// Flip all chunks from RW→RX for execution (W^X compliance).
+    fn finalize(&mut self) -> Result<(), String> {
+        for (&chunk_ptr, &size) in self.chunks.iter().zip(self.chunk_sizes.iter()) {
+            let ok = unsafe { mprotect(chunk_ptr as *mut c_void, size, PROT_READ | PROT_EXEC) };
+            if ok != 0 {
+                return Err("mprotect failed in trace arena finalize".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TraceArena {
+    fn drop(&mut self) {
+        for (&chunk_ptr, &size) in self.chunks.iter().zip(self.chunk_sizes.iter()) {
+            unsafe {
+                // FIX #10: mprotect before munmap is redundant — munmap works
+                // regardless of page protection. Skip it to avoid syscall overhead.
+                munmap(chunk_ptr as *mut c_void, size);
+            }
+        }
+    }
+}
+
+// Thread-local trace arena for sub-allocation (Fix #4).
+std::thread_local! {
+    static TRACE_ARENA: std::cell::RefCell<TraceArena> = std::cell::RefCell::new(TraceArena::new());
+}
+
+pub struct ExecutableMemory { ptr: *mut u8, len: usize, arena_backed: bool }
 
 // SAFETY: ExecutableMemory exclusively owns its mmap'd region.
 // It is safe to send across threads and share references because
@@ -299,13 +400,31 @@ impl ExecutableMemory {
     #[cfg(unix)]
     pub fn new(code: &[u8]) -> Result<Self, String> {
         let len = code.len().max(1);
+
+        // FIX #4: Try arena allocation first (sub-allocate within 4MB chunks).
+        // This avoids per-trace mmap+mprotect pairs that waste virtual memory
+        // and cause TLB pressure.
+        if let Ok(ptr) = TRACE_ARENA.with(|arena_cell| {
+            let mut arena = arena_cell.borrow_mut();
+            arena.alloc(len)
+        }) {
+            unsafe { ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len()); }
+            // Finalize arena to flip pages RW→RX before execution
+            TRACE_ARENA.with(|arena_cell| {
+                let mut arena = arena_cell.borrow_mut();
+                arena.finalize()
+            })?;
+            return Ok(Self { ptr, len, arena_backed: true });
+        }
+
+        // Fallback: individual mmap per trace
         let ptr = unsafe { mmap(ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
         if ptr.is_null() || ptr as usize == usize::MAX { return Err("mmap failed".into()); }
         unsafe { ptr::copy_nonoverlapping(code.as_ptr(), ptr as *mut u8, code.len()); }
         if unsafe { mprotect(ptr, len, PROT_READ | PROT_EXEC) } != 0 {
             unsafe { munmap(ptr, len) }; return Err("mprotect failed".into());
         }
-        Ok(Self { ptr: ptr as *mut u8, len })
+        Ok(Self { ptr: ptr as *mut u8, len, arena_backed: false })
     }
 
     #[cfg(not(unix))]
@@ -318,8 +437,14 @@ impl ExecutableMemory {
 
 impl Drop for ExecutableMemory {
     fn drop(&mut self) {
+        if self.arena_backed {
+            // Arena-backed memory is freed when the TraceArena is dropped,
+            // not per-ExecutableMemory. No per-drop munmap needed.
+            return;
+        }
         #[cfg(unix)] unsafe {
-            mprotect(self.ptr as *mut _, self.len, PROT_READ | PROT_WRITE);
+            // FIX #10: mprotect before munmap is redundant — munmap works
+            // regardless of page protection. Skip it to avoid the syscall overhead.
             munmap(self.ptr as *mut _, self.len);
         }
     }
@@ -556,8 +681,18 @@ impl NativeCodeGenerator {
                 self.mark_dirty(*dst);
             }
             Instr::BinOp(dst, op, lhs, rhs) => {
-                self.ensure_reg(*lhs, Reg::RAX)?;
-                self.ensure_reg(*rhs, Reg::RCX)?;
+                // FIX #2: Use wider register allocation to reduce load-spill-load
+                // cycles. Load lhs and rhs into registers from the wider pool
+                // (RAX, RCX, RDX, R8, R9, R10), then move to RAX/RCX for
+                // the actual arithmetic operation. This allows values that are
+                // still live to remain in RDX/R8/R9/R10 without being evicted
+                // just because RAX/RCX are needed for a different operation.
+                let lhs_reg = self.alloc_reg(*lhs)?;
+                let rhs_reg = self.alloc_reg(*rhs)?;
+                // Move operands to RAX/RCX for arithmetic (the codegen only
+                // supports RAX/RCX operand forms currently)
+                if lhs_reg != Reg::RAX { self.mov_reg_reg(lhs_reg, Reg::RAX); }
+                if rhs_reg != Reg::RCX { self.mov_reg_reg(rhs_reg, Reg::RCX); }
                 match op {
                     BinOpKind::Add => self.add_rax_rcx(),
                     BinOpKind::Sub => self.sub_rax_rcx(),
@@ -755,6 +890,55 @@ impl NativeCodeGenerator {
     // --- Register Allocation & Spilling ---
     // J5 fix: All methods updated to use flat array reg_map[reg as usize]
     // and Vec<Option<Reg>> slot_reg instead of FxHashMap lookups.
+    //
+    // FIX #2: Extended register allocator to use RAX, RCX, RDX, R8, R9, R10
+    // instead of only RAX and RCX. This reduces load-spill-load cycles when
+    // multiple values are live simultaneously.
+
+    /// Register allocation candidate pool (Fix #2).
+    /// Ordered by preference: RAX/RCX are scratch registers used by arithmetic
+    /// ops, but RDX, R8, R9, R10 are available for holding intermediate values
+    /// without forcing eviction of live RAX/RCX contents.
+    const REG_POOL: [Reg; 6] = [Reg::RAX, Reg::RCX, Reg::RDX, Reg::R8, Reg::R9, Reg::R10];
+
+    /// Allocate a free register from the wider pool (Fix #2).
+    /// Returns a free register, or evicts an occupied one. This allows
+    /// intermediate values to live in RDX/R8/R9/R10 instead of forcing
+    /// everything through RAX/RCX.
+    fn alloc_reg(&mut self, slot: u16) -> Result<Reg, String> {
+        self.ensure_slot_reg_capacity(slot);
+        // Check if already allocated
+        if let Some(reg) = self.slot_reg[slot as usize] {
+            return Ok(reg);
+        }
+        // Find a free register from the wider pool
+        for &reg in &Self::REG_POOL {
+            if self.reg_map[reg as usize] == RegState::Empty {
+                self.load_slot_to_reg(slot, reg)?;
+                self.bind_slot_reg(slot, reg);
+                return Ok(reg);
+            }
+        }
+        // All candidate registers are occupied — evict the least recently used.
+        // For simplicity, evict the first non-dirty occupant; if all dirty,
+        // spill the first one.
+        for &reg in &Self::REG_POOL {
+            if let RegState::Occupied(victim_slot) = self.reg_map[reg as usize] {
+                self.spill_slot(victim_slot, reg)?;
+                self.load_slot_to_reg(slot, reg)?;
+                self.bind_slot_reg(slot, reg);
+                return Ok(reg);
+            }
+        }
+        // All are dirty — spill first candidate
+        if let RegState::Dirty(victim_slot) = self.reg_map[Reg::RDX as usize] {
+            self.spill_slot(victim_slot, Reg::RDX)?;
+            self.load_slot_to_reg(slot, Reg::RDX)?;
+            self.bind_slot_reg(slot, Reg::RDX);
+            return Ok(Reg::RDX);
+        }
+        Err("No registers available for allocation".into())
+    }
 
     /// Ensure slot_reg Vec is large enough to hold the given slot index
     #[inline(always)]

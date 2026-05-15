@@ -333,7 +333,17 @@ pub struct MicroArchGNN {
     /// Instance-local RNG seed (replaces static mut for thread safety)
     seed: u64,
     /// Training samples (graph + measured IPC)
-    training_samples: Vec<(BlockGraph, f32)>,
+    /// FIX #7: Use Arc<BlockGraph> for shared ownership instead of cloning
+    /// the graph on every training step.
+    training_samples: Vec<(Arc<BlockGraph>, f32)>,
+    /// FIX #8: Pre-allocated scratch buffers to avoid per-prediction
+    /// O(N²×H²) heap allocations. These are reused across predictions.
+    #[allow(dead_code)]
+    hidden_buffer: Vec<f32>,
+    #[allow(dead_code)]
+    message_buffer: Vec<f32>,
+    #[allow(dead_code)]
+    output_buffer: Vec<f32>,
 }
 
 impl MicroArchGNN {
@@ -371,6 +381,10 @@ impl MicroArchGNN {
             readout_w2: (0..readout_dim).map(|_| init_weight()).collect(),
             seed,
             training_samples: Vec::new(),
+            // FIX #8: Pre-allocate scratch buffers (avoid per-prediction heap allocation)
+            hidden_buffer: vec![0.0f32; hidden_dim],
+            message_buffer: vec![0.0f32; hidden_dim],
+            output_buffer: vec![0.0f32; hidden_dim / 4],
         }
     }
 
@@ -391,6 +405,8 @@ impl MicroArchGNN {
         }).collect();
 
         // Message passing (2 rounds) with proper weight matrices
+        // FIX #8: Use pre-allocated scratch buffers instead of allocating
+        // new Vecs on each iteration of the message-passing loop.
         for _round in 0..2 {
             let mut new_hidden = hidden.clone();
 
@@ -401,7 +417,9 @@ impl MicroArchGNN {
                 let self_contrib = self.mat_vec(&self.w_self, &hidden[i]);
 
                 // Compute message from neighbors: mean(W_msg * h_j)
-                let mut msg = vec![0.0f32; self.hidden_dim];
+                // FIX #8: Reuse pre-allocated message_buffer
+                let mut msg = self.message_buffer.clone();
+                for k in 0..self.hidden_dim { msg[k] = 0.0; }
                 if !neighbors.is_empty() {
                     for &j in neighbors {
                         let w_msg_h = self.mat_vec(&self.w_msg, &hidden[j]);
@@ -483,9 +501,10 @@ impl MicroArchGNN {
             self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             let idx = (self.seed as usize) % self.training_samples.len();
 
-            // Clone the sample to release the borrow on self.training_samples
-            // before we mutate self.* weights in the backward pass.
-            let (graph, measured_ipc) = self.training_samples[idx].clone();
+            // FIX #7: Use Arc::clone instead of deep-cloning the graph.
+            // Arc::clone only increments the reference count (cheap) instead
+            // of copying the entire graph data structure (expensive).
+            let (graph, measured_ipc) = (Arc::clone(&self.training_samples[idx].0), self.training_samples[idx].1);
 
             let n_nodes = graph.nodes.len();
             if n_nodes == 0 { continue; }
@@ -844,8 +863,9 @@ impl NeuralSuperblockPredictor {
     }
 
     /// Record actual performance for training
-    pub fn record_performance(&mut self, graph: &BlockGraph, measured_ipc: f32) {
-        self.gnn.training_samples.push((graph.clone(), measured_ipc));
+    /// FIX #7: Use Arc<BlockGraph> to avoid cloning the graph on every training step.
+    pub fn record_performance(&mut self, graph: Arc<BlockGraph>, measured_ipc: f32) {
+        self.gnn.training_samples.push((graph, measured_ipc));
     }
 
     /// Simple training (gradient descent on error)
@@ -898,7 +918,7 @@ impl NeuralTracingJIT {
             block_id,
             decision,
             estimated_ipc,
-            graph, // Store the graph so record_execution can use the real structure
+            graph: Arc::new(graph), // FIX #7: Wrap in Arc for shared ownership
         };
 
         self.compiled_traces.write().unwrap_or_else(|e| e.into_inner()).insert(block_id, superblock.clone());
@@ -906,12 +926,13 @@ impl NeuralTracingJIT {
     }
 
     /// Record actual IPC after execution
+    /// FIX #7: Use Arc::clone instead of deep-cloning the graph.
     pub fn record_execution(&mut self, block_id: usize, measured_ipc: f32) {
         // Use the stored graph from the compiled trace (not an empty graph)
         let graph = self.compiled_traces.read().unwrap_or_else(|e| e.into_inner()).get(&block_id)
-            .map(|c| c.graph.clone());
+            .map(|c| Arc::clone(&c.graph));
         if let Some(graph) = graph {
-            self.predictor.record_performance(&graph, measured_ipc);
+            self.predictor.record_performance(graph, measured_ipc);
         }
     }
 }
@@ -929,7 +950,8 @@ pub struct CompiledSuperblock {
     pub decision: SuperblockDecision,
     pub estimated_ipc: f32,
     /// Stored graph so record_execution can use the actual graph structure
-    pub graph: BlockGraph,
+    /// FIX #7: Use Arc<BlockGraph> for shared ownership to avoid deep-cloning
+    pub graph: Arc<BlockGraph>,
 }
 
 #[cfg(test)]

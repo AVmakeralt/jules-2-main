@@ -17,6 +17,11 @@ type TaskFn = fn(*mut ());
 
 /// SoA task queue
 /// Stores task fields in separate contiguous arrays for better cache efficiency
+///
+/// FIX (PERF-6): Added cache-line padding between head and tail to prevent
+/// false sharing. Head is written by the consumer, tail by the producer.
+/// When they share a cache line, every producer write invalidates the
+/// consumer's cache and vice versa.
 pub struct SoaTaskQueue {
     /// Function pointers (separate array)
     functions: UnsafeCell<Vec<TaskFn>>,
@@ -28,9 +33,11 @@ pub struct SoaTaskQueue {
     flags: UnsafeCell<Vec<u8>>,
     /// Task types (separate array)
     task_types: UnsafeCell<Vec<u8>>,
-    /// Head index
+    /// Head index (consumer side)
     head: AtomicUsize,
-    /// Tail index
+    /// Padding to separate head and tail onto different cache lines
+    _pad: [u8; 56],  // 64 - size_of::<AtomicUsize>() = 56
+    /// Tail index (producer side)
     tail: AtomicUsize,
     /// Capacity
     capacity: usize,
@@ -55,6 +62,7 @@ impl SoaTaskQueue {
             flags: UnsafeCell::new(vec![0; capacity]),
             task_types: UnsafeCell::new(vec![0; capacity]),
             head: AtomicUsize::new(0),
+            _pad: [0; 56],
             tail: AtomicUsize::new(0),
             capacity,
             mask: capacity - 1,
@@ -96,6 +104,11 @@ impl SoaTaskQueue {
     
     /// Pop the highest-priority task
     /// Uses SIMD-like scanning of priority array
+    ///
+    /// TODO (PERF-7): This O(N) priority scan + shift is inefficient for large
+    /// queues. Should be replaced with a binary heap or skip-list based
+    /// priority queue. The current implementation is kept for correctness
+    /// but does not scale beyond ~100 elements in the queue.
     pub fn pop_highest_priority(&self) -> Option<(TaskFn, *mut (), u8, u8)> {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);

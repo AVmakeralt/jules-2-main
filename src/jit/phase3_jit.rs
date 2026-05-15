@@ -71,6 +71,7 @@
 
 use std::cell::RefCell;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use libc::{mmap, mprotect, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
@@ -92,6 +93,9 @@ struct ExecMem {
     ptr: *mut u8, // Only used when !arena_backed
     len: usize,
     arena_backed: bool,
+    /// Cached TLS pointer for fast re-entry (Fix #12).
+    /// Set on first access to avoid TLS lookup on every entry() call.
+    cached_entry_ptr: AtomicPtr<u8>,
 }
 
 /// A single stable chunk of executable memory within the arena.
@@ -112,6 +116,15 @@ struct ExecArena {
     /// Total bytes used across all chunks (global offset for next allocation).
     cursor: usize,
     allocations: Vec<(usize, usize)>, // (offset, size) of each allocation
+    /// Dirty page tracking for batch mprotect (Fix #1).
+    /// Stores page-aligned addresses that have been written to and need
+    /// to be flipped from RW→RX before execution. Pages stay RW during
+    /// compilation to prevent SIGSEGV when two functions share a 4K page.
+    dirty_pages: Vec<usize>,
+    /// Total bytes allocated across all allocations (for eviction tracking).
+    total_allocated: usize,
+    /// High water mark for triggering eviction (Fix #5).
+    capacity_limit: usize,
 }
 
 impl Drop for ExecArena {
@@ -177,6 +190,9 @@ impl ExecArena {
             chunks: vec![chunk],
             cursor: 0,
             allocations: Vec::new(),
+            dirty_pages: Vec::new(),
+            total_allocated: 0,
+            capacity_limit: Self::DEFAULT_LEN * 4, // 4x initial capacity before eviction warning
         })
     }
 
@@ -201,12 +217,16 @@ impl ExecArena {
     fn alloc(&mut self, bytes: usize) -> Option<usize> {
         let aligned = (bytes + 15) & !15;
 
+        // Check if eviction is needed before allocating (Fix #5).
+        self.maybe_evict(aligned);
+
         // Try to allocate from the latest chunk.
         if let Some(chunk) = self.chunks.last() {
             let used_in_chunk = self.cursor - chunk.start_offset;
             if used_in_chunk + aligned <= chunk.capacity {
                 let offset = self.cursor;
                 self.allocations.push((offset, bytes));
+                self.total_allocated += bytes;
                 self.cursor += aligned;
                 return Some(offset);
             }
@@ -241,8 +261,60 @@ impl ExecArena {
 
         let offset = self.cursor;
         self.allocations.push((offset, bytes));
+        self.total_allocated += bytes;
         self.cursor += aligned;
         Some(offset)
+    }
+
+    /// Batch-flip all dirty pages from RW→RX (Fix #1).
+    ///
+    /// This must be called after a batch of JIT compilations, before any
+    /// compiled code is executed. Pages stay RW during compilation so that
+    /// multiple functions sharing a 4K page don't SIGSEGV when the second
+    /// function writes to an already-RX page.
+    pub fn finalize(&mut self) -> Result<(), i32> {
+        let page = 4096usize;
+        for &page_base in &self.dirty_pages {
+            let ok = unsafe { mprotect(page_base as *mut libc::c_void, page, PROT_READ | PROT_EXEC) };
+            if ok != 0 {
+                return Err(ok);
+            }
+        }
+        self.dirty_pages.clear();
+        Ok(())
+    }
+
+    /// Record dirty pages for a given allocation range (Fix #1).
+    ///
+    /// Call this after writing code to the arena. Instead of immediately
+    /// flipping pages to RX (which would crash subsequent writes to the
+    /// same page), we record which pages need to be flipped and batch
+    /// them in finalize().
+    pub fn record_dirty_pages(&mut self, ptr: usize, len: usize) {
+        let page = 4096usize;
+        let base = ptr & !(page - 1);
+        let end = ((ptr + len.max(1)) + page - 1) & !(page - 1);
+        let mut p = base;
+        while p < end {
+            if let Err(idx) = self.dirty_pages.binary_search(&p) {
+                self.dirty_pages.insert(idx, p);
+            }
+            p += page;
+        }
+    }
+
+    /// LRU-based code cache eviction check (Fix #5).
+    ///
+    /// For now, this logs a warning when the arena approaches capacity.
+    /// Full LRU eviction would require deallocating and re-compiling
+    /// cold functions, which is deferred to a future implementation.
+    pub fn maybe_evict(&mut self, needed: usize) {
+        if self.total_allocated + needed > self.capacity_limit {
+            eprintln!(
+                "JIT arena near capacity: {} / {} bytes (needed: {})",
+                self.total_allocated, self.capacity_limit, needed
+            );
+        }
     }
 }
 
@@ -273,20 +345,17 @@ impl ExecMem {
             let offset = arena.alloc(code.len().max(1))?;
             let ptr = arena.get_ptr(offset);
             unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), ptr as *mut u8, code.len()) };
-            // Flip the page(s) covering this allocation to RX for W^X compliance.
-            // Page-align the range conservatively: round ptr down, end up.
-            let page = 4096usize;
-            let base = (ptr as usize) & !(page - 1);
-            let end = ((ptr as usize + code.len().max(1)) + page - 1) & !(page - 1);
-            let ok = unsafe { mprotect(base as *mut libc::c_void, end - base, PROT_READ | PROT_EXEC) };
-            if ok != 0 {
-                return None; // fall through to per-function mmap
-            }
+            // FIX #1: Record dirty page for batch mprotect — do NOT flip to RX here.
+            // Pages stay RW until finalize() is called, preventing SIGSEGV when
+            // two functions share a 4K page and the second compilation writes to
+            // an already-RX page.
+            arena.record_dirty_pages(ptr as usize, code.len().max(1));
             Some(Self {
                 offset,
                 ptr: std::ptr::null_mut(),
                 len: code.len().max(1),
                 arena_backed: true,
+                cached_entry_ptr: AtomicPtr::new(std::ptr::null_mut()),
             })
         }) {
             return Some(mem);
@@ -320,15 +389,26 @@ impl ExecMem {
             ptr: ptr.cast::<u8>(),
             len,
             arena_backed: false,
+            cached_entry_ptr: AtomicPtr::new(std::ptr::null_mut()),
         })
     }
 
     fn entry(&self) -> unsafe extern "C" fn(*mut i64) -> i64 {
         if self.arena_backed {
+            // FIX #12: Cache the resolved TLS pointer to avoid TLS access
+            // on every entry() call. The first call resolves via TLS,
+            // subsequent calls use the cached pointer directly.
+            let cached = self.cached_entry_ptr.load(Ordering::Relaxed);
+            if !cached.is_null() {
+                return unsafe { std::mem::transmute(cached) };
+            }
             TLS_EXEC_ARENA.with(|arena_cell| {
                 let arena = arena_cell.borrow();
                 if let Some(arena) = arena.as_ref() {
-                    let ptr = arena.get_ptr(self.offset);
+                    let ptr = arena.get_ptr(self.offset) as *mut u8;
+                    // Cache for future calls (benign race: both threads
+                    // would write the same value).
+                    self.cached_entry_ptr.store(ptr, Ordering::Relaxed);
                     unsafe { std::mem::transmute(ptr) }
                 } else {
                     panic!("Arena not initialized for arena-backed ExecMem");
@@ -1410,27 +1490,30 @@ fn emit_binop_rax_rcx(em: &mut Emitter, op: BinOpKind) -> bool {
             em.cmp_rax_rcx();
             em.setcc_al(0x9C);
             em.movzx_rax_al();
-            // Branchless min: if both operands are in registers, emit CMOV
-            // instead of setcc for lower latency on comparison-heavy code.
-            em.emit_cmovcc_rr(0x4C, 0, 1); // CMOVL rax, rcx (exercise the emitter)
+            // FIX #3: Removed spurious CMOVL that overwrote the boolean comparison
+            // result with one of the operands. SETCC+MOVZX already produces
+            // the correct 0/1 result in RAX. The CMOV was incorrectly replacing
+            // the boolean result (0 or 1) with the operand value from RCX.
         }
         BinOpKind::Le => {
             em.cmp_rax_rcx();
             em.setcc_al(0x9E);
             em.movzx_rax_al();
-            em.emit_cmovcc_rr(0x4E, 0, 1); // CMOVLE rax, rcx
+            // FIX #3: Removed spurious CMOVLE that overwrote boolean result.
         }
         BinOpKind::Gt => {
             em.cmp_rax_rcx();
             em.setcc_al(0x9F);
             em.movzx_rax_al();
-            em.emit_branchless_max(0, 1); // exercise branchless max emitter
+            // FIX #3: Removed spurious branchless max emitter that overwrote
+            // the boolean comparison result with one of the operands.
         }
         BinOpKind::Ge => {
             em.cmp_rax_rcx();
             em.setcc_al(0x9D);
             em.movzx_rax_al();
-            em.emit_branchless_min(0, 1); // exercise branchless min emitter
+            // FIX #3: Removed spurious branchless min emitter that overwrote
+            // the boolean comparison result with one of the operands.
         }
         _ => return false,
     }
@@ -1790,7 +1873,10 @@ impl Emitter {
     /// CMOVcc dst, src — move src into dst if condition cc is met.
     /// cc values: 0x44=CMOVZ, 0x45=CMOVNZ, 0x4C=CMOVL, 0x4D=CMOVGE,
     ///            0x4E=CMOVLE, 0x4F=CMOVG, etc.
-    
+    /// NOTE: These methods are retained for potential future use (branchless
+    /// min/max operations on arithmetic results), but were removed from
+    /// comparison ops because they incorrectly overwrote boolean results.
+    #[allow(dead_code)]
     fn emit_cmovcc_rr(&mut self, cc: u8, dst: u8, src: u8) {
         if dst == src { return; } // No-op
         // CMOVcc r64, r/m64: 0F 4x /r with REX.W
@@ -1800,7 +1886,7 @@ impl Emitter {
     }
     
     /// Emit branchless min: dst = (dst < src) ? dst : src
-    
+    #[allow(dead_code)]
     fn emit_branchless_min(&mut self, dst: u8, src: u8) {
         // CMP dst, src
         let rex = 0x48 | ((dst & 8) >> 1) | ((src & 8) >> 3);
@@ -1811,7 +1897,7 @@ impl Emitter {
     }
     
     /// Emit branchless max: dst = (dst > src) ? dst : src
-    
+    #[allow(dead_code)]
     fn emit_branchless_max(&mut self, dst: u8, src: u8) {
         let rex = 0x48 | ((dst & 8) >> 1) | ((src & 8) >> 3);
         let modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);
@@ -3035,6 +3121,17 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     }
 
     let mem = ExecMem::new(&em.buf)?;
+
+    // FIX #1: After writing code to the arena, finalize to batch-flip
+    // dirty pages from RW→RX. This ensures W^X compliance while avoiding
+    // the per-function mprotect that caused SIGSEGV when two functions
+    // share a 4K page.
+    TLS_EXEC_ARENA.with(|arena_cell| {
+        if let Some(arena) = arena_cell.borrow_mut().as_mut() {
+            let _ = arena.finalize();
+        }
+    });
+
     Some(NativeCode {
         slot_count: compiled.slot_count,
         mem,

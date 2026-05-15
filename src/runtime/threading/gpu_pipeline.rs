@@ -322,6 +322,12 @@ impl GpuPipeline {
     }
 
     /// Simulate GPU execution (CPU fallback for wgpu integration)
+    ///
+    /// TODO (PERF-13): Spawns a new OS thread per GPU task, which is
+    /// expensive. Should use a thread pool (e.g., the runtime's own
+    /// ThreadPool) for GPU task simulation. Each std::thread::spawn
+    /// costs ~50-100us for thread creation, which dominates the 10ms
+    /// simulated latency and limits throughput for small GPU tasks.
     fn simulate_gpu_execution(&self, task_id: u64, data: Vec<f32>) {
         let pending = self.pending.clone();
         let completed = self.completed.clone();

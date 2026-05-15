@@ -31,11 +31,23 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+/// PERF FIX: Deterministic hash function for variable names.
+/// Used by test code and string-based callers to convert &str keys to u64.
+/// Matches the hash used in the bytecode VM hot path.
+#[inline(always)]
+pub fn hash_var_name(s: &str) -> u64 {
+    let mut h: u64 = 5381;
+    for byte in s.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(byte as u64);
+    }
+    h
+}
+
 /// A profiled value observation for a variable
 #[derive(Debug, Clone)]
 pub struct ValueObservation {
-    /// The variable name being observed
-    pub var_name: String,
+    /// The variable key being observed (u64 hash of the name — zero allocation)
+    pub var_key: u64,
     /// Observed integer values and their counts
     pub int_values: HashMap<i64, u64>,
     /// Observed float value ranges (bucketed)
@@ -74,7 +86,7 @@ impl ValueObservation {
     /// Create a new, empty observation with the given drift window size
     pub fn new(drift_window_size: usize) -> Self {
         Self {
-            var_name: String::new(),
+            var_key: 0,
             int_values: HashMap::new(),
             float_buckets: HashMap::new(),
             total_observations: 0,
@@ -142,8 +154,8 @@ pub struct SpecializedVersion {
     pub id: u64,
     /// The function being specialized
     pub fn_name: String,
-    /// Guard conditions: variable → expected value
-    pub guards: Vec<(String, i64)>,
+    /// Guard conditions: variable key → expected value
+    pub guards: Vec<(u64, i64)>,
     /// How many times this specialization has been called
     pub hit_count: u64,
     /// Estimated cycle savings per call
@@ -256,8 +268,8 @@ impl DriftDetector {
 /// Specialized version that eliminates branches
 #[derive(Debug, Clone)]
 pub struct BranchElimination {
-    /// Variable name and the constant value it takes
-    pub condition: (String, bool),
+    /// Variable key and the constant value it takes
+    pub condition: (u64, bool),
     /// Which branches can be eliminated (branch indices)
     pub eliminated_branches: Vec<usize>,
     /// Estimated cycles saved per elimination
@@ -329,7 +341,7 @@ pub struct HotPath {
     /// Average time per call (ns)
     pub avg_time_ns: u64,
     /// Which variables would benefit most from specialization
-    pub best_specialization_candidates: Vec<(String, f64)>, // (var_name, estimated_speedup)
+    pub best_specialization_candidates: Vec<(u64, f64)>, // (var_key, estimated_speedup)
 }
 
 /// Per-function call profiling data
@@ -343,8 +355,8 @@ struct FnCallProfile {
 
 /// The data-dependent JIT evolution engine
 pub struct DataDependentJIT {
-    /// Observed value profiles for each variable
-    profiles: HashMap<String, ValueObservation>,
+    /// Observed value profiles for each variable (keyed by u64 hash — zero allocation)
+    profiles: HashMap<u64, ValueObservation>,
     /// Active specialized versions
     specializations: Vec<SpecializedVersion>,
     /// Threshold for considering a value "hot" (frequency > threshold)
@@ -410,21 +422,17 @@ impl DataDependentJIT {
 
     /// Observe a runtime value for a variable.
     /// Call this from the interpreter/VM hot path.
+    /// PERF FIX: Changed from &str to u64 key — zero allocation in the hot path.
     #[inline(always)]
-    pub fn observe_int(&mut self, var_name: &str, value: i64) {
+    pub fn observe_int(&mut self, key: u64, value: i64) {
         // Ensure the observation entry exists
-        // FIX: Use ValueObservation::new() instead of manually duplicating the
-        // constructor fields. The previous code had a subtle drift: if new fields
-        // were added to ValueObservation, this manual construction would silently
-        // use Default::default() or fail to compile. Using the canonical
-        // constructor ensures consistency.
-        if !self.profiles.contains_key(var_name) {
+        if !self.profiles.contains_key(&key) {
             let mut obs = ValueObservation::new(self.drift_window_size);
-            obs.var_name = var_name.to_string();
-            self.profiles.insert(var_name.to_string(), obs);
+            obs.var_key = key;
+            self.profiles.insert(key, obs);
         }
 
-        let obs = self.profiles.get_mut(var_name).unwrap();
+        let obs = self.profiles.get_mut(&key).unwrap();
 
         obs.total_observations += 1;
         *obs.int_values.entry(value).or_insert(0) += 1;
@@ -481,7 +489,7 @@ impl DataDependentJIT {
         // We need to compute estimated_speedup outside the mutable borrow,
         // so extract the data we need first, then compute, then update.
         let has_hot = {
-            let obs = self.profiles.get(var_name).unwrap();
+            let obs = self.profiles.get(&key).unwrap();
             let should_check_hot = obs.total_observations >= self.min_observations;
             if should_check_hot {
                 let count = obs.int_values[&value];
@@ -497,8 +505,8 @@ impl DataDependentJIT {
         };
 
         if let Some((value, freq)) = has_hot {
-            let estimated_speedup = self.estimate_speedup(var_name, value, freq);
-            if let Some(obs) = self.profiles.get_mut(var_name) {
+            let estimated_speedup = self.estimate_speedup(key, value, freq);
+            if let Some(obs) = self.profiles.get_mut(&key) {
                 obs.hot_value = Some(HotValue {
                     value,
                     frequency: freq,
@@ -511,48 +519,48 @@ impl DataDependentJIT {
         // Handle drift after all borrows are released
         if let Some(drift) = drift_result {
             self.drift_detections += 1;
-            self.handle_drift(var_name, &drift);
+            self.handle_drift(key, &drift);
         }
     }
 
     /// Observe a float value for a variable (bucketed for efficiency)
     #[inline]
-    pub fn observe_float(&mut self, var_name: &str, value: f64) {
+    pub fn observe_float(&mut self, key: u64, value: f64) {
         // Bucket float values by converting to a discretized form
         let bucket = (value * 100.0) as i64; // 0.01 precision buckets
-        self.observe_int(var_name, bucket);
+        self.observe_int(key, bucket);
     }
 
     /// Observe a boolean value for a variable, enabling branch elimination.
-    pub fn observe_bool(&mut self, var_name: &str, value: bool) {
+    pub fn observe_bool(&mut self, key: u64, value: bool) {
         // Store as 0/1 integer internally
-        self.observe_int(var_name, if value { 1 } else { 0 });
+        self.observe_int(key, if value { 1 } else { 0 });
     }
 
     /// Check if a variable has a hot value and return it
-    pub fn get_hot_value(&self, var_name: &str) -> Option<&HotValue> {
-        self.profiles.get(var_name)?.hot_value.as_ref()
+    pub fn get_hot_value(&self, key: u64) -> Option<&HotValue> {
+        self.profiles.get(&key)?.hot_value.as_ref()
     }
 
     /// Create a specialized version of a function for the observed hot values.
     ///
     /// This generates a guarded dispatch: if the guard conditions are met,
     /// jump to the specialized code; otherwise, fall back to the generic version.
-    pub fn try_specialize(&mut self, fn_name: &str, vars: &[String]) -> Option<SpecializedVersion> {
+    pub fn try_specialize(&mut self, fn_name: &str, vars: &[u64]) -> Option<SpecializedVersion> {
         // Collect hot values and profile info for the given variables in a single pass
         // to avoid borrow checker issues
         struct VarInfo {
-            var_name: String,
+            var_key: u64,
             hot_value: i64,
             is_boolean: bool,
             bool_constant: Option<bool>,
         }
         let mut var_infos: Vec<VarInfo> = Vec::new();
-        for var in vars {
-            if let Some(obs) = self.profiles.get(var) {
+        for &var_key in vars {
+            if let Some(obs) = self.profiles.get(&var_key) {
                 if let Some(ref hot) = obs.hot_value {
                     var_infos.push(VarInfo {
-                        var_name: var.clone(),
+                        var_key,
                         hot_value: hot.value,
                         is_boolean: obs.is_boolean,
                         bool_constant: obs.bool_constant,
@@ -569,13 +577,13 @@ impl DataDependentJIT {
         let mut simd_spec_count = 0u64;
 
         for info in &var_infos {
-            guards.push((info.var_name.clone(), info.hot_value));
+            guards.push((info.var_key, info.hot_value));
 
             // Check for branch elimination opportunity
             if info.is_boolean {
                 if let Some(constant) = info.bool_constant {
                     branch_elim = Some(BranchElimination {
-                        condition: (info.var_name.clone(), constant),
+                        condition: (info.var_key, constant),
                         eliminated_branches: vec![if constant { 1 } else { 0 }],
                         savings_per_elimination: 15, // ~15 cycles per eliminated branch
                     });
@@ -686,9 +694,10 @@ impl DataDependentJIT {
                 return false;
             }
             // All guards must match the provided args
-            for (guard_var, guard_val) in &spec.guards {
+            // Guard keys are u64 hashes; hash the arg names for comparison
+            for (guard_key, guard_val) in &spec.guards {
                 let found = args.iter().any(|(arg_name, arg_val)| {
-                    arg_name == guard_var && arg_val == guard_val
+                    hash_var_name(arg_name) == *guard_key && arg_val == guard_val
                 });
                 if !found {
                     return false;
@@ -793,10 +802,10 @@ impl DataDependentJIT {
             // "size", "flag", etc.) which was fundamentally broken — a variable
             // named `x` would be missed even if it was a batch size.
             // Now we rank by actual estimated speedup from observed data.
-            let mut candidates: Vec<(String, f64)> = self.profiles.iter()
-                .filter_map(|(var_name, obs)| {
+            let mut candidates: Vec<(u64, f64)> = self.profiles.iter()
+                .filter_map(|(var_key, obs)| {
                     obs.hot_value.as_ref().map(|hot| {
-                        (var_name.clone(), hot.estimated_speedup)
+                        (*var_key, hot.estimated_speedup)
                     })
                 })
                 .collect();
@@ -821,10 +830,10 @@ impl DataDependentJIT {
 
     // ── Internal estimation methods ─────────────────────────────────────
 
-    fn estimate_speedup(&self, var_name: &str, value: i64, frequency: f64) -> f64 {
+    fn estimate_speedup(&self, key: u64, value: i64, frequency: f64) -> f64 {
         // Data-driven speedup estimation: analyze the ACTUAL OBSERVED DATA
         // rather than relying on variable name patterns.
-        let obs = match self.profiles.get(var_name) {
+        let obs = match self.profiles.get(&key) {
             Some(o) => o,
             None => return 1.2 * frequency,
         };
@@ -870,10 +879,10 @@ impl DataDependentJIT {
         }
     }
 
-    fn estimate_guard_savings(&self, guards: &[(String, i64)]) -> u64 {
+    fn estimate_guard_savings(&self, guards: &[(u64, i64)]) -> u64 {
         let mut savings = 0u64;
-        for (var, value) in guards {
-            savings += self.estimate_speedup(var, *value, 1.0) as u64 * 10; // Per-call savings
+        for (var_key, value) in guards {
+            savings += self.estimate_speedup(*var_key, *value, 1.0) as u64 * 10; // Per-call savings
         }
         savings
     }
@@ -903,14 +912,14 @@ impl DataDependentJIT {
     }
 
     /// Handle drift detected for a variable
-    fn handle_drift(&mut self, var_name: &str, drift: &DriftResult) {
+    fn handle_drift(&mut self, var_key: u64, drift: &DriftResult) {
         // Deprecate specializations that depend on the old hot value
         for spec in self.specializations.iter_mut() {
             if spec.deprecated {
                 continue;
             }
-            for (guard_var, guard_val) in &spec.guards {
-                if guard_var == var_name && *guard_val == drift.old_hot_value {
+            for (guard_key, guard_val) in &spec.guards {
+                if guard_key == &var_key && *guard_val == drift.old_hot_value {
                     spec.deprecated = true;
                     self.deprecated_ids.push(spec.id);
                     self.re_specializations += 1;
@@ -920,7 +929,7 @@ impl DataDependentJIT {
         }
 
         // Clear the old hot value so a new one can be detected
-        if let Some(obs) = self.profiles.get_mut(var_name) {
+        if let Some(obs) = self.profiles.get_mut(&var_key) {
             obs.hot_value = None;
             obs.drift_detector.clear_hot_value();
             // If a new hot value emerged, set it
@@ -958,9 +967,16 @@ impl JitObserver for DataDependentJIT {
     }
 
     fn post_call(&mut self, fn_name: &str, args: &[i64], elapsed_ns: u64) {
-        // Collect arg observations into a temporary before mutating self
-        let arg_observations: Vec<(String, i64)> = args.iter().enumerate()
-            .map(|(i, &val)| (format!("{}_arg{}", fn_name, i), val))
+        // Collect arg observations as u64 keys — zero allocation
+        let arg_keys: Vec<u64> = args.iter().enumerate()
+            .map(|(i, _val)| {
+                let mut h: u64 = 5381;
+                for byte in fn_name.bytes() {
+                    h = h.wrapping_mul(33).wrapping_add(byte as u64);
+                }
+                // Combine function name hash with arg index
+                (h << 16) | (i as u64)
+            })
             .collect();
 
         // Update function call profile
@@ -989,23 +1005,21 @@ impl JitObserver for DataDependentJIT {
         };
 
         // Observe each argument value as a variable for hot value detection
-        for (var_name, arg_val) in &arg_observations {
-            self.observe_int(var_name, *arg_val);
+        for (&key, &arg_val) in arg_keys.iter().zip(args.iter()) {
+            self.observe_int(key, arg_val);
         }
 
         // Check if we should create a specialization for this function
         // Only attempt after sufficient observations
         if call_count >= self.min_observations && call_count % 100 == 0 {
-            let var_names: Vec<String> = arg_observations.iter()
-                .map(|(name, _)| name.clone())
-                .collect();
-            self.try_specialize(fn_name, &var_names);
+            self.try_specialize(fn_name, &arg_keys);
         }
     }
 
     fn check_loop_specialization(&self, loop_id: &str, trip_count: i64) -> Option<SpecializedLoopInfo> {
         // Check if this loop has been observed with a consistent trip count
-        if let Some(obs) = self.profiles.get(loop_id) {
+        let loop_key = hash_var_name(loop_id);
+        if let Some(obs) = self.profiles.get(&loop_key) {
             if let Some(ref hot) = obs.hot_value {
                 if hot.frequency >= self.hot_threshold {
                     return Some(self.generate_specialized_loop(hot.value));
@@ -1074,14 +1088,14 @@ mod tests {
         // Note: hot value detection checks the *current* observed value,
         // so we need 64 to be observed last (when total >= min_observations)
         for _ in 0..2 {
-            jit.observe_int("batch_size", 32);
+            jit.observe_int(hash_var_name("batch_size"), 32);
         }
         for _ in 0..8 {
-            jit.observe_int("batch_size", 64);
+            jit.observe_int(hash_var_name("batch_size"), 64);
         }
 
         // 8/10 = 80% = exactly at threshold (detected on last 64 observation)
-        let hot = jit.get_hot_value("batch_size");
+        let hot = jit.get_hot_value(hash_var_name("batch_size"));
         assert!(hot.is_some());
         assert_eq!(hot.unwrap().value, 64);
     }
@@ -1166,20 +1180,20 @@ mod tests {
 
         // Observe a flag variable as always true
         for _ in 0..10 {
-            jit.observe_bool("enable_feature", true);
+            jit.observe_bool(hash_var_name("enable_feature"), true);
         }
 
-        let hot = jit.get_hot_value("enable_feature");
+        let hot = jit.get_hot_value(hash_var_name("enable_feature"));
         assert!(hot.is_some());
         assert_eq!(hot.unwrap().value, 1);
 
         // Try to specialize
-        let spec = jit.try_specialize("process", &["enable_feature".to_string()]);
+        let spec = jit.try_specialize("process", &[hash_var_name("enable_feature")]);
         assert!(spec.is_some());
         let spec = spec.unwrap();
         assert!(spec.branch_elimination.is_some());
         let be = spec.branch_elimination.unwrap();
-        assert_eq!(be.condition.0, "enable_feature");
+        assert_eq!(be.condition.0, hash_var_name("enable_feature"));
         assert_eq!(be.condition.1, true);
     }
 
@@ -1190,14 +1204,14 @@ mod tests {
 
         // Observe batch_size = 16 (power of 2, SIMD-friendly)
         for _ in 0..10 {
-            jit.observe_int("batch_size", 16);
+            jit.observe_int(hash_var_name("batch_size"), 16);
         }
 
-        let hot = jit.get_hot_value("batch_size");
+        let hot = jit.get_hot_value(hash_var_name("batch_size"));
         assert!(hot.is_some());
         assert_eq!(hot.unwrap().value, 16);
 
-        let spec = jit.try_specialize("process_batch", &["batch_size".to_string()]);
+        let spec = jit.try_specialize("process_batch", &[hash_var_name("batch_size")]);
         assert!(spec.is_some());
         let spec = spec.unwrap();
         assert!(spec.simd_specialization.is_some());
@@ -1217,7 +1231,7 @@ mod tests {
 
         // batch_size = 12 (4+4+4, but 12%8=4)
         for _ in 0..10 {
-            jit.observe_int("batch_size", 12);
+            jit.observe_int(hash_var_name("batch_size"), 12);
         }
 
         // 12 is not power of 2, so no SIMD spec
@@ -1229,10 +1243,10 @@ mod tests {
         // All are multiples of 8 except 4.
         // Let's test with 4
         for _ in 0..10 {
-            jit.observe_int("size", 4);
+            jit.observe_int(hash_var_name("size"), 4);
         }
 
-        let spec = jit.try_specialize("process", &["size".to_string()]);
+        let spec = jit.try_specialize("process", &[hash_var_name("size")]);
         assert!(spec.is_some());
         let spec = spec.unwrap();
         assert!(spec.simd_specialization.is_some());
@@ -1249,10 +1263,10 @@ mod tests {
         jit.min_observations = 10;
 
         for _ in 0..10 {
-            jit.observe_int("x", 42);
+            jit.observe_int(hash_var_name("x"), 42);
         }
 
-        let spec = jit.try_specialize("f", &["x".to_string()]);
+        let spec = jit.try_specialize("f", &[hash_var_name("x")]);
         assert!(spec.is_some());
         let spec_id = spec.unwrap().id;
 
@@ -1276,10 +1290,10 @@ mod tests {
         jit.min_observations = 10;
 
         for _ in 0..10 {
-            jit.observe_int("x", 42);
+            jit.observe_int(hash_var_name("x"), 42);
         }
 
-        let spec = jit.try_specialize("my_func", &["x".to_string()]);
+        let spec = jit.try_specialize("my_func", &[hash_var_name("x")]);
         assert!(spec.is_some());
 
         // Lookup with matching args
@@ -1302,10 +1316,10 @@ mod tests {
         jit.min_observations = 10;
 
         for _ in 0..10 {
-            jit.observe_bool("is_active", true);
+            jit.observe_bool(hash_var_name("is_active"), true);
         }
 
-        let hot = jit.get_hot_value("is_active");
+        let hot = jit.get_hot_value(hash_var_name("is_active"));
         assert!(hot.is_some());
         assert_eq!(hot.unwrap().value, 1);
 
@@ -1321,7 +1335,7 @@ mod tests {
         jit.min_observations = 10;
 
         for i in 0..10 {
-            jit.observe_bool("is_active", i % 2 == 0);
+            jit.observe_bool(hash_var_name("is_active"), i % 2 == 0);
         }
 
         // Not a constant boolean
@@ -1336,10 +1350,10 @@ mod tests {
         jit.min_observations = 10;
 
         for _ in 0..10 {
-            jit.observe_int("my_func_arg0", 42);
+            jit.observe_int(hash_var_name("my_func_arg0"), 42);
         }
 
-        let spec = jit.try_specialize("my_func", &["my_func_arg0".to_string()]);
+        let spec = jit.try_specialize("my_func", &[hash_var_name("my_func_arg0")]);
         assert!(spec.is_some());
 
         // Pre-call with matching arg
@@ -1425,17 +1439,17 @@ mod tests {
 
         // Phase 1: value 42 is hot
         for _ in 0..10 {
-            jit.observe_int("x", 42);
+            jit.observe_int(hash_var_name("x"), 42);
         }
-        assert!(jit.get_hot_value("x").is_some());
+        assert!(jit.get_hot_value(hash_var_name("x")).is_some());
 
-        let spec = jit.try_specialize("f", &["x".to_string()]);
+        let spec = jit.try_specialize("f", &[hash_var_name("x")]);
         assert!(spec.is_some());
         let spec_id = spec.unwrap().id;
 
         // Phase 2: value 99 becomes dominant (drift)
         for _ in 0..200 {
-            jit.observe_int("x", 99);
+            jit.observe_int(hash_var_name("x"), 99);
         }
 
         // Check drift was detected (may take multiple observations to trigger)
@@ -1483,10 +1497,10 @@ mod tests {
 
         // Observe a generically-named variable with a power-of-2 value
         for _ in 0..10 {
-            jit.observe_int("x", 64);
+            jit.observe_int(hash_var_name("x"), 64);
         }
 
-        let hot = jit.get_hot_value("x");
+        let hot = jit.get_hot_value(hash_var_name("x"));
         assert!(hot.is_some());
         let hot = hot.unwrap();
         assert_eq!(hot.value, 64);
@@ -1503,10 +1517,10 @@ mod tests {
         jit.min_observations = 10;
 
         for _ in 0..10 {
-            jit.observe_int("n", 8);
+            jit.observe_int(hash_var_name("n"), 8);
         }
 
-        let spec = jit.try_specialize("process", &["n".to_string()]);
+        let spec = jit.try_specialize("process", &[hash_var_name("n")]);
         assert!(spec.is_some());
         let spec = spec.unwrap();
         // With data-driven detection, "n"=8 should get SIMD specialization
@@ -1526,10 +1540,10 @@ mod tests {
         jit.min_observations = 10;
 
         for _ in 0..10 {
-            jit.observe_bool("config_val", true);
+            jit.observe_bool(hash_var_name("config_val"), true);
         }
 
-        let hot = jit.get_hot_value("config_val");
+        let hot = jit.get_hot_value(hash_var_name("config_val"));
         assert!(hot.is_some());
         let hot = hot.unwrap();
         // Boolean with narrow distribution → 3.0 * frequency
@@ -1544,7 +1558,7 @@ mod tests {
         jit.min_observations = 10;
 
         for i in 0..10 {
-            jit.observe_int("mode", (i % 3) as i64);
+            jit.observe_int(hash_var_name("mode"), (i % 3) as i64);
         }
 
         // "mode" with values 0,1,2 has a small range
@@ -1552,10 +1566,10 @@ mod tests {
         // So we need to increase observations for a single value to be "hot"
         // Let's observe more of value 1 to make it hot
         for _ in 0..90 {
-            jit.observe_int("mode", 1);
+            jit.observe_int(hash_var_name("mode"), 1);
         }
 
-        let hot = jit.get_hot_value("mode");
+        let hot = jit.get_hot_value(hash_var_name("mode"));
         // With 94 observations of value 1 out of 100 total = 0.94 frequency
         if let Some(h) = hot {
             // Small range (0-2) → switch table speedup = 2.5 * frequency
@@ -1574,7 +1588,7 @@ mod tests {
         for i in 0..10 {
             let var_name = format!("var_{}", i);
             for _ in 0..10 {
-                jit.observe_int(&var_name, i);
+                jit.observe_int(hash_var_name(&var_name), i);
             }
         }
 
@@ -1596,12 +1610,12 @@ mod tests {
             let var_name = format!("var_{}", i);
             if i == 0 {
                 for _ in 0..10 {
-                    jit.observe_int(&var_name, 42);
+                    jit.observe_int(hash_var_name(&var_name), 42);
                 }
             } else {
                 // Observe diverse values so they won't be hot
                 for j in 0..10 {
-                    jit.observe_int(&var_name, j * 100 + i);
+                    jit.observe_int(hash_var_name(&var_name), j * 100 + i);
                 }
             }
         }
@@ -1624,11 +1638,11 @@ mod tests {
             let var_name = format!("var_{}", i);
             if i < 3 {
                 for _ in 0..10 {
-                    jit.observe_int(&var_name, 42);
+                    jit.observe_int(hash_var_name(&var_name), 42);
                 }
             } else {
                 for j in 0..10 {
-                    jit.observe_int(&var_name, j * 100 + i);
+                    jit.observe_int(hash_var_name(&var_name), j * 100 + i);
                 }
             }
         }

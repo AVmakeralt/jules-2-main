@@ -170,6 +170,11 @@ impl WorkStealingDeque {
 
     /// Steal half the tasks (batch stealing)
     /// Amortizes cache invalidation cost across multiple tasks
+    ///
+    /// TODO (PERF-11): Returns a new Vec on every call, which allocates.
+    /// Should be changed to steal_half_into(&self, buf: &mut Vec<TaskPtr>, guard: &Guard) -> usize
+    /// to allow caller-owned buffer reuse. This avoids per-steal allocation
+    /// in the hot work-stealing path.
     pub fn steal_half(&self, _guard: &Guard) -> Vec<TaskPtr> {
         let buffer = self.load_buffer();
         let top = self.top.load(Ordering::Acquire);

@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use parking_lot::Mutex;
 
 /// Green thread ID
 pub type GreenThreadId = u64;
@@ -216,10 +217,10 @@ extern "C" fn context_switch(
 /// Green thread scheduler
 
 pub struct GreenScheduler {
-    /// Ready queue of green threads
-    ready_queue: Arc<std::sync::Mutex<Vec<GreenThreadId>>>,
-    /// Green thread contexts
-    contexts: Arc<std::sync::Mutex<std::collections::HashMap<GreenThreadId, Box<GreenContext>>>>,
+    /// Ready queue of green threads (parking_lot::Mutex for faster lock/unlock)
+    ready_queue: Arc<Mutex<Vec<GreenThreadId>>>,
+    /// Green thread contexts (RwLock allows concurrent reads for schedule_next/join)
+    contexts: Arc<std::sync::RwLock<std::collections::HashMap<GreenThreadId, Box<GreenContext>>>>,
     /// Next thread ID
     next_id: AtomicUsize,
     /// Current running thread
@@ -227,18 +228,24 @@ pub struct GreenScheduler {
     /// Main context (for returning to main thread)
     main_sp: AtomicUsize,
     main_regs: AtomicUsize,
+    /// Condvar for join() to avoid spin-polling
+    join_cvar: std::sync::Condvar,
+    /// Mutex for join condvar
+    join_mutex: std::sync::Mutex<()>,
 }
 
 impl GreenScheduler {
     /// Create a new green thread scheduler
     pub fn new() -> Self {
         Self {
-            ready_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
-            contexts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ready_queue: Arc::new(Mutex::new(Vec::new())),
+            contexts: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             next_id: AtomicUsize::new(1),
             current: AtomicUsize::new(usize::MAX),
             main_sp: AtomicUsize::new(0),
             main_regs: AtomicUsize::new(0),
+            join_cvar: std::sync::Condvar::new(),
+            join_mutex: std::sync::Mutex::new(()),
         }
     }
 
@@ -252,12 +259,11 @@ impl GreenScheduler {
         // Create green thread context, storing the closure for execution
         let context = Box::new(GreenContext::new(id, STACK_SIZE, Box::new(f)));
         
-        let mut contexts = self.contexts.lock().unwrap();
-        contexts.insert(id, context);
+        // Write lock on contexts for insertion
+        self.contexts.write().unwrap().insert(id, context);
         
-        // Add to ready queue
-        let mut ready_queue = self.ready_queue.lock().unwrap();
-        ready_queue.push(id);
+        // Add to ready queue (parking_lot::Mutex — fast lock/unlock)
+        self.ready_queue.lock().push(id);
         
         id
     }
@@ -268,8 +274,7 @@ impl GreenScheduler {
         
         if current_id != usize::MAX {
             // Add current thread back to ready queue
-            let mut ready_queue = self.ready_queue.lock().unwrap();
-            ready_queue.push(current_id as GreenThreadId);
+            self.ready_queue.lock().push(current_id as GreenThreadId);
         }
         
         // Schedule next thread
@@ -286,14 +291,17 @@ impl GreenScheduler {
     /// call it directly. After the closure returns, we mark the thread
     /// as completed.
     fn schedule_next(&self) {
-        let mut ready_queue = self.ready_queue.lock().unwrap();
+        let next_id = {
+            let mut ready_queue = self.ready_queue.lock();
+            ready_queue.pop()
+        };
 
-        if let Some(next_id) = ready_queue.pop() {
+        if let Some(next_id) = next_id {
             // FIX (TH-3): Check if this thread has an unexecuted closure.
             // If so, take it and execute it now rather than attempting a
             // context switch to an uninitialized stack/instruction pointer.
             let closure_to_run = {
-                let mut contexts = self.contexts.lock().unwrap();
+                let mut contexts = self.contexts.write().unwrap();
                 match contexts.get_mut(&next_id) {
                     Some(ctx) => ctx.func.take(),
                     None => return,
@@ -305,22 +313,24 @@ impl GreenScheduler {
                 // This avoids the UB of jumping to a zeroed IP, and is
                 // correct for cooperative green threads where only one
                 // thread runs at a time.
-                drop(ready_queue); // release the lock before running user code
                 func();
-                // Mark the thread as completed
+                // Mark the thread as completed (read lock suffices — complete() uses atomic)
                 {
-                    let contexts = self.contexts.lock().unwrap();
+                    let contexts = self.contexts.read().unwrap();
                     if let Some(ctx) = contexts.get(&next_id) {
                         ctx.complete();
                     }
                 }
+                // Notify any threads waiting in join()
+                self.join_cvar.notify_all();
                 return;
             }
 
             // Snapshot the next thread's context fields before taking any
             // mutable borrows of the HashMap, so we don't hold two &mut at once.
+            // Read lock suffices — we only need to read sp and regs.
             let (new_sp, new_regs) = {
-                let contexts = self.contexts.lock().unwrap();
+                let contexts = self.contexts.read().unwrap();
                 match contexts.get(&next_id) {
                     Some(ctx) => (ctx.sp, ctx.regs),
                     None => return,
@@ -332,7 +342,7 @@ impl GreenScheduler {
 
             if current_id != usize::MAX {
                 // Save current thread's context and switch to the next thread
-                let mut contexts = self.contexts.lock().unwrap();
+                let mut contexts = self.contexts.write().unwrap();
                 if let Some(current_context) = contexts.get_mut(&(current_id as GreenThreadId)) {
                     let old_sp_ptr = &mut current_context.sp as *mut usize;
                     let old_regs_ptr = current_context.regs.as_mut_ptr() as *mut usize;
@@ -375,32 +385,34 @@ impl GreenScheduler {
         }
     }
 
-    /// Wait for a green thread to complete
+    /// Wait for a green thread to complete using Condvar instead of spin-polling.
+    ///
+    /// FIX (PERF-5): Replaced busy-wait yield loop with Condvar-based wait.
+    /// The original implementation called yield_now() in a tight loop, wasting
+    /// CPU cycles. Now we use a condvar that gets notified when any thread
+    /// completes, so the waiting thread sleeps until woken.
     pub fn join(&self, id: GreenThreadId) {
-        loop {
-            {
-                let contexts = self.contexts.lock().unwrap();
-                if let Some(context) = contexts.get(&id) {
-                    if context.is_completed() {
-                        return;
-                    }
-                } else {
-                    return;
-                }
+        let guard = self.join_mutex.lock().unwrap();
+        let _guard = self.join_cvar.wait_while(guard, |_| {
+            let contexts = self.contexts.read().unwrap();
+            if let Some(context) = contexts.get(&id) {
+                !context.is_completed()
+            } else {
+                false // Thread has been removed, so it's done
             }
-            // Yield and help with other work
-            self.yield_now();
-        }
+        }).unwrap();
     }
 
     /// Run the scheduler (main loop)
     pub fn run(&self) {
         loop {
-            let ready_queue = self.ready_queue.lock().unwrap();
-            if ready_queue.is_empty() {
+            let is_empty = {
+                let ready_queue = self.ready_queue.lock();
+                ready_queue.is_empty()
+            };
+            if is_empty {
                 break;
             }
-            drop(ready_queue);
             
             self.schedule_next();
         }

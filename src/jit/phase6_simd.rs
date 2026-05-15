@@ -8,6 +8,14 @@
 // │  Prefetch:          _MM_HINT_T0, 3 cache lines ahead (192 B / 48 floats)  │
 // └────────────────────────────────────────────────────────────────────────────┘
 //
+// TODO: Implement SIMD code generation for vectorizable loops in the JIT.
+// Currently, the JIT (phase3_jit.rs) emits scalar operations even for loops
+// that could benefit from SSE/AVX packed operations. Planned: detect
+// consecutive Add/Mul operations on array elements and emit PADDD/PMULUDQ
+// instead of scalar ADD/MUL. This would complement the existing SIMD
+// runtime dispatch in this module (which handles position/velocity updates)
+// with JIT-time vectorization for user-level array operations.
+//
 // ┌─ AoS→SoA transpose reference ─────────────────────────────────────────────┐
 // │                                                                            │
 // │  load_aos4  (SSE2)  – 4 particles, 12 f32 → 3×__m128                     │

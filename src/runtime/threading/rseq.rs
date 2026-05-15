@@ -247,11 +247,24 @@ pub fn unregister_rseq() -> bool {
     })
 }
 
+/// Per-CPU data with cache-line padding to prevent false sharing
+///
+/// FIX (PERF-6): Added PerCpuEntry wrapper with align(64) so each CPU's
+/// data occupies its own cache line. Without padding, adjacent entries in
+/// the Vec<T> share cache lines, causing false sharing when different CPUs
+/// modify their respective entries (e.g., per-CPU counters bouncing cache
+/// lines on every increment). Using #[repr(C, align(64))] ensures the
+/// compiler pads each entry to a 64-byte boundary automatically.
+#[repr(C, align(64))]
+struct PerCpuEntry<T> {
+    data: T,
+}
+
 /// Per-CPU data structure wrapper
 /// Provides wait-free access when rseq is available
 pub struct PerCpu<T> {
-    /// Array of per-CPU data
-    data: Vec<T>,
+    /// Array of per-CPU data with cache-line padding
+    entries: Vec<PerCpuEntry<T>>,
     /// Number of CPUs
     num_cpus: usize,
 }
@@ -263,10 +276,12 @@ impl<T> PerCpu<T> {
         F: Fn() -> T,
     {
         let num_cpus = num_cpus::get();
-        let data: Vec<T> = (0..num_cpus).map(|_| init()).collect();
+        let entries: Vec<PerCpuEntry<T>> = (0..num_cpus)
+            .map(|_| PerCpuEntry { data: init() })
+            .collect();
         
         Self {
-            data,
+            entries,
             num_cpus,
         }
     }
@@ -280,7 +295,7 @@ impl<T> PerCpu<T> {
             let cpu = unsafe { libc::sched_getcpu() } as usize;
             if cpu < self.num_cpus { cpu } else { cpu % self.num_cpus }
         });
-        &self.data[cpu_id]
+        &self.entries[cpu_id].data
     }
     
     /// Get mutable reference for the current CPU (wait-free with rseq)
@@ -289,13 +304,13 @@ impl<T> PerCpu<T> {
             let cpu = unsafe { libc::sched_getcpu() } as usize;
             if cpu < self.num_cpus { cpu } else { cpu % self.num_cpus }
         });
-        &mut self.data[cpu_id]
+        &mut self.entries[cpu_id].data
     }
     
     /// Get value for a specific CPU
     pub fn get_for_cpu(&self, cpu_id: usize) -> Option<&T> {
         if cpu_id < self.num_cpus {
-            Some(&self.data[cpu_id])
+            Some(&self.entries[cpu_id].data)
         } else {
             None
         }
@@ -304,7 +319,7 @@ impl<T> PerCpu<T> {
     /// Get mutable reference for a specific CPU
     pub fn get_mut_for_cpu(&mut self, cpu_id: usize) -> Option<&mut T> {
         if cpu_id < self.num_cpus {
-            Some(&mut self.data[cpu_id])
+            Some(&mut self.entries[cpu_id].data)
         } else {
             None
         }

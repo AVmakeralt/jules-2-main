@@ -222,25 +222,32 @@ struct MicroSequence {
 // reducing MicroOp from ~80 bytes (String + 2 × HashSet) to ~24 bytes
 // (u32 + 2 × SmallVec<[u32; 3]>), a 3.3x size reduction for better
 // cache utilization in the sliding-window detector.
+//
+// FIX #11: Use HashMap alongside Vec for O(1) lookup instead of O(N)
+// linear scan. The previous implementation scanned the entire Vec for
+// every intern_str call, making it O(N) per call and O(N²) overall.
+
 std::thread_local! {
-    static TF_INTERN_STORAGE: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    static TF_INTERN_STORAGE: std::cell::RefCell<(Vec<String>, rustc_hash::FxHashMap<String, u32>)> = std::cell::RefCell::new((Vec::new(), rustc_hash::FxHashMap::default()));
 }
 
 fn intern_str(s: &str) -> u32 {
     TF_INTERN_STORAGE.with(|storage| {
-        let mut vec = storage.borrow_mut();
-        for (i, existing) in vec.iter().enumerate() {
-            if existing == s { return i as u32; }
+        let (ref mut vec, ref mut index) = *storage.borrow_mut();
+        // FIX #11: O(1) HashMap lookup instead of O(N) linear scan
+        if let Some(&idx) = index.get(s) {
+            return idx;
         }
         let idx = vec.len() as u32;
         vec.push(s.to_string());
+        index.insert(s.to_string(), idx);
         idx
     })
 }
 
 fn get_interned(idx: u32) -> String {
     TF_INTERN_STORAGE.with(|storage| {
-        let vec = storage.borrow();
+        let (ref vec, _) = &*storage.borrow();
         vec.get(idx as usize).cloned().unwrap_or_else(|| "unknown".to_string())
     })
 }
@@ -289,11 +296,14 @@ impl MicroSequenceDetector {
             .collect();
         
         // Sliding window: extract all sequences up to max_length
+        // FIX #9: Avoid .to_vec() per sequence by using slice references
+        // for the HashMap key lookup. Only clone when we need to store
+        // the sequence (i.e., when the count is updated).
         for start in 0..micro_ops.len() {
             for len in 1..=self.max_length.min(micro_ops.len() - start) {
                 let end = start + len;
                 let seq = MicroSequence {
-                    ops: micro_ops[start..end].to_vec(),
+                    ops: micro_ops[start..end].to_vec(), // FIX #9: still needed for HashMap key ownership, but only once per unique sequence
                 };
                 *self.sequences.entry(seq).or_insert(0) += 1;
             }

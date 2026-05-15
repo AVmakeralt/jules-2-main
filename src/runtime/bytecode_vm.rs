@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -159,8 +159,10 @@ pub struct BytecodeFunction {
     pub num_params: u16,
 
     // Optimization metadata
-    pub hotness: AtomicU64,        // How often this function is called
-    pub execution_count: AtomicU64, // For adaptive optimization
+    // PERF FIX: Changed from AtomicU64 to Cell<u64> — these counters are only
+    // accessed from the VM thread, so atomic operations are unnecessary overhead.
+    pub hotness: Cell<u64>,        // How often this function is called
+    pub execution_count: Cell<u64>, // For adaptive optimization
     pub avg_slots_used: f64,       // For register allocation hints
 
     // ── Proof Trust Protocol ──────────────────────────────────────────────────
@@ -190,8 +192,8 @@ impl Clone for BytecodeFunction {
             constants: self.constants.clone(),
             num_locals: self.num_locals,
             num_params: self.num_params,
-            hotness: AtomicU64::new(self.hotness.load(Ordering::Relaxed)),
-            execution_count: AtomicU64::new(self.execution_count.load(Ordering::Relaxed)),
+            hotness: Cell::new(self.hotness.get()),
+            execution_count: Cell::new(self.execution_count.get()),
             avg_slots_used: self.avg_slots_used,
             trust_tier: self.trust_tier,
             arithmetic_mode: self.arithmetic_mode,
@@ -209,8 +211,8 @@ impl BytecodeFunction {
             constants: Vec::with_capacity(64),
             num_locals: 0,
             num_params: 0,
-            hotness: AtomicU64::new(0),
-            execution_count: AtomicU64::new(0),
+            hotness: Cell::new(0),
+            execution_count: Cell::new(0),
             avg_slots_used: 0.0,
             trust_tier: TrustTier::default(),
             arithmetic_mode: ArithmeticMode::default(),
@@ -1811,6 +1813,24 @@ impl BytecodeVM {
         for (i, f) in functions.iter().enumerate() {
             self.function_index.insert(f.name.clone(), i);
         }
+
+        // PERF FIX: Pre-allocate profile_points Vec by scanning all
+        // ProfilePoint instructions for the maximum ID. This avoids
+        // runtime Vec::resize_with() calls on every ProfilePoint hit.
+        let mut max_profile_id: u32 = 0;
+        for f in &functions {
+            for instr in &f.instructions {
+                if let Instr::ProfilePoint { id } = instr {
+                    max_profile_id = max_profile_id.max(*id);
+                }
+            }
+        }
+        // Pre-allocate with enough capacity for all profile points
+        let needed = (max_profile_id as usize).saturating_add(1);
+        if self.profile_points.len() < needed {
+            self.profile_points.resize_with(needed, || AtomicU64::new(0));
+        }
+
         self.functions = functions;
     }
 
@@ -1831,14 +1851,14 @@ impl BytecodeVM {
         let start_time = std::time::Instant::now();
 
         // ── Save caller's slot state ──
-        // When execute() is called recursively (e.g., from the Call handler),
-        // the shared slot array would be wiped by the callee, destroying the
-        // caller's local variables. We save the caller's active slots and
-        // restore them after the callee returns.
+        // PERF FIX: Instead of saving the entire slot array up to max_slot_used
+        // (which could be 64+ slots = 8+ KB of cloning per call), we only save
+        // the slots that the callee will actually overwrite (first needed_slots
+        // entries). Slots beyond needed_slots are untouched by the callee.
         let is_nested = !self.call_stack.is_empty();
+        let needed_slots = self.functions[func_idx].num_locals.max(self.functions[func_idx].num_params) as usize;
         let saved_slots: Option<Vec<Value>> = if is_nested {
-            // Save only the slots that were actually used by the caller.
-            let save_len = self.memory_pool.max_slot_used.saturating_add(1);
+            let save_len = needed_slots.min(self.memory_pool.max_slot_used.saturating_add(1));
             Some(self.memory_pool.slots.iter().take(save_len).cloned().collect())
         } else {
             None
@@ -1846,27 +1866,27 @@ impl BytecodeVM {
         let saved_max_slot = self.memory_pool.max_slot_used;
 
         // Initialize slots with arguments
-        let needed_slots = self.functions[func_idx].num_locals.max(self.functions[func_idx].num_params) as usize;
         let num_slots = needed_slots.max(64); // Minimum slot size to avoid index-out-of-bounds
         // Only grow the slot array — never shrink it. This avoids O(n) reallocation
         // on every function call for leaf functions that need fewer slots.
         if self.memory_pool.slots.len() < num_slots {
             self.memory_pool.slots.resize(num_slots, Value::Unit);
         }
-        // Clear all slots to Unit before setting arguments — stale values from
-        // a previous call must not leak into the new invocation.
-        for slot in self.memory_pool.slots.iter_mut().take(num_slots) {
+        // PERF FIX: Only clear the function's local slots, not the entire slot array.
+        // Uninitialized slots beyond the callee's region are preserved (the caller
+        // needs them), and we only clear what the callee will use.
+        for slot in self.memory_pool.slots.iter_mut().take(needed_slots) {
             *slot = Value::Unit;
         }
         self.memory_pool.max_slot_used = num_slots.saturating_sub(1);
         for (i, arg) in args.iter().enumerate() {
-            if i < num_slots {
+            if i < needed_slots {
                 self.memory_pool.slots[i] = arg.clone();
             }
         }
 
         // Update execution counters
-        self.functions[func_idx].execution_count.fetch_add(1, Ordering::Relaxed);
+        self.functions[func_idx].execution_count.set(self.functions[func_idx].execution_count.get() + 1);
         let func_len = self.functions[func_idx].instructions.len();
 
         // Determine the effective arithmetic mode for this function.
@@ -2093,143 +2113,145 @@ impl BytecodeVM {
                 // The generic slow path clones only on type-mismatch, which
                 // already implies a slow dynamic-dispatch branch.
                 Instr::Add { dst, lhs, rhs } => {
-                    let l_val = &slots[*lhs as usize];
-                    let r_val = &slots[*rhs as usize];
+                    // PERF FIX: Use unsafe get_unchecked for hot-path slot access.
+                    // SAFETY: The compiler generates slot indices within num_locals,
+                    // and the slot array is pre-allocated to at least needed_slots.
+                    let l_idx = *lhs as usize;
+                    let r_idx = *rhs as usize;
+                    let d_idx = *dst as usize;
+                    let l_ref = unsafe { slots.get_unchecked(l_idx) };
+                    let r_ref = unsafe { slots.get_unchecked(r_idx) };
                     
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
-                        // Tier 1 Fix: Use arithmetic mode instead of raw `+`
-                        // Wrapping mode (default): silently wraps on overflow
-                        // Strict mode: returns error on overflow
-                        // Saturating mode: clamps to i64::MIN/MAX
-                        slots[*dst as usize] = Value::I64(arithmetic_mode.add(*l, *r));
+                    if let (Value::I64(l), Value::I64(r)) = (l_ref, r_ref) {
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::I64(arithmetic_mode.add(*l, *r)); }
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
-                        slots[*dst as usize] = Value::F64(l + r);
+                    if let (Value::F64(l), Value::F64(r)) = (l_ref, r_ref) {
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::F64(*l + *r); }
                         pc += 1;
                         continue;
                     }
                     
-                    let lhs_val = l_val.clone();
-                    let rhs_val = r_val.clone();
-                    slots[*dst as usize] = Self::add_values_static(&lhs_val, &rhs_val)?;
+                    // Slow path: PERF FIX — no need to clone. Compute result first,
+                    // then write. NLL ends the shared borrows when add_values_static returns.
+                    let result = Self::add_values_static(l_ref, r_ref)?;
+                    unsafe { *slots.get_unchecked_mut(d_idx) = result; }
                     pc += 1;
                 }
                 
                 Instr::Sub { dst, lhs, rhs } => {
-                    let l_val = &slots[*lhs as usize];
-                    let r_val = &slots[*rhs as usize];
+                    let l_idx = *lhs as usize;
+                    let r_idx = *rhs as usize;
+                    let d_idx = *dst as usize;
+                    let l_ref = unsafe { slots.get_unchecked(l_idx) };
+                    let r_ref = unsafe { slots.get_unchecked(r_idx) };
                     
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
-                        // Tier 1 Fix: Use arithmetic mode instead of raw `-`
-                        slots[*dst as usize] = Value::I64(arithmetic_mode.sub(*l, *r));
+                    if let (Value::I64(l), Value::I64(r)) = (l_ref, r_ref) {
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::I64(arithmetic_mode.sub(*l, *r)); }
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
-                        slots[*dst as usize] = Value::F64(l - r);
+                    if let (Value::F64(l), Value::F64(r)) = (l_ref, r_ref) {
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::F64(*l - *r); }
                         pc += 1;
                         continue;
                     }
                     
-                    let lhs_val = l_val.clone();
-                    let rhs_val = r_val.clone();
-                    slots[*dst as usize] = Self::sub_values_static(&lhs_val, &rhs_val)?;
+                    // PERF FIX: No need to clone — NLL ends borrows on return.
+                    let result = Self::sub_values_static(l_ref, r_ref)?;
+                    unsafe { *slots.get_unchecked_mut(d_idx) = result; }
                     pc += 1;
                 }
                 
                 Instr::Mul { dst, lhs, rhs } => {
-                    let l_val = &slots[*lhs as usize];
-                    let r_val = &slots[*rhs as usize];
+                    let l_idx = *lhs as usize;
+                    let r_idx = *rhs as usize;
+                    let d_idx = *dst as usize;
+                    let l_ref = unsafe { slots.get_unchecked(l_idx) };
+                    let r_ref = unsafe { slots.get_unchecked(r_idx) };
                     
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
-                        // Tier 1 Fix: Use arithmetic mode instead of raw `*`
-                        // This was the root cause of the "Arithmetic Panic" —
-                        // Rust's default `*` panics on overflow in debug mode.
-                        // Now we use wrapping_mul() by default for speed.
-                        slots[*dst as usize] = Value::I64(arithmetic_mode.mul(*l, *r));
+                    if let (Value::I64(l), Value::I64(r)) = (l_ref, r_ref) {
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::I64(arithmetic_mode.mul(*l, *r)); }
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
-                        slots[*dst as usize] = Value::F64(l * r);
+                    if let (Value::F64(l), Value::F64(r)) = (l_ref, r_ref) {
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::F64(*l * *r); }
                         pc += 1;
                         continue;
                     }
                     
-                    let lhs_val = l_val.clone();
-                    let rhs_val = r_val.clone();
-                    slots[*dst as usize] = Self::mul_values_static(&lhs_val, &rhs_val)?;
+                    // PERF FIX: No need to clone — NLL ends borrows on return.
+                    let result = Self::mul_values_static(l_ref, r_ref)?;
+                    unsafe { *slots.get_unchecked_mut(d_idx) = result; }
                     pc += 1;
                 }
                 
                 Instr::Div { dst, lhs, rhs } => {
-                    let l_val = &slots[*lhs as usize];
-                    let r_val = &slots[*rhs as usize];
+                    let l_idx = *lhs as usize;
+                    let r_idx = *rhs as usize;
+                    let d_idx = *dst as usize;
+                    let l_ref = unsafe { slots.get_unchecked(l_idx) };
+                    let r_ref = unsafe { slots.get_unchecked(r_idx) };
                     
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (l_ref, r_ref) {
                         if *r == 0 {
                             return Err(RuntimeError::new("division by zero"));
                         }
-                        slots[*dst as usize] = Value::I64(l / r);
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::I64(*l / *r); }
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                    if let (Value::F64(l), Value::F64(r)) = (l_ref, r_ref) {
                         if *r == 0.0 {
                             return Err(RuntimeError::new("division by zero"));
                         }
-                        slots[*dst as usize] = Value::F64(l / r);
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::F64(*l / *r); }
                         pc += 1;
                         continue;
                     }
                     
-                    let lhs_val = l_val.clone();
-                    let rhs_val = r_val.clone();
-                    slots[*dst as usize] = Self::div_values_static(&lhs_val, &rhs_val)?;
+                    // PERF FIX: No need to clone — NLL ends borrows on return.
+                    let result = Self::div_values_static(l_ref, r_ref)?;
+                    unsafe { *slots.get_unchecked_mut(d_idx) = result; }
                     pc += 1;
                 }
 
                 // ── Floor division (rounds toward -∞, unlike Div which truncates toward 0) ──
                 Instr::FloorDiv { dst, lhs, rhs } => {
-                    let l_val = &slots[*lhs as usize];
-                    let r_val = &slots[*rhs as usize];
+                    let l_idx = *lhs as usize;
+                    let r_idx = *rhs as usize;
+                    let d_idx = *dst as usize;
+                    let l_ref = unsafe { slots.get_unchecked(l_idx) };
+                    let r_ref = unsafe { slots.get_unchecked(r_idx) };
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (l_ref, r_ref) {
                         if *r == 0 {
                             return Err(RuntimeError::new("floor division by zero"));
                         }
-                        // Use checked_div to avoid panic on i64::MIN / -1
-                        // (which overflows in Rust's debug mode). The mathematical
-                        // result is i64::MIN, which is also the truncating result,
-                        // and the correction below is a no-op since both operands
-                        // are negative (signs match → no adjustment).
-                        let d = l.checked_div(*r).unwrap_or(i64::MIN); // truncating division (toward 0)
-                        // Correction: when signs differ and there's a remainder,
-                        // floor division is one less than truncating division.
+                        let d = (*l).checked_div(*r).unwrap_or(i64::MIN);
                         let result = if (*l < 0) != (*r < 0) && *l % *r != 0 {
                             d - 1
                         } else {
                             d
                         };
-                        slots[*dst as usize] = Value::I64(result);
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::I64(result); }
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                    if let (Value::F64(l), Value::F64(r)) = (l_ref, r_ref) {
                         if *r == 0.0 {
                             return Err(RuntimeError::new("floor division by zero"));
                         }
-                        slots[*dst as usize] = Value::F64((l / r).floor());
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::F64((*l / *r).floor()); }
                         pc += 1;
                         continue;
                     }
 
-                    // Fallback: delegate to the interpreter's floor_div logic
-                    let lhs_val = l_val.clone();
-                    let rhs_val = r_val.clone();
-                    slots[*dst as usize] = Self::floor_div_values_static(&lhs_val, &rhs_val)?;
+                    // PERF FIX: No need to clone — NLL ends borrows on return.
+                    let result = Self::floor_div_values_static(l_ref, r_ref)?;
+                    unsafe { *slots.get_unchecked_mut(d_idx) = result; }
                     pc += 1;
                 }
 
@@ -2257,14 +2279,17 @@ impl BytecodeVM {
                     if *offset < 0 {
                         // Backward jump = loop backedge. Feed trip-count
                         // hint to the DataDependentJIT. We use the current
-                        // function name as the profiling key.
-                        let fn_name = &func.name;
+                        // PERF FIX: Use numeric key instead of format!() string —
+                        // zero allocation in the hot dispatch loop.
+                        // Key encoding: hash the function name, then combine with PC.
+                        let mut fn_hash: u64 = 5381;
+                        for byte in func.name.bytes() {
+                            fn_hash = fn_hash.wrapping_mul(33).wrapping_add(byte as u64);
+                        }
+                        let jit_key = (fn_hash << 16) | (pc as u64);
                         let loop_len = (-(*offset)) as u64;
-                        // Observe the loop length as a proxy for the trip count.
-                        // This is a lightweight observation — the heavy lifting
-                        // (guard checking, specialization) happens in try_specialize.
                         self.data_dependent_jit.observe_int(
-                            &format!("{fn_name}::loop_len@{pc}"),
+                            jit_key,
                             loop_len as i64,
                         );
 
@@ -2336,29 +2361,32 @@ impl BytecodeVM {
                 
                 // ── Remainder ──
                 Instr::Rem { dst, lhs, rhs } => {
-                    let l_val = &slots[*lhs as usize];
-                    let r_val = &slots[*rhs as usize];
+                    let l_idx = *lhs as usize;
+                    let r_idx = *rhs as usize;
+                    let d_idx = *dst as usize;
+                    let l_ref = unsafe { slots.get_unchecked(l_idx) };
+                    let r_ref = unsafe { slots.get_unchecked(r_idx) };
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (l_ref, r_ref) {
                         if *r == 0 {
                             return Err(RuntimeError::new("remainder by zero"));
                         }
-                        slots[*dst as usize] = Value::I64(l % r);
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::I64(*l % *r); }
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                    if let (Value::F64(l), Value::F64(r)) = (l_ref, r_ref) {
                         if *r == 0.0 {
                             return Err(RuntimeError::new("remainder by zero"));
                         }
-                        slots[*dst as usize] = Value::F64(l % r);
+                        unsafe { *slots.get_unchecked_mut(d_idx) = Value::F64(*l % *r); }
                         pc += 1;
                         continue;
                     }
 
-                    let lhs_val = l_val.clone();
-                    let rhs_val = r_val.clone();
-                    slots[*dst as usize] = Self::rem_values_static(&lhs_val, &rhs_val)?;
+                    // PERF FIX: No need to clone — NLL ends borrows on return.
+                    let result = Self::rem_values_static(l_ref, r_ref)?;
+                    unsafe { *slots.get_unchecked_mut(d_idx) = result; }
                     pc += 1;
                 }
 
@@ -2378,8 +2406,10 @@ impl BytecodeVM {
                         continue;
                     }
 
-                    let src_val = s_val.clone();
-                    slots[*dst as usize] = Self::neg_values_static(&src_val)?;
+                    // PERF FIX: No need to clone — pass reference directly. NLL ends
+                    // the shared borrow when neg_values_static returns.
+                    let result = Self::neg_values_static(s_val)?;
+                    slots[*dst as usize] = result;
                     pc += 1;
                 }
 
@@ -2388,20 +2418,20 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::I64(l & r);
                         pc += 1;
                         continue;
                     }
 
                     // Generic fallback: coerce to i64
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "BitAnd: left operand is not an integer ({})", lv.type_name()
+                    // PERF FIX: No need to clone — call as_i64() on references.
+                    // NLL ends borrows before the slot write.
+                    let l_i64 = l_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitAnd: left operand is not an integer ({})", l_val.type_name()
                     )))?;
-                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "BitAnd: right operand is not an integer ({})", rv.type_name()
+                    let r_i64 = r_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitAnd: right operand is not an integer ({})", r_val.type_name()
                     )))?;
                     slots[*dst as usize] = Value::I64(l_i64 & r_i64);
                     pc += 1;
@@ -2412,19 +2442,18 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::I64(l | r);
                         pc += 1;
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "BitOr: left operand is not an integer ({})", lv.type_name()
+                    // PERF FIX: No need to clone — call as_i64() on references.
+                    let l_i64 = l_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitOr: left operand is not an integer ({})", l_val.type_name()
                     )))?;
-                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "BitOr: right operand is not an integer ({})", rv.type_name()
+                    let r_i64 = r_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitOr: right operand is not an integer ({})", r_val.type_name()
                     )))?;
                     slots[*dst as usize] = Value::I64(l_i64 | r_i64);
                     pc += 1;
@@ -2435,19 +2464,18 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::I64(l ^ r);
                         pc += 1;
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "BitXor: left operand is not an integer ({})", lv.type_name()
+                    // PERF FIX: No need to clone — call as_i64() on references.
+                    let l_i64 = l_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitXor: left operand is not an integer ({})", l_val.type_name()
                     )))?;
-                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "BitXor: right operand is not an integer ({})", rv.type_name()
+                    let r_i64 = r_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "BitXor: right operand is not an integer ({})", r_val.type_name()
                     )))?;
                     slots[*dst as usize] = Value::I64(l_i64 ^ r_i64);
                     pc += 1;
@@ -2458,19 +2486,18 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::I64(l.wrapping_shl(*r as u32));
                         pc += 1;
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "Shl: left operand is not an integer ({})", lv.type_name()
+                    // PERF FIX: No need to clone — call as_i64() on references.
+                    let l_i64 = l_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "Shl: left operand is not an integer ({})", l_val.type_name()
                     )))?;
-                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "Shl: right operand is not an integer ({})", rv.type_name()
+                    let r_i64 = r_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "Shl: right operand is not an integer ({})", r_val.type_name()
                     )))?;
                     slots[*dst as usize] = Value::I64(l_i64.wrapping_shl(r_i64 as u32));
                     pc += 1;
@@ -2481,19 +2508,18 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::I64(l.wrapping_shr(*r as u32));
                         pc += 1;
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    let l_i64 = lv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "Shr: left operand is not an integer ({})", lv.type_name()
+                    // PERF FIX: No need to clone — call as_i64() on references.
+                    let l_i64 = l_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "Shr: left operand is not an integer ({})", l_val.type_name()
                     )))?;
-                    let r_i64 = rv.as_i64().ok_or_else(|| RuntimeError::new(format!(
-                        "Shr: right operand is not an integer ({})", rv.type_name()
+                    let r_i64 = r_val.as_i64().ok_or_else(|| RuntimeError::new(format!(
+                        "Shr: right operand is not an integer ({})", r_val.type_name()
                     )))?;
                     slots[*dst as usize] = Value::I64(l_i64.wrapping_shr(r_i64 as u32));
                     pc += 1;
@@ -2515,14 +2541,14 @@ impl BytecodeVM {
                     }
 
                     // Generic fallback: coerce to i64 and bitwise-not
-                    let src_val = s_val.clone();
-                    if let Some(i) = src_val.as_i64() {
+                    // PERF FIX: No need to clone — call as_i64()/as_bool() on reference.
+                    if let Some(i) = s_val.as_i64() {
                         slots[*dst as usize] = Value::I64(!i);
-                    } else if let Some(b) = src_val.as_bool() {
+                    } else if let Some(b) = s_val.as_bool() {
                         slots[*dst as usize] = Value::Bool(!b);
                     } else {
                         return Err(RuntimeError::new(format!(
-                            "Not: cannot negate {} at pc={pc}", src_val.type_name()
+                            "Not: cannot negate {} at pc={pc}", s_val.type_name()
                         )));
                     }
                     pc += 1;
@@ -2533,12 +2559,12 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l == r);
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                    if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l == r);
                         pc += 1;
                         continue;
@@ -2549,9 +2575,10 @@ impl BytecodeVM {
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l == r, "Eq")?;
+                    // PERF FIX: No need to clone — NLL ends the shared borrows
+                    // when compare_values_static returns, before the slot write.
+                    let result = Self::compare_values_static(l_val, r_val, |l, r| l == r, "Eq")?;
+                    slots[*dst as usize] = result;
                     pc += 1;
                 }
 
@@ -2560,12 +2587,12 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l != r);
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                    if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l != r);
                         pc += 1;
                         continue;
@@ -2576,9 +2603,9 @@ impl BytecodeVM {
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l != r, "Ne")?;
+                    // PERF FIX: No need to clone — pass references directly.
+                    let result = Self::compare_values_static(l_val, r_val, |l, r| l != r, "Ne")?;
+                    slots[*dst as usize] = result;
                     pc += 1;
                 }
 
@@ -2587,20 +2614,20 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l < r);
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                    if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l < r);
                         pc += 1;
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l < r, "Lt")?;
+                    // PERF FIX: No need to clone — pass references directly.
+                    let result = Self::compare_values_static(l_val, r_val, |l, r| l < r, "Lt")?;
+                    slots[*dst as usize] = result;
                     pc += 1;
                 }
 
@@ -2609,20 +2636,20 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l <= r);
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                    if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l <= r);
                         pc += 1;
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l <= r, "Le")?;
+                    // PERF FIX: No need to clone — pass references directly.
+                    let result = Self::compare_values_static(l_val, r_val, |l, r| l <= r, "Le")?;
+                    slots[*dst as usize] = result;
                     pc += 1;
                 }
 
@@ -2631,20 +2658,20 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l > r);
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                    if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l > r);
                         pc += 1;
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l > r, "Gt")?;
+                    // PERF FIX: No need to clone — pass references directly.
+                    let result = Self::compare_values_static(l_val, r_val, |l, r| l > r, "Gt")?;
+                    slots[*dst as usize] = result;
                     pc += 1;
                 }
 
@@ -2653,29 +2680,29 @@ impl BytecodeVM {
                     let l_val = &slots[*lhs as usize];
                     let r_val = &slots[*rhs as usize];
 
-                    if let (Value::I64(l), Value::I64(r)) = (l_val, r_val) {
+                    if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l >= r);
                         pc += 1;
                         continue;
                     }
-                    if let (Value::F64(l), Value::F64(r)) = (l_val, r_val) {
+                    if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
                         slots[*dst as usize] = Value::Bool(l >= r);
                         pc += 1;
                         continue;
                     }
 
-                    let lv = l_val.clone();
-                    let rv = r_val.clone();
-                    slots[*dst as usize] = Self::compare_values_static(&lv, &rv, |l, r| l >= r, "Ge")?;
+                    // PERF FIX: No need to clone — pass references directly.
+                    let result = Self::compare_values_static(l_val, r_val, |l, r| l >= r, "Ge")?;
+                    slots[*dst as usize] = result;
                     pc += 1;
                 }
 
                 // JumpIfFalse/JumpIfTrue removed — merged into JumpFalse/JumpTrue above
 
                 // ── Function Call ──
-                // func slot contains a Value::Fn. Push a CallFrame, collect args,
-                // then recursively execute the callee via vm_ptr (raw pointer to
-                // self) to avoid conflicting with the `slots` mutable borrow.
+                // PERF FIX: Avoid heap allocation for common case of ≤4 args.
+                // Stack-allocate small arg arrays; only heap-allocate for 5+ args.
+                // Pass args as &[Value] to execute() — no owned Vec needed.
                 Instr::Call { dst, func, argc, start } => {
                     let dst_idx = *dst as usize;
                     let func_val = slots[*func as usize].clone();
@@ -2683,38 +2710,45 @@ impl BytecodeVM {
                     let arg_count = *argc as usize;
 
                     // Collect args before any further mutation of slots.
-                    // Stack-allocate for small arg counts (≤4) to avoid heap alloc.
-                    let args: Vec<Value> = if arg_count <= 4 {
-                        let mut small: [Value; 4] = [Value::Unit, Value::Unit, Value::Unit, Value::Unit];
+                    // PERF FIX: For ≤4 args (the vast majority of calls), use a
+                    // stack-allocated array to avoid heap allocation entirely.
+                    // For 5+ args, fall back to Vec allocation.
+                    let mut small_args: [Value; 4] = [Value::Unit, Value::Unit, Value::Unit, Value::Unit];
+                    let heap_args: Vec<Value>;
+                    let args_slice: &[Value] = if arg_count <= 4 {
                         for i in 0..arg_count {
-                            small[i] = slots.get(arg_start + i).cloned().unwrap_or(Value::Unit);
+                            small_args[i] = slots.get(arg_start + i).cloned().unwrap_or(Value::Unit);
                         }
-                        small[..arg_count].to_vec()
+                        &small_args[..arg_count]
                     } else {
-                        (0..arg_count)
+                        heap_args = (0..arg_count)
                             .map(|i| slots.get(arg_start + i).cloned().unwrap_or(Value::Unit))
-                            .collect()
+                            .collect();
+                        &heap_args
                     };
 
                     // ── DataDependentJIT: profile call arguments ──
                     // Observe integer arguments so the JIT can detect hot
                     // values and create guarded specializations.
+                    // PERF FIX: Use numeric keys instead of format!() strings.
                     {
-                        let fn_name_for_jit = match &func_val {
-                            Value::Fn(closure) => closure.decl.name.clone(),
-                            _ => "anonymous".to_string(),
+                        let fn_hash: u64 = match &func_val {
+                            Value::Fn(closure) => {
+                                let mut h: u64 = 5381;
+                                for byte in closure.decl.name.bytes() {
+                                    h = h.wrapping_mul(33).wrapping_add(byte as u64);
+                                }
+                                h
+                            }
+                            _ => 0,
                         };
-                        for (i, arg) in args.iter().enumerate() {
+                        for (i, arg) in args_slice.iter().enumerate() {
                             if let Value::I64(v) = arg {
-                                self.data_dependent_jit.observe_int(
-                                    &format!("{fn_name_for_jit}::arg{i}"),
-                                    *v,
-                                );
+                                let key = (fn_hash << 16) | (i as u64);
+                                self.data_dependent_jit.observe_int(key, *v);
                             } else if let Value::Bool(v) = arg {
-                                self.data_dependent_jit.observe_bool(
-                                    &format!("{fn_name_for_jit}::arg{i}"),
-                                    *v,
-                                );
+                                let key = (fn_hash << 16) | (i as u64);
+                                self.data_dependent_jit.observe_bool(key, *v);
                             }
                         }
                     }
@@ -2733,7 +2767,7 @@ impl BytecodeVM {
                                 | "matmul_elemwise"
                                 | "scaled_matmul"
                             ) {
-                                let ret = args.into_iter().next().ok_or_else(|| {
+                                let ret = args_slice.first().cloned().ok_or_else(|| {
                                     RuntimeError::new(format!(
                                         "{fn_name}() requires at least 1 argument"
                                     ))
@@ -2756,7 +2790,7 @@ impl BytecodeVM {
                                         num_locals: self.functions[idx].num_locals,
                                     });
 
-                                    let result = unsafe { (*vm_ptr).execute(idx, &args) };
+                                    let result = unsafe { (*vm_ptr).execute(idx, args_slice) };
 
                                     // Pop the call frame
                                     self.call_stack.pop();
@@ -2787,7 +2821,7 @@ impl BytecodeVM {
                                 | "matmul_elemwise"
                                 | "scaled_matmul"
                             ) {
-                                let ret = args.into_iter().next().ok_or_else(|| {
+                                let ret = args_slice.first().cloned().ok_or_else(|| {
                                     RuntimeError::new(format!(
                                         "{fn_name}() requires at least 1 argument"
                                     ))
@@ -2809,7 +2843,7 @@ impl BytecodeVM {
                                         num_locals: self.functions[idx].num_locals,
                                     });
 
-                                    let result = unsafe { (*vm_ptr).execute(idx, &args) };
+                                    let result = unsafe { (*vm_ptr).execute(idx, args_slice) };
 
                                     self.call_stack.pop();
 
@@ -2898,44 +2932,66 @@ impl BytecodeVM {
                 }
 
                 // ── Load Field from Struct ──
-                // field_idx is a pre-computed index into the struct's field values,
-                // sorted by the order the fields were declared at compile time.
+                // PERF FIX: Use field_order for O(1) indexed access instead of
+                // O(n) iter().nth(). Also use per-instruction-site inline caches
+                // (indexed by PC) instead of a single global cache to avoid thrashing.
                 Instr::LoadField { dst, obj, field_idx } => {
                     let obj_val = &slots[*obj as usize];
                     match obj_val {
                         Value::Struct(data) => {
-                            // Use InlineCache for O(1) field access — avoids O(n) iter().nth()
                             let shape_id = data.fields.len() as u64;
-                            // Try inline cache first (monomorphic fast path)
-                            let cached = if let Some(cache) = self.inline_caches.get(0) {
-                                cache.lookup(shape_id)
-                            } else {
-                                None
-                            };
+                            // Try per-site inline cache first
+                            let cache_idx = pc;
+                            let cached = self.inline_caches.get(cache_idx)
+                                .and_then(|cache| cache.lookup(shape_id));
                             if let Some(offset) = cached {
-                                if let Some(v) = data.fields.iter().nth(offset as usize).map(|(_, v)| v) {
-                                    slots[*dst as usize] = v.clone();
-                                    pc += 1;
-                                    continue;
+                                // O(1) access: use field_order[offset] to get key, then HashMap lookup
+                                let fidx = offset as usize;
+                                if fidx < data.field_order.len() {
+                                    if let Some(v) = data.fields.get(&data.field_order[fidx]) {
+                                        slots[*dst as usize] = v.clone();
+                                        pc += 1;
+                                        continue;
+                                    }
                                 }
+                                // Cache miss (field_order mismatch) — fall through to slow path
                             }
-                            // Slow path: iterate to field_idx, then update cache
+                            // Slow path: use field_order for direct O(1) indexed access
                             let fidx = *field_idx as usize;
-                            let mut iter = data.fields.iter();
-                            let result = if let Some((_key, v)) = iter.nth(fidx) {
-                                // Update inline cache for next time
-                                if self.inline_caches.is_empty() {
-                                    self.inline_caches.push(InlineCache::new());
+                            let result = if fidx < data.field_order.len() {
+                                let key = &data.field_order[fidx];
+                                if let Some(v) = data.fields.get(key) {
+                                    // Update per-site inline cache
+                                    if cache_idx >= self.inline_caches.len() {
+                                        self.inline_caches.resize_with(cache_idx + 1, InlineCache::new);
+                                    }
+                                    if let Some(cache) = self.inline_caches.get_mut(cache_idx) {
+                                        cache.update(shape_id, fidx as i32);
+                                    }
+                                    Ok(v.clone())
+                                } else {
+                                    Err(RuntimeError::new(format!(
+                                        "LoadField: field key '{}' not found in struct '{}' at pc={pc}",
+                                        key, data.name
+                                    )))
                                 }
-                                if let Some(cache) = self.inline_caches.get_mut(0) {
-                                    cache.update(shape_id, fidx as i32);
-                                }
-                                Ok(v.clone())
                             } else {
-                                Err(RuntimeError::new(format!(
-                                    "LoadField: field index {} out of range at pc={pc}",
-                                    field_idx
-                                )))
+                                // Fallback: O(n) iter for structs without field_order
+                                let mut iter = data.fields.iter();
+                                if let Some((_key, v)) = iter.nth(fidx) {
+                                    if cache_idx >= self.inline_caches.len() {
+                                        self.inline_caches.resize_with(cache_idx + 1, InlineCache::new);
+                                    }
+                                    if let Some(cache) = self.inline_caches.get_mut(cache_idx) {
+                                        cache.update(shape_id, fidx as i32);
+                                    }
+                                    Ok(v.clone())
+                                } else {
+                                    Err(RuntimeError::new(format!(
+                                        "LoadField: field index {} out of range at pc={pc}",
+                                        field_idx
+                                    )))
+                                }
                             };
                             match result {
                                 Ok(v) => slots[*dst as usize] = v,
@@ -2953,46 +3009,60 @@ impl BytecodeVM {
                 }
 
                 // ── Store Field in Struct ──
+                // PERF FIX: Use field_order for O(1) key lookup instead of O(n) iter().nth().
+                // Also use per-instruction-site inline caches indexed by PC.
                 Instr::StoreField { obj, field_idx, src } => {
                     let src_val = std::mem::replace(&mut slots[*src as usize], Value::Unit);
                     let obj_val = &mut slots[*obj as usize];
                     match obj_val {
                         Value::Struct(data) => {
-                            // Use InlineCache for O(1) field key lookup
                             let shape_id = data.fields.len() as u64;
-                            let cached = if let Some(cache) = self.inline_caches.get(0) {
-                                cache.lookup(shape_id)
+                            let cache_idx = pc;
+                            // Try per-site inline cache for key lookup
+                            let cached = self.inline_caches.get(cache_idx)
+                                .and_then(|cache| cache.lookup(shape_id));
+                            let key = if let Some(offset) = cached {
+                                let fidx = offset as usize;
+                                if fidx < data.field_order.len() {
+                                    Some(data.field_order[fidx].clone())
+                                } else {
+                                    // Cache miss — fall through to slow path
+                                    None
+                                }
                             } else {
                                 None
                             };
-                            let key = if let Some(offset) = cached {
-                                data.fields.iter().nth(offset as usize).map(|(k, _)| k.clone())
+                            let key = if let Some(k) = key {
+                                k
                             } else {
-                                // Slow path: find Nth field in sorted order
+                                // Slow path: use field_order for O(1) indexed access
                                 let fidx = *field_idx as usize;
-                                let key = data.fields.iter().nth(fidx).map(|(k, _)| k.clone());
-                                // Update inline cache
-                                if let Some(ref _k) = key {
-                                    if self.inline_caches.is_empty() {
-                                        self.inline_caches.push(InlineCache::new());
+                                let found_key = if fidx < data.field_order.len() {
+                                    Some(data.field_order[fidx].clone())
+                                } else {
+                                    // Fallback for structs without field_order
+                                    data.fields.iter().nth(fidx).map(|(k, _)| k.clone())
+                                };
+                                // Update per-site inline cache
+                                if let Some(ref _k) = found_key {
+                                    if cache_idx >= self.inline_caches.len() {
+                                        self.inline_caches.resize_with(cache_idx + 1, InlineCache::new);
                                     }
-                                    if let Some(cache) = self.inline_caches.get_mut(0) {
+                                    if let Some(cache) = self.inline_caches.get_mut(cache_idx) {
                                         cache.update(shape_id, fidx as i32);
                                     }
                                 }
-                                key
+                                match found_key {
+                                    Some(k) => k,
+                                    None => {
+                                        return Err(RuntimeError::new(format!(
+                                            "StoreField: field index {} out of range at pc={pc}",
+                                            field_idx
+                                        )));
+                                    }
+                                }
                             };
-                            match key {
-                                Some(k) => {
-                                    data.fields.insert(k, src_val);
-                                }
-                                None => {
-                                    return Err(RuntimeError::new(format!(
-                                        "StoreField: field index {} out of range at pc={pc}",
-                                        field_idx
-                                    )));
-                                }
-                            }
+                            data.fields.insert(key, src_val);
                         }
                         other => {
                             return Err(RuntimeError::new(format!(
@@ -3388,6 +3458,7 @@ impl BytecodeVM {
                     let fs = *field_start as usize;
                     let fc = *field_count as usize;
                     let mut fields = FxHashMap::default();
+                    let mut field_order = Vec::with_capacity(fc);
                     // Fields are stored as pairs of (name_value, field_value) in slots
                     for i in 0..fc {
                         let name_val = slots.get(fs + i * 2).cloned().unwrap_or(Value::Unit);
@@ -3396,9 +3467,10 @@ impl BytecodeVM {
                             Value::Str(s) => s.clone(),
                             other => format!("field_{i}_{}", other.type_name()),
                         };
+                        field_order.push(key.clone());
                         fields.insert(key, field_val);
                     }
-                    slots[*dst as usize] = Value::Struct(Box::new(StructData { name, fields }));
+                    slots[*dst as usize] = Value::Struct(Box::new(StructData { name, fields, field_order }));
                     pc += 1;
                 }
 

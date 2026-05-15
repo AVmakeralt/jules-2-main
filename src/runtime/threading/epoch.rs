@@ -3,43 +3,49 @@
 // Safe memory reclamation for lock-free data structures
 // =========================================================================
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 
-/// Wrapper around `*const AtomicU64` that implements `Send` + `Sync`.
+/// Wrapper around `*const Participant` that implements `Send` + `Sync`.
 ///
 /// # Safety
-/// The caller must ensure that the pointed-to `AtomicU64` outlives
+/// The caller must ensure that the pointed-to `Participant` outlives
 /// any access through this pointer and that all access is through
-/// atomic operations (which are thread-safe by definition).
+/// atomic operations or methods that are inherently thread-safe.
 #[repr(transparent)]
-struct EpochPtr(*const AtomicU64);
+struct ParticipantPtr(*const Participant);
 
-unsafe impl Send for EpochPtr {}
-unsafe impl Sync for EpochPtr {}
+unsafe impl Send for ParticipantPtr {}
+unsafe impl Sync for ParticipantPtr {}
 
 /// Global epoch counter
 static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// Number of active readers (pinned guards). Epoch advancement is blocked
-/// while this is non-zero, preventing garbage reclamation while any guard
-/// still holds a reference to an epoch.
-static ACTIVE_READERS: AtomicUsize = AtomicUsize::new(0);
-
-/// FIX (PERF-3): Participant registry for tracking minimum epoch across
-/// all participants. The original implementation used a single global
-/// ACTIVE_READERS counter, causing severe cache-line contention on
-/// multi-core systems. Now we track per-participant epochs and compute
-/// the minimum for safe epoch advancement.
-static PARTICIPANT_EPOCHS: RwLock<Vec<EpochPtr>> = RwLock::new(Vec::new());
+/// FIX (PERF-3): Participant registry for tracking active/pinned state and
+/// epoch across all participants. The original implementation used a single
+/// global ACTIVE_READERS counter, causing severe cache-line contention on
+/// multi-core systems. Now we track per-participant state and check each
+/// participant's `active` flag independently, spreading cache-line traffic
+/// across per-participant cache lines.
+static PARTICIPANT_REGISTRY: RwLock<Vec<ParticipantPtr>> = RwLock::new(Vec::new());
 
 /// Number of epochs in the cycle
 const NUM_EPOCHS: usize = 3;
 
 /// Thread-local epoch participant
+///
+/// FIX (PERF-3): Replaced global ACTIVE_READERS counter with per-participant
+/// `active` flag. The original global counter caused severe cache-line
+/// contention on multi-core systems — every pin()/unpin() modified the
+/// same cache line. Now each participant has its own `active` atomic on
+/// a separate cache line, eliminating the contention.
 #[derive(Debug)]
 pub struct Participant {
     local_epoch: AtomicU64,
+    /// Per-participant active flag (replaces global ACTIVE_READERS).
+    /// Set to true when pinned, false when unpinned. Each participant
+    /// has its own cache line, eliminating false sharing.
+    active: AtomicBool,
     garbage_bags: [std::sync::Mutex<GarbageBag>; NUM_EPOCHS],
 }
 
@@ -47,25 +53,34 @@ impl Participant {
     pub fn new() -> Self {
         let p = Self {
             local_epoch: AtomicU64::new(0),
+            active: AtomicBool::new(false),
             garbage_bags: [
                 std::sync::Mutex::new(GarbageBag::new()),
                 std::sync::Mutex::new(GarbageBag::new()),
                 std::sync::Mutex::new(GarbageBag::new()),
             ],
         };
-        // FIX (PERF-3): Register this participant's epoch pointer so
-        // advance_epoch can compute the minimum across all participants.
-        if let Ok(mut registry) = PARTICIPANT_EPOCHS.write() {
-            registry.push(EpochPtr(&p.local_epoch as *const AtomicU64));
+        // FIX (PERF-3): Register this participant so advance_epoch can
+        // check its active flag and local_epoch. We store a raw pointer
+        // because Participant is stored in Arc<Participant> in the worker
+        // pool and will outlive the registry entry.
+        if let Ok(mut registry) = PARTICIPANT_REGISTRY.write() {
+            registry.push(ParticipantPtr(&p as *const Participant));
         }
         p
     }
 
     /// Pin the current epoch
+    ///
+    /// FIX (PERF-3): Uses per-participant `active` flag instead of global
+    /// ACTIVE_READERS counter. This eliminates cache-line contention:
+    /// each participant's active flag is on its own cache line (within the
+    /// Participant struct which is already 128-byte aligned in the Worker),
+    /// so pinning one participant doesn't invalidate another's cache.
     pub fn pin(&self) -> Guard<'_> {
-        // Increment active readers to prevent epoch advancement while
-        // any guard exists.
-        ACTIVE_READERS.fetch_add(1, Ordering::Acquire);
+        // Set this participant as active to prevent epoch advancement
+        // while any guard exists.
+        self.active.store(true, Ordering::Release);
 
         let current = self.local_epoch.load(Ordering::Acquire);
         let global = GLOBAL_EPOCH.load(Ordering::Acquire);
@@ -126,8 +141,11 @@ impl<'a> Guard<'a> {
 
 impl<'a> Drop for Guard<'a> {
     fn drop(&mut self) {
-        // Unpin: decrement active readers so epoch advancement can proceed
-        ACTIVE_READERS.fetch_sub(1, Ordering::Release);
+        // Unpin: clear the participant's active flag so epoch
+        // advancement can proceed. This replaces the global
+        // ACTIVE_READERS.fetch_sub(1) with a per-participant store,
+        // eliminating cache-line contention.
+        self.participant.active.store(false, Ordering::Release);
     }
 }
 
@@ -182,27 +200,31 @@ impl GarbageBag {
 /// have caught up to the current epoch. This prevents garbage from being
 /// reclaimed while a reader is still accessing it.
 ///
-/// FIX (PERF-3): The original implementation used a single global
-/// ACTIVE_READERS counter, creating cache-line contention on multi-core
-/// systems. Now we also verify that no participant is lagging more than
-/// 1 epoch behind before advancing, by checking the minimum epoch across
-/// all registered participants.
+/// FIX (PERF-3): Replaced global ACTIVE_READERS counter with per-participant
+/// `active` flags. The original single counter caused cache-line contention
+/// on multi-core systems. Now we check each participant's active flag and
+/// local_epoch independently, which spreads the cache-line traffic across
+/// per-participant cache lines (the Participant structs are 128-byte aligned
+/// in the Worker struct, so they're already on separate cache lines).
 pub fn advance_epoch() {
-    // Do not advance while any guard (reader) is active — otherwise garbage
-    // could be reclaimed while a reader is still accessing it.
-    if ACTIVE_READERS.load(Ordering::Acquire) > 0 {
-        return;
-    }
-
-    // FIX (PERF-3): Check that all participants have caught up before
-    // advancing. This prevents premature reclamation when a participant
-    // is pinned in an older epoch.
-    let global = GLOBAL_EPOCH.load(Ordering::Acquire);
-    if let Ok(registry) = PARTICIPANT_EPOCHS.read() {
-        for ep in registry.iter() {
+    // Check if any participant is currently active (pinned).
+    // We use the PARTICIPANT_REGISTRY to iterate all participants.
+    // This replaces the global ACTIVE_READERS counter.
+    if let Ok(registry) = PARTICIPANT_REGISTRY.read() {
+        for pp in registry.iter() {
             // SAFETY: The pointer comes from a Participant that is still alive.
             // Participants are stored in Arc<Participant> in the worker pool.
-            let participant_epoch = unsafe { (*ep.0).load(Ordering::Acquire) };
+            let participant = unsafe { &*pp.0 };
+            // If any participant is active (pinned), don't advance
+            if participant.active.load(Ordering::Acquire) {
+                return;
+            }
+        }
+
+        // Also check that all participants have caught up before advancing.
+        let global = GLOBAL_EPOCH.load(Ordering::Acquire);
+        for pp in registry.iter() {
+            let participant_epoch = unsafe { (*pp.0).local_epoch.load(Ordering::Acquire) };
             // If any participant is more than 1 epoch behind, don't advance yet
             if global.saturating_sub(participant_epoch) > 1 {
                 return;

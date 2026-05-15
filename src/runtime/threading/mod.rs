@@ -42,7 +42,7 @@ pub use gpu_pipeline::{GpuOpType, GpuPipeline, GpuTaskDescriptor, GpuTaskHandle}
 pub use hw_optimizations::{AmxContext, Avx512Mask, CatManager, CompareOp, HugePageAllocator, HwCapabilities, TsxTransaction, avx512_conflict_detection, is_amx_available, is_avx512_available, is_cat_available, is_tsx_available};
 pub use hyper_sparse::{BitSegment, HyperSparseMap, HyperSparseSoA, SegmentedSieve};
 pub use jit_scheduler::{HwCounter, HwCounterReader, HwCounterValue, JitSchedulerCompiler, RuntimeStats, SchedulingStrategy, SelfOptimizingRuntime, TraceBasedScheduler, WorkloadPhase};
-pub use join::{join, JoinHandle};
+pub use join::{join, BoxedTask, JoinHandle, SlabTask, TaskVtable};
 pub use kernel_bypass::{HybridNotify, IoUring, UintrReceiver, UintrSender, is_io_uring_available, is_uintr_available};
 pub use lossy_computation::{HwCounterFeedback, LossyComputationContext, LossyComputationManager, LossyFastPath, PrecisionLevel, TaskPriority};
 pub use novel_scheduling::{CompressedTask, NeuralScheduler, NovelSchedulingEngine, SpeculativeExecutor, SpeculativeTask, TaskFeatures, TrainingSample, WorkCompressor};
