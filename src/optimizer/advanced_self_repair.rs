@@ -17,8 +17,6 @@
 //  11. Causal Analysis — Counterfactual root-cause ranking
 // =============================================================================
 
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
