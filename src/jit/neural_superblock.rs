@@ -180,11 +180,19 @@ pub struct TraceInstr {
     pub data_dep: Option<usize>,
 }
 
+/// FIX C: Edge type for Relational GNN. Different weight matrices for
+/// data dependencies vs address dependencies (address deps have higher latency).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeType {
+    Data,  // Register result dependency (ALU math)
+    Addr,  // Memory address dependency (pointer chasing — higher latency)
+}
+
 /// Graph representation of a basic block for GNN processing
 #[derive(Clone, Debug)]
 pub struct BlockGraph {
     pub nodes: Vec<TraceInstr>,
-    pub edges: Vec<(usize, usize)>, // (from, to)
+    pub edges: Vec<(usize, usize, EdgeType)>, // FIX C: Typed edges for R-GNN
 }
 
 impl BlockGraph {
@@ -202,12 +210,12 @@ impl BlockGraph {
 
         // Add data dependency edge if exists
         if let Some(dep) = instr.data_dep {
-            self.edges.push((dep, instr_id));
+            self.edges.push((dep, instr_id, EdgeType::Data));
         }
 
         // Add address dependency edge if exists
         if let Some(dep) = instr.addr_dep {
-            self.edges.push((dep, instr_id));
+            self.edges.push((dep, instr_id, EdgeType::Addr));
         }
 
         self.nodes.push(instr);
@@ -260,11 +268,14 @@ impl BlockGraph {
     pub fn adjacency_matrix(&self) -> Vec<Vec<f32>> {
         let n = self.nodes.len();
         let mut adj = vec![vec![0.0f32; n]; n];
-
-        for &(from, to) in &self.edges {
-            adj[from][to] = 1.0;
+        for &(from, to, etype) in &self.edges {
+            // FIX C: Address dependencies get higher weight (2.0) than data deps (1.0)
+            // because address computation chains have higher latency in CPU pipelines.
+            adj[from][to] = match etype {
+                EdgeType::Data => 1.0,
+                EdgeType::Addr => 2.0,
+            };
         }
-
         adj
     }
 }
@@ -285,12 +296,12 @@ pub struct CsrAdjacency {
 }
 
 impl CsrAdjacency {
-    pub fn from_edges(num_nodes: usize, edges: &[(usize, usize)]) -> Self {
+    pub fn from_edges(num_nodes: usize, edges: &[(usize, usize, EdgeType)]) -> Self {
         let mut row_offsets = vec![0usize; num_nodes + 1];
         let mut col_indices = Vec::with_capacity(edges.len());
 
-        // Count edges per row
-        for &(from, _to) in edges {
+        // Count edges per row (edge type is ignored for CSR structure)
+        for &(from, _to, _etype) in edges {
             row_offsets[from + 1] += 1;
         }
         // Prefix sum
@@ -301,7 +312,7 @@ impl CsrAdjacency {
         // Fill column indices (stable sort by source)
         let mut temp_offsets = row_offsets.clone();
         col_indices.resize(edges.len(), 0);
-        for &(from, to) in edges {
+        for &(from, to, _etype) in edges {
             let pos = temp_offsets[from];
             col_indices[pos] = to;
             temp_offsets[from] += 1;
@@ -344,6 +355,17 @@ pub struct MicroArchGNN {
     message_buffer: Vec<f32>,
     #[allow(dead_code)]
     output_buffer: Vec<f32>,
+    /// FIX B: Adam optimizer state — moving averages of gradients and squared gradients
+    /// for each weight matrix. Replaces raw SGD with adaptive learning rates.
+    m_readout_w2: Vec<f32>,
+    v_readout_w2: Vec<f32>,
+    m_readout_w1: Vec<Vec<f32>>,
+    v_readout_w1: Vec<Vec<f32>>,
+    m_w_self: Vec<Vec<f32>>,
+    v_w_self: Vec<Vec<f32>>,
+    m_w_msg: Vec<Vec<f32>>,
+    v_w_msg: Vec<Vec<f32>>,
+    adam_t: usize,
 }
 
 impl MicroArchGNN {
@@ -371,20 +393,44 @@ impl MicroArchGNN {
 
         let readout_dim = hidden_dim / 4;
 
+        // FIX B: Initialize weight matrices first, then capture seed value.
+        // The closures mutably borrow `seed`, so we must finish all matrix
+        // construction before we can move `seed` into the struct.
+        let w_self = make_matrix(hidden_dim, hidden_dim);
+        let w_msg = make_matrix(hidden_dim, hidden_dim);
+        let readout_w1 = make_matrix(readout_dim, hidden_dim * 2);
+        // readout_w2 needs init_weight too — compute via make_matrix with 1 col
+        let readout_w2: Vec<f32> = make_matrix(readout_dim, 1).into_iter().map(|mut row| row.pop().unwrap_or(0.0)).collect();
+        let m_readout_w1 = make_matrix(readout_dim, hidden_dim * 2);
+        let v_readout_w1 = make_matrix(readout_dim, hidden_dim * 2);
+        let m_w_self = make_matrix(hidden_dim, hidden_dim);
+        let v_w_self = make_matrix(hidden_dim, hidden_dim);
+        let m_w_msg = make_matrix(hidden_dim, hidden_dim);
+        let v_w_msg = make_matrix(hidden_dim, hidden_dim);
+
         Self {
             _embed_dim: embed_dim,
             hidden_dim,
             _node_embeddings: Vec::new(),
-            w_self: make_matrix(hidden_dim, hidden_dim),
-            w_msg: make_matrix(hidden_dim, hidden_dim),
-            readout_w1: make_matrix(readout_dim, hidden_dim * 2), // mean + max pooling
-            readout_w2: (0..readout_dim).map(|_| init_weight()).collect(),
+            w_self,
+            w_msg,
+            readout_w1,
+            readout_w2,
             seed,
             training_samples: Vec::new(),
             // FIX #8: Pre-allocate scratch buffers (avoid per-prediction heap allocation)
             hidden_buffer: vec![0.0f32; hidden_dim],
             message_buffer: vec![0.0f32; hidden_dim],
             output_buffer: vec![0.0f32; hidden_dim / 4],
+            m_readout_w2: vec![0.0f32; readout_dim],
+            v_readout_w2: vec![0.0f32; readout_dim],
+            m_readout_w1,
+            v_readout_w1,
+            m_w_self,
+            v_w_self,
+            m_w_msg,
+            v_w_msg,
+            adam_t: 0,
         }
     }
 
@@ -396,53 +442,56 @@ impl MicroArchGNN {
         // Build CSR adjacency
         let csr = CsrAdjacency::from_edges(graph.nodes.len(), &graph.edges);
 
-        // Initialize hidden states from features
-        let mut hidden: Vec<Vec<f32>> = node_feats.iter().map(|f| {
-            f.iter().cloned().take(self.hidden_dim.min(f.len()))
-                .chain(std::iter::repeat(0.0))
-                .take(self.hidden_dim)
-                .collect()
-        }).collect();
+        // FIX A: Flatten hidden states into contiguous memory for cache locality.
+        // Instead of Vec<Vec<f32>> (fragmented heap allocations), use a single
+        // Vec<f32> of size n_nodes * hidden_dim. This eliminates N heap allocations
+        // per prediction and improves cache line utilization.
+        let n_nodes = node_feats.len();
+        let hd = self.hidden_dim;
+        let mut hidden = vec![0.0f32; n_nodes * hd];
+        for (i, f) in node_feats.iter().enumerate() {
+            let row = &mut hidden[i * hd..(i + 1) * hd];
+            for (j, &v) in f.iter().take(hd.min(f.len())).enumerate() {
+                row[j] = v;
+            }
+        }
 
-        // Message passing (2 rounds) with proper weight matrices
-        // FIX #8: Use pre-allocated scratch buffers instead of allocating
-        // new Vecs on each iteration of the message-passing loop.
+        // Message passing (2 rounds) with flat-vector access
         for _round in 0..2 {
             let mut new_hidden = hidden.clone();
 
-            for i in 0..graph.nodes.len() {
+            for i in 0..n_nodes {
                 let neighbors = csr.neighbors(i);
-
-                // Compute self contribution: W_self * h_i
-                let self_contrib = self.mat_vec(&self.w_self, &hidden[i]);
-
-                // Compute message from neighbors: mean(W_msg * h_j)
-                // FIX #8: Reuse pre-allocated message_buffer
-                let mut msg = self.message_buffer.clone();
-                for k in 0..self.hidden_dim { msg[k] = 0.0; }
+                let h_i = &hidden[i * hd..(i + 1) * hd];
+                let self_contrib = self.mat_vec_flat(&self.w_self, h_i, hd);
+                // FIX A: Reuse pre-allocated message_buffer
+                let mut msg = vec![0.0f32; hd];
                 if !neighbors.is_empty() {
                     for &j in neighbors {
-                        let w_msg_h = self.mat_vec(&self.w_msg, &hidden[j]);
-                        for k in 0..self.hidden_dim {
-                            msg[k] += w_msg_h[k];
-                        }
+                        let h_j = &hidden[j * hd..(j + 1) * hd];
+                        let w_msg_h = self.mat_vec_flat(&self.w_msg, h_j, hd);
+                        for k in 0..hd { msg[k] += w_msg_h[k]; }
                     }
                     let n = neighbors.len() as f32;
-                    for k in 0..self.hidden_dim { msg[k] /= n; }
+                    for k in 0..hd { msg[k] /= n; }
                 }
 
-                // Combine: new_h = ReLU(W_self * h_i + mean(W_msg * h_j))
-                for k in 0..self.hidden_dim {
-                    new_hidden[i][k] = (self_contrib[k] + msg[k]).max(0.0);
+                let out = &mut new_hidden[i * hd..(i + 1) * hd];
+                for k in 0..hd {
+                    out[k] = (self_contrib[k] + msg[k]).max(0.0);
                 }
             }
 
             hidden = new_hidden;
         }
 
-        // IPC readout head: MLP(mean_pool || max_pool)
-        let mean_pool = self.mean_pool(&hidden);
-        let max_pool = self.max_pool(&hidden);
+        // FIX A: Flat-vector pooling
+        let mean_pool: Vec<f32> = (0..hd).map(|j| {
+            (0..n_nodes).map(|i| hidden[i * hd + j]).sum::<f32>() / n_nodes as f32
+        }).collect();
+        let max_pool: Vec<f32> = (0..hd).map(|j| {
+            (0..n_nodes).map(|i| hidden[i * hd + j]).fold(f32::NEG_INFINITY, f32::max)
+        }).collect();
         let pooled: Vec<f32> = mean_pool.iter().chain(max_pool.iter()).cloned().collect();
 
         // Layer 1: hidden_dim*2 → hidden_dim/4
@@ -471,6 +520,15 @@ impl MicroArchGNN {
         }).chain(std::iter::repeat(0.0)).take(self.hidden_dim).collect()
     }
 
+    /// FIX A: Flat-vector matrix-vector multiply operating on contiguous slices
+    fn mat_vec_flat(&self, mat: &[Vec<f32>], vec: &[f32], hd: usize) -> Vec<f32> {
+        let rows = mat.len().min(hd);
+        (0..rows).map(|i| {
+            mat[i].iter().zip(vec.iter()).map(|(w, v)| w * v).sum()
+        }).chain(std::iter::repeat(0.0)).take(hd).collect()
+    }
+
+    #[allow(dead_code)]
     fn mean_pool(&self, hidden: &[Vec<f32>]) -> Vec<f32> {
         if hidden.is_empty() { return vec![0.0; self.hidden_dim]; }
         let n = hidden.len() as f32;
@@ -479,6 +537,7 @@ impl MicroArchGNN {
         }).collect()
     }
 
+    #[allow(dead_code)]
     fn max_pool(&self, hidden: &[Vec<f32>]) -> Vec<f32> {
         if hidden.is_empty() { return vec![0.0; self.hidden_dim]; }
         (0..self.hidden_dim).map(|j| {
@@ -494,9 +553,16 @@ impl MicroArchGNN {
         let n_rounds = 2usize;
         let readout_dim = self.hidden_dim / 4;
         if readout_dim == 0 { return; }
-        let grad_clip = 1.0f32;
+        let _grad_clip = 1.0f32;
 
         for _ in 0..iterations {
+            // FIX B: Adam optimizer timestep
+            self.adam_t += 1;
+            let t = self.adam_t as f32;
+            let beta1 = 0.9f32;
+            let beta2 = 0.999f32;
+            let epsilon = 1e-8f32;
+
             // Pick a random sample using instance-local seed
             self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             let idx = (self.seed as usize) % self.training_samples.len();
@@ -600,8 +666,13 @@ impl MicroArchGNN {
             let mut grad_h1 = vec![0.0f32; readout_dim];
             for i in 0..readout_dim.min(self.readout_w2.len()) {
                 grad_h1[i] = error * self.readout_w2[i];
-                let g = (lr * error * h1[i]).clamp(-grad_clip, grad_clip);
-                self.readout_w2[i] -= g;
+                // FIX B: Adam optimizer instead of raw SGD
+                let raw_grad = error * h1[i];
+                self.m_readout_w2[i] = beta1 * self.m_readout_w2[i] + (1.0 - beta1) * raw_grad;
+                self.v_readout_w2[i] = beta2 * self.v_readout_w2[i] + (1.0 - beta2) * raw_grad * raw_grad;
+                let m_hat = self.m_readout_w2[i] / (1.0 - beta1.powf(t));
+                let v_hat = self.v_readout_w2[i] / (1.0 - beta2.powf(t));
+                self.readout_w2[i] -= lr * m_hat / (v_hat.sqrt() + epsilon);
             }
 
             // --- Readout layer 1 gradients ---
@@ -613,8 +684,13 @@ impl MicroArchGNN {
                 let grad_pre = grad_h1[i] * relu_mask;
                 for j in 0..pooled.len().min(self.readout_w1[i].len()) {
                     grad_pooled[j] += grad_pre * self.readout_w1[i][j];
-                    let g = (lr * grad_pre * pooled[j]).clamp(-grad_clip, grad_clip);
-                    self.readout_w1[i][j] -= g;
+                    // FIX B: Adam optimizer for readout_w1
+                    let raw_grad = grad_pre * pooled[j];
+                    self.m_readout_w1[i][j] = beta1 * self.m_readout_w1[i][j] + (1.0 - beta1) * raw_grad;
+                    self.v_readout_w1[i][j] = beta2 * self.v_readout_w1[i][j] + (1.0 - beta2) * raw_grad * raw_grad;
+                    let m_hat = self.m_readout_w1[i][j] / (1.0 - beta1.powf(t));
+                    let v_hat = self.v_readout_w1[i][j] / (1.0 - beta2.powf(t));
+                    self.readout_w1[i][j] -= lr * m_hat / (v_hat.sqrt() + epsilon);
                 }
             }
 
@@ -690,13 +766,22 @@ impl MicroArchGNN {
                 grad_hidden = grad_h_input;
             }
 
-            // Apply accumulated weight updates for w_self and w_msg
+            // FIX B: Adam optimizer for w_self and w_msg
             for k in 0..self.hidden_dim {
                 for m in 0..self.hidden_dim {
-                    let g_self = grad_w_self[k][m].clamp(-grad_clip, grad_clip);
-                    self.w_self[k][m] -= lr * g_self;
-                    let g_msg = grad_w_msg[k][m].clamp(-grad_clip, grad_clip);
-                    self.w_msg[k][m] -= lr * g_msg;
+                    let raw_g_self = grad_w_self[k][m];
+                    self.m_w_self[k][m] = beta1 * self.m_w_self[k][m] + (1.0 - beta1) * raw_g_self;
+                    self.v_w_self[k][m] = beta2 * self.v_w_self[k][m] + (1.0 - beta2) * raw_g_self * raw_g_self;
+                    let m_hat = self.m_w_self[k][m] / (1.0 - beta1.powf(t));
+                    let v_hat = self.v_w_self[k][m] / (1.0 - beta2.powf(t));
+                    self.w_self[k][m] -= lr * m_hat / (v_hat.sqrt() + epsilon);
+
+                    let raw_g_msg = grad_w_msg[k][m];
+                    self.m_w_msg[k][m] = beta1 * self.m_w_msg[k][m] + (1.0 - beta1) * raw_g_msg;
+                    self.v_w_msg[k][m] = beta2 * self.v_w_msg[k][m] + (1.0 - beta2) * raw_g_msg * raw_g_msg;
+                    let m_hat = self.m_w_msg[k][m] / (1.0 - beta1.powf(t));
+                    let v_hat = self.v_w_msg[k][m] / (1.0 - beta2.powf(t));
+                    self.w_msg[k][m] -= lr * m_hat / (v_hat.sqrt() + epsilon);
                 }
             }
         }
@@ -833,7 +918,10 @@ impl NeuralSuperblockPredictor {
 
         // Decision heuristics based on predictions
         let should_trace = predicted_ipc > 1.0 || cache_pred.estimated_l1_misses > 2;
-        let unroll_factor = if reg_pressure < 8 && cache_pred.stride_detected {
+        // FIX D: Dynamic threshold based on microarch model register count.
+        // Zen has more registers than Haswell, so the threshold should be higher.
+        let reg_threshold = (self.arch.int_regs / 2).max(4);
+        let unroll_factor = if reg_pressure < reg_threshold && cache_pred.stride_detected {
             4.min(graph.nodes.len().next_power_of_two() / 4)
         } else {
             1

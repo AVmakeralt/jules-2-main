@@ -43,6 +43,11 @@ pub enum Effect {
     Async,
     /// Effect not yet determined (conservative).
     Unknown,
+    /// FIX IR #2: Region-based mutation tracking. Instead of just saying
+    /// an expression has `Mutation`, the IR specifies *where* it mutates.
+    /// This allows the compiler to parallelize two mutating functions if
+    /// they operate on different memory regions ("Sanctuaries").
+    MutationIn(usize), // usize = RegionID
 }
 
 /// Ownership metadata for IR values.
@@ -725,6 +730,36 @@ pub enum IrExpr {
         ty: Ty,
         effect: Effect,
     },
+
+    // ── Explicit prefetch primitive ────────────────────────────────────────
+    /// FIX IR #1: Explicit prefetch primitive. Allows the Superoptimizer
+    /// to schedule prefetch instructions relative to compute instructions,
+    /// rather than having the JIT inject PREFETCHNTA at the last second.
+    /// The `addr` is the expression whose result should be prefetched,
+    /// and `hint` indicates the cache level (0=L1, 1=L2, 2=L3/NTA).
+    Prefetch {
+        addr: Box<IrExpr>,
+        hint: usize,
+        span: Span,
+    },
+
+    // ── Domain-Agnostic ParallelIterator ───────────────────────────────────
+    /// FIX IR #3: Domain-Agnostic ParallelIterator. Unifies ECS queries
+    /// and Tensor maps into a single node, allowing the optimizer to apply
+    /// the same fusion logic to a neural network layer as it does to an
+    /// ECS system update. This eliminates "compiler schizophrenia" by
+    /// merging domain-specific syntax early through isomorphic mapping.
+    ParallelIterator {
+        /// The collection being iterated (could be an ECS world, tensor, array, etc.)
+        collection: Box<IrExpr>,
+        /// The lambda/body to apply to each element
+        body: Box<IrExpr>,
+        /// Parallelism hint
+        parallelism: IrParallelismHint,
+        /// Effect of the body
+        body_effect: Effect,
+        span: Span,
+    },
 }
 
 // =============================================================================
@@ -886,6 +921,7 @@ impl fmt::Display for Effect {
             Effect::ControlFlow => write!(f, "control_flow"),
             Effect::Async => write!(f, "async"),
             Effect::Unknown => write!(f, "unknown"),
+            Effect::MutationIn(region) => write!(f, "mutation_in({})", region),
         }
     }
 }
@@ -1221,6 +1257,12 @@ impl IrExpr {
 
             // ── Trait method call — explicitly annotated ──
             IrExpr::TraitCall { effect, .. } => *effect,
+
+            // ── FIX IR #1: Prefetch is a hint, not a side effect ──
+            IrExpr::Prefetch { .. } => Effect::Pure,
+
+            // ── FIX IR #3: ParallelIterator inherits body effect ──
+            IrExpr::ParallelIterator { body_effect, .. } => *body_effect,
         }
     }
 }
@@ -1966,6 +2008,23 @@ impl IrValidator {
                     Self::check_vid(*vid, max_vid, fname, diags);
                 }
             }
+
+            // FIX IR #1: Prefetch validation
+            IrExpr::Prefetch { addr, hint, span: _ } => {
+                Self::validate_expr(addr, max_vid, max_bid, fname, diags);
+                if *hint > 2 {
+                    diags.push(Diagnostic::warning(
+                        Span::dummy(),
+                        "prefetch hint should be 0 (L1), 1 (L2), or 2 (NTA)".to_string(),
+                    ));
+                }
+            }
+
+            // FIX IR #3: ParallelIterator validation
+            IrExpr::ParallelIterator { collection, body, .. } => {
+                Self::validate_expr(collection, max_vid, max_bid, fname, diags);
+                Self::validate_expr(body, max_vid, max_bid, fname, diags);
+            }
         }
     }
 
@@ -2253,6 +2312,8 @@ bitflags::bitflags! {
         const SIMD = 1 << 6;
         /// Effect not yet determined (conservative — assume anything).
         const UNKNOWN = 1 << 7;
+        /// FIX IR #2: Region-aware mutation tracking
+        const REGION_MASK  = 0xFF00; // Upper byte can encode RegionID
     }
 }
 
@@ -2282,6 +2343,8 @@ impl EffectCapSet {
             Effect::ControlFlow => Self::CONTROL_FLOW,
             Effect::Async => Self::ASYNC,
             Effect::Unknown => Self::UNKNOWN,
+            // FIX IR #2: Region-based mutation maps to MUTATE with region encoding
+            Effect::MutationIn(_region) => Self::MUTATE,
         }
     }
 

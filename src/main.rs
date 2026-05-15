@@ -3122,7 +3122,10 @@ fn cmd_compile(args: &CliArgs) -> i32 {
     // Run full compilation pipeline
     let path_str = path.to_string_lossy().into_owned();
     let mut unit = CompileUnit::from_owned(path_str, source);
-    let result = Pipeline::new().run(&mut unit);
+    let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;  // FIX #4: Wire opt_level so -O0 doesn't run heavyweight passes
+    pipeline.quiet = args.quiet;
+    let result = pipeline.run(&mut unit);
 
     if unit.has_errors() {
         let msgs: Vec<_> = unit

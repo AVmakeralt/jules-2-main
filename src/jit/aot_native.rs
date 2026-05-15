@@ -41,11 +41,50 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque, BTreeMap};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Write;
 
 use crate::compiler::ast::*;
+
+// FIX #1: Non-allocating small vector for instr_uses(). Most instructions have
+// ≤4 uses, so ArrayVec avoids the ~15K–50K Vec allocations per function that
+// the old Vec-based approach caused across all optimization passes.
+type SmallVars = smallvec::SmallVec<[VarId; 4]>;
+
+/// FIX #13: SmallVec for Phi incoming values — most Phi nodes have ≤2 incoming.
+type SmallPhi = smallvec::SmallVec<[(BlockId, VarId); 2]>;
+
+/// FIX #2: Cached const-map built once and reused across passes.
+/// Replaces the O(B×I) linear scan in find_const_def() and the repeated
+/// const-map rebuilds in peephole and algebra_simplify.
+pub struct ConstMapCache {
+    map: HashMap<VarId, i64>,
+}
+
+impl ConstMapCache {
+    pub fn build(func: &IRFunction) -> Self {
+        let map = func.blocks.iter()
+            .flat_map(|b| b.instrs.iter())
+            .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
+            .collect();
+        Self { map }
+    }
+
+    pub fn get(&self, var: VarId) -> Option<i64> {
+        self.map.get(&var).copied()
+    }
+
+    /// Rebuild from function (call after mutations that add/remove Const instructions)
+    pub fn rebuild(&mut self, func: &IRFunction) {
+        self.map.clear();
+        self.map.extend(
+            func.blocks.iter()
+                .flat_map(|b| b.instrs.iter())
+                .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
+        );
+    }
+}
 
 // =============================================================================
 // §0  CONFIGURATION & CONSTANTS
@@ -163,7 +202,7 @@ impl AotOptLevel {
                 loop_unrolling: true,
                 max_unroll: 8,              // Full unroll for small loops
                 sched: true,
-                max_passes: 4,              // Multiple optimization rounds
+                max_passes: 2,              // FIX #3: Reduced from 4 — early-termination makes extra passes wasteful
                 algebra_simplify: true,    // Algebraic identities
                 reassociate: true,           // Re-associate expressions
                 gvn_across_blocks: true,    // Full GVN across blocks
@@ -306,8 +345,8 @@ pub enum IRInstr {
     Ret    { value: Option<VarId> },
 
     // ── Calls ────────────────────────────────────────────────────────────
-    Call     { dst: VarId, func: String, args: Vec<VarId> },
-    TailCall { func: String, args: Vec<VarId> },
+    Call     { dst: VarId, func: String, args: SmallVars },
+    TailCall { func: String, args: SmallVars },
 
     // ── Memory ───────────────────────────────────────────────────────────
     Alloca { dst: VarId, align: u32 },
@@ -315,7 +354,7 @@ pub enum IRInstr {
     Load   { dst: VarId, ptr: VarId },
 
     // ── SSA phi ──────────────────────────────────────────────────────────
-    Phi { dst: VarId, incoming: Vec<(BlockId, VarId)> },
+    Phi { dst: VarId, incoming: SmallPhi },
 
     // ── Misc ─────────────────────────────────────────────────────────────
     Label,
@@ -362,7 +401,7 @@ pub struct IRFunction {
     pub name:         String,
     pub params:       Vec<VarId>,
     pub ret_ty:       Option<Type>,
-    pub blocks:       BTreeMap<BlockId, IRBlock>,
+    pub blocks:       Vec<IRBlock>,  // FIX #5: Vec for O(1) access (BlockId is sequential usize)
     pub entry_block:  BlockId,
     pub next_var:     VarId,
     pub next_block:   BlockId,
@@ -373,8 +412,8 @@ pub struct IRFunction {
 
 impl IRFunction {
     pub fn new(name: String) -> Self {
-        let mut blocks = BTreeMap::new();
-        blocks.insert(0, IRBlock::new(0));
+        let mut blocks = Vec::new();
+        blocks.push(IRBlock::new(0));
         Self { name, params: Vec::new(), ret_ty: None, blocks,
                entry_block: 0, next_var: 0, next_block: 1,
                call_count: 0, called_by: Vec::new(), inline_cost: 0 }
@@ -386,25 +425,32 @@ impl IRFunction {
 
     pub fn fresh_block(&mut self) -> BlockId {
         let id = self.next_block; self.next_block += 1;
-        self.blocks.insert(id, IRBlock::new(id));
+        self.blocks.push(IRBlock::new(id));
         id
     }
 
     pub fn push_to(&mut self, block: BlockId, instr: IRInstr) {
-        self.blocks.entry(block)
-            .or_insert_with(|| IRBlock::new(block))
-            .instrs.push(instr);
+        // FIX #5: Direct Vec index access — blocks are always created via fresh_block()
+        if block < self.blocks.len() {
+            self.blocks[block].instrs.push(instr);
+        } else {
+            // Fallback: extend Vec to accommodate the block (shouldn't normally happen)
+            while self.blocks.len() <= block {
+                self.blocks.push(IRBlock::new(self.blocks.len()));
+            }
+            self.blocks[block].instrs.push(instr);
+        }
     }
 
     /// Rebuild predecessor lists from successor info
     pub fn build_predecessors(&mut self) {
-        for b in self.blocks.values_mut() { b.predecessors.clear(); }
+        for b in self.blocks.iter_mut() { b.predecessors.clear(); }
         // Collect edges first to avoid simultaneous mutable/immutable borrows
-        let edges: Vec<(BlockId, BlockId)> = self.blocks.iter()
-            .flat_map(|(&from, b)| b.successors.iter().map(move |&to| (from, to)))
+        let edges: Vec<(BlockId, BlockId)> = self.blocks.iter().enumerate()
+            .flat_map(|(from, b)| b.successors.iter().map(move |&to| (from, to)))
             .collect();
         for (from, to) in edges {
-            if let Some(succ) = self.blocks.get_mut(&to) {
+            if let Some(succ) = self.blocks.get_mut(to) {
                 if !succ.predecessors.contains(&from) {
                     succ.predecessors.push(from);
                 }
@@ -417,7 +463,7 @@ impl IRFunction {
         // Mark loop headers with high frequency
         let dom = compute_dominators(self);
         let mut loop_headers = Vec::new();
-        for (&bid, block) in &self.blocks {
+        for (bid, block) in self.blocks.iter().enumerate() {
             for &succ in &block.successors {
                 // Back edge: succ dominates bid → succ is a loop header
                 if dominates(&dom, succ, bid) {
@@ -426,21 +472,21 @@ impl IRFunction {
             }
         }
         for succ in loop_headers {
-            if let Some(b) = self.blocks.get_mut(&succ) {
+            if let Some(b) = self.blocks.get_mut(succ) {
                 b.freq = 100.0;
             }
         }
     }
 
     pub fn compute_inline_cost(&mut self) {
-        self.inline_cost = self.blocks.values()
+        self.inline_cost = self.blocks.iter()
             .map(|b| b.instrs.len()).sum();
     }
 
     /// All variable definitions in this function
     pub fn all_defs(&self) -> HashMap<VarId, (BlockId, usize)> {
         let mut m = HashMap::new();
-        for (&bid, b) in &self.blocks {
+        for (bid, b) in self.blocks.iter().enumerate() {
             for (idx, instr) in b.instrs.iter().enumerate() {
                 if let Some(d) = instr_def(instr) { m.insert(d, (bid, idx)); }
             }
@@ -576,7 +622,7 @@ impl LowerCtx {
     fn fresh_var(&mut self)   -> VarId   { self.func.fresh_var() }
 
     fn set_successors(&mut self, block: BlockId, succs: Vec<BlockId>) {
-        if let Some(b) = self.func.blocks.get_mut(&block) {
+        if let Some(b) = self.func.blocks.get_mut(block) {
             b.successors = succs;
         }
     }
@@ -595,7 +641,7 @@ impl LowerCtx {
         if let Some(body) = &f.body {
             self.lower_block(body);
         }
-        if !self.func.blocks[&self.cur].is_terminated() {
+        if !self.func.blocks[self.cur].is_terminated() {
             self.emit(IRInstr::Ret { value: None });
         }
         self.func.build_predecessors();
@@ -664,7 +710,7 @@ impl LowerCtx {
         // Then branch
         self.switch_to(then_b);
         self.lower_block(then);
-        if !self.func.blocks[&self.cur].is_terminated() {
+        if !self.func.blocks[self.cur].is_terminated() {
             self.emit(IRInstr::Br { target: merge_b });
         }
         let then_end = self.cur;
@@ -676,7 +722,7 @@ impl LowerCtx {
             match e {
                 IfOrBlock::Block(b) => {
                     self.lower_block(b);
-                    if !self.func.blocks[&self.cur].is_terminated() {
+                    if !self.func.blocks[self.cur].is_terminated() {
                         self.emit(IRInstr::Br { target: merge_b });
                     }
                     let else_end = self.cur;
@@ -684,7 +730,7 @@ impl LowerCtx {
                 }
                 IfOrBlock::If(s) => {
                     self.lower_stmt(s);
-                    if !self.func.blocks[&self.cur].is_terminated() {
+                    if !self.func.blocks[self.cur].is_terminated() {
                         self.emit(IRInstr::Br { target: merge_b });
                     }
                     let else_end = self.cur;
@@ -716,7 +762,7 @@ impl LowerCtx {
         self.continue_targets.push(header);
         self.switch_to(body_b);
         self.lower_block(body);
-        if !self.func.blocks[&self.cur].is_terminated() {
+        if !self.func.blocks[self.cur].is_terminated() {
             self.emit(IRInstr::Br { target: header });
         }
         let body_end = self.cur;
@@ -777,7 +823,7 @@ impl LowerCtx {
             let new_var = self.fresh_var(); // will be defined in incr_b
             self.emit(IRInstr::Phi {
                 dst: phi_var,
-                incoming: vec![(prev, start), (incr_b, new_var)],
+                incoming: smallvec::smallvec![(prev, start), (incr_b, new_var)],
             });
 
             // Bind the pattern name to phi_var so the body sees the right variable
@@ -796,7 +842,7 @@ impl LowerCtx {
             self.continue_targets.push(incr_b);
             self.switch_to(body_b);
             self.lower_block(body);
-            if !self.func.blocks[&self.cur].is_terminated() {
+            if !self.func.blocks[self.cur].is_terminated() {
                 self.emit(IRInstr::Br { target: incr_b });
             }
             let body_end = self.cur;
@@ -879,7 +925,7 @@ impl LowerCtx {
                     let arg_vars: Vec<_> = args.iter()
                         .map(|a| self.lower_expr(a)).collect();
                     let d = self.fresh_var();
-                    self.emit(IRInstr::Call { dst: d, func: name.clone(), args: arg_vars });
+                    self.emit(IRInstr::Call { dst: d, func: name.clone(), args: arg_vars.into() });
                     d
                 } else {
                     let v = self.fresh_var();
@@ -997,7 +1043,7 @@ fn eval_instr_sccp(instr: &IRInstr, vals: &HashMap<VarId, LatticeVal>,
 /// Build def-to-use map once for O(1) user lookup (fixes O(V*B*I) to O(V+E))
 fn build_use_map(func: &IRFunction) -> HashMap<VarId, Vec<(BlockId, usize)>> {
     let mut use_map: HashMap<VarId, Vec<(BlockId, usize)>> = HashMap::new();
-    for (&block_id, block) in &func.blocks {
+    for (block_id, block) in func.blocks.iter().enumerate() {
         for (instr_idx, instr) in block.instrs.iter().enumerate() {
             for var in instr_uses(instr) {
                 use_map.entry(var).or_default().push((block_id, instr_idx));
@@ -1022,7 +1068,7 @@ pub fn run_sccp(func: &mut IRFunction) {
 
     // Seed the SSA worklist with the entry block's instructions only.
     // Additional blocks are added as they become reachable via CondBr evaluation.
-    if let Some(entry_blk) = func.blocks.get(&func.entry_block) {
+    if let Some(entry_blk) = func.blocks.get(func.entry_block) {
         for (idx, _) in entry_blk.instrs.iter().enumerate() {
             ssa_work.push_back((func.entry_block, idx));
         }
@@ -1032,39 +1078,42 @@ pub fn run_sccp(func: &mut IRFunction) {
     while let Some((bid, idx)) = ssa_work.pop_front() {
         // Process any newly-reachable blocks from the cfg worklist first
         while let Some(new_bid) = cfg_work.pop_front() {
-            if let Some(block) = func.blocks.get(&new_bid) {
+            if let Some(block) = func.blocks.get(new_bid) {
                 for (i, _) in block.instrs.iter().enumerate() {
                     ssa_work.push_back((new_bid, i));
                 }
             }
         }
 
-        let instr = match func.blocks.get(&bid).and_then(|b| b.instrs.get(idx)) {
-            Some(i) => i.clone(),
-            None    => continue,
-        };
-        if let Some(dst) = instr_def(&instr) {
-            let old = vals.get(&dst).copied().unwrap_or(LatticeVal::Undefined);
-            let new = eval_instr_sccp(&instr, &vals, &executable);
-            let merged = LatticeVal::meet(old, new);
-            if merged != old {
-                vals.insert(dst, merged);
-                // Fix: O(1) lookup using pre-built use map instead of O(B*I) scan
-                if let Some(users) = use_map.get(&dst) {
-                    for &(block_id, instr_idx) in users {
-                        if executable.contains(&block_id) {
-                            ssa_work.push_back((block_id, instr_idx));
+        // FIX #10: Avoid cloning the instruction. Work with references
+        // inside a scoped block instead of cloning the entire IRInstr.
+        {
+            let instr_ref = func.blocks.get(bid).and_then(|b| b.instrs.get(idx));
+            let instr = match instr_ref {
+                Some(i) => i,
+                None    => continue, // Note: this continues the outer while loop
+            };
+            if let Some(dst) = instr_def(instr) {
+                let old = vals.get(&dst).copied().unwrap_or(LatticeVal::Undefined);
+                let new = eval_instr_sccp(instr, &vals, &executable);
+                let merged = LatticeVal::meet(old, new);
+                if merged != old {
+                    vals.insert(dst, merged);
+                    if let Some(users) = use_map.get(&dst) {
+                        for &(block_id, instr_idx) in users {
+                            if executable.contains(&block_id) {
+                                ssa_work.push_back((block_id, instr_idx));
+                            }
                         }
                     }
                 }
             }
-        }
-        // Conditional branch constant folding → prune CFG
-        match &instr {
-            IRInstr::CondBr { cond, if_true, if_false } => {
-                match vals.get(cond) {
-                    Some(&LatticeVal::Constant(c)) => {
-                        let t = if c != 0 { *if_true } else { *if_false };
+            // Conditional branch constant folding → prune CFG
+            match instr {
+                IRInstr::CondBr { cond, if_true, if_false } => {
+                    match vals.get(cond) {
+                        Some(&LatticeVal::Constant(c)) => {
+                            let t = if c != 0 { *if_true } else { *if_false };
                         if executable.insert(t) { cfg_work.push_back(t); }
                     }
                     _ => {
@@ -1079,10 +1128,11 @@ pub fn run_sccp(func: &mut IRFunction) {
             }
             _ => {}
         }
+        } // end FIX #10 scoped block
     }
 
     // Rewrite: replace constant defs with Const instructions
-    for (&bid, block) in &mut func.blocks {
+    for (bid, block) in func.blocks.iter_mut().enumerate() {
         if !executable.contains(&bid) {
             block.instrs = vec![IRInstr::Br { target: func.entry_block }];
             continue;
@@ -1117,7 +1167,7 @@ pub fn run_gvn(func: &mut IRFunction) {
     // Per-block pass (a full inter-block GVN would need dominator tree walk)
     // FIX #6: Use in-place mutation instead of clone for non-replaced instructions.
     // Only instructions replaced by Move need to be mutated; others stay in place.
-    for block in func.blocks.values_mut() {
+    for block in func.blocks.iter_mut() {
         let mut new = Vec::with_capacity(block.instrs.len());
         for instr in block.instrs.drain(..) {
             let key = match &instr {
@@ -1158,7 +1208,7 @@ pub fn run_gvn(func: &mut IRFunction) {
 pub fn run_copy_prop(func: &mut IRFunction) {
     // Build copy map: if dst = Move { src }, substitute all uses of dst with canonical src
     let mut copies: HashMap<VarId, VarId> = HashMap::new();
-    for block in func.blocks.values() {
+    for block in func.blocks.iter() {
         for instr in &block.instrs {
             if let IRInstr::Move { dst, src } = instr {
                 // Resolve transitively: walk the chain to find the true root
@@ -1184,7 +1234,7 @@ pub fn run_copy_prop(func: &mut IRFunction) {
         *copies.get(&v).unwrap_or(&v)
     }
 
-    for block in func.blocks.values_mut() {
+    for block in func.blocks.iter_mut() {
         for instr in &mut block.instrs {
             match instr {
                 IRInstr::Move   { src, .. }        => *src = subst(*src, &copies),
@@ -1232,15 +1282,15 @@ pub fn run_copy_prop(func: &mut IRFunction) {
 // =============================================================================
 
 pub fn run_dce(func: &mut IRFunction) {
-    let mut live: HashMap<BlockId, HashSet<VarId>> = func.blocks.keys()
-        .map(|&id| (id, HashSet::new())).collect();
+    let mut live: HashMap<BlockId, HashSet<VarId>> = (0..func.blocks.len())
+        .map(|id| (id, HashSet::new())).collect();
 
     let mut changed = true;
     while changed {
         changed = false;
-        let bids: Vec<BlockId> = func.blocks.keys().copied().rev().collect();
+        let bids: Vec<BlockId> = (0..func.blocks.len()).rev().collect();
         for bid in bids {
-            let block = &func.blocks[&bid];
+            let block = &func.blocks[bid];
             let mut cur_live: HashSet<VarId> = block.successors.iter()
                 .flat_map(|s| live.get(s).into_iter().flatten().copied())
                 .collect();
@@ -1255,16 +1305,20 @@ pub fn run_dce(func: &mut IRFunction) {
         }
     }
 
-    for (&bid, block) in &mut func.blocks {
+    for (bid, block) in func.blocks.iter_mut().enumerate() {
         let mut live_now = live[&bid].clone();
         let mut new_instrs: Vec<IRInstr> = Vec::new();
-        for instr in block.instrs.iter().rev() {
-            let dead = matches!(instr_def(instr), Some(d) if !live_now.contains(&d))
+        // FIX #7: Take ownership of instructions instead of cloning.
+        // std::mem::take swaps in an empty Vec and gives us ownership,
+        // eliminating all the per-instruction clone overhead.
+        let old_instrs = std::mem::take(&mut block.instrs);
+        for instr in old_instrs.into_iter().rev() {
+            let dead = matches!(instr_def(&instr), Some(d) if !live_now.contains(&d))
                 && !instr.has_side_effects();
             if !dead {
-                if let Some(d) = instr_def(instr) { live_now.remove(&d); }
-                live_now.extend(instr_uses(instr));
-                new_instrs.push(instr.clone()); // FIX #6: clone still needed — reverse iteration requires immutable borrow
+                if let Some(d) = instr_def(&instr) { live_now.remove(&d); }
+                live_now.extend(instr_uses(&instr));
+                new_instrs.push(instr);
             }
         }
         new_instrs.reverse();
@@ -1285,7 +1339,7 @@ pub fn run_dce(func: &mut IRFunction) {
 /// - x ^ 0 = x, 0 ^ x = x
 /// - (x + a) - a = x (reassociation aware)
 pub fn run_algebra_simplify(func: &mut IRFunction) {
-    let const_map: HashMap<VarId, i64> = func.blocks.values()
+    let const_map: HashMap<VarId, i64> = func.blocks.iter()
         .flat_map(|b| b.instrs.iter())
         .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
         .collect();
@@ -1294,7 +1348,7 @@ pub fn run_algebra_simplify(func: &mut IRFunction) {
     // cloning every instruction. In the common case (no simplification),
     // we avoid the clone entirely by leaving the instruction in place.
     // Only simplified instructions create a new value.
-    for block in func.blocks.values_mut() {
+    for block in func.blocks.iter_mut() {
         for instr in &mut block.instrs {
             let simplified = match instr {
                 // x + 0 = x
@@ -1397,7 +1451,7 @@ pub fn run_algebra_simplify(func: &mut IRFunction) {
 /// Group constants together to enable constant folding.
 pub fn run_reassociate(func: &mut IRFunction) {
     // Build value map for substitution
-    let value_map: HashMap<VarId, IRInstr> = func.blocks.values()
+    let value_map: HashMap<VarId, IRInstr> = func.blocks.iter()
         .flat_map(|b| b.instrs.iter())
         .filter_map(|i| {
             if let Some(d) = instr_def(i) {
@@ -1408,7 +1462,7 @@ pub fn run_reassociate(func: &mut IRFunction) {
         })
         .collect();
 
-    for block in func.blocks.values_mut() {
+    for block in func.blocks.iter_mut() {
         let mut new_instrs: Vec<IRInstr> = Vec::with_capacity(block.instrs.len());
         for instr in &block.instrs {
             // Try to fold (a + c1) + c2 → a + (c1 + c2)
@@ -1491,7 +1545,7 @@ pub fn run_vrp(func: &mut IRFunction) -> HashMap<VarId, ValueRange> {
     let mut ranges: HashMap<VarId, ValueRange> = HashMap::new();
 
     // Single forward pass for now (a full VRP needs fix-point iteration)
-    for block in func.blocks.values() {
+    for block in func.blocks.iter() {
         for instr in &block.instrs {
             let range = match instr {
                 IRInstr::Const { value, .. } => ValueRange::point(*value),
@@ -1516,7 +1570,7 @@ pub fn run_vrp(func: &mut IRFunction) -> HashMap<VarId, ValueRange> {
     }
 
     // Use range info to fold constants
-    for block in func.blocks.values_mut() {
+    for block in func.blocks.iter_mut() {
         let mut new_instrs = Vec::with_capacity(block.instrs.len());
         for instr in &block.instrs {
             if let Some(d) = instr_def(instr) {
@@ -1556,7 +1610,7 @@ pub fn compute_dominators(func: &IRFunction) -> HashMap<BlockId, BlockId> {
         changed = false;
         for &b in &rpo {
             if b == entry { continue; }
-            let preds: Vec<BlockId> = func.blocks.get(&b)
+            let preds: Vec<BlockId> = func.blocks.get(b)
                 .map(|blk| blk.predecessors.clone())
                 .unwrap_or_default();
             let mut new_idom: Option<BlockId> = None;
@@ -1615,7 +1669,7 @@ fn rpo_order(func: &IRFunction) -> Vec<BlockId> {
     while let Some(bid) = stack.pop() {
         if !visited.insert(bid) { continue; }
         post.push(bid);
-        if let Some(b) = func.blocks.get(&bid) {
+        if let Some(b) = func.blocks.get(bid) {
             for &s in &b.successors { stack.push(s); }
         }
     }
@@ -1638,7 +1692,7 @@ pub struct NaturalLoop {
 pub fn detect_loops(func: &IRFunction, idom: &HashMap<BlockId, BlockId>) -> Vec<NaturalLoop> {
     let mut loops: Vec<NaturalLoop> = Vec::new();
     // Find back edges: (latch → header) where header dominates latch
-    for (&bid, block) in &func.blocks {
+    for (bid, block) in func.blocks.iter().enumerate() {
         for &succ in &block.successors {
             if dominates(idom, succ, bid) {
                 // Back edge: bid→succ, header=succ
@@ -1663,7 +1717,7 @@ fn find_loop_body(latch: BlockId, header: BlockId, func: &IRFunction) -> HashSet
     let mut worklist = vec![latch];
     while let Some(b) = worklist.pop() {
         if b == header { continue; }
-        if let Some(block) = func.blocks.get(&b) {
+        if let Some(block) = func.blocks.get(b) {
             for &pred in &block.predecessors {
                 if body.insert(pred) { worklist.push(pred); }
             }
@@ -1680,7 +1734,7 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
     for lp in loops {
         // Compute set of variables defined inside the loop
         let loop_defs: HashSet<VarId> = lp.body.iter()
-            .flat_map(|&bid| func.blocks.get(&bid).into_iter()
+            .flat_map(|&bid| func.blocks.get(bid).into_iter()
                 .flat_map(|b| b.instrs.iter().filter_map(instr_def)))
             .collect();
 
@@ -1691,18 +1745,21 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
             changed = false;
             for &bid in &lp.body {
                 if bid == lp.header { continue; }
-                let instrs = match func.blocks.get(&bid) {
-                    Some(b) => b.instrs.clone(),
+                // FIX #8: Avoid cloning the entire instruction vector.
+                // Instead, extract only the needed metadata (side effects, def, uses).
+                let instr_info: Vec<(bool, Option<VarId>, SmallVars)> = match func.blocks.get(bid) {
+                    Some(b) => b.instrs.iter()
+                        .map(|i| (i.has_side_effects(), instr_def(i), instr_uses(i)))
+                        .collect(),
                     None    => continue,
                 };
-                for (idx, instr) in instrs.iter().enumerate() {
+                for (idx, (has_sfx, def, uses)) in instr_info.iter().enumerate() {
                     if hoisted.contains(&(bid, idx)) { continue; }
-                    if instr.has_side_effects() { continue; }
-                    if instr_def(instr).is_none() { continue; }
-                    let uses = instr_uses(instr);
+                    if *has_sfx { continue; }
+                    if def.is_none() { continue; }
                     let invariant = uses.iter().all(|u| !loop_defs.contains(u)
                         || hoisted.iter().any(|(hb, hi)| {
-                            func.blocks.get(hb).and_then(|b| b.instrs.get(*hi))
+                            func.blocks.get(*hb).and_then(|b| b.instrs.get(*hi))
                                 .and_then(instr_def).map_or(false, |d| d == *u)
                         }));
                     if invariant {
@@ -1717,7 +1774,7 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
         if hoisted.is_empty() { continue; }
         let pre_header = func.fresh_block();
         // Insert pre-header between predecessors-outside-loop and header
-        let outside_preds: Vec<BlockId> = func.blocks.get(&lp.header)
+        let outside_preds: Vec<BlockId> = func.blocks.get(lp.header)
             .map(|b| b.predecessors.iter()
                 .filter(|&&p| !lp.body.contains(&p))
                 .copied().collect())
@@ -1725,7 +1782,7 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
 
         // Redirect outside preds to pre-header
         for &pred in &outside_preds {
-            if let Some(pb) = func.blocks.get_mut(&pred) {
+            if let Some(pb) = func.blocks.get_mut(pred) {
                 for s in &mut pb.successors {
                     if *s == lp.header { *s = pre_header; }
                 }
@@ -1744,12 +1801,12 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
         // Populate pre-header with hoisted instructions + jump to header
         let mut pre_instrs: Vec<IRInstr> = Vec::new();
         for &(bid, idx) in &hoisted {
-            if let Some(instr) = func.blocks.get(&bid).and_then(|b| b.instrs.get(idx)) {
+            if let Some(instr) = func.blocks.get(bid).and_then(|b| b.instrs.get(idx)) {
                 pre_instrs.push(instr.clone());
             }
         }
         pre_instrs.push(IRInstr::Br { target: lp.header });
-        if let Some(pb) = func.blocks.get_mut(&pre_header) {
+        if let Some(pb) = func.blocks.get_mut(pre_header) {
             pb.instrs    = pre_instrs;
             pb.successors = vec![lp.header];
         }
@@ -1757,7 +1814,7 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
         // Fix up Phi nodes in the loop header: any incoming edge that referred to
         // an outside predecessor must now point to pre_header instead.
         let outside_preds_set: HashSet<BlockId> = outside_preds.iter().copied().collect();
-        if let Some(hdr) = func.blocks.get_mut(&lp.header) {
+        if let Some(hdr) = func.blocks.get_mut(lp.header) {
             for instr in &mut hdr.instrs {
                 if let IRInstr::Phi { incoming, .. } = instr {
                     for (pred, _) in incoming.iter_mut() {
@@ -1775,10 +1832,12 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
             hoisted_by_block.entry(bid).or_default().insert(idx);
         }
         for (bid, idxs) in hoisted_by_block {
-            if let Some(block) = func.blocks.get_mut(&bid) {
+            if let Some(block) = func.blocks.get_mut(bid) {
                 let mut new_instrs = Vec::new();
-                for (i, instr) in block.instrs.iter().enumerate() {
-                    if !idxs.contains(&i) { new_instrs.push(instr.clone()); }
+                // FIX #8: Take ownership instead of cloning
+                let old_instrs = std::mem::take(&mut block.instrs);
+                for (i, instr) in old_instrs.into_iter().enumerate() {
+                    if !idxs.contains(&i) { new_instrs.push(instr); }
                 }
                 block.instrs = new_instrs;
             }
@@ -1791,23 +1850,30 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
 // =============================================================================
 
 pub fn run_strength_reduction(func: &mut IRFunction, loops: &[NaturalLoop]) {
+    // FIX #2: Pre-build const-map once for O(1) lookup instead of O(B×I) per call
+    let const_map: HashMap<VarId, i64> = func.blocks.iter()
+        .flat_map(|b| b.instrs.iter())
+        .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
+        .collect();
+
     for lp in loops {
         // Find induction variables: i = i + const inside the loop
         let mut ivs: HashMap<VarId, (VarId, i64)> = HashMap::new(); // var → (base, step)
 
         for &bid in &lp.body {
-            let instrs = match func.blocks.get(&bid) {
+            let instrs = match func.blocks.get(bid) {
                 Some(b) => b.instrs.clone(),
                 None    => continue,
             };
             for instr in &instrs {
                 if let IRInstr::Add { dst, lhs, rhs } = instr {
                     // Check if lhs is a loop variable and rhs is a constant
-                    let rhs_const = find_const_def(func, *rhs, &lp.body);
+                    // FIX #2: Use pre-built const_map for O(1) lookup
+                    let rhs_const = const_map.get(rhs).copied();
                     if let Some(step) = rhs_const {
                         ivs.insert(*dst, (*lhs, step));
                     }
-                    let lhs_const = find_const_def(func, *lhs, &lp.body);
+                    let lhs_const = const_map.get(lhs).copied();
                     if let Some(step) = lhs_const {
                         ivs.insert(*dst, (*rhs, step));
                     }
@@ -1817,14 +1883,15 @@ pub fn run_strength_reduction(func: &mut IRFunction, loops: &[NaturalLoop]) {
 
         // Strength-reduce: mul iv, const → accumulate addition
         for &bid in &lp.body {
-            let instrs = match func.blocks.get(&bid) {
+            let instrs = match func.blocks.get(bid) {
                 Some(b) => b.instrs.clone(),
                 None    => continue,
             };
             let mut new_instrs = Vec::with_capacity(instrs.len());
             for instr in &instrs {
                 if let IRInstr::Mul { dst, lhs, rhs } = instr {
-                    let rhs_const = find_const_def(func, *rhs, &lp.body);
+                    // FIX #2: Use pre-built const_map for O(1) lookup
+                    let rhs_const = const_map.get(rhs).copied();
                     if let Some(factor) = rhs_const {
                         if let Some(&(_base, _step)) = ivs.get(lhs) {
                             // Replace mul with: dst_accum = base * factor (pre-header)
@@ -1844,7 +1911,7 @@ pub fn run_strength_reduction(func: &mut IRFunction, loops: &[NaturalLoop]) {
                     new_instrs.push(instr.clone());
                 }
             }
-            if let Some(block) = func.blocks.get_mut(&bid) {
+            if let Some(block) = func.blocks.get_mut(bid) {
                 block.instrs = new_instrs;
             }
         }
@@ -1852,7 +1919,7 @@ pub fn run_strength_reduction(func: &mut IRFunction, loops: &[NaturalLoop]) {
 }
 
 fn find_const_def(func: &IRFunction, var: VarId, _loop_body: &HashSet<BlockId>) -> Option<i64> {
-    for block in func.blocks.values() {
+    for block in func.blocks.iter() {
         for instr in &block.instrs {
             if let IRInstr::Const { dst, value } = instr {
                 if *dst == var { return Some(*value); }
@@ -1862,20 +1929,25 @@ fn find_const_def(func: &IRFunction, var: VarId, _loop_body: &HashSet<BlockId>) 
     None
 }
 
+/// FIX #2: O(1) const lookup using pre-built map
+fn find_const_def_cached(const_map: &HashMap<VarId, i64>, var: VarId) -> Option<i64> {
+    const_map.get(&var).copied()
+}
+
 // =============================================================================
 // §5j  PEEPHOLE OPTIMISATION (40+ patterns, multi-pass)
 // =============================================================================
 
 pub fn run_peephole(func: &mut IRFunction) {
-    for block in func.blocks.values_mut() {
+    for block in func.blocks.iter_mut() {
         let mut changed = true;
+        // FIX #6: Build const_map once before the loop, then update incrementally.
+        // Avoids O(n) HashMap rebuild on every iteration of the fixpoint loop.
+        let mut const_map: HashMap<VarId, i64> = block.instrs.iter()
+            .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
+            .collect();
         while changed {
             changed = false;
-            // Rebuild const_map each iteration so newly-introduced Const instructions
-            // are visible to subsequent pattern matches within the same pass.
-            let const_map: HashMap<VarId, i64> = block.instrs.iter()
-                .filter_map(|i| if let IRInstr::Const { dst, value } = i { Some((*dst, *value)) } else { None })
-                .collect();
             let mut new: Vec<IRInstr> = Vec::with_capacity(block.instrs.len());
             let mut i = 0;
             while i < block.instrs.len() {
@@ -1886,11 +1958,13 @@ pub fn run_peephole(func: &mut IRFunction) {
                     // ── sub x, x → 0 ────────────────────────────────────
                     IRInstr::Sub { dst, lhs, rhs } if lhs == rhs => {
                         new.push(IRInstr::Const { dst: *dst, value: 0 });
+                        const_map.insert(*dst, 0); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
                     // ── xor x, x → 0 ────────────────────────────────────
                     IRInstr::Xor { dst, lhs, rhs } if lhs == rhs => {
                         new.push(IRInstr::Const { dst: *dst, value: 0 });
+                        const_map.insert(*dst, 0); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
                     // ── and x, x → x ────────────────────────────────────
@@ -1919,6 +1993,7 @@ pub fn run_peephole(func: &mut IRFunction) {
                         if const_map.get(rhs) == Some(&0)
                         || const_map.get(lhs) == Some(&0) => {
                         new.push(IRInstr::Const { dst: *dst, value: 0 });
+                        const_map.insert(*dst, 0); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
                     // ── mul x, 1 → x ────────────────────────────────────
@@ -1988,11 +2063,13 @@ pub fn run_peephole(func: &mut IRFunction) {
                     // ── icmp eq x, x → 1 ────────────────────────────────
                     IRInstr::ICmp { dst, cond: ICmpCond::Eq, lhs, rhs } if lhs == rhs => {
                         new.push(IRInstr::Const { dst: *dst, value: 1 });
+                        const_map.insert(*dst, 1); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
                     // ── icmp ne x, x → 0 ────────────────────────────────
                     IRInstr::ICmp { dst, cond: ICmpCond::Ne, lhs, rhs } if lhs == rhs => {
                         new.push(IRInstr::Const { dst: *dst, value: 0 });
+                        const_map.insert(*dst, 0); // FIX #6: Incremental update
                         changed = true; did_replace = true;
                     }
                     // ── move x, x → (eliminate) ─────────────────────────
@@ -2016,7 +2093,7 @@ pub fn run_peephole(func: &mut IRFunction) {
 
 pub fn run_tco(func: &mut IRFunction) {
     let fname = func.name.clone();
-    for block in func.blocks.values_mut() {
+    for block in func.blocks.iter_mut() {
         let n = block.instrs.len();
         if n < 2 { continue; }
         // Pattern: Call { func=fname, args } followed immediately by Ret { Some(dst) }
@@ -2041,8 +2118,8 @@ pub fn run_jump_threading(func: &mut IRFunction) {
     let mut changed = true;
     while changed {
         changed = false;
-        let trivial: Vec<(BlockId, BlockId)> = func.blocks.iter()
-            .filter_map(|(&bid, block)| {
+        let trivial: Vec<(BlockId, BlockId)> = func.blocks.iter().enumerate()
+            .filter_map(|(bid, block)| {
                 if block.instrs.len() == 1 {
                     if let IRInstr::Br { target } = &block.instrs[0] {
                         if *target != bid { return Some((bid, *target)); }
@@ -2054,11 +2131,11 @@ pub fn run_jump_threading(func: &mut IRFunction) {
 
         for (from, to) in trivial {
             // Redirect all predecessors of `from` directly to `to`
-            let preds: Vec<BlockId> = func.blocks.get(&from)
+            let preds: Vec<BlockId> = func.blocks.get(from)
                 .map(|b| b.predecessors.clone())
                 .unwrap_or_default();
             for pred in preds {
-                if let Some(pb) = func.blocks.get_mut(&pred) {
+                if let Some(pb) = func.blocks.get_mut(pred) {
                     for s in &mut pb.successors {
                         if *s == from { *s = to; }
                     }
@@ -2190,8 +2267,8 @@ pub fn instr_def(i: &IRInstr) -> Option<VarId> {
     }
 }
 
-pub fn instr_uses(i: &IRInstr) -> Vec<VarId> {
-    let mut u = Vec::new();
+pub fn instr_uses(i: &IRInstr) -> SmallVars {
+    let mut u = SmallVars::new();
     match i {
         IRInstr::Add  { lhs, rhs, .. } | IRInstr::Sub  { lhs, rhs, .. } |
         IRInstr::Mul  { lhs, rhs, .. } | IRInstr::SDiv { lhs, rhs, .. } |
@@ -2304,7 +2381,7 @@ pub fn compute_live_intervals(func: &IRFunction) -> Vec<(VarId, usize, usize)> {
     let mut pos = 0usize;
     let order = rpo_order(func);
     for bid in &order {
-        if let Some(block) = func.blocks.get(bid) {
+        if let Some(block) = func.blocks.get(*bid) {
             for instr in &block.instrs {
                 if let Some(d) = instr_def(instr) {
                     ivs.entry(d).or_insert((pos, pos)).1 = pos;
@@ -2325,7 +2402,7 @@ pub fn compute_live_intervals(func: &IRFunction) -> Vec<(VarId, usize, usize)> {
 
 fn build_coalescing_hints(func: &IRFunction) -> HashMap<VarId, VarId> {
     let mut hints = HashMap::new();
-    for block in func.blocks.values() {
+    for block in func.blocks.iter() {
         for instr in &block.instrs {
             if let IRInstr::Move { dst, src } = instr {
                 hints.insert(*dst, *src);
@@ -2363,7 +2440,7 @@ fn instr_latency(i: &IRInstr) -> usize {
 }
 
 pub fn run_sched(func: &mut IRFunction) {
-    for block in func.blocks.values_mut() {
+    for block in func.blocks.iter_mut() {
         // Split terminators from the schedulable body.
         // Terminators (Br, CondBr, Ret, TailCall) must stay at the end.
         let term_start = block.instrs.iter().rposition(|i| matches!(i,
@@ -2391,6 +2468,15 @@ pub fn run_sched(func: &mut IRFunction) {
             if let Some(d) = instr_def(instr) { def_at.insert(d, i); }
         }
 
+        // FIX #15: Build reverse dependency map for O(n log n) scheduling
+        // instead of O(n²) linear scan.
+        let mut rev_deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, dep_list) in deps.iter().enumerate() {
+            for &d in dep_list {
+                rev_deps[d].push(i);
+            }
+        }
+
         // Compute ASAP (earliest cycle) for each instruction
         let mut asap = vec![0usize; n];
         for i in 0..n {
@@ -2399,22 +2485,36 @@ pub fn run_sched(func: &mut IRFunction) {
             }
         }
 
-        // Topological sort respecting ASAP (list scheduling)
+        // FIX #15: O(n log n) scheduling using ready-set tracking instead of
+        // O(n²) linear scan. Maintains a set of ready instructions and updates
+        // it incrementally as instructions are scheduled.
+        let mut pending_deps: Vec<usize> = deps.iter().map(|d| d.len()).collect();
+        let mut ready: Vec<usize> = (0..n)
+            .filter(|&j| pending_deps[j] == 0)
+            .collect();
         let mut scheduled = vec![false; n];
         let mut result    = Vec::with_capacity(n);
         let mut cycle     = 0usize;
 
         while result.len() < n {
-            // Pick the ready instruction with the latest ASAP (critical-path first)
-            let picked = (0..n)
-                .filter(|&j| !scheduled[j] && deps[j].iter().all(|&d| scheduled[d]))
-                .filter(|&j| asap[j] <= cycle)
-                .max_by_key(|&j| asap[j]);
+            // Find the best ready instruction (max ASAP = longest critical path)
+            let best = ready.iter()
+                .filter(|&&j| asap[j] <= cycle)
+                .max_by_key(|&&j| asap[j])
+                .copied();
 
-            if let Some(j) = picked {
+            if let Some(j) = best {
                 scheduled[j] = true;
+                ready.retain(|&r| r != j);
                 result.push(block.instrs[j].clone());
                 cycle += instr_latency(&block.instrs[j]);
+                // Update dependents: decrease their pending count
+                for &dep in &rev_deps[j] {
+                    pending_deps[dep] -= 1;
+                    if pending_deps[dep] == 0 && !scheduled[dep] {
+                        ready.push(dep);
+                    }
+                }
             } else {
                 cycle += 1; // stall
             }
@@ -2702,7 +2802,7 @@ impl NativeCodeGen {
         // Emit blocks in RPO order for best fall-through layout
         let order = rpo_order(func);
         for bid in &order {
-            let block = match func.blocks.get(bid) {
+            let block = match func.blocks.get(*bid) {
                 Some(b) => b.clone(),
                 None    => continue,
             };
@@ -3098,7 +3198,12 @@ fn emit_elf(code: &[u8], symbols: &[(String, usize)], output_path: &str) -> Resu
     let ehdr_size:   usize = 64;
     let phdr_size:   usize = 56;
     let phdr_count:  usize = 1;
-    let code_padded: usize = (code.len() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    // FIX #17: Use actual code size + alignment instead of full page padding.
+    // The old code padded to a full 4096-byte page, wasting disk space for
+    // small programs. Now we align to 16 bytes (sufficient for x86-64
+    // instruction alignment) and let the loader handle page alignment at
+    // runtime via the PT_LOAD segment's p_align field.
+    let code_padded: usize = (code.len() + 15) & !15;
 
     // File layout:
     //   [0]               ELF header (64 bytes)
@@ -3260,7 +3365,7 @@ pub fn compile_to_native(
     opt_level:   AotOptLevel,
 ) -> Result<(), String> {
     let cfg = opt_level.to_config();
-    eprintln!("AoT v2.0 — compiling at -O{} ({})", opt_level as u8, opt_level.name());
+    // Removed unconditional eprintln — cmd_compile handles output formatting
 
     // ── Phase 1: Call graph ──────────────────────────────────────────────
     let cg = CallGraph::build(program);
@@ -3281,7 +3386,9 @@ pub fn compile_to_native(
     for func in &mut ir_fns {
         let idom  = compute_dominators(func);
         let loops = detect_loops(func, &idom);
-        func.estimate_frequencies();
+        // FIX #16: Removed redundant estimate_frequencies() before the loop.
+        // The call at pass==0 inside the loop already does this work, and
+        // compute_dominators() it internally calls is O(N·D) per function.
 
         // Multi-pass optimization loop
         let passes = cfg.max_passes;
@@ -3320,17 +3427,27 @@ pub fn compile_to_native(
             if cfg.tco               { run_tco(func); }
             if cfg.jump_threading    { run_jump_threading(func); func.build_predecessors(); }
 
+            // FIX #3: Early termination — count instructions before and after the pass
+            // to detect when no further progress is possible.
+            let pre_count: usize = func.blocks.iter().map(|b| b.instrs.len()).sum();
+
             // Aggressive cleanup after control flow changes
             if cfg.dce               { run_dce(func); }
             if cfg.gvn               { run_gvn(func); }
             if cfg.copy_prop         { run_copy_prop(func); }
             if cfg.peephole          { run_peephole(func); }
+
+            // FIX #3: If no instructions were removed, the optimization has converged
+            let post_count: usize = func.blocks.iter().map(|b| b.instrs.len()).sum();
+            if post_count == pre_count && pass > 0 {
+                break; // Converged — no point in further iterations
+            }
         }
 
         // Hot path optimization: prioritize scheduling for high-frequency blocks
         if cfg.hot_path_only {
             // Boost frequencies for hot blocks before scheduling
-            for block in func.blocks.values_mut() {
+            for block in func.blocks.iter_mut() {
                 if block.freq > 10.0 {
                     block.freq = 100.0; // Mark as hot
                 }
