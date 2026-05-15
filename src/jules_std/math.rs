@@ -7,6 +7,7 @@
 // =============================================================================
 
 
+use std::borrow::Cow;
 use std::f64::consts as f64c;
 
 // ─── Public API: called from interp.rs eval_builtin ─────────────────────────
@@ -20,7 +21,7 @@ pub fn dispatch(
         ($msg:expr) => {
             Some(Err(crate::interp::RuntimeError {
                 span: Some(crate::compiler::lexer::Span::dummy()),
-                message: $msg.to_string(),
+                message: Cow::Owned($msg.to_string()),
                 code: "E9999",
             }))
         };
@@ -636,7 +637,7 @@ fn dispatch_scalar(
         ($msg:expr) => {
             Some(Err(crate::interp::RuntimeError {
                 span: Some(crate::compiler::lexer::Span::dummy()),
-                message: $msg.to_string(),
+                message: Cow::Owned($msg.to_string()),
                 code: "E9999",
             }))
         };

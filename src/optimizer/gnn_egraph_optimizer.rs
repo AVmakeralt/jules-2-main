@@ -669,34 +669,46 @@ impl ProgramGraph {
     }
 
     /// Get the adjacency matrix (N x N) normalized
+    ///
+    /// Dense format is kept because downstream GNN layers (message-passing
+    /// matmuls) expect a contiguous (N, N) tensor.  Only non-zero entries
+    /// are written, and degrees are computed directly from the edge list
+    /// in O(E) instead of scanning the full N² matrix.
     pub fn adjacency_matrix(&self) -> Tensor {
         let n = self.nodes.len();
         if n == 0 {
             return Tensor::zeros(1, 1);
         }
         let mut adj = Tensor::zeros(n, n);
+
+        // Compute degrees directly from the edge list — O(E) instead of O(N²).
+        let mut degree = vec![0.0f32; n];
+
+        // Write only non-zero entries to the dense matrix.
         for e in &self.edges {
             if e.src < n && e.dst < n {
                 adj.data[e.src * n + e.dst] += 1.0;
+                degree[e.src] += 1.0;
+                degree[e.dst] += 1.0;
             }
         }
-        // Add self-loops
+        // Add self-loops (each contributes 1 to both row and column degree)
         for i in 0..n {
             adj.data[i * n + i] += 1.0;
+            degree[i] += 1.0; // self-loop contributes to both row i and col i
         }
-        // Normalize: D^{-1/2} A D^{-1/2}
-        let mut degree = vec![0.0; n];
-        for i in 0..n {
-            for j in 0..n {
-                degree[i] += adj.data[i * n + j];
+
+        // Normalize: D^{-1/2} A D^{-1/2} — only touch non-zero entries
+        for e in &self.edges {
+            if e.src < n && e.dst < n {
+                let di = if degree[e.src] > 0.0 { 1.0 / degree[e.src].sqrt() } else { 0.0 };
+                let dj = if degree[e.dst] > 0.0 { 1.0 / degree[e.dst].sqrt() } else { 0.0 };
+                adj.data[e.src * n + e.dst] *= di * dj;
             }
         }
         for i in 0..n {
-            for j in 0..n {
-                let di = if degree[i] > 0.0 { 1.0 / degree[i].sqrt() } else { 0.0 };
-                let dj = if degree[j] > 0.0 { 1.0 / degree[j].sqrt() } else { 0.0 };
-                adj.data[i * n + j] *= di * dj;
-            }
+            let di = if degree[i] > 0.0 { 1.0 / degree[i].sqrt() } else { 0.0 };
+            adj.data[i * n + i] *= di * di;
         }
         adj
     }

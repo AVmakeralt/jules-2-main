@@ -236,7 +236,7 @@ impl SuperoptPass {
                 // Function bodies are considered "warm" — they may be called
                 // multiple times, so optimization is worthwhile.
                 if let Some(body) = &mut fn_decl.body {
-                    self.walk_block(body, is_hot || true, full_mode);
+                    self.walk_block(body, is_hot, full_mode);
                 }
             }
             Item::System(sys_decl) => {

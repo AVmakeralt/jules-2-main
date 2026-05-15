@@ -3,6 +3,12 @@
 #[allow(unused_variables)]
 #[allow(unused_macros)]
 #[allow(clippy::drop_ref)]
+// High-performance global allocator (issue #86 — performance audit).
+// Must be declared before any code that allocates.
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 // Compiler modules
 pub mod compiler;
 
@@ -132,7 +138,7 @@ pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
             }
             vm.call_fn(entry, vec![])
                 .map(|_| ())
-                .map_err(|e| e.message)
+                .map_err(|e| e.message.into_owned())
         }
         PipelineResult::Ok(_) => {
             // Legacy path (no IR) — this should NEVER happen anymore.
@@ -1411,7 +1417,7 @@ fn adapt_runtime_error(e: crate::interp::RuntimeError) -> Diag {
         span: e.span,
         code: Some(e.code),
         pass: PassSource::Unknown,
-        message: e.message,
+        message: e.message.into_owned(),
         labels: vec![],
         hint: None,
     }
@@ -3742,7 +3748,7 @@ impl Repl {
                 }
                 vm.call_fn("main", vec![])
                     .map(|_| ())
-                    .map_err(|e| ReplRunError::Runtime(e.message))
+                    .map_err(|e| ReplRunError::Runtime(e.message.into_owned()))
             }
             PipelineResult::Ok(_) => {
                 // Legacy path (no IR) — this should NEVER happen anymore.

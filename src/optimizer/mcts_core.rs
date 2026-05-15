@@ -21,6 +21,7 @@
 #![cfg(feature = "core-superopt")]
 
 use std::ops::{Index, IndexMut};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use libc::{mmap, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -199,6 +200,7 @@ pub struct OpcodeInfo {
 }
 
 /// The opcode table — contains all valid opcodes and their properties.
+#[derive(Clone)]
 pub struct OpcodeTable {
     opcodes: Vec<OpcodeInfo>,
 }
@@ -259,6 +261,13 @@ impl OpcodeTable {
         ];
         debug_assert_eq!(opcodes.len(), op::COUNT as usize);
         Self { opcodes }
+    }
+
+    /// Return a cached reference to the standard opcode table.
+    /// Uses OnceLock so the table is constructed only once.
+    pub fn cached() -> &'static OpcodeTable {
+        static STANDARD_TABLE: OnceLock<OpcodeTable> = OnceLock::new();
+        STANDARD_TABLE.get_or_init(|| Self::standard())
     }
 
     #[inline]
@@ -400,9 +409,8 @@ impl FlatProgram {
             }
         }
 
-        // S27 fix: Move OpcodeTable outside the loop — creating it per
-        // instruction allocates a Vec each time, wasting cycles.
-        let table = OpcodeTable::standard();
+        // S27 fix: Use cached OpcodeTable — avoids allocating a Vec each time.
+        let table = OpcodeTable::cached();
 
         for instr in self.instrs.iter() {
             if instr.is_nop() {
@@ -779,7 +787,7 @@ impl MutationEngine {
     pub fn new(seed: u64, num_inputs: u8) -> Self {
         Self {
             rng: Xorshift64::new(seed),
-            table: OpcodeTable::standard(),
+            table: OpcodeTable::cached().clone(),
             num_inputs,
             max_reg: 31,
         }
@@ -1565,7 +1573,7 @@ impl DeepMctsSearch {
 
     /// Run the search for the given number of iterations.
     pub fn search(&mut self, source: &FlatProgram, iterations: usize) -> Option<FlatProgram> {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
         let source_cost = source.cost(&table);
         let mut best_program = *source;
         let mut best_cost = source_cost;
@@ -1674,10 +1682,10 @@ mod tests {
         assert_eq!(program.effective_len(), 0);
 
         let mut program = FlatProgram::empty();
-        program[0] = FlatInstr::binop(op::ADD, 2, 0, 1, &OpcodeTable::standard());
+        program[0] = FlatInstr::binop(op::ADD, 2, 0, 1, OpcodeTable::cached());
         assert_eq!(program.effective_len(), 1);
 
-        program[1] = FlatInstr::binop(op::MUL, 3, 2, 0, &OpcodeTable::standard());
+        program[1] = FlatInstr::binop(op::MUL, 3, 2, 0, OpcodeTable::cached());
         assert_eq!(program.effective_len(), 2);
 
         assert!(program[2].is_nop());
@@ -1697,7 +1705,7 @@ mod tests {
 
     #[test]
     fn test_opcode_table_standard() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
         assert_eq!(table.len(), op::COUNT);
         assert_eq!(table.get(op::ADD).name, "add");
         assert_eq!(table.get(op::ADD).num_srcs, 2);
@@ -1720,7 +1728,7 @@ mod tests {
 
         let mut program = FlatProgram::empty();
         program[0] = FlatInstr::load_const(2, 5);
-        program[1] = FlatInstr::binop(op::ADD, 3, 0, 2, &OpcodeTable::standard());
+        program[1] = FlatInstr::binop(op::ADD, 3, 0, 2, OpcodeTable::cached());
 
         for _ in 0..100 {
             let mutation = engine.random_mutation(&program);
@@ -1733,7 +1741,7 @@ mod tests {
     fn test_mutation_opcode_replace() {
         let engine = MutationEngine::new(123, 2);
         let mut program = FlatProgram::empty();
-        program[0] = FlatInstr::binop(op::ADD, 2, 0, 1, &OpcodeTable::standard());
+        program[0] = FlatInstr::binop(op::ADD, 2, 0, 1, OpcodeTable::cached());
 
         let mutation = Mutation::OpcodeReplace {
             instr_idx: 0,
@@ -1747,7 +1755,7 @@ mod tests {
     fn test_mutation_operand_replace() {
         let engine = MutationEngine::new(123, 2);
         let mut program = FlatProgram::empty();
-        program[0] = FlatInstr::binop(op::ADD, 2, 0, 1, &OpcodeTable::standard());
+        program[0] = FlatInstr::binop(op::ADD, 2, 0, 1, OpcodeTable::cached());
 
         let mutation = Mutation::OperandReplace {
             instr_idx: 0,
@@ -1806,7 +1814,7 @@ mod tests {
 
     #[test]
     fn test_test_vector_evaluator_simple_add() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
         let mut evaluator = TestVectorEvaluator::new();
 
         let mut program = FlatProgram::empty();
@@ -1824,7 +1832,7 @@ mod tests {
 
     #[test]
     fn test_test_vector_evaluator_load_const() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
         let mut evaluator = TestVectorEvaluator::new();
 
         let mut program = FlatProgram::empty();
@@ -1836,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_test_vector_evaluator_mul_and_shift() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
         let mut evaluator = TestVectorEvaluator::new();
 
         let mut program = FlatProgram::empty();
@@ -1849,7 +1857,7 @@ mod tests {
 
     #[test]
     fn test_test_vector_evaluator_batch() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
         let mut evaluator = TestVectorEvaluator::new();
 
         let mut program = FlatProgram::empty();
@@ -1863,7 +1871,7 @@ mod tests {
 
     #[test]
     fn test_test_vector_evaluator_div_by_zero() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
         let mut evaluator = TestVectorEvaluator::new();
 
         let mut program = FlatProgram::empty();
@@ -1878,7 +1886,7 @@ mod tests {
 
     #[test]
     fn test_test_vector_evaluator_comparisons() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
         let mut evaluator = TestVectorEvaluator::new();
 
         let mut program = FlatProgram::empty();
@@ -1891,7 +1899,7 @@ mod tests {
 
     #[test]
     fn test_search_finds_shift_optimization() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
 
         // Source: r1 = 2; r2 = r0 * r1 (cost: 1+3+2=6)
         let mut source = FlatProgram::empty();
@@ -1932,7 +1940,7 @@ mod tests {
 
     #[test]
     fn test_is_well_formed() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
 
         let mut program = FlatProgram::empty();
         program[0] = FlatInstr::binop(op::ADD, 2, 0, 1, &table);
@@ -1947,7 +1955,7 @@ mod tests {
 
     #[test]
     fn test_output_regs() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
 
         let mut program = FlatProgram::empty();
         program[0] = FlatInstr::load_const(1, 42);
@@ -1960,7 +1968,7 @@ mod tests {
 
     #[test]
     fn test_program_cost() {
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
 
         let mut program = FlatProgram::empty();
         program[0] = FlatInstr::load_const(1, 42);
@@ -1992,7 +2000,7 @@ mod tests {
             return;
         }
         let executor = executor.unwrap();
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
 
         let mut program = FlatProgram::empty();
         program[0] = FlatInstr::binop(op::ADD, 2, 0, 1, &table);
@@ -2015,7 +2023,7 @@ mod tests {
             return;
         }
         let executor = executor.unwrap();
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
 
         let mut program = FlatProgram::empty();
         program[0] = FlatInstr::load_const(1, 1);
@@ -2033,7 +2041,7 @@ mod tests {
             return;
         }
         let executor = executor.unwrap();
-        let table = OpcodeTable::standard();
+        let table = OpcodeTable::cached().clone();
 
         let mut program = FlatProgram::empty();
         program[0] = FlatInstr::load_const(0, 42);
@@ -2049,7 +2057,7 @@ mod tests {
 
         assert_eq!(program.effective_len(), 4);
         for i in 0..4 {
-            assert!(program[i].opcode < OpcodeTable::standard().len());
+            assert!(program[i].opcode < OpcodeTable::cached().len());
             assert!(!program[i].is_nop());
         }
     }

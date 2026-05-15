@@ -16,7 +16,7 @@ use crate::compiler::ir::TaskOwnership as IrTaskOwnership;
 use crate::compiler::ir::*;
 use crate::compiler::lexer::Span;
 use crate::compiler::typeck::Diagnostics;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 
 /// Loop context for break/continue lowering.
@@ -90,7 +90,7 @@ struct LowerCtx {
     /// String constant table.
     strings: Vec<String>,
     /// String → index lookup for O(1) interning.
-    string_map: HashMap<String, u32>,
+    string_map: FxHashMap<String, u32>,
     /// Region counter for region-alloc instructions.
     next_region: u32,
     /// Currently-building function name (for diagnostics).
@@ -104,7 +104,7 @@ struct LowerCtx {
     /// recursive calls (fib calling fib) and cross-function calls (main
     /// calling helper) to resolve correctly in the Call handler, instead
     /// of silently emitting ConstUnit for unknown identifiers.
-    fn_names: HashSet<String>,
+    fn_names: FxHashSet<String>,
 }
 
 impl LowerCtx {
@@ -119,12 +119,12 @@ impl LowerCtx {
             env: vec![],
             scope_stack: vec![],
             strings: vec![],
-            string_map: HashMap::new(),
+            string_map: FxHashMap::default(),
             next_region: 0,
             current_fn: String::new(),
             loop_stack: vec![],
             diagnostics: Diagnostics { items: vec![] },
-            fn_names: HashSet::new(),
+            fn_names: FxHashSet::default(),
         }
     }
 
@@ -206,7 +206,7 @@ impl LowerCtx {
         span: Span,
     ) {
         // Collect all variable names from both branches
-        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut names: FxHashSet<String> = FxHashSet::default();
         for (name, _) in then_env {
             names.insert(name.clone());
         }
@@ -270,7 +270,7 @@ impl LowerCtx {
         span: Span,
     ) -> Vec<(String, ValueId)> {
         // Deduplicate variable names (use the most recent binding for each)
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = FxHashSet::default();
         let mut unique_vars: Vec<(String, ValueId)> = Vec::new();
         for (name, vid) in pre_loop_env.iter().rev() {
             if seen.insert(name.clone()) {

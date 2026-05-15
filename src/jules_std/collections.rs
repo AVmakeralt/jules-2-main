@@ -6,12 +6,13 @@
 // Pure Rust, zero external dependencies.
 // =============================================================================
 
+use std::borrow::Cow;
 use crate::interp::{RuntimeError, Value};
 use crate::compiler::lexer::Span;
 
 macro_rules! rt_err {
     ($msg:expr) => {
-        RuntimeError { span: Some(Span::dummy()), message: $msg.to_string(), code: "E9999" }
+        RuntimeError { span: Some(Span::dummy()), message: Cow::Borrowed($msg), code: "E9999" }
     };
 }
 

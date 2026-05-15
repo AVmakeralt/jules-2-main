@@ -6,6 +6,7 @@
 use crate::runtime::gpu_backend::GpuMemoryManager;
 use crate::ml::xla_backend::{compile_and_execute, XlaBackend, XlaConfig};
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -579,9 +580,6 @@ impl Tensor {
         let k = self.shape[1];
         let n = other.shape[1];
 
-        let other_t = transpose_2d(&other.data, k, n);
-        let mut result = vec![0.0; m * n];
-
         let ops = m.saturating_mul(k).saturating_mul(n);
         let threads = thread::available_parallelism()
             .map(|n| n.get())
@@ -589,32 +587,44 @@ impl Tensor {
 
         let _use_jules_kernel = Self::use_native_jules_kernel(m, k, n);
 
+        let mut result = vec![0.0; m * n];
+
         if threads > 1 && ops >= Self::PARALLEL_MATMUL_MIN_OPS {
-            // Split rows into two halves and process in parallel using join
+            // Parallel path: transpose B only when needed for the tiled kernel,
+            // and share matrix data via Arc to avoid cloning large buffers.
             use crate::runtime::threading::join;
 
             let mid = m / 2;
-            let a_data_lo = self.data.clone();
-            let bt_data_lo = other_t.clone();
-            let a_data_hi = self.data.clone();
-            let bt_data_hi = other_t.clone();
+            let a_arc: Arc<Vec<f32>> = Arc::new(self.data.clone());
+            // Transpose B conditionally — only required by the tiled microkernel.
+            let bt_arc: Arc<Vec<f32>> = Arc::new(transpose_2d(&other.data, k, n));
 
             let (out_lo, out_hi) = join::<Vec<f32>, Vec<f32>, _, _>(
-                move || {
-                    let mut buf = vec![0.0f32; mid * n];
-                    matmul_blocked_rows(&a_data_lo, &bt_data_lo, 0, mid, k, n, &mut buf, 0);
-                    buf
+                {
+                    let a_data = Arc::clone(&a_arc);
+                    let bt_data = Arc::clone(&bt_arc);
+                    move || {
+                        let mut buf = vec![0.0f32; mid * n];
+                        matmul_blocked_rows(&a_data, &bt_data, 0, mid, k, n, &mut buf, 0);
+                        buf
+                    }
                 },
-                move || {
-                    let mut buf = vec![0.0f32; (m - mid) * n];
-                    matmul_blocked_rows(&a_data_hi, &bt_data_hi, mid, m, k, n, &mut buf, mid);
-                    buf
+                {
+                    let a_data = Arc::clone(&a_arc);
+                    let bt_data = Arc::clone(&bt_arc);
+                    move || {
+                        let mut buf = vec![0.0f32; (m - mid) * n];
+                        matmul_blocked_rows(&a_data, &bt_data, mid, m, k, n, &mut buf, mid);
+                        buf
+                    }
                 },
             );
 
             result[..mid * n].copy_from_slice(&out_lo);
             result[mid * n..].copy_from_slice(&out_hi);
         } else {
+            // Sequential path: transpose B only when the tiled kernel needs it.
+            let other_t = transpose_2d(&other.data, k, n);
             matmul_blocked_rows(&self.data, &other_t, 0, m, k, n, &mut result, 0);
         }
 

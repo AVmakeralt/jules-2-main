@@ -32,6 +32,7 @@ use crate::compiler::formal_verify::{ArithmeticMode, EntropyWatchdog, OsrEngine,
 use crate::interp::{RuntimeError, StructData, Value};
 #[cfg(feature = "gnn-optimizer")]
 use crate::runtime::memory_management::PrefetchEngine;
+use crate::runtime::symbol::global_intern;
 use crate::optimizer::data_dependent_jit::DataDependentJIT;
 
 // =============================================================================
@@ -1808,7 +1809,7 @@ pub struct BytecodeVM {
     /// Maps slot indices to their last known constant value, allowing
     /// LoadConstInt/LoadConstFloat to skip redundant cloning when the
     /// cached value matches the instruction's immediate.
-    value_cache: [Option<Value>; 256],
+    value_cache: [Option<Value>; 16],
 }
 
 impl BytecodeVM {
@@ -3572,10 +3573,11 @@ impl BytecodeVM {
 
                 // ── MakeStruct: construct struct from field values ──
                 Instr::MakeStruct { dst, name_idx, field_start, field_count } => {
-                    let name = match constants.get(*name_idx as usize) {
+                    let name_str = match constants.get(*name_idx as usize) {
                         Some(Value::Str(s)) => s.clone(),
                         _ => format!("struct_{}", name_idx),
                     };
+                    let name = global_intern(&name_str).as_u32();
                     let fs = *field_start as usize;
                     let fc = *field_count as usize;
                     let mut fields = FxHashMap::default();
@@ -3584,11 +3586,12 @@ impl BytecodeVM {
                     for i in 0..fc {
                         let name_val = slots.get(fs + i * 2).cloned().unwrap_or(Value::Unit);
                         let field_val = slots.get(fs + i * 2 + 1).cloned().unwrap_or(Value::Unit);
-                        let key = match &name_val {
+                        let key_str = match &name_val {
                             Value::Str(s) => s.clone(),
                             other => format!("field_{i}_{}", other.type_name()),
                         };
-                        field_order.push(key.clone());
+                        let key = global_intern(&key_str).as_u32();
+                        field_order.push(key);
                         fields.insert(key, field_val);
                     }
                     slots[*dst as usize] = Value::Struct(Box::new(StructData { name, fields, field_order }));

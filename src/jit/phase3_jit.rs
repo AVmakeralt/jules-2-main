@@ -70,6 +70,7 @@
 //!    prefixes, and fixup regions are checked for consistency.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -120,7 +121,7 @@ struct ExecArena {
     /// Stores page-aligned addresses that have been written to and need
     /// to be flipped from RW→RX before execution. Pages stay RW during
     /// compilation to prevent SIGSEGV when two functions share a 4K page.
-    dirty_pages: Vec<usize>,
+    dirty_pages: BTreeSet<usize>,
     /// Total bytes allocated across all allocations (for eviction tracking).
     total_allocated: usize,
     /// High water mark for triggering eviction (Fix #5).
@@ -190,7 +191,7 @@ impl ExecArena {
             chunks: vec![chunk],
             cursor: 0,
             allocations: Vec::new(),
-            dirty_pages: Vec::new(),
+            dirty_pages: BTreeSet::new(),
             total_allocated: 0,
             capacity_limit: Self::DEFAULT_LEN * 4, // 4x initial capacity before eviction warning
         })
@@ -296,9 +297,7 @@ impl ExecArena {
         let end = ((ptr + len.max(1)) + page - 1) & !(page - 1);
         let mut p = base;
         while p < end {
-            if let Err(idx) = self.dirty_pages.binary_search(&p) {
-                self.dirty_pages.insert(idx, p);
-            }
+            self.dirty_pages.insert(p);
             p += page;
         }
     }

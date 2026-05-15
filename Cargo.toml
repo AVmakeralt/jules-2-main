@@ -119,6 +119,7 @@ name = "dump-ir"
 path = "examples/dump_ir.rs"
 
 [dependencies]
+mimalloc = "0.1"
 pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }
 libc = "0.2"

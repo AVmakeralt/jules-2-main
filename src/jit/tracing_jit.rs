@@ -304,6 +304,8 @@ struct TraceArena {
     chunks: Vec<*mut u8>,
     /// Current chunk sizes (for munmap on drop)
     chunk_sizes: Vec<usize>,
+    /// Per-chunk dirty flag: true if alloc() wrote to this chunk
+    chunk_dirty: Vec<bool>,
     /// Offset into current chunk
     offset: usize,
     /// Current chunk remaining capacity
@@ -319,6 +321,7 @@ impl TraceArena {
         Self {
             chunks: Vec::new(),
             chunk_sizes: Vec::new(),
+            chunk_dirty: Vec::new(),
             offset: 0,
             remaining: 0,
         }
@@ -347,24 +350,33 @@ impl TraceArena {
             }
             self.chunks.push(ptr as *mut u8);
             self.chunk_sizes.push(chunk_size);
+            self.chunk_dirty.push(false);
             self.offset = 0;
             self.remaining = chunk_size;
         }
 
         // Allocate from current chunk
+        let chunk_idx = self.chunks.len() - 1;
         let chunk_ptr = *self.chunks.last().unwrap();
         let ptr = unsafe { chunk_ptr.add(self.offset) };
         self.offset += aligned;
         self.remaining -= aligned;
+        // Mark current chunk as dirty so finalize() will mprotect it
+        self.chunk_dirty[chunk_idx] = true;
         Ok(ptr)
     }
 
-    /// Flip all chunks from RW→RX for execution (W^X compliance).
+    /// Flip only dirty chunks from RW→RX for execution (W^X compliance).
+    /// Clean chunks (already RX or never written) are skipped to avoid
+    /// redundant mprotect syscalls.
     fn finalize(&mut self) -> Result<(), String> {
-        for (&chunk_ptr, &size) in self.chunks.iter().zip(self.chunk_sizes.iter()) {
-            let ok = unsafe { mprotect(chunk_ptr as *mut c_void, size, PROT_READ | PROT_EXEC) };
-            if ok != 0 {
-                return Err("mprotect failed in trace arena finalize".into());
+        for (i, (&chunk_ptr, &size)) in self.chunks.iter().zip(self.chunk_sizes.iter()).enumerate() {
+            if self.chunk_dirty.get(i).copied().unwrap_or(false) {
+                let ok = unsafe { mprotect(chunk_ptr as *mut c_void, size, PROT_READ | PROT_EXEC) };
+                if ok != 0 {
+                    return Err("mprotect failed in trace arena finalize".into());
+                }
+                self.chunk_dirty[i] = false; // Reset dirty flag after mprotect
             }
         }
         Ok(())

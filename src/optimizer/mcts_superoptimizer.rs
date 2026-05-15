@@ -1986,6 +1986,7 @@ impl MctsSuperoptimizer {
         };
 
         let mut root = MctsNode::new(instr.clone());
+        root.cached_cost = Some(original_cost);
         self.node_count = 1;
 
         // Run MCTS simulations

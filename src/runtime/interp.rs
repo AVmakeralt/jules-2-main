@@ -51,11 +51,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
+use smallvec::SmallVec;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 // ── Fast HashMap — ~2x faster than SipHash for short string keys ─────────────
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 // ── Direct threading: when compiling with nightly, use computed-goto labels ──
 //   This eliminates the match dispatch overhead in the hot VM loop.
@@ -177,15 +178,23 @@ pub enum Value {
 }
 
 /// Boxed payload for [`Value::Struct`], keeping the enum size small.
+///
+/// PERF (Issue #5): Field keys and the struct name are stored as interned
+/// `u32` Symbols instead of `String`s.  This makes every field lookup a
+/// cheap u32 hash instead of a full string hash, and eliminates per-access
+/// String allocation overhead.  Use `global_intern` / `global_resolve` to
+/// convert between `&str` ↔ `u32`.
 #[derive(Debug, Clone)]
 pub struct StructData {
-    pub name: String,
-    pub fields: FxHashMap<String, Value>,
-    /// Ordered field names for O(1) indexed access by position.
+    /// Interned struct name (use `global_resolve(name)` for display)
+    pub name: u32,
+    /// Field map keyed by interned Symbol (u32) — O(1) lookup without string hashing
+    pub fields: FxHashMap<u32, Value>,
+    /// Ordered field Symbol IDs for O(1) indexed access by position.
     /// The bytecode VM uses field_idx to index into this Vec, then
-    /// does an O(1) HashMap lookup with the key — avoiding the
+    /// does an O(1) HashMap lookup with the u32 key — avoiding the
     /// O(n) `.iter().nth()` pattern on FxHashMap.
-    pub field_order: Vec<String>,
+    pub field_order: Vec<u32>,
 }
 
 impl Default for Value {
@@ -240,48 +249,53 @@ impl DataLoader {
 }
 
 impl Value {
-    pub fn type_name(&self) -> &str {
+    /// Return the type name of this value.
+    ///
+    /// PERF (Issue #5): Returns `Cow<'_, str>` so that the Struct variant can
+    /// resolve its interned u32 name on demand, while all other variants
+    /// return a borrowed static `&str` at zero cost.
+    pub fn type_name(&self) -> Cow<'_, str> {
         match self {
-            Value::I8(_) => "i8",
-            Value::I16(_) => "i16",
-            Value::I32(_) => "i32",
-            Value::I64(_) => "i64",
-            Value::U8(_) => "u8",
-            Value::U16(_) => "u16",
-            Value::U32(_) => "u32",
-            Value::U64(_) => "u64",
-            Value::F32(_) => "f32",
-            Value::F64(_) => "f64",
-            Value::Bool(_) => "bool",
-            Value::Str(_) => "str",
-            Value::Unit => "()",
-            Value::Range { .. } => "range",
-            Value::Vec2(_) => "vec2",
-            Value::Vec3(_) => "vec3",
-            Value::Vec4(_) => "vec4",
-            Value::IVec2(_) => "ivec2",
-            Value::IVec3(_) => "ivec3",
-            Value::IVec4(_) => "ivec4",
-            Value::Mat2(_) => "mat2",
-            Value::Mat3(_) => "mat3",
-            Value::Mat4(_) => "mat4",
-            Value::Quat(_) => "quat",
-            Value::Tensor(_) => "tensor",
-            Value::TensorFast(_) => "tensor",
-            Value::DataLoader(_) => "dataloader",
-            Value::Tuple(_) => "tuple",
-            Value::Array(_) => "array",
-            Value::HashMap(_) => "map",
-            Value::Struct(data) => &data.name,
-            Value::Some(_) => "Some",
-            Value::None => "None",
-            Value::Ok(_) => "Ok",
-            Value::Err(_) => "Err",
-            Value::Fn(_) => "fn",
-            Value::Entity(_) => "entity",
-            Value::World(_) => "world",
-            Value::Model(_) => "model",
-            Value::Return(_) | Value::Break(_) | Value::Continue => "<control-flow>",
+            Value::I8(_) => Cow::Borrowed("i8"),
+            Value::I16(_) => Cow::Borrowed("i16"),
+            Value::I32(_) => Cow::Borrowed("i32"),
+            Value::I64(_) => Cow::Borrowed("i64"),
+            Value::U8(_) => Cow::Borrowed("u8"),
+            Value::U16(_) => Cow::Borrowed("u16"),
+            Value::U32(_) => Cow::Borrowed("u32"),
+            Value::U64(_) => Cow::Borrowed("u64"),
+            Value::F32(_) => Cow::Borrowed("f32"),
+            Value::F64(_) => Cow::Borrowed("f64"),
+            Value::Bool(_) => Cow::Borrowed("bool"),
+            Value::Str(_) => Cow::Borrowed("str"),
+            Value::Unit => Cow::Borrowed("()"),
+            Value::Range { .. } => Cow::Borrowed("range"),
+            Value::Vec2(_) => Cow::Borrowed("vec2"),
+            Value::Vec3(_) => Cow::Borrowed("vec3"),
+            Value::Vec4(_) => Cow::Borrowed("vec4"),
+            Value::IVec2(_) => Cow::Borrowed("ivec2"),
+            Value::IVec3(_) => Cow::Borrowed("ivec3"),
+            Value::IVec4(_) => Cow::Borrowed("ivec4"),
+            Value::Mat2(_) => Cow::Borrowed("mat2"),
+            Value::Mat3(_) => Cow::Borrowed("mat3"),
+            Value::Mat4(_) => Cow::Borrowed("mat4"),
+            Value::Quat(_) => Cow::Borrowed("quat"),
+            Value::Tensor(_) => Cow::Borrowed("tensor"),
+            Value::TensorFast(_) => Cow::Borrowed("tensor"),
+            Value::DataLoader(_) => Cow::Borrowed("dataloader"),
+            Value::Tuple(_) => Cow::Borrowed("tuple"),
+            Value::Array(_) => Cow::Borrowed("array"),
+            Value::HashMap(_) => Cow::Borrowed("map"),
+            Value::Struct(data) => Cow::Owned(crate::runtime::symbol::global_resolve(crate::runtime::symbol::Symbol(data.name))),
+            Value::Some(_) => Cow::Borrowed("Some"),
+            Value::None => Cow::Borrowed("None"),
+            Value::Ok(_) => Cow::Borrowed("Ok"),
+            Value::Err(_) => Cow::Borrowed("Err"),
+            Value::Fn(_) => Cow::Borrowed("fn"),
+            Value::Entity(_) => Cow::Borrowed("entity"),
+            Value::World(_) => Cow::Borrowed("world"),
+            Value::Model(_) => Cow::Borrowed("model"),
+            Value::Return(_) | Value::Break(_) | Value::Continue => Cow::Borrowed("<control-flow>"),
         }
     }
 
@@ -479,7 +493,7 @@ impl fmt::Display for Value {
                 let inner: Vec<_> = vs.iter().map(|v| v.to_string()).collect();
                 write!(f, "({})", inner.join(", "))
             }
-            Value::Struct(data) => write!(f, "{} {{ … }}", data.name),
+            Value::Struct(data) => write!(f, "{} {{ … }}", crate::runtime::symbol::global_resolve(crate::runtime::symbol::Symbol(data.name))),
             Value::DataLoader(d) => {
                 let d = d.borrow();
                 write!(
@@ -523,7 +537,7 @@ impl fmt::Display for Value {
 #[derive(Debug, Clone)]
 pub struct Tensor {
     pub elem: ElemType,
-    pub shape: Vec<usize>,
+    pub shape: SmallVec<[usize; 4]>,
     pub data: TensorStorage,
     /// When `Some`, this tensor has a gradient buffer attached (`@grad`).
     pub grad: Option<Box<Tensor>>,
@@ -572,7 +586,8 @@ impl GpuBufferHandle {
 
 impl Tensor {
     #[inline]
-    pub fn zeros(shape: Vec<usize>) -> Self {
+    pub fn zeros(shape: impl Into<SmallVec<[usize; 4]>>) -> Self {
+        let shape = shape.into();
         let n = shape.iter().product::<usize>().max(1);
         let mut data = Vec::with_capacity(n);
         data.resize(n, 0.0_f32);
@@ -586,7 +601,8 @@ impl Tensor {
     }
 
     #[inline]
-    pub fn from_data(shape: Vec<usize>, data: Vec<f32>) -> Self {
+    pub fn from_data(shape: impl Into<SmallVec<[usize; 4]>>, data: Vec<f32>) -> Self {
+        let shape = shape.into();
         let expected = shape.iter().product::<usize>().max(1);
         debug_assert_eq!(
             data.len(),
@@ -989,7 +1005,7 @@ thread_local! {
 #[derive(Debug, Default)]
 pub struct EcsWorld {
     next_id: EntityId,
-    alive: std::collections::HashSet<EntityId>,
+    alive: FxHashSet<EntityId>,
     /// component_type → SparseSet
     components: FxHashMap<String, SparseSet>,
     /// Pending events (signal_name → Vec<EntityId>)
@@ -1134,12 +1150,15 @@ struct FusedPlanCache {
 }
 
 impl SparseSet {
+    /// Update-or-insert: if `id` already exists, overwrite its value in-place;
+    /// otherwise append a new entry.  Equivalent to a combined `remove` +
+    /// `insert` but avoids the swap-and-pop + push overhead when the key is
+    /// already present.
     #[inline]
-    fn insert(&mut self, id: EntityId, val: Value) {
+    fn upsert(&mut self, id: EntityId, val: Value) {
         if let Some(&idx) = self.sparse.get(&id) {
             self.dense_vals[idx] = val;
-            // Bump version on updates too: a value change can affect cached
-            // join plans that embed dense-index assumptions.
+            // Bump version: a value change can affect cached join plans.
             self.version = self.version.wrapping_add(1);
         } else {
             let idx = self.dense_ids.len();
@@ -1148,6 +1167,13 @@ impl SparseSet {
             self.dense_vals.push(val);
             self.version = self.version.wrapping_add(1);
         }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    fn insert(&mut self, id: EntityId, val: Value) {
+        // Delegate to upsert — identical semantics, single implementation.
+        self.upsert(id, val);
     }
 
     #[inline]
@@ -1187,7 +1213,7 @@ impl EcsWorld {
     pub fn new() -> Self {
         Self {
             next_id: 0,
-            alive: std::collections::HashSet::new(),
+            alive: FxHashSet::default(),
             components: FxHashMap::default(),
             events: FxHashMap::default(),
             vec3_plan_cache: FxHashMap::default(),
@@ -1425,10 +1451,15 @@ impl EcsWorld {
     }
 
     pub fn insert_component(&mut self, id: EntityId, comp_type: &str, val: Value) {
-        self.components
-            .entry(comp_type.to_owned())
-            .or_default()
-            .insert(id, val.clone());
+        // Two-path: avoid allocation for existing keys.
+        if let Some(set) = self.components.get_mut(comp_type) {
+            set.upsert(id, val.clone());
+        } else {
+            self.components
+                .entry(comp_type.to_owned())
+                .or_default()
+                .upsert(id, val.clone());
+        }
 
         // Track which components this entity has (for O(1) despawn).
         self.entity_components
@@ -1566,10 +1597,15 @@ impl EcsWorld {
 
     /// Emit an event signal for the training loop.
     pub fn emit_event(&mut self, signal: &str, entity: EntityId) {
-        self.events
-            .entry(signal.to_owned())
-            .or_default()
-            .push(entity);
+        // Two-path: avoid allocation for existing keys.
+        if let Some(v) = self.events.get_mut(signal) {
+            v.push(entity);
+        } else {
+            self.events
+                .entry(signal.to_owned())
+                .or_default()
+                .push(entity);
+        }
     }
 
     /// Tight linear integration pass for the common `pos += vel * dt` case.
@@ -1580,11 +1616,11 @@ impl EcsWorld {
         if pos_comp == vel_comp {
             return 0;
         }
-        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+        let Some((owned_key, mut pos_set)) = self.components.remove_entry(pos_comp) else {
             return 0;
         };
         let Some(vel_set) = self.components.get(vel_comp) else {
-            self.components.insert(pos_comp.to_owned(), pos_set);
+            self.components.insert(owned_key, pos_set);
             return 0;
         };
 
@@ -1620,7 +1656,7 @@ impl EcsWorld {
                 }
             }
         }
-        self.components.insert(pos_comp.to_owned(), pos_set);
+        self.components.insert(owned_key, pos_set);
         updated
     }
 
@@ -1635,11 +1671,11 @@ impl EcsWorld {
         if pos_comp == vel_comp {
             return 0;
         }
-        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+        let Some((owned_key, mut pos_set)) = self.components.remove_entry(pos_comp) else {
             return 0;
         };
         let Some(vel_set) = self.components.get(vel_comp) else {
-            self.components.insert(pos_comp.to_owned(), pos_set);
+            self.components.insert(owned_key, pos_set);
             return 0;
         };
         let mut updated = 0usize;
@@ -1660,7 +1696,7 @@ impl EcsWorld {
                 updated += 1;
             }
         }
-        self.components.insert(pos_comp.to_owned(), pos_set);
+        self.components.insert(owned_key, pos_set);
         updated
     }
 
@@ -1705,12 +1741,12 @@ impl EcsWorld {
             cache.chunk_size = chunk_size;
         }
 
-        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+        let Some((owned_key, mut pos_set)) = self.components.remove_entry(pos_comp) else {
             self.vec3_plan_cache.insert(key, cache);
             return 0;
         };
         let Some(vel_set) = self.components.get(vel_comp) else {
-            self.components.insert(pos_comp.to_owned(), pos_set);
+            self.components.insert(owned_key, pos_set);
             self.vec3_plan_cache.insert(key, cache);
             return 0;
         };
@@ -1730,7 +1766,7 @@ impl EcsWorld {
                 }
             }
         }
-        self.components.insert(pos_comp.to_owned(), pos_set);
+        self.components.insert(owned_key, pos_set);
         self.vec3_plan_cache.insert(key, cache);
         updated
     }
@@ -1779,12 +1815,12 @@ impl EcsWorld {
             cache.chunk_size = chunk_size;
         }
 
-        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+        let Some((owned_key, mut pos_set)) = self.components.remove_entry(pos_comp) else {
             self.vec3_plan_cache.insert(key, cache);
             return 0;
         };
         let Some(vel_set) = self.components.get(vel_comp) else {
-            self.components.insert(pos_comp.to_owned(), pos_set);
+            self.components.insert(owned_key, pos_set);
             self.vec3_plan_cache.insert(key, cache);
             return 0;
         };
@@ -1829,7 +1865,7 @@ impl EcsWorld {
                 i += 1;
             }
         }
-        self.components.insert(pos_comp.to_owned(), pos_set);
+        self.components.insert(owned_key, pos_set);
         self.vec3_plan_cache.insert(key, cache);
         updated
     }
@@ -2091,12 +2127,12 @@ impl EcsWorld {
             cache.chunk_size = chunk_size;
         }
 
-        let Some(mut pos_set) = self.components.remove(pos_comp) else {
+        let Some((pos_key, mut pos_set)) = self.components.remove_entry(pos_comp) else {
             self.fused_plan_cache.insert(key, cache);
             return 0;
         };
-        let Some(mut health_set) = self.components.remove(health_comp) else {
-            self.components.insert(pos_comp.to_owned(), pos_set);
+        let Some((health_key, mut health_set)) = self.components.remove_entry(health_comp) else {
+            self.components.insert(pos_key, pos_set);
             self.fused_plan_cache.insert(key, cache);
             return 0;
         };
@@ -2104,8 +2140,8 @@ impl EcsWorld {
             self.components.get(vel_comp),
             self.components.get(damage_comp),
         ) else {
-            self.components.insert(pos_comp.to_owned(), pos_set);
-            self.components.insert(health_comp.to_owned(), health_set);
+            self.components.insert(pos_key, pos_set);
+            self.components.insert(health_key, health_set);
             self.fused_plan_cache.insert(key, cache);
             return 0;
         };
@@ -2131,8 +2167,8 @@ impl EcsWorld {
                 }
             }
         }
-        self.components.insert(pos_comp.to_owned(), pos_set);
-        self.components.insert(health_comp.to_owned(), health_set);
+        self.components.insert(pos_key, pos_set);
+        self.components.insert(health_key, health_set);
         self.fused_plan_cache.insert(key, cache);
         updated
     }
@@ -2447,11 +2483,14 @@ pub struct NnModel {
     pub name: String,
     pub layers: Vec<WeightLayer>,
     pub training: bool,
-    /// Gradient accumulator: one tensor per weight tensor, same shape.
-    pub grads: Vec<Vec<Tensor>>,
-    /// Adam state: first and second moment estimates.
-    pub m1: Vec<Vec<Tensor>>,
-    pub m2: Vec<Vec<Tensor>>,
+    /// Gradient accumulator: flat storage for all layers' gradient tensors.
+    pub grads: Vec<Tensor>,
+    /// Adam state: first and second moment estimates (flat storage).
+    pub m1: Vec<Tensor>,
+    pub m2: Vec<Tensor>,
+    /// Layer boundaries within the flat `grads` / `m1` / `m2` vectors.
+    /// Layer i occupies indices `layer_offsets[i]..layer_offsets[i+1]`.
+    pub layer_offsets: Vec<usize>,
     pub step: u64,
 }
 
@@ -2611,13 +2650,15 @@ impl NnModel {
         }
 
         let n = layers.len();
+        let layer_offsets = vec![0usize; n + 1];
         NnModel {
             name: decl.name.clone(),
             layers,
             training: false,
-            grads: vec![vec![]; n],
-            m1: vec![vec![]; n],
-            m2: vec![vec![]; n],
+            grads: Vec::new(),
+            m1: Vec::new(),
+            m2: Vec::new(),
+            layer_offsets,
             step: 0,
         }
     }
@@ -3807,7 +3848,7 @@ pub fn compile_fn(decl: &FnDecl) -> CompiledFn {
 #[allow(unused_macros)]
 macro_rules! rt_err {
     ($msg:expr) => { Err(RuntimeError::new($msg)) };
-    ($fmt:literal $(, $arg:expr)*) => { Err(RuntimeError::new(format!($fmt $(, $arg)*))) };
+    ($fmt:literal $(, $arg:expr)*) => { Err(RuntimeError::new(Cow::Owned(format!($fmt $(, $arg)*)))) };
 }
 
 // ── Register-based VM executor ───────────────────────────────────────────────
@@ -4188,9 +4229,9 @@ pub fn vm_exec(
                 *reg_mut!(*d) = Value::Tuple(Box::new(vals));
             }
             Instr::NewStruct(d, ni) => {
-                let name = str_c!(*ni).to_owned();
+                let name_sym = crate::runtime::symbol::global_intern(str_c!(*ni)).as_u32();
                 *reg_mut!(*d) = Value::Struct(Box::new(StructData {
-                    name,
+                    name: name_sym,
                     fields: FxHashMap::default(),
                     field_order: Vec::new(),
                 }));
@@ -4201,11 +4242,11 @@ pub fn vm_exec(
                 *reg_mut!(*d) = interp.eval_field(o, field)?;
             }
             Instr::FieldSet(obj, fi, val) => {
-                let field = str_pool[*fi as usize].clone();
+                let field_sym = crate::runtime::symbol::global_intern(&str_pool[*fi as usize]).as_u32();
                 let v = reg!(*val).clone();
                 match &mut regs[*obj as usize] {
                     Value::Struct(data) => {
-                        data.fields.insert(field, v);
+                        data.fields.insert(field_sym, v);
                     }
                     _ => {}
                 }
@@ -4381,7 +4422,7 @@ pub fn vm_exec_i32(
     macro_rules! rt_err {
         ($($arg:tt)*) => {{
             return Some(Err(RuntimeError {
-                message: format!($($arg)*),
+                message: Cow::Owned(format!($($arg)*)),
                 span: None,
                 code: "E9999",
             }));
@@ -4432,7 +4473,7 @@ pub fn vm_exec_i32(
                     BinOpKind::Div => {
                         if b == 0 {
                             return Some(Err(RuntimeError {
-                                message: "division by zero".into(),
+                                message: Cow::Borrowed("division by zero"),
                                 span: None,
                                 code: "E9999",
                             }));
@@ -4442,7 +4483,7 @@ pub fn vm_exec_i32(
                     BinOpKind::Rem => {
                         if b == 0 {
                             return Some(Err(RuntimeError {
-                                message: "modulo by zero".into(),
+                                message: Cow::Borrowed("modulo by zero"),
                                 span: None,
                                 code: "E9999",
                             }));
@@ -4579,9 +4620,17 @@ fn vm_unop(op: UnOpKind, v: Value) -> Result<Value, RuntimeError> {
 // §7  RUNTIME ERROR
 // =============================================================================
 
+/// Runtime error type.
+///
+/// PERF (Issue #9): The `message` field uses `Cow<'static, str>` instead of
+/// `String`.  Common/static error messages use `Cow::Borrowed("static msg")`
+/// (zero allocation on the happy-path return), while dynamic messages that
+/// require `format!(…)` use `Cow::Owned`.  Since errors are rare compared
+/// to the total instruction count, this saves heap allocations on the vast
+/// majority of execution paths that never actually construct an error.
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
-    pub message: String,
+    pub message: Cow<'static, str>,
     pub span: Option<Span>,
     /// Error code (e.g. "E9001") from the error_codes module.
     /// Defaults to "E9999" (unknown runtime error) if not explicitly set.
@@ -4590,7 +4639,7 @@ pub struct RuntimeError {
 
 impl RuntimeError {
     #[cold]
-    pub fn new(msg: impl Into<String>) -> Self {
+    pub fn new(msg: impl Into<Cow<'static, str>>) -> Self {
         RuntimeError {
             message: msg.into(),
             span: None,
@@ -4599,7 +4648,7 @@ impl RuntimeError {
     }
 
     /// Create a runtime error with a specific error code.
-    pub fn with_code(msg: impl Into<String>, code: &'static str) -> Self {
+    pub fn with_code(msg: impl Into<Cow<'static, str>>, code: &'static str) -> Self {
         RuntimeError {
             message: msg.into(),
             span: None,
@@ -4644,7 +4693,7 @@ impl fmt::Display for RuntimeError {
 // =============================================================================
 
 pub struct FnClosure {
-    pub decl: FnDecl,
+    pub decl: Rc<FnDecl>,
     pub capture: Frame, // captured environment for closures
 }
 
@@ -5003,7 +5052,7 @@ impl Interpreter {
         match item {
             Item::Fn(f) => {
                 let closure = FnClosure {
-                    decl: f.clone(),
+                    decl: Rc::new(f.clone()),
                     capture: FxHashMap::default(),
                 };
                 self.fns.insert(f.name.clone(), Arc::new(closure));
@@ -5895,7 +5944,7 @@ impl Interpreter {
                     ensures: vec![],
                     effect: None,
                 };
-                Ok(Value::Fn(Arc::new(FnClosure { decl, capture })))
+                Ok(Value::Fn(Arc::new(FnClosure { decl: Rc::new(decl), capture })))
             }
 
             Expr::Block(b) => self.eval_block(b, env),
@@ -5904,11 +5953,12 @@ impl Interpreter {
                 let mut field_vals = FxHashMap::default();
                 let mut field_order = Vec::with_capacity(fields.len());
                 for (fname, fexpr) in fields {
-                    field_order.push(fname.clone());
-                    field_vals.insert(fname.clone(), self.eval_expr(fexpr, env)?);
+                    let sym = crate::runtime::symbol::global_intern(fname).as_u32();
+                    field_order.push(sym);
+                    field_vals.insert(sym, self.eval_expr(fexpr, env)?);
                 }
                 Ok(Value::Struct(Box::new(StructData {
-                    name: name.clone(),
+                    name: crate::runtime::symbol::global_intern(name).as_u32(),
                     fields: field_vals,
                     field_order,
                 })))
@@ -6043,7 +6093,7 @@ impl Interpreter {
 
     /// Helper: extract CPU data from a tensor guard (RwLock or RefCell)
     fn tensor_cpu_data(tensor: &Tensor) -> (Vec<usize>, Vec<f32>) {
-        let shape = tensor.shape.clone();
+        let shape = tensor.shape.to_vec();
         let data = match &tensor.data {
             TensorStorage::Cpu(v) => v.clone(),
             TensorStorage::Gpu(_) => tensor.cpu_data().to_vec(),
@@ -6081,8 +6131,7 @@ impl Interpreter {
                 let a_guard = a.read().unwrap();
                 let b_guard = b.read().unwrap();
                 let (a_shape, a_cpu) = Self::tensor_cpu_data(&a_guard);
-                let (_b_shape, b_cpu) = Self::tensor_cpu_data(&b_guard);
-                let b_shape = b_guard.shape.clone();
+                let (b_shape, b_cpu) = Self::tensor_cpu_data(&b_guard);
                 let out = if let Some(gpu) = &self.gpu {
                     let ga = gpu.upload(&a_cpu, a_shape.clone());
                     let gb = gpu.upload(&b_cpu, b_shape.clone());
@@ -6158,7 +6207,7 @@ impl Interpreter {
                     } else if let Some(Value::Struct(_)) = env.get(name).cloned() {
                         let mut s = env.get(name).unwrap().clone();
                         if let Value::Struct(ref mut data) = s {
-                            data.fields.insert(field.clone(), effective_rhs);
+                            data.fields.insert(crate::runtime::symbol::global_intern(field).as_u32(), effective_rhs);
                         }
                         env.set(name, s);
                     }
@@ -6190,7 +6239,7 @@ impl Interpreter {
     fn eval_field(&mut self, obj: Value, field: &str) -> Result<Value, RuntimeError> {
         match obj {
             Value::Struct(ref data) => data.fields
-                .get(field)
+                .get(&crate::runtime::symbol::global_intern(field).as_u32())
                 .cloned()
                 .ok_or_else(|| RuntimeError::new(format!("no field `{field}`"))),
             Value::Entity(id) => {
@@ -8548,7 +8597,7 @@ impl Interpreter {
                     if let Some(graph) = &self.computation_graph {
                         let tensor = t.read().unwrap().clone();
                         let ml_tensor = crate::ml::ml_engine::Tensor {
-                            shape: tensor.shape.clone(),
+                            shape: tensor.shape.to_vec(),
                             data: tensor.cpu_data().to_vec(),
                         };
                         let node_id = graph.lock().unwrap().add_input(ml_tensor);
@@ -8809,7 +8858,7 @@ impl Interpreter {
             {
                 crate::jules_std::dispatch(name, &args).unwrap_or_else(|| {
                     Err(RuntimeError {
-                        message: format!("unknown std function: {}", name),
+                        message: Cow::Owned(format!("unknown std function: {}", name)),
                         span: None,
                         code: "E9999",
                     })
@@ -8823,7 +8872,7 @@ impl Interpreter {
             "fused_elementwise" => {
                 // Elementwise chain fusion annotation: just return the argument.
                 args.first().cloned().ok_or_else(|| RuntimeError {
-                    message: "fused_elementwise() requires exactly 1 argument".into(),
+                    message: Cow::Borrowed("fused_elementwise() requires exactly 1 argument"),
                     span: None,
                     code: "E9999",
                 })
@@ -8831,7 +8880,7 @@ impl Interpreter {
             "exact_div_restore" => {
                 // (x / y) * y → exact_div_restore(x): identity, assumes exact division.
                 args.first().cloned().ok_or_else(|| RuntimeError {
-                    message: "exact_div_restore() requires exactly 1 argument".into(),
+                    message: Cow::Borrowed("exact_div_restore() requires exactly 1 argument"),
                     span: None,
                     code: "E9999",
                 })
@@ -8840,7 +8889,7 @@ impl Interpreter {
                 // HadamardMul(MatMul(a,b), c) fused — identity for scalar,
                 // full tensor eval would need backend support.
                 args.first().cloned().ok_or_else(|| RuntimeError {
-                    message: "matmul_elemwise() requires at least 1 argument".into(),
+                    message: Cow::Borrowed("matmul_elemwise() requires at least 1 argument"),
                     span: None,
                     code: "E9999",
                 })
@@ -8848,7 +8897,7 @@ impl Interpreter {
             "scaled_matmul" => {
                 // alpha * MatMul(a, b) fused — identity for scalar.
                 args.first().cloned().ok_or_else(|| RuntimeError {
-                    message: "scaled_matmul() requires at least 1 argument".into(),
+                    message: Cow::Borrowed("scaled_matmul() requires at least 1 argument"),
                     span: None,
                     code: "E9999",
                 })
@@ -8856,7 +8905,7 @@ impl Interpreter {
 
             // Not a built-in
             _ => Err(RuntimeError {
-                message: format!("unknown function: {}", name),
+                message: Cow::Owned(format!("unknown function: {}", name)),
                 span: None,
                 code: "E9999",
             }),
@@ -9403,7 +9452,7 @@ impl Interpreter {
             Pattern::Struct { fields, .. } => {
                 if let Value::Struct(ref data) = val {
                     for (fname, maybe_pat) in fields {
-                        if let Some(fval) = data.fields.get(fname) {
+                        if let Some(fval) = data.fields.get(&crate::runtime::symbol::global_intern(fname).as_u32()) {
                             if let Some(p) = maybe_pat {
                                 self.bind_pattern(p, fval.clone(), env);
                             } else {
@@ -10765,7 +10814,7 @@ mod tests {
         let a = Tensor::from_data(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]);
         let b = Tensor::from_data(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]); // identity
         let c = a.matmul(&b).unwrap();
-        assert_eq!(c.shape, vec![2, 2]);
+        assert_eq!(c.shape.as_slice(), &[2, 2]);
         let d = c.cpu_data();
         assert!((d[0] - 1.0).abs() < 1e-5);
         assert!((d[1] - 2.0).abs() < 1e-5);
@@ -10797,7 +10846,7 @@ mod tests {
             ],
         );
         let c = a.matmul(&b).unwrap();
-        assert_eq!(c.shape, vec![2, 2, 2]);
+        assert_eq!(c.shape.as_slice(), &[2, 2, 2]);
         let d = c.cpu_data();
         assert!((d[0] - 4.0).abs() < 1e-6);
         assert!((d[1] - 5.0).abs() < 1e-6);
@@ -10823,7 +10872,7 @@ mod tests {
         let a = Tensor::from_data(vec![2, 3], vec![1.0; 6]);
         let b = Tensor::from_data(vec![3, 3], vec![2.0; 9]);
         let c = a.concat(&b).unwrap();
-        assert_eq!(c.shape, vec![5, 3]);
+        assert_eq!(c.shape.as_slice(), &[5, 3]);
         assert_eq!(c.numel(), 15);
     }
 
@@ -10876,7 +10925,7 @@ mod tests {
     fn test_tensor_transpose() {
         let t = Tensor::from_data(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let t2 = t.transpose().unwrap();
-        assert_eq!(t2.shape, vec![3, 2]);
+        assert_eq!(t2.shape.as_slice(), &[3, 2]);
         assert_eq!(t2.cpu_data()[0], 1.0);
         assert_eq!(t2.cpu_data()[1], 4.0); // first column of original
     }
@@ -11692,7 +11741,7 @@ mod tests {
             .unwrap();
         if let Value::TensorFast(t) = state {
             let tt = t.borrow();
-            assert_eq!(tt.shape, vec![128, 4]);
+            assert_eq!(tt.shape.as_slice(), &[128, 4]);
             assert_eq!(tt.numel(), 512);
         } else {
             panic!("expected tensor from sim::state_tensor");
@@ -12202,7 +12251,7 @@ mod tests {
         };
         let result = i.eval_expr(&e, &mut env).unwrap();
         if let Value::TensorFast(t) = result {
-            assert_eq!(t.borrow().shape, vec![2, 2]);
+            assert_eq!(t.borrow().shape.as_slice(), &[2, 2]);
         } else {
             panic!("expected tensor");
         }
@@ -12388,7 +12437,7 @@ mod tests {
         model.training = false;
         let input = Tensor::from_data(vec![1, 4], vec![1.0, 0.5, -1.0, 0.0]);
         let out = model.forward(input).unwrap();
-        assert_eq!(out.shape, vec![1, 2]);
+        assert_eq!(out.shape.as_slice(), &[1, 2]);
         // Softmax: outputs should sum to 1.
         let sum: f32 = out.cpu_data().iter().sum();
         assert!(
@@ -12425,7 +12474,7 @@ mod tests {
         let mut model = NnModel::from_decl(&decl);
         let input = Tensor::from_data(vec![1, 4], vec![1.0; 4]);
         let out = model.forward(input).unwrap();
-        assert_eq!(out.shape, vec![1, 2]);
+        assert_eq!(out.shape.as_slice(), &[1, 2]);
     }
 
     // ── Vec swizzle ───────────────────────────────────────────────────────────

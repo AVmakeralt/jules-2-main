@@ -31,6 +31,7 @@ use std::time::Instant;
 use rustc_hash::FxHashMap;
 
 use crate::compiler::ast::{FnDecl, Program};
+use std::borrow::Cow;
 use crate::interp::{compile_fn, CompiledFn, Interpreter, RuntimeError, Value};
 use crate::jit::phase3_jit as jit;
 use crate::jit::tracing_jit::TracingJIT;
@@ -513,7 +514,7 @@ impl TieredExecutionManager {
             return interp.call_fn(name, args);
         }
         Err(RuntimeError {
-            message: "interpreter not initialized".to_string(),
+            message: Cow::Borrowed("interpreter not initialized"),
             span: None,
             code: "E9999",
         })

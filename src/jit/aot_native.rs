@@ -344,6 +344,9 @@ pub enum IRInstr {
     Ret    { value: Option<VarId> },
 
     // ── Calls ────────────────────────────────────────────────────────────
+    // TODO: migrate `func: String` to `func: u32` (interned symbol) when the
+    // full string interning migration happens; this eliminates per-call heap
+    // allocations and enables symbol-table lookups by index.
     Call     { dst: VarId, func: String, args: SmallVars },
     TailCall { func: String, args: SmallVars },
 
@@ -1802,13 +1805,6 @@ pub fn run_licm(func: &mut IRFunction, loops: &[NaturalLoop]) {
                     if invariant {
                         hoisted.insert((bid, idx));
                         changed = true;
-                        // If the hoisted instruction defines a variable that is
-                        // a compile-time constant, verify with find_const_def.
-                        // This enables downstream passes to trust the const value
-                        // even after hoisting reorders instructions.
-                        if let Some(def_var) = def {
-                            let _const_val = find_const_def(func, *def_var, &lp.body);
-                        }
                     }
                 }
             }
@@ -1962,6 +1958,7 @@ pub fn run_strength_reduction(func: &mut IRFunction, loops: &[NaturalLoop]) {
     }
 }
 
+#[allow(dead_code)]
 fn find_const_def(func: &IRFunction, var: VarId, _loop_body: &HashSet<BlockId>) -> Option<i64> {
     for block in func.blocks.iter() {
         for instr in &block.instrs {
@@ -2311,8 +2308,10 @@ pub fn instr_def(i: &IRInstr) -> Option<VarId> {
     }
 }
 
-pub fn instr_uses(i: &IRInstr) -> SmallVars {
-    let mut u = SmallVars::new();
+/// Non-allocating version of `instr_uses()` — clears and fills the provided buffer.
+/// Use this in hot loops (DCE, GVN, scheduling) to avoid per-call SmallVec allocation.
+pub fn instr_uses_into(i: &IRInstr, out: &mut SmallVars) {
+    out.clear();
     match i {
         IRInstr::Add  { lhs, rhs, .. } | IRInstr::Sub  { lhs, rhs, .. } |
         IRInstr::Mul  { lhs, rhs, .. } | IRInstr::SDiv { lhs, rhs, .. } |
@@ -2320,22 +2319,27 @@ pub fn instr_uses(i: &IRInstr) -> SmallVars {
         IRInstr::Or   { lhs, rhs, .. } | IRInstr::Xor  { lhs, rhs, .. } |
         IRInstr::Shl  { lhs, rhs, .. } | IRInstr::AShr { lhs, rhs, .. } |
         IRInstr::LShr { lhs, rhs, .. } | IRInstr::ICmp { lhs, rhs, .. } => {
-            u.push(*lhs); u.push(*rhs);
+            out.push(*lhs); out.push(*rhs);
         }
         IRInstr::Neg  { src, .. } | IRInstr::Not  { src, .. } |
-        IRInstr::Move { src, .. } | IRInstr::Load { ptr: src, .. } => { u.push(*src); }
+        IRInstr::Move { src, .. } | IRInstr::Load { ptr: src, .. } => { out.push(*src); }
         // ← CondBr uses `cond` (v1 bug fix: was incorrectly sharing `src` pattern)
-        IRInstr::CondBr { cond, .. }                => { u.push(*cond); }
-        IRInstr::Store  { ptr, value }              => { u.push(*ptr); u.push(*value); }
+        IRInstr::CondBr { cond, .. }                => { out.push(*cond); }
+        IRInstr::Store  { ptr, value }              => { out.push(*ptr); out.push(*value); }
         IRInstr::Call   { args, .. }                |
-        IRInstr::TailCall { args, .. }              => { u.extend(args.iter().copied()); }
-        IRInstr::Ret    { value: Some(v) }          => { u.push(*v); }
+        IRInstr::TailCall { args, .. }              => { out.extend(args.iter().copied()); }
+        IRInstr::Ret    { value: Some(v) }          => { out.push(*v); }
         IRInstr::Phi    { incoming, .. }            => {
-            for (_, v) in incoming { u.push(*v); }
+            for (_, v) in incoming { out.push(*v); }
         }
         _ => {}
     }
-    u
+}
+
+pub fn instr_uses(i: &IRInstr) -> SmallVars {
+    let mut v = SmallVars::new();
+    instr_uses_into(i, &mut v);
+    v
 }
 
 // =============================================================================
@@ -3525,41 +3529,24 @@ pub fn compile_to_native(
                 func.estimate_frequencies();
             }
 
-            // Core optimizations (always beneficial)
-            if cfg.sccp              { run_sccp(func); }
-            if cfg.gvn               { run_gvn(func); }
-            if cfg.copy_prop         { run_copy_prop(func); }
-
-            // Algebraic simplification (Thorough only)
-            if cfg.algebra_simplify  { run_algebra_simplify(func); }
-
-            // Value range propagation enables more aggressive folding
-            if cfg.vrp               { run_vrp(func); }
-
-            // Loop optimizations
-            if cfg.licm              { run_licm(func, &loops); }
-            if cfg.strength_reduce    { run_strength_reduction(func, &loops); }
-
-            // Cleanup passes
-            if cfg.dce               { run_dce(func); }
-            if cfg.peephole          { run_peephole(func); }
-
-            // Reassociation can create new GVN opportunities
-            if cfg.reassociate        { run_reassociate(func); }
-            if cfg.copy_prop         { run_copy_prop(func); }
-
-            // Control flow optimizations
-            if cfg.tco               { run_tco(func); }
-            if cfg.jump_threading    { run_jump_threading(func); func.build_predecessors(); }
-
-            // FIX #3: Early termination — count instructions before and after the pass
+            // FIX #3: Early termination — count instructions before the pass
             // to detect when no further progress is possible.
             let pre_count: usize = func.blocks.iter().map(|b| b.instrs.len()).sum();
 
-            // Aggressive cleanup after control flow changes
-            if cfg.dce               { run_dce(func); }
+            // Correct pass order (each run exactly once per iteration):
+            // SCCP → GVN → copy_prop → algebraic_simplify → VRP → LICM
+            // → strength_reduce → reassociate → TCO → jump_threading → DCE → peephole
+            if cfg.sccp              { run_sccp(func); }
             if cfg.gvn               { run_gvn(func); }
             if cfg.copy_prop         { run_copy_prop(func); }
+            if cfg.algebra_simplify  { run_algebra_simplify(func); }
+            if cfg.vrp               { run_vrp(func); }
+            if cfg.licm              { run_licm(func, &loops); }
+            if cfg.strength_reduce   { run_strength_reduction(func, &loops); }
+            if cfg.reassociate       { run_reassociate(func); }
+            if cfg.tco               { run_tco(func); }
+            if cfg.jump_threading    { run_jump_threading(func); func.build_predecessors(); }
+            if cfg.dce               { run_dce(func); }
             if cfg.peephole          { run_peephole(func); }
 
             // FIX #3: If no instructions were removed, the optimization has converged
@@ -3575,6 +3562,13 @@ pub fn compile_to_native(
             for block in func.blocks.iter_mut() {
                 if block.freq > 10.0 {
                     block.freq = 100.0; // Mark as hot
+                }
+            }
+            // Strip cold blocks (freq <= 1.0) down to only side-effect
+            // instructions, skipping optimization on them entirely.
+            for block in func.blocks.iter_mut() {
+                if block.freq <= 1.0 {
+                    block.instrs.retain(|i| i.has_side_effects());
                 }
             }
         }

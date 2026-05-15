@@ -65,8 +65,8 @@
 // compiler's analysis results that feed into the ZCHMA tier-selection engine.
 // Previously imported from crate::compiler::borrowck, but that module does not
 // export these types, so we define self-contained versions here.
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,26 +273,26 @@ pub struct LifetimeTierMapper {
 
 #[derive(Debug, Default)]
 pub struct TierSelectionStats {
-    pub total_allocations: AtomicU64,
-    pub tier_selections: HashMap<MemoryTierId, AtomicU64>,
-    pub migration_decisions: AtomicU64,
-    pub successful_migrations: AtomicU64,
-    pub failed_migrations: AtomicU64,
+    pub total_allocations: Cell<u64>,
+    pub tier_selections: HashMap<MemoryTierId, Cell<u64>>,
+    pub migration_decisions: Cell<u64>,
+    pub successful_migrations: Cell<u64>,
+    pub failed_migrations: Cell<u64>,
 }
 
-// NOTE: AtomicU64 does not implement Clone, so we implement it manually
-// by re-creating zero-valued atomics. This is correct for statistics
-// counters that are only meaningful within a single runtime instance.
+// NOTE: Cell<u64> implements Clone by copying the value.
+// This is correct for statistics counters that are only meaningful
+// within a single runtime instance.
 impl Clone for TierSelectionStats {
     fn clone(&self) -> Self {
         Self {
-            total_allocations: AtomicU64::new(self.total_allocations.load(Ordering::Relaxed)),
+            total_allocations: Cell::new(self.total_allocations.get()),
             tier_selections: self.tier_selections.iter().map(|(k, v)| {
-                (*k, AtomicU64::new(v.load(Ordering::Relaxed)))
+                (*k, Cell::new(v.get()))
             }).collect(),
-            migration_decisions: AtomicU64::new(self.migration_decisions.load(Ordering::Relaxed)),
-            successful_migrations: AtomicU64::new(self.successful_migrations.load(Ordering::Relaxed)),
-            failed_migrations: AtomicU64::new(self.failed_migrations.load(Ordering::Relaxed)),
+            migration_decisions: Cell::new(self.migration_decisions.get()),
+            successful_migrations: Cell::new(self.successful_migrations.get()),
+            failed_migrations: Cell::new(self.failed_migrations.get()),
         }
     }
 }
@@ -315,7 +315,7 @@ impl LifetimeTierMapper {
         access_pattern: &AccessPattern,
         size_bytes: u64,
     ) -> PlacementDistribution {
-        self.selection_stats.total_allocations.fetch_add(1, Ordering::Relaxed);
+        self.selection_stats.total_allocations.set(self.selection_stats.total_allocations.get() + 1);
         
         // Classify the access pattern
         let pattern_class = self.access_classifier.classify(access_pattern);
@@ -368,8 +368,10 @@ impl LifetimeTierMapper {
         if let Some(tier) = distribution.most_likely_tier() {
             self.selection_stats.tier_selections
                 .entry(tier)
-                .or_insert_with(|| AtomicU64::new(0))
-                .fetch_add(1, Ordering::Relaxed);
+                .or_insert_with(|| Cell::new(0));
+            if let Some(counter) = self.selection_stats.tier_selections.get(&tier) {
+                counter.set(counter.get() + 1);
+            }
         }
         
         distribution
@@ -899,7 +901,7 @@ pub struct MigrationResult {
 /// data between memory tiers doesn't change program meaning.
 pub struct TierMigrationValidator {
     /// SMT solver for formal verification.
-    smt_solver: Box<dyn TierSmtSolver>,
+    smt_solver: TierSmtSolverKind,
     /// Cache of validated migration scenarios.
     validation_cache: HashMap<MigrationScenario, ValidationResult>,
 }
@@ -947,7 +949,7 @@ impl TierMigrationValidator {
     /// Create a new tier migration validator.
     pub fn new() -> Self {
         Self {
-            smt_solver: Box::new(BuiltinTierSmtSolver::new()),
+            smt_solver: TierSmtSolverKind::Builtin(BuiltinTierSmtSolver::new()),
             validation_cache: HashMap::new(),
         }
     }
@@ -1123,6 +1125,20 @@ impl TierMigrationValidator {
 
 trait TierSmtSolver {
     fn solve(&mut self, query: SmtQuery) -> SmtResult;
+}
+
+/// Enum-based SMT solver dispatch — avoids Box<dyn Trait> overhead
+/// since there is only one implementation (BuiltinTierSmtSolver).
+enum TierSmtSolverKind {
+    Builtin(BuiltinTierSmtSolver),
+}
+
+impl TierSmtSolver for TierSmtSolverKind {
+    fn solve(&mut self, query: SmtQuery) -> SmtResult {
+        match self {
+            TierSmtSolverKind::Builtin(s) => s.solve(query),
+        }
+    }
 }
 
 /// SMT query for tier migration validation.
