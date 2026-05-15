@@ -19,7 +19,8 @@
 //   Intel VT-d Specification (IOMMU)
 // =========================================================================
 
-use std::collections::HashMap;
+// Zero-heap design: no HashMap, Vec, Box, Arc, or std::collections.
+// All data structures use fixed-size arrays with linear scan.
 
 // ─── 1. IDENTITY MAPPING ────────────────────────────────────────────────────
 
@@ -44,16 +45,25 @@ pub const PAGE_MASK: u64 = !0xFFF;
 /// Default sanctuary size: 8 MB (power of 2, SFI-compatible)
 pub const SANCTUARY_SIZE: u64 = 8 * 1024 * 1024;
 
+/// Maximum number of on-demand PD tables. Each PD table covers 1GB of
+/// address space when using 2MB pages, or 1GB using 512 × 2MB entries.
+/// 16 PD tables covers 16 GB, sufficient for the Jules bare-metal runtime.
+const MAX_PD_TABLES: usize = 16;
+
 /// A single PML4 table for identity mapping.
 /// Supports up to 512 × 1GB = 512GB of identity-mapped memory.
+/// Zero-heap: all data is in fixed-size inline arrays.
 pub struct IdentityMap {
     /// PML4 table (512 × 8 bytes = 4KB)
     pml4: [u64; PML4_ENTRIES],
     /// PDPT tables (each 512 × 8 = 4KB)
     pdpt: [[u64; PDPT_ENTRIES]; PML4_ENTRIES],
-    /// PD tables for 4KB page support, allocated on demand.
-    /// Key: (pml4_idx, pdpt_idx), Value: 512-entry page table.
-    pd: HashMap<(usize, usize), Box<[u64; PD_ENTRIES]>>,
+    /// PD tables for 4KB/2MB page support, allocated on demand.
+    /// Each entry stores (pml4_idx, pdpt_idx) and the 512-entry page table.
+    /// Linear scan lookup — acceptable for ≤16 entries.
+    pd_keys: [(usize, usize); MAX_PD_TABLES],
+    pd_tables: [[u64; PD_ENTRIES]; MAX_PD_TABLES],
+    pd_count: usize,
     /// Whether each PDPT entry has been initialized
     pdpt_used: [bool; PML4_ENTRIES],
     /// Use 1GB gigantic pages (maps entire 1GB per PDPT entry)
@@ -67,11 +77,53 @@ impl IdentityMap {
         Self {
             pml4: [0; PML4_ENTRIES],
             pdpt: [[0; PDPT_ENTRIES]; PML4_ENTRIES],
-            pd: HashMap::new(),
+            pd_keys: [(0, 0); MAX_PD_TABLES],
+            pd_tables: [[0; PD_ENTRIES]; MAX_PD_TABLES],
+            pd_count: 0,
             pdpt_used: [false; PML4_ENTRIES],
             use_1gb_pages,
             mapped_bytes: 0,
         }
+    }
+
+    /// Look up a PD table by (pml4_idx, pdpt_idx). Returns None if not found.
+    fn _get_pd(&self, key: (usize, usize)) -> Option<&[u64; PD_ENTRIES]> {
+        for i in 0..self.pd_count {
+            if self.pd_keys[i] == key {
+                return Some(&self.pd_tables[i]);
+            }
+        }
+        None
+    }
+
+    /// Look up a PD table by (pml4_idx, pdpt_idx) mutably. Returns None if not found.
+    fn get_pd_mut(&mut self, key: (usize, usize)) -> Option<&mut [u64; PD_ENTRIES]> {
+        for i in 0..self.pd_count {
+            if self.pd_keys[i] == key {
+                return Some(&mut self.pd_tables[i]);
+            }
+        }
+        None
+    }
+
+    /// Get or create a PD table for the given key. Returns the table index.
+    /// Returns None if MAX_PD_TABLES is exhausted.
+    fn get_or_create_pd(&mut self, key: (usize, usize)) -> Option<usize> {
+        // Check if it already exists
+        for i in 0..self.pd_count {
+            if self.pd_keys[i] == key {
+                return Some(i);
+            }
+        }
+        // Allocate a new one
+        if self.pd_count >= MAX_PD_TABLES {
+            return None;
+        }
+        let idx = self.pd_count;
+        self.pd_keys[idx] = key;
+        self.pd_tables[idx] = [0; PD_ENTRIES];
+        self.pd_count += 1;
+        Some(idx)
     }
 
     /// Map a 4KB page as identity: VA = PA.
@@ -90,20 +142,15 @@ impl IdentityMap {
 
         // Ensure PDPT entry points to a PD (not a 1GB huge page)
         if self.pdpt[pml4_idx][pdpt_idx] == 0 || (self.pdpt[pml4_idx][pdpt_idx] & PTE_HUGE_PAGE) != 0 {
-            let pd_table = self.pd.entry((pml4_idx, pdpt_idx)).or_insert_with(|| Box::new([0u64; PD_ENTRIES]));
-            let pd_addr = pd_table.as_ptr() as u64;
+            let pd_idx = self.get_or_create_pd((pml4_idx, pdpt_idx))
+                .expect("PD table limit exhausted — increase MAX_PD_TABLES");
+            let pd_addr = self.pd_tables[pd_idx].as_ptr() as u64;
             self.pdpt[pml4_idx][pdpt_idx] = (pd_addr & PAGE_MASK) | PTE_PRESENT | PTE_WRITABLE;
         }
 
-        // PD entry points to PT — for 4KB pages, we use the PD entry itself
-        // as a page table entry array (simplified: PD[pt_idx] = 4KB page mapping)
-        // In a full implementation, PD would point to a separate PT.
-        // Here we use the pd array as a combined PD+PT where each entry maps a 4KB page.
-        // PD entries for 4KB mapping: point to the page itself (no huge page bit).
-        // Since we don't have a separate PT level in this simplified model,
-        // we use pd[(pml4_idx, pdpt_idx)] as the PD and treat entries as PT entries.
-        // Each pd[(pml4_idx, pdpt_idx)][pd_idx] acts as a PT entry for 4KB pages.
-        let pd_table = self.pd.get_mut(&(pml4_idx, pdpt_idx)).expect("pd table must exist after initialization");
+        // PD entry for 4KB page mapping.
+        let pd_table = self.get_pd_mut((pml4_idx, pdpt_idx))
+            .expect("pd table must exist after initialization");
         pd_table[pd_idx] = (phys_addr & PAGE_MASK) | flags | PTE_PRESENT;
         self.mapped_bytes += 4 * 1024; // 4 KB
 
@@ -124,19 +171,15 @@ impl IdentityMap {
 
         // PDPT entry must point to a PD (no huge page bit at this level)
         if self.pdpt[pml4_idx][pdpt_idx] == 0 || (self.pdpt[pml4_idx][pdpt_idx] & PTE_HUGE_PAGE) != 0 {
-            // Allocate a PD table on demand
-            let pd_table = self.pd.entry((pml4_idx, pdpt_idx)).or_insert_with(|| {
-                let mut table = Box::new([0u64; PD_ENTRIES]);
-                // Initialize all entries to not-present
-                table.fill(0);
-                table
-            });
-            let pd_addr = pd_table.as_ptr() as u64;
+            // Allocate a PD table on demand (zero-heap: fixed array)
+            let pd_idx = self.get_or_create_pd((pml4_idx, pdpt_idx))
+                .expect("PD table limit exhausted — increase MAX_PD_TABLES");
+            let pd_addr = self.pd_tables[pd_idx].as_ptr() as u64;
             self.pdpt[pml4_idx][pdpt_idx] = (pd_addr & PAGE_MASK) | PTE_PRESENT | PTE_WRITABLE;
         }
 
         // PD entry with huge page bit (2MB page)
-        if let Some(pd_table) = self.pd.get_mut(&(pml4_idx, pdpt_idx)) {
+        if let Some(pd_table) = self.get_pd_mut((pml4_idx, pdpt_idx)) {
             pd_table[pd_idx] = (phys_addr & !0x1F_FFFF) | flags | PTE_HUGE_PAGE | PTE_PRESENT;
         }
         self.mapped_bytes += 2 * 1024 * 1024; // 2 MB
@@ -390,27 +433,34 @@ impl CfiJumpTable {
     pub fn count(&self) -> usize { self.count }
 }
 
+/// Maximum CFI violations that can be recorded.
+const CFI_MAX_VIOLATIONS: usize = 256;
+
 /// CFI compliance verification report.
+/// Zero-heap: uses fixed-size arrays instead of Vec.
 pub struct CfiReport {
     pub total_jumps: usize,
     pub verified_jumps: usize,
-    pub violations: Vec<(usize, u64)>,
+    pub violations: [(usize, u64); CFI_MAX_VIOLATIONS],
+    pub violation_count: usize,
     pub is_compliant: bool,
 }
 
 /// Verify CFI compliance for a set of indirect jump targets.
 pub fn verify_cfi_compliance(jump_targets: &[u64], table: &CfiJumpTable) -> CfiReport {
     let mut verified = 0;
-    let mut violations = Vec::new();
+    let mut violations = [(0usize, 0u64); CFI_MAX_VIOLATIONS];
+    let mut violation_count = 0;
     for (i, &target) in jump_targets.iter().enumerate() {
         if table.is_valid_target(target) {
             verified += 1;
-        } else {
-            violations.push((i, target));
+        } else if violation_count < CFI_MAX_VIOLATIONS {
+            violations[violation_count] = (i, target);
+            violation_count += 1;
         }
     }
-    let is_compliant = violations.is_empty();
-    CfiReport { total_jumps: jump_targets.len(), verified_jumps: verified, violations, is_compliant }
+    let is_compliant = violation_count == 0;
+    CfiReport { total_jumps: jump_targets.len(), verified_jumps: verified, violations, violation_count, is_compliant }
 }
 
 #[cfg(test)]
@@ -527,7 +577,7 @@ mod tests {
         assert_eq!(report.total_jumps, 3);
         assert_eq!(report.verified_jumps, 2);
         assert!(!report.is_compliant);
-        assert_eq!(report.violations.len(), 1);
+        assert_eq!(report.violation_count, 1);
         assert_eq!(report.violations[0], (2, 0x3000));
     }
 

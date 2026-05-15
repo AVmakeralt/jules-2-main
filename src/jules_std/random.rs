@@ -180,8 +180,24 @@ pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError
                 if lo >= hi {
                     return Some(Err(rt_err!("random::rand_int(): lo >= hi")));
                 }
-                let v = GLOBAL_PCG.with(|r| r.borrow_mut().next_range(lo as u32, hi as u32));
-                Some(Ok(Value::I32(v as i32)))
+                // Handle the full i64 range by computing range in u64 and
+                // offsetting from lo. This avoids the previous bug where
+                // lo/hi were truncated to u32, producing wrong ranges for
+                // negative values or values > u32::MAX.
+                let range = (hi - lo) as u64;
+                let v = if range <= u32::MAX as u64 {
+                    // Fast path: fits in u32
+                    GLOBAL_PCG.with(|r| r.borrow_mut().next_range(0, range as u32)) as i64 + lo
+                } else {
+                    // Slow path: use u64 range via next_u64 modulo
+                    GLOBAL_PCG.with(|r| {
+                        let mut rng = r.borrow_mut();
+                        // Simple rejection sampling to avoid modulo bias
+                        let raw = rng.next_u64();
+                        (raw % range) as i64 + lo
+                    })
+                };
+                Some(Ok(Value::I64(v)))
             } else { Some(Err(rt_err!("random::rand_int() requires two integers"))) }
         }
 

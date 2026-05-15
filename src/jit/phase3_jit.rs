@@ -875,13 +875,15 @@ impl Emitter {
         self.emit3(0x0F, 0x2E, 0xC1);
     }
 
-    /// cvttsd2si eax, xmm0  — f64 → i32 (truncating)
+    /// cvttsd2si rax, xmm0  — f64 → i64 (truncating)
+    /// Correct encoding: F2 48 0F 2C C0
+    ///   F2 = SSE2 mandatory prefix
+    ///   48 = REX.W (64-bit operand size → rax, not eax)
+    ///   0F 2C = cvttsd2si opcode
+    ///   C0 = ModRM: mod=11 reg=0(rax) rm=0(xmm0)
     fn cvttsd2si_eax_xmm0(&mut self) {
-        self.emit2(0xF2, 0x48);
-        self.emit_rex(false, true, false, false);
-        self.emit_modrm(0xC0, 0, 0);
-        self.b(0x2C);
-        self.b(0xC0);
+        self.emit4(0xF2, 0x48, 0x0F, 0x2C);
+        self.b(0xC0); // ModRM: mod=11, reg=0(rax), rm=0(xmm0)
     }
 
     /// cvttss2si eax, xmm0  — f32 → i32 (truncating)

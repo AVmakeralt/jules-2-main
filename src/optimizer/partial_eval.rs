@@ -519,11 +519,14 @@ impl PartialEvaluator {
         match (lv, rv) {
             (PartialValue::Int(l), PartialValue::Int(r)) => {
                 match op {
-                    BinOpKind::Add => Some(PartialValue::Int(*l + *r)),
-                    BinOpKind::Sub => Some(PartialValue::Int(*l - *r)),
-                    BinOpKind::Mul => Some(PartialValue::Int(*l * *r)),
-                    BinOpKind::Div if *r != 0 => Some(PartialValue::Int(*l / *r)),
-                    BinOpKind::Rem if *r != 0 => Some(PartialValue::Int(*l % *r)),
+                    // Use i64 wrapping semantics to match the runtime behavior.
+                    // PartialValue::Int stores u128 for representation range, but
+                    // the runtime uses i64 with wrapping arithmetic.
+                    BinOpKind::Add => Some(PartialValue::Int((*l as i64).wrapping_add(*r as i64) as u128)),
+                    BinOpKind::Sub => Some(PartialValue::Int((*l as i64).wrapping_sub(*r as i64) as u128)),
+                    BinOpKind::Mul => Some(PartialValue::Int((*l as i64).wrapping_mul(*r as i64) as u128)),
+                    BinOpKind::Div if *r != 0 => Some(PartialValue::Int((*l as i64).wrapping_div(*r as i64) as u128)),
+                    BinOpKind::Rem if *r != 0 => Some(PartialValue::Int((*l as i64).wrapping_rem(*r as i64) as u128)),
                     BinOpKind::Eq => Some(PartialValue::Bool(*l == *r)),
                     BinOpKind::Ne => Some(PartialValue::Bool(*l != *r)),
                     BinOpKind::Lt => Some(PartialValue::Bool(*l < *r)),

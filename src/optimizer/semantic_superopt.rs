@@ -465,8 +465,9 @@ impl SemanticSuperoptimizer {
                 *cond = self.optimize_expr(old);
                 self.optimize_block(then);
                 if let Some(else_box) = else_ {
-                    if let IfOrBlock::Block(b) = &mut **else_box {
-                        self.optimize_block(b);
+                    match &mut **else_box {
+                        IfOrBlock::Block(b) => self.optimize_block(b),
+                        IfOrBlock::If(s) => self.optimize_stmt(s),
                     }
                 }
             }

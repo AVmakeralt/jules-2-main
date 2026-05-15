@@ -528,11 +528,7 @@ impl FunctionCompiler {
                         let dst = self.slot_for(instr.dst.unwrap());
                         let lhs_slot = self.slot_for(*lhs);
                         let rhs_slot = self.slot_for(*rhs);
-                        // No HadamardDiv in the VM; lower as Div.
-                        self.emit(Instr::Div { dst, lhs: lhs_slot, rhs: rhs_slot });
-                        self.errors.push(
-                            "IrOp::HadamardDiv lowered as Div — element-wise semantics lost".to_string()
-                        );
+                        self.emit(Instr::HadamardDiv { dst, lhs: lhs_slot, rhs: rhs_slot });
                     }
 
                     IrOp::TensorConcat { lhs, rhs } => {

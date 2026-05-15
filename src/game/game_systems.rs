@@ -175,11 +175,17 @@ impl PhysicsWorld {
     fn resolve_collision(&mut self, id1: u32, id2: u32) {
         // Simple impulse-based collision response
         let (pos1, vel1, mass1) = {
-            let b = self.bodies.get(&id1).unwrap();
+            let b = match self.bodies.get(&id1) {
+                Some(b) => b,
+                None => return, // Body was removed between detection and resolution
+            };
             (b.position, b.velocity, b.mass)
         };
         let (pos2, vel2, mass2) = {
-            let b = self.bodies.get(&id2).unwrap();
+            let b = match self.bodies.get(&id2) {
+                Some(b) => b,
+                None => return, // Body was removed between detection and resolution
+            };
             (b.position, b.velocity, b.mass)
         };
 

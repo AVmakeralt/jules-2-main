@@ -901,14 +901,14 @@ impl NeuralTracingJIT {
             graph, // Store the graph so record_execution can use the real structure
         };
 
-        self.compiled_traces.write().unwrap().insert(block_id, superblock.clone());
+        self.compiled_traces.write().unwrap_or_else(|e| e.into_inner()).insert(block_id, superblock.clone());
         Some(superblock)
     }
 
     /// Record actual IPC after execution
     pub fn record_execution(&mut self, block_id: usize, measured_ipc: f32) {
         // Use the stored graph from the compiled trace (not an empty graph)
-        let graph = self.compiled_traces.read().unwrap().get(&block_id)
+        let graph = self.compiled_traces.read().unwrap_or_else(|e| e.into_inner()).get(&block_id)
             .map(|c| c.graph.clone());
         if let Some(graph) = graph {
             self.predictor.record_performance(&graph, measured_ipc);

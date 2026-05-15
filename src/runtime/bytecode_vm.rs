@@ -108,6 +108,9 @@ pub enum Instr {
     // Element-wise (Hadamard) multiply for tensors/arrays
     HadamardMul { dst: u16, lhs: u16, rhs: u16 },
 
+    // Element-wise (Hadamard) division for tensors/arrays
+    HadamardDiv { dst: u16, lhs: u16, rhs: u16 },
+
     // Compound construction from register range
     MakeArray { dst: u16, start: u16, count: u16 },
     MakeTuple { dst: u16, start: u16, count: u16 },
@@ -612,6 +615,7 @@ impl BytecodeCompiler {
             | Instr::MatMul { dst, .. }
             | Instr::Pow { dst, .. }
             | Instr::HadamardMul { dst, .. }
+            | Instr::HadamardDiv { dst, .. }
             | Instr::MakeArray { dst, .. }
             | Instr::MakeTuple { dst, .. }
             | Instr::MakeStruct { dst, .. }
@@ -707,7 +711,15 @@ impl BytecodeCompiler {
     fn eval_const_expr(&self, expr: &crate::compiler::ast::Expr) -> Option<Value> {
         use crate::compiler::ast::Expr;
         match expr {
-            Expr::IntLit { value, .. } => Some(Value::I64(*value as i64)),
+            Expr::IntLit { value, .. } => {
+                // Guard: u128 values that don't fit in i64 cannot be folded.
+                // Return None so the expression is evaluated at runtime instead
+                // of silently truncating the upper 64 bits.
+                if *value > i64::MAX as u128 {
+                    return None;
+                }
+                Some(Value::I64(*value as i64))
+            }
             Expr::FloatLit { value, .. } => Some(Value::F64(*value)),
             Expr::BoolLit { value, .. } => Some(Value::Bool(*value)),
             Expr::BinOp { op, lhs, rhs, .. } => {
@@ -1594,7 +1606,11 @@ impl BytecodeCompiler {
                 self.compile_expr(lhs, dst)?;
                 let rhs_slot = self.alloc_slot();
                 self.compile_expr(rhs, rhs_slot)?;
-                self.emit(Instr::Div { dst, lhs: dst, rhs: rhs_slot });
+                // BUG-NOTE: HadamardDiv (element-wise division) should produce
+                // per-element division for tensor operands. We emit the dedicated
+                // HadamardDiv instruction here; the runtime dispatch handles both
+                // scalar and tensor operands correctly.
+                self.emit(Instr::HadamardDiv { dst, lhs: dst, rhs: rhs_slot });
             }
             Expr::Grad { inner, .. } => {
                 // Gradient tracking is transparent at runtime
@@ -2184,7 +2200,12 @@ impl BytecodeVM {
                         if *r == 0 {
                             return Err(RuntimeError::new("floor division by zero"));
                         }
-                        let d = l / r; // truncating division (toward 0)
+                        // Use checked_div to avoid panic on i64::MIN / -1
+                        // (which overflows in Rust's debug mode). The mathematical
+                        // result is i64::MIN, which is also the truncating result,
+                        // and the correction below is a no-op since both operands
+                        // are negative (signs match → no adjustment).
+                        let d = l.checked_div(*r).unwrap_or(i64::MIN); // truncating division (toward 0)
                         // Correction: when signs differ and there's a remainder,
                         // floor division is one less than truncating division.
                         let result = if (*l < 0) != (*r < 0) && *l % *r != 0 {
@@ -3270,6 +3291,72 @@ impl BytecodeVM {
                     pc += 1;
                 }
 
+                // ── Hadamard (element-wise) division ──
+                Instr::HadamardDiv { dst, lhs, rhs } => {
+                    let l_val = &slots[*lhs as usize];
+                    let r_val = &slots[*rhs as usize];
+                    match (l_val, r_val) {
+                        (Value::Tensor(l_arc), Value::Tensor(r_arc)) => {
+                            let l_tensor = l_arc.read().unwrap();
+                            let r_tensor = r_arc.read().unwrap();
+                            let result = l_tensor.hadamard_div(&r_tensor)?;
+                            drop(l_tensor);
+                            drop(r_tensor);
+                            slots[*dst as usize] = Value::Tensor(std::sync::Arc::new(std::sync::RwLock::new(result)));
+                        }
+                        (Value::TensorFast(l_arc), Value::TensorFast(r_arc)) => {
+                            let l_tensor = l_arc.borrow();
+                            let r_tensor = r_arc.borrow();
+                            let result = l_tensor.hadamard_div(&r_tensor)?;
+                            drop(l_tensor);
+                            drop(r_tensor);
+                            slots[*dst as usize] = Value::TensorFast(std::sync::Arc::new(std::cell::RefCell::new(result)));
+                        }
+                        (Value::Vec4(a), Value::Vec4(b)) => {
+                            slots[*dst as usize] = Value::Vec4([a[0]/b[0], a[1]/b[1], a[2]/b[2], a[3]/b[3]]);
+                        }
+                        (Value::Vec3(a), Value::Vec3(b)) => {
+                            slots[*dst as usize] = Value::Vec3([a[0]/b[0], a[1]/b[1], a[2]/b[2]]);
+                        }
+                        (Value::Vec2(a), Value::Vec2(b)) => {
+                            slots[*dst as usize] = Value::Vec2([a[0]/b[0], a[1]/b[1]]);
+                        }
+                        (Value::Array(l_arr), Value::Array(r_arr)) => {
+                            let l_guard = l_arr.borrow();
+                            let r_guard = r_arr.borrow();
+                            if l_guard.len() != r_guard.len() {
+                                return Err(RuntimeError::new(format!(
+                                    "HadamardDiv: array length mismatch ({} vs {}) at pc={pc}",
+                                    l_guard.len(), r_guard.len()
+                                )));
+                            }
+                            // Element-wise division for numeric arrays
+                            let result: Vec<Value> = l_guard.iter().zip(r_guard.iter())
+                                .map(|(l, r)| {
+                                    match (l.as_f64(), r.as_f64()) {
+                                        (Some(lf), Some(rf)) => {
+                                            if rf == 0.0 {
+                                                Value::F64(f64::NAN)
+                                            } else {
+                                                Value::F64(lf / rf)
+                                            }
+                                        },
+                                        _ => Value::Unit,
+                                    }
+                                })
+                                .collect();
+                            drop(l_guard);
+                            drop(r_guard);
+                            slots[*dst as usize] = Value::Array(Rc::new(RefCell::new(result)));
+                        }
+                        // Scalar fallback: delegate to Div semantics
+                        _ => {
+                            slots[*dst as usize] = Self::div_values_static(l_val, r_val)?;
+                        }
+                    }
+                    pc += 1;
+                }
+
                 // ── MakeArray: construct array from register range ──
                 Instr::MakeArray { dst, start, count } => {
                     let s = *start as usize;
@@ -3497,6 +3584,10 @@ impl BytecodeVM {
     // Static helper functions for use in the hot loop
     #[inline(always)]
     fn add_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
+        // Handle integer arithmetic first (I64 is the primary runtime int type)
+        if let (Some(li), Some(ri)) = (l.as_i64(), r.as_i64()) {
+            return Ok(Value::I64(li.wrapping_add(ri)));
+        }
         if let Some(lf) = l.as_f64() {
             if let Some(rf) = r.as_f64() {
                 return Ok(Value::F64(lf + rf));
@@ -3511,6 +3602,9 @@ impl BytecodeVM {
 
     #[inline(always)]
     fn sub_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
+        if let (Some(li), Some(ri)) = (l.as_i64(), r.as_i64()) {
+            return Ok(Value::I64(li.wrapping_sub(ri)));
+        }
         if let Some(lf) = l.as_f64() {
             if let Some(rf) = r.as_f64() {
                 return Ok(Value::F64(lf - rf));
@@ -3525,6 +3619,9 @@ impl BytecodeVM {
 
     #[inline(always)]
     fn mul_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
+        if let (Some(li), Some(ri)) = (l.as_i64(), r.as_i64()) {
+            return Ok(Value::I64(li.wrapping_mul(ri)));
+        }
         if let Some(lf) = l.as_f64() {
             if let Some(rf) = r.as_f64() {
                 return Ok(Value::F64(lf * rf));
@@ -3539,6 +3636,13 @@ impl BytecodeVM {
 
     #[inline(always)]
     fn div_values_static(l: &Value, r: &Value) -> Result<Value, RuntimeError> {
+        if let (Some(li), Some(ri)) = (l.as_i64(), r.as_i64()) {
+            if ri == 0 {
+                return Err(RuntimeError::new("division by zero"));
+            }
+            // Use checked_div to avoid panic on i64::MIN / -1
+            return Ok(Value::I64(li.checked_div(ri).unwrap_or(i64::MIN)));
+        }
         if let Some(lf) = l.as_f64() {
             if let Some(rf) = r.as_f64() {
                 if rf == 0.0 {
@@ -3561,7 +3665,8 @@ impl BytecodeVM {
             if ri == 0 {
                 return Err(RuntimeError::new("floor division by zero"));
             }
-            let d = li / ri; // truncating
+            // Use checked_div to avoid panic on i64::MIN / -1 overflow
+            let d = li.checked_div(ri).unwrap_or(i64::MIN); // truncating
             let result = if (li < 0) != (ri < 0) && li % ri != 0 {
                 d - 1
             } else {

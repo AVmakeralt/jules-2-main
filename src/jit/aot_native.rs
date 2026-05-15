@@ -835,7 +835,7 @@ impl LowerCtx {
             }
             Expr::Ident { name, .. } => {
                 *self.var_env.get(name.as_str())
-                    .unwrap_or_else(|| panic!("undefined: {}", name))
+                    .unwrap_or_else(|| panic!("aot_native: undefined variable `{}` — ensure all variables are bound before use", name))
             }
             Expr::BinOp { op, lhs, rhs, .. } => {
                 let l = self.lower_expr(lhs);
@@ -858,7 +858,7 @@ impl LowerCtx {
                     BinOpKind::Le     => IRInstr::ICmp { dst: d, cond: ICmpCond::SLe, lhs: l, rhs: r },
                     BinOpKind::Gt     => IRInstr::ICmp { dst: d, cond: ICmpCond::SGt, lhs: l, rhs: r },
                     BinOpKind::Ge     => IRInstr::ICmp { dst: d, cond: ICmpCond::SGe, lhs: l, rhs: r },
-                    other => { panic!("unsupported binary operator: {:?}", other); }
+                    other => { panic!("aot_native: unsupported binary operator `{:?}` — not yet implemented in the AoT native backend", other); }
                 };
                 self.emit(i);
                 d
@@ -869,7 +869,7 @@ impl LowerCtx {
                 let i = match op {
                     UnOpKind::Neg => IRInstr::Neg { dst: d, src: s },
                     UnOpKind::Not => IRInstr::Not { dst: d, src: s },
-                    other => { panic!("unsupported unary operator: {:?}", other); }
+                    other => { panic!("aot_native: unsupported unary operator `{:?}` — not yet implemented in the AoT native backend", other); }
                 };
                 self.emit(i);
                 d

@@ -177,12 +177,20 @@ impl XorShift64 {
         x ^= x >> 7;
         x ^= x << 17;
         self.state = x;
+        // Guard against degenerate zero state: xorshift64 outputs 0 forever
+        // if state becomes 0. Re-seed with a non-zero constant.
+        if self.state == 0 {
+            self.state = 0x2545_F491_4F6C_DD1D;
+        }
         x
     }
 
     #[inline]
     fn next_f32(&mut self) -> f32 {
-        (self.next_u64() as u32 as f32) / (u32::MAX as f32)
+        // Use high 24 bits for correct [0, 1) range without bias.
+        // (u32::MAX as f32) rounds up to 2^32, so the naive approach can
+        // produce 1.0. Shifting right by 8 and dividing by 2^24 avoids this.
+        ((self.next_u64() as u32 >> 8) as f32) / ((1u32 << 24) as f32)
     }
 }
 

@@ -126,10 +126,11 @@ impl Tensor {
         !self.data.iter().any(|x| x.is_nan() || x.is_infinite())
     }
 
-    pub fn assert_valid(&self) {
+    pub fn assert_valid(&self) -> Result<(), String> {
         if !self.is_valid() {
-            eprintln!("ERROR: Tensor {} contains NaN/Inf!", self.name);
-            panic!("Invalid tensor");
+            Err(format!("Tensor {} contains NaN/Inf", self.name))
+        } else {
+            Ok(())
         }
     }
 
