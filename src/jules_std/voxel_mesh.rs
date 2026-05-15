@@ -35,7 +35,6 @@
 // sieve_210, morton, sdf_ray, and gaussian_splat modules.
 // =============================================================================
 
-#![allow(dead_code)]
 #![allow(unused_imports)]
 
 use crate::interp::{RuntimeError, Value};

@@ -6,7 +6,6 @@
 // Performance: AVX2/FMA-ready via #[inline(always)] hot paths.
 // =============================================================================
 
-#![allow(dead_code)]
 
 use std::f64::consts as f64c;
 

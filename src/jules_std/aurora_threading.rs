@@ -38,7 +38,6 @@
 // Uses num_cpus for core detection.
 // =============================================================================
 
-#![allow(dead_code)]
 #![allow(unused_imports)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

@@ -19,7 +19,6 @@
 // - Speculative type specialization: fast I64/F64 paths, generic fallback
 // =============================================================================
 
-#![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

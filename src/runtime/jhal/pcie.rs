@@ -42,7 +42,6 @@
 //      static array with a fixed maximum.
 // =========================================================================
 
-#![allow(dead_code)]
 use core::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use core::cell::UnsafeCell;
 use super::io_port::{outl, inl};

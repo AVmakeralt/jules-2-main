@@ -34,7 +34,6 @@ const IC_MAP_PRIVATE: i32 = 0x02;
 #[cfg(unix)]
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
-    #[allow(dead_code)]
     fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
 }

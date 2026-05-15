@@ -9,7 +9,6 @@
 //! 2. A fallback to standard I/O when io_uring is unavailable
 //! 3. Async I/O operations that bypass the OS syscall layer
 
-#![allow(dead_code)]
 use std::io::{Read, Result as IoResult, Write};
 
 /// io_uring availability status

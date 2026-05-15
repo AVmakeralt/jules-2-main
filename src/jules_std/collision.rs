@@ -18,8 +18,6 @@
 // Pure Rust, zero external dependencies.
 // =============================================================================
 
-#![allow(dead_code)]
-
 use crate::interp::{RuntimeError, Value};
 use crate::jules_std::genesis_weave::{GenesisWeave, hash_coord_2d, hash_to_f64};
 use crate::jules_std::morton::encode_2d;

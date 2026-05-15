@@ -27,7 +27,6 @@
 // collision, sdf_ray modules.
 // =============================================================================
 
-#![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
 use crate::jules_std::prng_simd::{ShishiuaRng, SimdPrng8};

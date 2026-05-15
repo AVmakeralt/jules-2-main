@@ -9,7 +9,6 @@
 // Production-ready with full error handling and memory safety.
 // =============================================================================
 
-#![allow(dead_code)]
 
 use lazy_static::lazy_static;
 use std::collections::HashMap;

@@ -43,7 +43,6 @@ const MAX_REPAIR_ATTEMPTS: u32 = 10;
 /// Cost threshold for E-Graph saturation (max iterations)
 const EGRAPH_MAX_ITERATIONS: usize = 20;
 /// Minimum improvement ratio to accept a patch (e.g., 10% faster)
-#[allow(dead_code)]
 const MIN_IMPROVEMENT_RATIO: f64 = 0.10;
 
 /// Repair strategy configuration

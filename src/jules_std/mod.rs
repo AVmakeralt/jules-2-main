@@ -5,8 +5,6 @@
 // Each submodule exposes `pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError>>`.
 // =============================================================================
 
-#![allow(dead_code)]
-
 use rustc_hash::FxHashMap;
 
 mod ai;

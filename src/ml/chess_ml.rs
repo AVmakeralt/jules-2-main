@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::runtime::gpu_backend::{GpuBackend, GpuMemoryManager};
 use std::time::{Duration, Instant};
 

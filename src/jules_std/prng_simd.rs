@@ -15,7 +15,6 @@
 // Uses std::simd where available (Rust 1.73+), falls back to scalar.
 // =============================================================================
 
-#![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
 

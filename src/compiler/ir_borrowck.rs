@@ -400,7 +400,6 @@ impl IrBorrowChecker {
     }
 
     /// Collect the incoming (BlockId, ValueId) pairs from a Phi instruction.
-    #[allow(dead_code)]
     fn phi_incoming(op: &IrOp) -> &[(BlockId, ValueId)] {
         match op {
             IrOp::Phi { incoming } => incoming,

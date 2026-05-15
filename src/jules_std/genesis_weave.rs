@@ -20,7 +20,6 @@
 // Pure Rust, zero external dependencies. Uses prng_simd and sieve_210 modules.
 // =============================================================================
 
-#![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
 use crate::jules_std::prng_simd::SquaresRng;

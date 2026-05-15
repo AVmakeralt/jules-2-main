@@ -230,13 +230,11 @@ impl VectorPatternDetector {
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[allow(dead_code)]
     fn has_sse42() -> bool {
         is_x86_feature_detected!("sse4.2")
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    #[allow(dead_code)]
     fn has_sse42() -> bool {
         false
     }

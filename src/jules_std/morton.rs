@@ -16,7 +16,6 @@
 // Pure Rust, zero external dependencies.
 // =============================================================================
 
-#![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
 

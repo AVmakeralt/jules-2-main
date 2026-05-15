@@ -5,7 +5,6 @@
 // Tests: Bytecode VM, TensorFast, Tracing JIT, Symbol interning, SIMD ops.
 // =============================================================================
 
-#![allow(dead_code)]
 use std::time::Instant;
 
 fn main() {

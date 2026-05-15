@@ -39,7 +39,6 @@
 //   - Full loop unrolling (8 iterations)
 // =============================================================================
 
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;

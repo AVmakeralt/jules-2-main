@@ -106,7 +106,6 @@ pub struct ComponentDescriptor {
 }
 
 /// Speculative memory reorganizer
-#[allow(dead_code)] // fields used by future runtime integration
 pub struct SpeculativeMemoryReorg {
     /// HTM lock (simulated for cross-platform)
     htm_available: bool,
@@ -129,7 +128,6 @@ pub struct ReorgTask {
 }
 
 /// Layout predictor using EMA-tracked access pattern metrics
-#[allow(dead_code)] // thresholds used by future ML-based prediction
 pub struct LayoutPredictor {
     /// Historical patterns
     patterns: Vec<AccessPattern>,

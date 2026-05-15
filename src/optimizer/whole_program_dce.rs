@@ -246,7 +246,6 @@ impl Default for DeadCodeConfig {
 
 /// Builds a complete call graph across all dependencies with type-aware
 /// dispatch resolution.
-#[allow(dead_code)] // fields used by future integration
 pub struct DependencyGraphBuilder {
     /// All discovered modules.
     modules: HashMap<String, ModuleInfo>,
@@ -279,7 +278,6 @@ pub struct DependencyGraphBuilder {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields used by future integration
 struct ModuleInfo {
     path: PathBuf,
     exports: HashSet<String>,
@@ -288,7 +286,6 @@ struct ModuleInfo {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields used by future integration
 struct FunctionInfo {
     name: String,
     /// Function parameter types (for dispatch resolution).
@@ -310,7 +307,6 @@ struct CallSite {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields used by future integration
 struct DispatchSite {
     receiver_type: String,
     trait_name: String,
@@ -325,7 +321,6 @@ struct UsageSite {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // variants used by future integration
 enum UsageKind {
     /// Constructed: `Foo { x: 1 }` or `Enum::Variant`
     Construct,
@@ -1471,7 +1466,6 @@ impl SymbolicExecutor {
         Vec::new()
     }
 
-    #[allow(dead_code)] // used by future trait dispatch analysis
     fn dispatch_to_query(&self, dispatch: &DispatchSite, impl_fn: &str) -> SymbolicQuery {
         SymbolicQuery {
             region_id: format!("{}:{}:{}", dispatch.trait_name, dispatch.method_name, impl_fn),
@@ -1897,7 +1891,6 @@ struct UnusedBinding {
 // Query Cache (structural hash key)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)] // cache_dir used by future persistent caching
 struct QueryCache {
     /// In-memory cache, keyed by structural hash of the query.
     cache: HashMap<u64, QueryResult>,
@@ -2101,7 +2094,6 @@ impl GnnUnsatPredictor {
 
 /// Eliminates dead code from a program based on analysis results.
 /// Supports all DeadCodeKind variants.
-#[allow(dead_code)] // config used by future integration
 pub struct DeadCodeEliminator {
     /// Analysis results to apply.
     analysis: DeadCodeAnalysisResult,

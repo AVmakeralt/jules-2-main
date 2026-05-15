@@ -1876,7 +1876,6 @@ impl Emitter {
     /// NOTE: These methods are retained for potential future use (branchless
     /// min/max operations on arithmetic results), but were removed from
     /// comparison ops because they incorrectly overwrote boolean results.
-    #[allow(dead_code)]
     fn emit_cmovcc_rr(&mut self, cc: u8, dst: u8, src: u8) {
         if dst == src { return; } // No-op
         // CMOVcc r64, r/m64: 0F 4x /r with REX.W
@@ -1886,7 +1885,6 @@ impl Emitter {
     }
     
     /// Emit branchless min: dst = (dst < src) ? dst : src
-    #[allow(dead_code)]
     fn emit_branchless_min(&mut self, dst: u8, src: u8) {
         // CMP dst, src
         let rex = 0x48 | ((dst & 8) >> 1) | ((src & 8) >> 3);
@@ -1897,7 +1895,6 @@ impl Emitter {
     }
     
     /// Emit branchless max: dst = (dst > src) ? dst : src
-    #[allow(dead_code)]
     fn emit_branchless_max(&mut self, dst: u8, src: u8) {
         let rex = 0x48 | ((dst & 8) >> 1) | ((src & 8) >> 3);
         let modrm = 0xC0 | ((dst & 7) << 3) | (src & 7);

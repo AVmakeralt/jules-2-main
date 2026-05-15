@@ -44,7 +44,6 @@
 //      Console uses a fixed array of MAX_CORES ring buffers (~64 KiB total).
 // =========================================================================
 
-#![allow(dead_code)]
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use super::io_port::{outb, inb};

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Ultra-high-performance prefetch engine for bytecode VM execution.
 //!
 //! **Goal**: keep every CPU execution unit fed at all times by issuing the

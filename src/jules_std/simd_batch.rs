@@ -42,8 +42,6 @@
 // Pure Rust, zero external dependencies. Uses morton, prng_simd modules.
 // =============================================================================
 
-#![allow(dead_code)]
-
 use crate::interp::{RuntimeError, Value};
 use crate::jules_std::morton::{encode_2d, decode_2d, encode_3d};
 

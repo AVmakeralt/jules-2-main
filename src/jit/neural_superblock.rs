@@ -349,11 +349,8 @@ pub struct MicroArchGNN {
     training_samples: Vec<(Arc<BlockGraph>, f32)>,
     /// FIX #8: Pre-allocated scratch buffers to avoid per-prediction
     /// O(N²×H²) heap allocations. These are reused across predictions.
-    #[allow(dead_code)]
     hidden_buffer: Vec<f32>,
-    #[allow(dead_code)]
     message_buffer: Vec<f32>,
-    #[allow(dead_code)]
     output_buffer: Vec<f32>,
     /// FIX B: Adam optimizer state — moving averages of gradients and squared gradients
     /// for each weight matrix. Replaces raw SGD with adaptive learning rates.
@@ -528,7 +525,6 @@ impl MicroArchGNN {
         }).chain(std::iter::repeat(0.0)).take(hd).collect()
     }
 
-    #[allow(dead_code)]
     fn mean_pool(&self, hidden: &[Vec<f32>]) -> Vec<f32> {
         if hidden.is_empty() { return vec![0.0; self.hidden_dim]; }
         let n = hidden.len() as f32;
@@ -537,7 +533,6 @@ impl MicroArchGNN {
         }).collect()
     }
 
-    #[allow(dead_code)]
     fn max_pool(&self, hidden: &[Vec<f32>]) -> Vec<f32> {
         if hidden.is_empty() { return vec![0.0; self.hidden_dim]; }
         (0..self.hidden_dim).map(|j| {

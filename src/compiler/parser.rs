@@ -19,7 +19,6 @@
 //    Callers that want to continue past an error call `try_parse` helpers.
 // =============================================================================
 
-#![allow(dead_code)]
 
 use std::fmt;
 

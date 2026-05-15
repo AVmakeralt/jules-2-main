@@ -6,7 +6,6 @@
 // Pure Rust, zero external dependencies (uses std::net).
 // =============================================================================
 
-#![allow(dead_code)]
 
 use std::io::{Read, Write};
 

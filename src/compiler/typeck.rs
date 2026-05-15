@@ -4318,16 +4318,13 @@ mod tests {
         Span::dummy()
     }
 
-    #[allow(dead_code)]
     fn f32_ty() -> Type {
         Type::Scalar(ElemType::F32)
     }
-    #[allow(dead_code)]
     fn bool_ty() -> Type {
         Type::Scalar(ElemType::Bool)
     }
 
-    #[allow(dead_code)]
     fn tensor_ty(elem: ElemType, dims: Vec<u64>) -> Type {
         Type::Tensor {
             elem,

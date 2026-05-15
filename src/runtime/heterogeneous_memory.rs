@@ -1128,7 +1128,6 @@ trait TierSmtSolver {
 /// SMT query for tier migration validation.
 /// Contains constraints that must hold for safe migration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // scenario used for logging
 struct SmtQuery {
     /// Unique identifier for the query.
     query_id: u64,
@@ -1146,7 +1145,6 @@ struct SmtQuery {
 
 /// Constraint on memory access ordering during migration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // internal SMT types
 struct OrderingConstraint {
     /// Thread ID that must observe ordering.
     thread_id: usize,
@@ -1160,7 +1158,6 @@ struct OrderingConstraint {
 
 /// Constraint on cache coherency during migration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // internal SMT types
 struct CoherencyConstraint {
     /// Cache line range that must be coherent.
     cache_line_start: u64,
@@ -1173,7 +1170,6 @@ struct CoherencyConstraint {
 
 /// Result of SMT solving for tier migration validation.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // model/solver_iterations for diagnostics
 struct SmtResult {
     /// Whether the query is satisfiable (SAT = unsafe, UNSAT = safe).
     is_sat: bool,
@@ -1468,7 +1464,6 @@ impl BuiltinTierSmtSolver {
 ///
 /// This is the entry point for the runtime to interact with ZCHMA's
 /// memory management capabilities.
-#[allow(dead_code)] // validator used in request_migration, topology for discovery
 pub struct ZchmaRuntime {
     /// Lifetime-to-tier mapper.
     mapper: LifetimeTierMapper,

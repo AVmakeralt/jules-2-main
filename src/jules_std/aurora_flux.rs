@@ -34,7 +34,6 @@
 // Pure Rust, zero external dependencies. Uses every Aurora Flux sub-module.
 // =============================================================================
 
-#![allow(dead_code)]
 #![allow(unused_imports)]
 
 use crate::interp::{RuntimeError, Value};

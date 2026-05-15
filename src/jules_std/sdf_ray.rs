@@ -27,7 +27,6 @@
 // Pure Rust, zero external dependencies. Uses genesis_weave, morton, prng_simd.
 // =============================================================================
 
-#![allow(dead_code)]
 
 use crate::interp::{RuntimeError, Value};
 use crate::jules_std::genesis_weave::{hash_coord_2d, hash_to_f64, terrain_height, biome_at};

@@ -28,8 +28,6 @@
 // Uses prng_simd, genesis_weave, sieve_210, morton, collision, sdf_ray.
 // =============================================================================
 
-#![allow(dead_code)]
-
 use crate::interp::{RuntimeError, Value};
 use crate::jules_std::prng_simd::{SquaresRng, SimdPrng8};
 use crate::jules_std::genesis_weave::{hash_coord_2d, hash_to_f64, Biome, terrain_height};
