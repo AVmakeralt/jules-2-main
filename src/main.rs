@@ -42,8 +42,9 @@ pub use ml::chess_ml;
 pub use tools::frame_debugger;
 pub use tools::hot_reload;
 pub use runtime::networking;
-pub use runtime::ZchmaRuntime;
-pub use runtime::MemoryReorgOrchestrator;
+// Removed unused re-exports: ZchmaRuntime and MemoryReorgOrchestrator
+// are runtime infrastructure not used by the pipeline. If needed in
+// the future, they can be re-exported from the runtime module.
 pub use tools::profiling_tools;
 pub use game::scene_editor;
 pub use tools::shader_tooling;
@@ -838,6 +839,153 @@ impl Pipeline {
             }
         }
 
+        // ── Pass 13: Whole-Program Dead Code Elimination ──────────────────────
+        // Builds a dependency graph across the entire program and identifies
+        // unreachable functions, unused structs/enums/consts via reachability
+        // analysis from entry points (main, systems, agents). Emits advisory
+        // warnings for dead code — never hard errors.
+        if self.opt_level >= 2 {
+            use crate::optimizer::whole_program_dce::DependencyGraphBuilder;
+            let mut dep_graph = DependencyGraphBuilder::new();
+            dep_graph.build_call_graph(&program);
+
+            let mut entry_points: Vec<String> = vec!["main".to_string()];
+            // Systems and agents are always reachable entry points.
+            // Access them via the dependency graph's known_functions and
+            // reverse_call_graph to identify leaf/unreachable symbols.
+            for item in &program.items {
+                match item {
+                    crate::compiler::ast::Item::System(sys) => {
+                        entry_points.push(format!("sys:{}", sys.name));
+                    }
+                    crate::compiler::ast::Item::Agent(agent) => {
+                        entry_points.push(agent.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+
+            let reachable = dep_graph.reachable_from(&entry_points);
+            let unused_fns: Vec<_> = dep_graph.leaf_functions()
+                .into_iter()
+                .filter(|f| !reachable.contains(f))
+                .collect();
+            let unused_structs = dep_graph.unused_structs();
+            let unused_enums = dep_graph.unused_enums();
+            let unused_consts = dep_graph.unused_consts();
+
+            if self.print_opt_stats {
+                eprintln!("[opt/WP-DCE] reachable={} unused_fns={} unused_structs={} unused_enums={} unused_consts={}",
+                    reachable.len(), unused_fns.len(), unused_structs.len(),
+                    unused_enums.len(), unused_consts.len());
+            }
+            for f in &unused_fns {
+                unit.diags.push(Diag::warning(Span::dummy(),
+                    format!("[wp-dce/advisory] function `{}` is unreachable from any entry point", f)));
+            }
+            for s in &unused_structs {
+                unit.diags.push(Diag::warning(Span::dummy(),
+                    format!("[wp-dce/advisory] struct/component `{}` is never constructed", s)));
+            }
+            for e in &unused_enums {
+                unit.diags.push(Diag::warning(Span::dummy(),
+                    format!("[wp-dce/advisory] enum `{}` is never used", e)));
+            }
+            for c in &unused_consts {
+                unit.diags.push(Diag::warning(Span::dummy(),
+                    format!("[wp-dce/advisory] const `{}` is never referenced", c)));
+            }
+        }
+
+        // ── Pass 14: SoA Layout Optimizer (AoS → SoA Conversion) ─────────────
+        // Analyzes ECS component access patterns and suggests or applies
+        // Array-of-Structures to Structure-of-Arrays layout conversions for
+        // improved cache locality. Advisory only — never hard errors.
+        if self.opt_level >= 2 {
+            use crate::optimizer::soa_optimizer::{SoaOptimizer, StructureMetadata, ArrayMetadata};
+            let mut soa = SoaOptimizer::new();
+
+            for item in &program.items {
+                if let crate::compiler::ast::Item::Component(comp) = item {
+                    let fields: Vec<(String, String)> = comp.fields.iter()
+                        .map(|f| (f.name.clone(), format!("{:?}", f.ty)))
+                        .collect();
+                    let field_sizes: Vec<usize> = comp.fields.iter()
+                        .map(|f| estimate_type_byte_size(&f.ty))
+                        .collect();
+                    let struct_meta = StructureMetadata::new(comp.name.clone(), fields, field_sizes);
+                    let array_meta = ArrayMetadata::new(comp.name.clone(), struct_meta, 0);
+                    soa.register_array(array_meta);
+                }
+            }
+
+            let swaps = soa.analyze_and_swap();
+            if self.print_opt_stats {
+                let suggestions = soa.get_suggestions();
+                eprintln!("[opt/SoA] arrays={} swaps={} suggestions={}",
+                    soa.stats().total_arrays, swaps.len(), suggestions.len());
+            }
+            for swap in &swaps {
+                unit.diags.push(Diag::note(Span::dummy(),
+                    format!("[soa/advisory] `{}`: {:?} → {:?} (estimated speedup {:.1}x)",
+                        swap.array_name, swap.old_layout, swap.new_layout, swap.speedup)));
+            }
+            for sug in soa.get_suggestions() {
+                unit.diags.push(Diag::note(Span::dummy(),
+                    format!("[soa/advisory] `{}`: suggest {:?} — {}",
+                        sug.array_name, sug.suggested_layout, sug.reason)));
+            }
+        }
+
+        // ── Pass 15: Memory Optimizer (NUMA / Huge Pages) ────────────────────
+        // Registers large data regions from struct/component definitions and
+        // applies NUMA-aware allocation and huge page optimization suggestions.
+        // Advisory only — never hard errors.
+        if self.opt_level >= 2 {
+            use crate::optimizer::memory_optimizer::{MemoryOptimizer, DataRegion, AccessPattern};
+            let mut mem_opt = MemoryOptimizer::new();
+
+            for item in &program.items {
+                match item {
+                    crate::compiler::ast::Item::Struct(s) => {
+                        let size: usize = s.fields.iter()
+                            .map(|f| estimate_type_byte_size(&f.ty))
+                            .sum();
+                        if size > 0 {
+                            let mut region = DataRegion::new(s.name.clone(), size);
+                            region.set_pattern(AccessPattern::Unknown);
+                            mem_opt.register_region(region);
+                        }
+                    }
+                    crate::compiler::ast::Item::Component(c) => {
+                        let size: usize = c.fields.iter()
+                            .map(|f| estimate_type_byte_size(&f.ty))
+                            .sum();
+                        if size > 0 {
+                            let mut region = DataRegion::new(c.name.clone(), size);
+                            region.set_pattern(AccessPattern::Sequential);
+                            mem_opt.register_region(region);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            mem_opt.optimize_all();
+            let suggestions = mem_opt.get_suggestions();
+            if self.print_opt_stats {
+                let stats = mem_opt.stats();
+                eprintln!("[opt/Mem] regions={} numa_local={} interleaved={} huge_pages={} numa_huge={}",
+                    stats.total_regions, stats.numa_local, stats.numa_interleaved,
+                    stats.huge_pages, stats.numa_huge);
+            }
+            for sug in &suggestions {
+                unit.diags.push(Diag::note(Span::dummy(),
+                    format!("[mem/advisory] `{}`: {:?} — {} (benefit {:.1}x)",
+                        sug.region, sug.strategy, sug.reason, sug.expected_benefit)));
+            }
+        }
+
         // ── Convert diagnostics to rich format for check/explain commands ────
         // After all passes complete, build the rich diagnostic collector so
         // callers (jules check, jules explain) can access teaching notes,
@@ -975,6 +1123,37 @@ impl Pipeline {
             return PipelineResult::HaltedAt(PassName::BorrowCheck);
         }
 
+        // ── Pass: Formal Verification (Trust Tier Assignment) ───────────────
+        // Assigns a TrustTier to each IR function based on formal verification
+        // of safety properties (termination, overflow, bounds). The trust tier
+        // controls runtime safety checks — higher tiers can skip more checks.
+        // Advisory only — emits notes, never hard errors.
+        if self.opt_level >= 2 {
+            use crate::compiler::formal_verify::FormalVerifier;
+            let verifier = FormalVerifier::new();
+            let mut verified_count = 0usize;
+            let mut tier_counts: [usize; 4] = [0, 0, 0, 0];
+            for func in &ir_module.functions {
+                let instr_count: usize = func.blocks.iter().map(|b| b.instrs.len()).sum();
+                let result = verifier.verify_function(&func.name, instr_count);
+                let tier_idx = result.tier as usize;
+                if tier_idx < 4 {
+                    tier_counts[tier_idx] += 1;
+                }
+                verified_count += 1;
+                if self.print_opt_stats {
+                    unit.diags.push(Diag::note(Span::dummy(),
+                        format!("[formal-verify] `{}`: tier={:?} termination={} overflow={} bounds={}",
+                            func.name, result.tier, result.termination_proven,
+                            result.overflow_proven_safe, result.bounds_proven_safe)));
+                }
+            }
+            if self.print_opt_stats && verified_count > 0 {
+                eprintln!("[opt/FormalVerify] verified={} tier0={} tier1={} tier2={} tier3={}",
+                    verified_count, tier_counts[0], tier_counts[1], tier_counts[2], tier_counts[3]);
+            }
+        }
+
         if self.emit_ir {
             eprintln!("=== IR Module ===\n{}", ir_module);
         }
@@ -1040,6 +1219,38 @@ pub enum PassName {
 
 // ── Diagnostic adapters (one per pass module) ──────────────────────────────
 
+/// Estimate the byte size of an AST type for memory optimization passes.
+/// Uses conservative defaults when exact size is unknown.
+fn estimate_type_byte_size(ty: &crate::compiler::ast::Type) -> usize {
+    use crate::compiler::ast::{Type, VecSize};
+    match ty {
+        Type::Scalar(elem) => elem.byte_size(),
+        Type::Vec { size, .. } => match size {
+            VecSize::N2 => 8,
+            VecSize::N3 => 12,
+            VecSize::N4 => 16,
+        },
+        Type::Mat { size } => match size {
+            VecSize::N2 => 16,
+            VecSize::N3 => 36,
+            VecSize::N4 => 64,
+        },
+        Type::Quat => 16,
+        Type::Tuple(elems) => elems.iter().map(estimate_type_byte_size).sum(),
+        Type::Array { elem, len: _ } => estimate_type_byte_size(elem) * 8, // heuristic
+        Type::Named(_) => 8, // pointer-sized heuristic for unknown named types
+        Type::Option(inner) => estimate_type_byte_size(inner) + 8,
+        Type::Result { ok, err } => estimate_type_byte_size(ok) + estimate_type_byte_size(err) + 8,
+        Type::Ref { .. } => 8,
+        Type::Slice(_) => 16, // fat pointer
+        Type::FnPtr { .. } => 8,
+        Type::Never | Type::Infer => 0,
+        Type::Own(inner) => estimate_type_byte_size(inner),
+        Type::Tensor { elem, shape: _ } => elem.byte_size() * 64, // heuristic
+        _ => 8, // conservative default
+    }
+}
+
 fn parse_error_to_diag(e: crate::compiler::parser::ParseError) -> Diag {
     let mut d = Diag::error(e.span, e.message).with_code("E0002");
     if let Some(h) = e.hint {
@@ -1089,28 +1300,9 @@ fn adapt_sema_diag(d: crate::compiler::sema::Diagnostic) -> Diag {
 }
 
 /// DEPRECATED: AST borrowck is no longer authoritative. IR borrowck is the
-/// sole source of truth. This adapter is kept for potential future diagnostic
-/// unification but is currently unused.
-#[allow(dead_code)]
-fn adapt_borrowck_diag(d: crate::compiler::borrowck::Diagnostic) -> Diag {
-    let sev = match d.severity {
-        crate::compiler::borrowck::Severity::Error => DiagSeverity::Error,
-        crate::compiler::borrowck::Severity::Warning => DiagSeverity::Warning,
-        crate::compiler::borrowck::Severity::Note => DiagSeverity::Note,
-    };
-    let mut out = Diag {
-        severity: sev,
-        span: Some(d.span),
-        code: d.code,
-        message: d.message,
-        labels: vec![],
-        hint: d.hint,
-    };
-    for (s, m) in d.labels {
-        out.labels.push((s, m));
-    }
-    out
-}
+/// sole source of truth. This adapter has been removed — the AST borrow
+/// checker is dead code. If AST borrowck diagnostics are ever needed again,
+/// they should go through the unified diagnostic system.
 
 fn adapt_runtime_error(e: crate::interp::RuntimeError) -> Diag {
     Diag {
@@ -3396,18 +3588,47 @@ impl Repl {
             return Err(ReplRunError::Compile(unit.diags));
         }
 
-        let Some(program) = result.program() else {
-            return Err(ReplRunError::Runtime(
-                "pipeline did not produce a runnable program".into(),
-            ));
-        };
-
-        let mut interp = crate::interp::Interpreter::new();
-        interp.load_program(&program);
-        interp
-            .call_fn("main", vec![])
-            .map(|_| ())
-            .map_err(|e| ReplRunError::Runtime(e.message))
+        // ══ ONE TRUTH RULE: REPL must use the IR pipeline, not the old ═══
+        // ══ tree-walking interpreter. The IR is the sole source of truth.  ═
+        match result {
+            PipelineResult::OkWithIr { ir_module, .. } => {
+                let ir_bc = crate::compiler::ir_to_bytecode::compile_ir_module(&ir_module);
+                if !ir_bc.errors.is_empty() {
+                    let err_msgs: Vec<String> = ir_bc.errors.iter()
+                        .map(|e| format!("[ir-codegen] {}", e))
+                        .collect();
+                    return Err(ReplRunError::Runtime(format!(
+                        "IR codegen failed ({} error(s)). No AST fallback permitted.\n{}",
+                        err_msgs.len(),
+                        err_msgs.join("\n")
+                    )));
+                }
+                if ir_bc.functions.is_empty() {
+                    return Err(ReplRunError::Runtime(
+                        "IR codegen produced no functions. No AST fallback permitted.".into(),
+                    ));
+                }
+                let mut vm = crate::runtime::bytecode_vm::BytecodeVM::new();
+                if let Err(e) = vm.load_ir_functions(ir_bc.functions) {
+                    return Err(ReplRunError::Runtime(format!(
+                        "VM failed to load IR-compiled functions: {}. No AST fallback permitted.",
+                        e
+                    )));
+                }
+                vm.call_fn("main", vec![])
+                    .map(|_| ())
+                    .map_err(|e| ReplRunError::Runtime(e.message))
+            }
+            PipelineResult::Ok(_) => {
+                // Legacy path (no IR) — this should NEVER happen anymore.
+                Err(ReplRunError::Runtime(
+                    "internal error: pipeline produced no IR. This should never happen.".into(),
+                ))
+            }
+            PipelineResult::HaltedAt(_) => Err(ReplRunError::Runtime(
+                "pipeline halted before producing a runnable program".into(),
+            )),
+        }
     }
 
     fn cmd_tokens(&self, code: &str) {

@@ -165,17 +165,16 @@ phase2 = []
 phase3-jit = []
 cranelift-backend = ["cranelift-codegen", "cranelift-module", "cranelift-jit"]
 numa = ["nix"]
-phase4-llvm = []
-phase5-cow = []
 phase6-simd = []
+# XLA FFI backend — code-gated feature. The XLA library is optional;
+# when disabled the backend falls back to CPU execution.
 xla = []
 gnn-optimizer = []
 core-superopt = []
-legacy-passes = []
 smt-verify = ["z3"]  # Requires libclang + Z3 lib/headers (see README)
 machine-instr-model = ["core-superopt"]  # Machine-instruction-aware optimization layer
 ultra-fast = ["phase3-jit", "phase6-simd", "core-superopt", "machine-instr-model"]
-full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "cranelift-backend", "phase4-llvm", "phase5-cow", "phase6-simd", "gnn-optimizer", "core-superopt", "machine-instr-model", "legacy-passes"]
+full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "cranelift-backend", "phase6-simd", "xla", "gnn-optimizer", "core-superopt", "machine-instr-model"]
 
 [lints.rust]
 dead_code = "warn"

@@ -118,7 +118,7 @@ fn run_sample(sample: &Sample, iterations: usize) -> Result<SampleReport, String
             ));
         }
 
-        let Some(program) = result.program() else {
+        let Some(_program) = result.program() else {
             return Err(format!(
                 "pipeline halted before codegen/runtime in sample `{}` at iteration {}",
                 sample.name, i
@@ -126,14 +126,21 @@ fn run_sample(sample: &Sample, iterations: usize) -> Result<SampleReport, String
         };
 
         if sample.run_main {
-            let mut interp = jules::interp::Interpreter::new();
-            interp.load_program(&program);
+            let ir_module = result.ir_module().ok_or_else(|| {
+                format!("pipeline produced no IR for sample `{}` at iteration {}", sample.name, i)
+            })?;
+            let ir_bc = jules::compiler::ir_to_bytecode::compile_ir_module(ir_module);
+            if !ir_bc.errors.is_empty() {
+                return Err(format!(
+                    "IR codegen failed for `{}` iteration {}: {} errors",
+                    sample.name, i, ir_bc.errors.len()
+                ));
+            }
+            let mut vm = jules::runtime::bytecode_vm::BytecodeVM::new();
+            vm.load_ir_functions(ir_bc.functions).map_err(|e| format!("VM load failed: {}", e))?;
             let run_start = Instant::now();
-            interp.call_fn("main", vec![]).map_err(|e| {
-                format!(
-                    "runtime error in `{}` iteration {}: {}",
-                    sample.name, i, e.message
-                )
+            vm.call_fn("main", vec![]).map_err(|e| {
+                format!("runtime error in `{}` iteration {}: {}", sample.name, i, e.message)
             })?;
             let run_elapsed = run_start.elapsed();
             runtime_times.as_mut().unwrap().push(run_elapsed);
