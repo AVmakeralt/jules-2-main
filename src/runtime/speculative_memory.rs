@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn test_pattern_detection() {
-        let mut pattern = AccessPattern {
+        let pattern = AccessPattern {
             random_count: 100,
             sequential_count: 10,
             strided_count: 10,

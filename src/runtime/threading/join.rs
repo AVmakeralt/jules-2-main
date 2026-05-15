@@ -450,9 +450,11 @@ mod tests {
     #[test]
     fn test_par_for_sequential() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let sum = AtomicUsize::new(0);
-        par_for(0..10, |i| {
-            sum.fetch_add(i, Ordering::Relaxed);
+        use std::sync::Arc;
+        let sum = Arc::new(AtomicUsize::new(0));
+        let sum_clone = sum.clone();
+        par_for(0..10, move |i| {
+            sum_clone.fetch_add(i, Ordering::Relaxed);
         });
         assert_eq!(sum.load(Ordering::Relaxed), 45);
     }

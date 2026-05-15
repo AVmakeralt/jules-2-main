@@ -646,6 +646,18 @@ impl CompileUnit {
     }
 }
 
+/// Returns true if the program is "small enough" that heavy optimization
+/// passes are unlikely to produce meaningful improvements.  Trivial programs
+/// have at most 3 top-level items and at most 1 function definition — e.g.
+/// `fn main() {}` or `fn main() { let x = 1; }`.
+fn is_trivial_program(program: &crate::compiler::ast::Program) -> bool {
+    if program.items.len() > 3 { return false; }
+    let fn_count = program.items.iter()
+        .filter(|i| matches!(i, crate::compiler::ast::Item::Fn(_)))
+        .count();
+    fn_count <= 1
+}
+
 /// The full front-end pipeline.  Each pass adds to `unit.diags`.
 pub struct Pipeline {
     pub warn_as_error: bool,
@@ -880,7 +892,9 @@ impl Pipeline {
         // Specializes functions by evaluating static (compile-time known) arguments
         // and building residual programs for dynamic parts.  This is distinct from
         // inlining — it works across module boundaries and unrolls static loops.
-        if self.opt_level >= 2 {
+        // Skipped for trivial programs — partial evaluation of a single empty
+        // function cannot produce meaningful improvements.
+        if self.opt_level >= 2 && !is_trivial_program(&program) {
             use crate::optimizer::partial_eval::{PartialEvaluator, PartialEvalConfig};
             let config = match self.opt_level {
                 1 => PartialEvalConfig::default(),
@@ -902,7 +916,9 @@ impl Pipeline {
         // ── Pass 11: Alias-Aware Memory Layout via Ownership Proofs ────────────
         // Uses the borrow checker's lifetime graph to prove noalias relationships,
         // reorder struct fields for cache locality, and suggest AoS→SoA conversions.
-        if self.opt_level >= 2 {
+        // Skipped for trivial programs — alias analysis is wasted when there are
+        // no struct/component/agent items.
+        if self.opt_level >= 2 && !is_trivial_program(&program) {
             use crate::optimizer::alias_layout::LayoutOptimizer;
             let mut layout = LayoutOptimizer::default();
             let result = layout.optimize_program(&program);
@@ -916,7 +932,8 @@ impl Pipeline {
         // ── Pass 12: Profile-Guided Dead Struct Field Elimination ──────────────
         // Detects struct fields that are written but never read in hot paths,
         // removes dead writes, and shrinks struct sizes for better cache utilization.
-        if self.opt_level >= 2 {
+        // Skipped for trivial programs — dead field elimination requires structs.
+        if self.opt_level >= 2 && !is_trivial_program(&program) {
             use crate::optimizer::dead_field_elim::DeadFieldEliminator;
             let mut elim = DeadFieldEliminator::default();
             let result = elim.optimize_program(&mut program);
@@ -930,7 +947,9 @@ impl Pipeline {
         // ── Passes 13-15: WP-DCE, SoA Layout, Memory Optimizer ──────────────
         // Collect struct/component/agent/system metadata in a SINGLE traversal
         // instead of three separate traversals. This saves 2x iteration cost.
-        if self.opt_level >= 2 {
+        // Skipped for trivial programs — whole-program analysis, SoA layout,
+        // and memory optimization are all wasted on a single empty function.
+        if self.opt_level >= 2 && !is_trivial_program(&program) {
             use crate::optimizer::whole_program_dce::DependencyGraphBuilder;
             use crate::optimizer::soa_optimizer::{SoaOptimizer, StructureMetadata, ArrayMetadata};
             use crate::optimizer::memory_optimizer::{MemoryOptimizer, DataRegion, AccessPattern};
@@ -4589,6 +4608,7 @@ mod tests {
                 d.severity = DiagSeverity::Error;
             }
         }
+        unit.recalc_diag_counts();
         assert!(unit.has_errors());
     }
 

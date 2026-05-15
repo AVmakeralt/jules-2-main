@@ -1324,7 +1324,7 @@ mod tests {
         assert_eq!(hot.unwrap().value, 1);
 
         // Check that the profiled variable is detected as boolean
-        let obs = jit.profiles.get("is_active").unwrap();
+        let obs = jit.profiles.get(&hash_var_name("is_active")).unwrap();
         assert!(obs.is_boolean);
         assert_eq!(obs.bool_constant, Some(true));
     }
@@ -1339,7 +1339,7 @@ mod tests {
         }
 
         // Not a constant boolean
-        let obs = jit.profiles.get("is_active").unwrap();
+        let obs = jit.profiles.get(&hash_var_name("is_active")).unwrap();
         assert!(obs.is_boolean);
         assert!(obs.bool_constant.is_none()); // Not constant
     }

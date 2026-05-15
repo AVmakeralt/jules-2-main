@@ -2773,7 +2773,7 @@ mod tests {
 
     #[test]
     fn test_code_size_estimation() {
-        let mut program = Program::new();
+        let program = Program::new();
         // Empty program → 0 bytes for any function
         assert_eq!(estimate_function_size(&program, "nonexistent"), 0);
     }
