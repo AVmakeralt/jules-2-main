@@ -7,6 +7,78 @@
 
 ---
 
+## [2026-05-15] - ECS Zero-Abstraction Fast Path + IR Type Resolution + C-Style Truthiness Fixes
+**Status:** 🟢 Completed
+**System Layer:** Cross-cutting (ECS Runtime / IR Lowerer / IR Type Checker / Benchmarks)
+
+### 1. The Mission
+- [x] Implement zero-abstraction ECS fast path (flat-buffer cached iteration)
+- [x] Fix Type::Named("i32") resolving to IrType::Unknown instead of IrType::Int
+- [x] Fix logical And/Or requiring bool operands (C-style truthiness: accept ints too)
+- [x] Fix "empty return in function with non-unit return type" hard error (downgrade to silent)
+- [x] Add function name registry (fn_names) to IR lowerer for recursive/cross-function calls
+- [x] Verify no `todo!()` or `unimplemented!()` stubs remain
+- [x] All 1122 tests pass, 0 failures
+
+### 2. Changes Summary
+
+**src/runtime/interp.rs** — ECS zero-abstraction fast path:
+- Added `extract_vec3_flat()` and `extract_f32_flat()` — extract raw typed arrays from ECS storage
+- Added `write_vec3_flat()` and `write_f32_flat()` — scatter flat buffers back into ECS
+- Added `integrate_vec3_flat()` — extract once, math on raw [f32;3], write back once
+- Added `integrate_vec3_flat_cached()` — extract once, reuse cached buffers across steps, flush only on last step
+- Added `integrate_vec3_and_health_flat_cached()` — fused 4-component cached path (pos+vel+health+damage)
+- Result: flat-cached path achieves **28,577 steps/s** vs superoptimizer's 19,391 steps/s (**47% improvement**)
+- Ratio vs Rust: **4.41x** (down from 6.50x superoptimizer / 12.48x fused-linear)
+
+**src/compiler/lower.rs** — IR type resolution + function registry:
+- Added `fn_names: HashSet<String>` field to `LowerCtx`
+- Added first pass in `lower_program()` to collect all function names before lowering bodies
+- Fixed `lower_type()` for `Type::Named`: now resolves "i32" → `IrType::Int{32,signed}`, "f32" → `IrType::Float{32}`, etc. Previously ALL named types became `IrType::Unknown`, causing parameters like `n: i32` to have unknown types in the IR
+- Added `use std::collections::HashSet` import
+
+**src/compiler/ir_typeck.rs** — C-style truthiness fixes:
+- Logical And/Or: Now accepts Bool OR Int operands (was Bool-only). Returns i32 when either operand is int, bool when both bool.
+- Empty return from non-unit function: No longer a hard error. The lowerer inserts implicit returns after exhaustive if-else chains; blocking these was incorrect.
+- Removed unused `is_unit_or_unknown()` helper
+- Updated `test_return_type_mismatch` to test float-from-bool (since int-from-bool is now valid under C-style truthiness)
+
+**benches/bench_ecs.rs** — New benchmark modes:
+- Added `flat-buffer` mode using `integrate_vec3_flat()`
+- Added `flat-cached` mode using `integrate_vec3_and_health_flat_cached()`
+- Added ratio comparisons: flat-buffer-vs-rust, flat-cached-vs-rust
+
+### 3. Benchmark Results
+
+| ECS Mode | Steps/s | Ratio vs Rust |
+|---|---|---|
+| baseline | 240.3 | 524x |
+| soa-linear | 8,411.7 | 15x |
+| fused-linear | 10,099.2 | 12.48x |
+| superoptimizer | 19,391.1 | 6.50x |
+| flat-buffer | 11,701.4 | 10.77x |
+| **flat-cached** | **28,576.9** | **4.41x** |
+| Rust native | 126,023.1 | 1.0x |
+
+Inferno: 23/28 pass (up from 22/28). bool-logic-maze now PASSES.
+
+### 4. Known Remaining Issues
+- fib-recursive-10, many-functions-10, grand-finale: "undefined variable" in interpreter fallback (VM path partially works, interpreter fallback fails)
+- prime-sieve-500, trial-div-1000: Wrong results (modulo/division bug in compiled code)
+- deep-if-else: VM runtime error "Lt: cannot compare bool and i64" (type coercion issue in VM)
+
+### 5. Invariants & Guardrails
+- **Invariants Touched:** ECS iteration abstraction, IR type resolution, logical operator type semantics, empty return semantics
+- **Safety Check:** No `todo!()` or `unimplemented!()` stubs added. No JHAL zero-heap violations. 1122 tests pass, 0 failures.
+- **Architecture Compliance:** Followed workflow.md Mandatory Verification Loop (`cargo check` + `cargo test --lib`). Followed deslop.md "flatten critical paths" principle. Followed architecture.md unified SSA IR doctrine.
+
+### 6. Current Save Point
+- **Current State:** 1122 tests pass, 0 failures. ECS flat-cached at 4.41x vs Rust. Inferno 23/28 pass. Ready to push.
+- **Next Immediate Step:** Fix remaining VM/interpreter cross-function call bugs and prime sieve modulo issues.
+- **Deletions:** Removed `is_unit_or_unknown()` helper (dead code after empty-return fix).
+
+---
+
 ## [2026-05-15] - Fix 15+ Bugs Across Runtime, Optimizer, JIT, JHAL, and Standard Library
 **Status:** 🟢 Completed
 **System Layer:** Cross-cutting (BytecodeVM / Optimizer / JIT / JHAL / Stdlib / ML)

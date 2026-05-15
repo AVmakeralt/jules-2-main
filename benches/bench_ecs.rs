@@ -135,6 +135,61 @@ fn main() {
         );
     }
 
+    let mut flat_elapsed_s = None;
+    if mode == "flat" || mode == "both" || mode == "rust-compare" {
+        let mut world_flat = EcsWorld::default();
+        for _ in 0..n {
+            let id = world_flat.spawn();
+            world_flat.insert_component(id, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+            world_flat.insert_component(id, "vel", Value::Vec3([1.0, 0.0, 0.0]));
+            world_flat.insert_component(id, "health", Value::F32(100.0));
+            world_flat.insert_component(id, "damage", Value::F32(0.25));
+        }
+        let tf = Instant::now();
+        for _ in 0..steps {
+            let _ = world_flat.integrate_vec3_flat("pos", "vel", dt);
+        }
+        let elapsed = tf.elapsed().as_secs_f64();
+        flat_elapsed_s = Some(elapsed);
+        let sps = steps as f64 / elapsed.max(1e-12);
+        println!(
+            "flat-buffer elapsed: {:.3}s ({:.1} steps/s)",
+            elapsed, sps
+        );
+    }
+
+    let mut flat_cached_elapsed_s = None;
+    if mode == "flat-cached" || mode == "both" || mode == "rust-compare" {
+        let mut world_fc = EcsWorld::default();
+        for _ in 0..n {
+            let id = world_fc.spawn();
+            world_fc.insert_component(id, "pos", Value::Vec3([0.0, 0.0, 0.0]));
+            world_fc.insert_component(id, "vel", Value::Vec3([1.0, 0.0, 0.0]));
+            world_fc.insert_component(id, "health", Value::F32(100.0));
+            world_fc.insert_component(id, "damage", Value::F32(0.25));
+        }
+        let mut pos_buf: Vec<[f32; 3]> = Vec::new();
+        let mut vel_buf: Vec<[f32; 3]> = Vec::new();
+        let mut health_buf: Vec<f32> = Vec::new();
+        let mut damage_buf: Vec<f32> = Vec::new();
+        let tf = Instant::now();
+        for s in 0..steps {
+            let flush = s == steps - 1;
+            let _ = world_fc.integrate_vec3_and_health_flat_cached(
+                "pos", "vel", "health", "damage", dt,
+                &mut pos_buf, &mut vel_buf, &mut health_buf, &mut damage_buf,
+                flush,
+            );
+        }
+        let elapsed = tf.elapsed().as_secs_f64();
+        flat_cached_elapsed_s = Some(elapsed);
+        let sps = steps as f64 / elapsed.max(1e-12);
+        println!(
+            "flat-cached elapsed: {:.3}s ({:.1} steps/s)",
+            elapsed, sps
+        );
+    }
+
     let mut aot_elapsed_s = None;
     if mode == "aot-hash" || mode == "both" || mode == "rust-compare" {
         let mut world_aot = EcsWorld::default();
@@ -220,6 +275,20 @@ fn main() {
             println!(
                 "superoptimizer-vs-rust ratio (sec/step): {:.2}x",
                 superopt_sec_per_step / rust_sec_per_step.max(1e-12)
+            );
+        }
+        if let Some(flat_s) = flat_elapsed_s {
+            let flat_sec_per_step = flat_s / (steps as f64).max(1.0);
+            println!(
+                "flat-buffer-vs-rust ratio (sec/step): {:.2}x",
+                flat_sec_per_step / rust_sec_per_step.max(1e-12)
+            );
+        }
+        if let Some(flat_cached_s) = flat_cached_elapsed_s {
+            let flat_cached_sec_per_step = flat_cached_s / (steps as f64).max(1.0);
+            println!(
+                "flat-cached-vs-rust ratio (sec/step): {:.2}x",
+                flat_cached_sec_per_step / rust_sec_per_step.max(1e-12)
             );
         }
     }

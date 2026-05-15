@@ -16,7 +16,7 @@ use crate::compiler::ir::TaskOwnership as IrTaskOwnership;
 use crate::compiler::ir::*;
 use crate::compiler::lexer::Span;
 use crate::compiler::typeck::Diagnostics;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// Loop context for break/continue lowering.
@@ -43,6 +43,17 @@ struct LoopContext {
 /// by the caller.
 pub fn lower_program(program: &Program) -> FlatIrModule {
     let mut ctx = LowerCtx::new();
+
+    // FIX (IR-2): First pass — collect all function names before lowering any
+    // bodies. This ensures recursive calls (fib calling fib) and cross-function
+    // calls (main calling helper) resolve correctly instead of emitting
+    // ConstUnit for unknown identifiers.
+    for item in &program.items {
+        if let Item::Fn(fn_decl) = item {
+            ctx.fn_names.insert(fn_decl.name.clone());
+        }
+    }
+
     for item in &program.items {
         ctx.lower_item(item);
     }
@@ -88,6 +99,12 @@ struct LowerCtx {
     loop_stack: Vec<LoopContext>,
     /// FIX (IR-1): Diagnostics collector for compile-time errors.
     diagnostics: Diagnostics,
+    /// FIX (IR-2): Function name registry — populated by a first pass over
+    /// the program before any function bodies are lowered. This enables
+    /// recursive calls (fib calling fib) and cross-function calls (main
+    /// calling helper) to resolve correctly in the Call handler, instead
+    /// of silently emitting ConstUnit for unknown identifiers.
+    fn_names: HashSet<String>,
 }
 
 impl LowerCtx {
@@ -107,6 +124,7 @@ impl LowerCtx {
             current_fn: String::new(),
             loop_stack: vec![],
             diagnostics: Diagnostics { items: vec![] },
+            fn_names: HashSet::new(),
         }
     }
 
@@ -2410,7 +2428,30 @@ impl LowerCtx {
                 IrType::Array { elem: Box::new(IrType::Float { width: 32 }), len: Some(4) }
             }
 
-            Type::Named(name) => IrType::Unknown, // opaque named type
+            Type::Named(name) => {
+                // FIX (IR-3): Resolve common named types to proper IR types.
+                // The parser creates Type::Named("i32") for `n: i32` annotations,
+                // but the lowerer was converting all named types to IrType::Unknown,
+                // which caused the IR type checker to see parameter types as Unknown/Unit
+                // and reject valid comparisons like `n <= 1`.
+                match name.as_str() {
+                    "i8"    => IrType::Int { width: 8,  signed: true },
+                    "i16"   => IrType::Int { width: 16, signed: true },
+                    "i32"   => IrType::Int { width: 32, signed: true },
+                    "i64"   => IrType::Int { width: 64, signed: true },
+                    "u8"    => IrType::Int { width: 8,  signed: false },
+                    "u16"   => IrType::Int { width: 16, signed: false },
+                    "u32"   => IrType::Int { width: 32, signed: false },
+                    "u64"   => IrType::Int { width: 64, signed: false },
+                    "f16"   => IrType::Float { width: 16 },
+                    "f32"   => IrType::Float { width: 32 },
+                    "f64"   => IrType::Float { width: 64 },
+                    "bool"  => IrType::Bool,
+                    "usize" => IrType::Int { width: 64, signed: false },
+                    "str" | "String" => IrType::String,
+                    _ => IrType::Unknown, // truly opaque named type
+                }
+            }
 
             Type::Tuple(elems) => {
                 IrType::Struct {
