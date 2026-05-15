@@ -7,6 +7,60 @@
 
 ---
 
+## [2026-05-15] - Hook Up Hanging Code: Wire Optimizer & Verification Passes, Fix One Truth Rule Violations
+**Status:** 🟢 Completed
+**System Layer:** Cross-cutting (Compiler Pipeline / CLI / Optimizer / Verification / Benchmarks)
+
+### 1. The Mission
+- [x] Fix REPL to use IR pipeline instead of old tree-walking interpreter (One Truth Rule violation)
+- [x] Fix micro-benchmark.rs to use IR pipeline instead of old interpreter (One Truth Rule violation)
+- [x] Wire whole_program_dce into pipeline (Pass 13) — dependency graph + reachability analysis
+- [x] Wire soa_optimizer into pipeline (Pass 14) — AoS→SoA layout conversion suggestions
+- [x] Wire memory_optimizer into pipeline (Pass 15) — NUMA/huge page optimization suggestions
+- [x] Wire formal_verify after IR BorrowCheck — TrustTier assignment per function
+- [x] Remove ghost features from Cargo.toml (phase4-llvm, phase5-cow, legacy-passes)
+- [x] Keep xla feature (has actual #[cfg(feature = "xla")] code behind it)
+- [x] Remove dead code: adapt_borrowck_diag function, unused re-exports (ZchmaRuntime, MemoryReorgOrchestrator)
+- [x] Add estimate_type_byte_size helper for SoA/memory optimizer passes
+- [x] Verify no `todo!()` or `unimplemented!()` stubs remain
+- [x] All 1122 tests pass, 0 failures, 0 compiler warnings
+- [x] Push to GitHub
+
+### 2. Changes Summary
+
+**src/main.rs** — Pipeline passes wired up:
+- Pass 13 (Whole-Program DCE): Builds DependencyGraphBuilder, runs reachability from entry points (main, systems, agents), emits advisory warnings for unreachable functions, unused structs/enums/consts
+- Pass 14 (SoA Layout Optimizer): Creates SoaOptimizer, registers ECS components with field metadata, calls analyze_and_swap(), emits advisory notes about layout changes
+- Pass 15 (Memory Optimizer): Creates MemoryOptimizer, registers data regions from struct/component definitions, calls optimize_all(), emits advisory notes about NUMA/huge page suggestions
+- Formal Verification (after IR BorrowCheck): Creates FormalVerifier, verifies each IR function, assigns TrustTier, emits note diagnostics
+- REPL: Replaced tree-walking interpreter with IR pipeline (compile_ir_module → load_ir_functions → BytecodeVM)
+- Removed dead adapt_borrowck_diag function (AST borrowck is dead code)
+- Removed unused re-exports (ZchmaRuntime, MemoryReorgOrchestrator)
+- Added estimate_type_byte_size() helper for memory-related optimizer passes
+
+**src/micro-benchmark.rs** — One Truth Rule fix:
+- Replaced jules::interp::Interpreter with IR pipeline execution path
+- Uses compile_ir_module → BytecodeVM, matching jules_run_file() and REPL
+
+**Cargo.toml** — Ghost feature cleanup:
+- Removed phase4-llvm (zero code gated behind it)
+- Removed phase5-cow (zero code gated behind it)
+- Removed legacy-passes (zero code gated behind it)
+- Kept xla feature (has actual #[cfg(feature = "xla")] code in xla_backend.rs and superopt_xla_bridge.rs)
+- Removed ghost features from `full` feature
+
+### 3. Invariants & Guardrails
+- **Invariants Touched:** One Truth Rule (REPL + micro-benchmark now use IR pipeline), pipeline completeness (4 new passes wired)
+- **Safety Check:** No `todo!()` or `unimplemented!()` stubs found. No JHAL zero-heap violations. Zero compiler warnings. 1122 tests pass, 0 failures.
+- **Architecture Compliance:** Followed workflow.md Mandatory Verification Loop (`cargo check` + `cargo test --lib`). Followed agents.md Unified IR Doctrine. Followed architecture.md for SoA/memory optimization and formal verification.
+
+### 4. Current Save Point
+- **Current State:** 1122 tests pass, 0 failures, 0 compiler warnings. All MD files followed. Commit 5e5722c pushed to GitHub.
+- **Next Immediate Step:** Continue with remaining architecture.md action items: deprecate flat bytecode entirely, implement SSA direct interpreter, add attribute preservation in lowering, wire autovec/autovec_bridge.
+- **Deletions:** adapt_borrowck_diag (dead code), unused re-exports ZchmaRuntime/MemoryReorgOrchestrator, ghost features phase4-llvm/phase5-cow/legacy-passes.
+
+---
+
 ## [2026-05-15] - Zero Warnings, Zero Test Failures, IR Split-Brain Fix
 **Status:** 🟢 Completed
 **System Layer:** Cross-cutting (Compiler Pipeline / CLI / Tests / All Modules)
