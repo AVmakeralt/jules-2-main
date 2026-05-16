@@ -1362,28 +1362,34 @@ impl BytecodeCompiler {
                     }
                     _ => {
                         // Eager evaluation for all other operators
+                        // CRITICAL: Save the LHS result to a temporary slot before
+                        // compiling the RHS, because the RHS may overwrite `dst`.
+                        // For example, in `is_even(2) + is_even(3)`, both calls
+                        // use dst=0, so the second call would overwrite the first.
                         self.compile_expr(lhs, dst)?;
+                        let lhs_slot = self.alloc_slot();
+                        self.emit(Instr::Move { dst: lhs_slot, src: dst });
                         let rhs_slot = self.alloc_slot();
                         self.compile_expr(rhs, rhs_slot)?;
 
                         match op {
-                            BinOpKind::Add     => self.emit(Instr::Add { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Sub     => self.emit(Instr::Sub { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Mul     => self.emit(Instr::Mul { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Div     => self.emit(Instr::Div { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Rem     => self.emit(Instr::Rem { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::FloorDiv => self.emit(Instr::FloorDiv { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Eq      => self.emit(Instr::Eq { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Ne      => self.emit(Instr::Ne { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Lt      => self.emit(Instr::Lt { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Le      => self.emit(Instr::Le { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Gt      => self.emit(Instr::Gt { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Ge      => self.emit(Instr::Ge { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::BitAnd  => self.emit(Instr::BitAnd { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::BitOr   => self.emit(Instr::BitOr { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::BitXor  => self.emit(Instr::BitXor { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Shl     => self.emit(Instr::Shl { dst, lhs: dst, rhs: rhs_slot }),
-                            BinOpKind::Shr     => self.emit(Instr::Shr { dst, lhs: dst, rhs: rhs_slot }),
+                            BinOpKind::Add     => self.emit(Instr::Add { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Sub     => self.emit(Instr::Sub { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Mul     => self.emit(Instr::Mul { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Div     => self.emit(Instr::Div { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Rem     => self.emit(Instr::Rem { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::FloorDiv => self.emit(Instr::FloorDiv { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Eq      => self.emit(Instr::Eq { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Ne      => self.emit(Instr::Ne { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Lt      => self.emit(Instr::Lt { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Le      => self.emit(Instr::Le { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Gt      => self.emit(Instr::Gt { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Ge      => self.emit(Instr::Ge { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::BitAnd  => self.emit(Instr::BitAnd { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::BitOr   => self.emit(Instr::BitOr { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::BitXor  => self.emit(Instr::BitXor { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Shl     => self.emit(Instr::Shl { dst, lhs: lhs_slot, rhs: rhs_slot }),
+                            BinOpKind::Shr     => self.emit(Instr::Shr { dst, lhs: lhs_slot, rhs: rhs_slot }),
                             BinOpKind::And | BinOpKind::Or => unreachable!(),
                         }
                     }
@@ -1551,8 +1557,14 @@ impl BytecodeCompiler {
 
             // ── If expression ─────────────────────────────────────────────
             Expr::IfExpr { cond, then, else_, .. } => {
-                self.compile_expr(cond, dst)?;
-                let jump_false_pos = self.emit_jump_false(dst);
+                // Compile condition into a TEMPORARY slot, not dst.
+                // If we compile the condition into dst, we clobber any variable
+                // that happens to live in the same slot as dst (e.g., a function
+                // parameter in slot 0). The then/else branches may reference
+                // that variable later, so we must preserve its value.
+                let cond_slot = self.alloc_slot();
+                self.compile_expr(cond, cond_slot)?;
+                let jump_false_pos = self.emit_jump_false(cond_slot);
                 self.compile_block(then, dst)?;
                 if let Some(else_block) = else_ {
                     let jump_end_pos = self.emit_jump();
@@ -1777,8 +1789,13 @@ pub struct BytecodeVM {
     /// Native function table (indexed by CallNative.func_idx)
     native_functions: Vec<Box<dyn Fn(&[Value]) -> Result<Value, RuntimeError> + Send + Sync>>,
 
-    /// Call stack for function invocations
+    /// Call stack for function invocations (used by jump-based calls only;
+    /// recursive execute() calls do NOT push frames to avoid Return confusion).
     call_stack: Vec<CallFrame>,
+
+    /// Nesting depth for recursive execute() calls. When > 0, the current
+    /// execute() is a nested call and must save/restore caller slots.
+    nesting_depth: u32,
 
     /// Profiling data: per-point hit counters
     profile_points: Vec<AtomicU64>,
@@ -1827,6 +1844,7 @@ impl BytecodeVM {
             prefetch: PrefetchEngine::default(),
             native_functions: Vec::new(),
             call_stack: Vec::new(),
+            nesting_depth: 0,
             profile_points: Vec::new(),
             data_dependent_jit: DataDependentJIT::new(),
             global_arithmetic_mode: None,
@@ -1891,30 +1909,35 @@ impl BytecodeVM {
             self.profile_points.resize_with(needed, || AtomicU64::new(0));
         }
 
-        // Build the global constant pool by merging all function-local
-        // constants. This enables shared constant access across function
-        // boundaries via LoadConst instructions.
+        // Build the global constant pool by concatenating all function-local
+        // constant pools. We must NOT deduplicate, because LoadConst indices
+        // in each function's instructions reference positions within that
+        // function's local constant pool. Deduplication would break those
+        // indices. Instead, we remap each function's LoadConst indices by
+        // adding an offset (the running total of constants from prior functions).
         self.constants.clear();
-        for f in &functions {
-            for c in &f.constants {
-                // Deduplicate: only add constants not already in the global pool.
-                // Use shallow comparison for common scalar types.
-                let already_exists = self.constants.iter().any(|existing| {
-                    match (existing, c) {
-                        (Value::I64(a), Value::I64(b)) => a == b,
-                        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
-                        (Value::Bool(a), Value::Bool(b)) => a == b,
-                        (Value::Str(a), Value::Str(b)) => a == b,
-                        _ => false,
+        let mut const_offset: u32 = 0;
+        let mut remapped_functions = functions;
+        for f in &mut remapped_functions {
+            // Extend the global pool with this function's constants.
+            self.constants.extend(f.constants.iter().cloned());
+
+            // Remap LoadConst indices: each per-function idx becomes
+            // (const_offset + per_function_idx) in the global pool.
+            if const_offset > 0 {
+                for instr in &mut f.instructions {
+                    if let Instr::LoadConst { idx, .. } = instr {
+                        *idx = const_offset + *idx;
                     }
-                });
-                if !already_exists {
-                    self.constants.push(c.clone());
                 }
             }
+
+            const_offset += f.constants.len() as u32;
+            // Clear the per-function pool (no longer needed).
+            f.constants.clear();
         }
 
-        self.functions = functions;
+        self.functions = remapped_functions;
     }
 
     /// Load functions compiled from the IR-to-bytecode pipeline.
@@ -1938,7 +1961,7 @@ impl BytecodeVM {
         // (which could be 64+ slots = 8+ KB of cloning per call), we only save
         // the slots that the callee will actually overwrite (first needed_slots
         // entries). Slots beyond needed_slots are untouched by the callee.
-        let is_nested = !self.call_stack.is_empty();
+        let is_nested = self.nesting_depth > 0;
         let needed_slots = self.functions[func_idx].num_locals.max(self.functions[func_idx].num_params) as usize;
         let saved_slots: Option<Vec<Value>> = if is_nested {
             let save_len = needed_slots.min(self.memory_pool.max_slot_used.saturating_add(1));
@@ -2677,17 +2700,17 @@ impl BytecodeVM {
                     let r_val = &slots[*rhs as usize];
 
                     if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l == r);
+                        slots[*dst as usize] = Value::I64(if l == r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
                     if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l == r);
+                        slots[*dst as usize] = Value::I64(if l == r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
                     if let (Value::Bool(l), Value::Bool(r)) = (l_val, r_val) {
-                        slots[*dst as usize] = Value::Bool(l == r);
+                        slots[*dst as usize] = Value::I64(if l == r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
@@ -2705,17 +2728,17 @@ impl BytecodeVM {
                     let r_val = &slots[*rhs as usize];
 
                     if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l != r);
+                        slots[*dst as usize] = Value::I64(if l != r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
                     if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l != r);
+                        slots[*dst as usize] = Value::I64(if l != r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
                     if let (Value::Bool(l), Value::Bool(r)) = (l_val, r_val) {
-                        slots[*dst as usize] = Value::Bool(l != r);
+                        slots[*dst as usize] = Value::I64(if l != r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
@@ -2732,12 +2755,12 @@ impl BytecodeVM {
                     let r_val = &slots[*rhs as usize];
 
                     if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l < r);
+                        slots[*dst as usize] = Value::I64(if l < r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
                     if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l < r);
+                        slots[*dst as usize] = Value::I64(if l < r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
@@ -2754,12 +2777,12 @@ impl BytecodeVM {
                     let r_val = &slots[*rhs as usize];
 
                     if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l <= r);
+                        slots[*dst as usize] = Value::I64(if l <= r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
                     if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l <= r);
+                        slots[*dst as usize] = Value::I64(if l <= r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
@@ -2776,12 +2799,12 @@ impl BytecodeVM {
                     let r_val = &slots[*rhs as usize];
 
                     if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l > r);
+                        slots[*dst as usize] = Value::I64(if l > r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
                     if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l > r);
+                        slots[*dst as usize] = Value::I64(if l > r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
@@ -2798,12 +2821,12 @@ impl BytecodeVM {
                     let r_val = &slots[*rhs as usize];
 
                     if let (Value::I64(l), Value::I64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l >= r);
+                        slots[*dst as usize] = Value::I64(if l >= r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
                     if let (Value::F64(l), Value::F64(r)) = (&l_val, &r_val) {
-                        slots[*dst as usize] = Value::Bool(l >= r);
+                        slots[*dst as usize] = Value::I64(if l >= r { 1 } else { 0 });
                         pc += 1;
                         continue;
                     }
@@ -2905,17 +2928,22 @@ impl BytecodeVM {
                                         profiler.record_function_call(idx);
                                     }
 
-                                    // Push call frame (return to next instruction)
-                                    self.call_stack.push(CallFrame {
-                                        return_pc: pc + 1,
-                                        base_slot: 0,
-                                        num_locals: self.functions[idx].num_locals,
-                                    });
+                                    // NOTE: We do NOT push a call frame here.
+                                    // The recursive execute() call handles
+                                    // saving/restoring caller slots on its own.
+                                    // If we push a frame, the callee's Return
+                                    // instruction will pop it and try to resume
+                                    // execution in the WRONG dispatch loop,
+                                    // corrupting the return flow.
+                                    //
+                                    // Instead, we increment nesting_depth
+                                    // so the callee's execute() knows it's
+                                    // nested and saves/restores caller slots.
+                                    self.nesting_depth += 1;
 
                                     let result = unsafe { (*vm_ptr).execute(idx, args_slice) };
 
-                                    // Pop the call frame
-                                    self.call_stack.pop();
+                                    self.nesting_depth -= 1;
 
                                     match result {
                                         Ok(ret_val) => {
@@ -2959,15 +2987,13 @@ impl BytecodeVM {
                             let callee_idx = self.function_index.get(fn_name).copied();
                             match callee_idx {
                                 Some(idx) => {
-                                    self.call_stack.push(CallFrame {
-                                        return_pc: pc + 1,
-                                        base_slot: 0,
-                                        num_locals: self.functions[idx].num_locals,
-                                    });
+                                    // NOTE: No call frame push — recursive execute()
+                                    // handles save/restore on its own.
+                                    self.nesting_depth += 1;
 
                                     let result = unsafe { (*vm_ptr).execute(idx, args_slice) };
 
-                                    self.call_stack.pop();
+                                    self.nesting_depth -= 1;
 
                                     match result {
                                         Ok(ret_val) => {
@@ -4454,5 +4480,75 @@ mod tests {
         vm.load_functions(functions);
         let result = vm.call_fn("bench", vec![]).unwrap();
         assert_i64(&result, 3);
+    }
+
+    #[test]
+    fn test_vm_is_even_return_from_if() {
+        // Regression test: early return from inside if-block in a function with params
+        let src = r#"
+fn is_even(n: i32) -> i32 {
+    if n - (n / 2) * 2 == 0 {
+        return 1;
+    }
+    0
+}
+fn bench() -> i32 {
+    is_even(2) + is_even(3) + is_even(4) + is_even(5)
+}
+"#;
+        let mut unit = crate::CompileUnit::new("<test>".to_string(), src);
+        let result = crate::Pipeline::new().run(&mut unit);
+        if unit.has_errors() {
+            for d in &unit.diags {
+                if d.is_error() {
+                    eprintln!("COMPILE ERROR: {}", d.message);
+                }
+            }
+            panic!("compile errors");
+        }
+        let (prog, ir_module) = match result {
+            crate::PipelineResult::OkWithIr { program, ir_module } => (program, ir_module),
+            _ => panic!("pipeline failed"),
+        };
+
+        // ── Test via IR → Bytecode path ──
+        let ir_bc = crate::compiler::ir_to_bytecode::compile_ir_module(&ir_module);
+        eprintln!("\n=== IR BYTECODE ===");
+        for f in &ir_bc.functions {
+            eprintln!("Function: {} (params={}, locals={})", f.name, f.num_params, f.num_locals);
+            for (j, instr) in f.instructions.iter().enumerate() {
+                eprintln!("  [{:3}] {:?}", j, instr);
+            }
+        }
+        let mut vm = BytecodeVM::new();
+        vm.load_ir_functions(ir_bc.functions).unwrap();
+        for n in 2..=5 {
+            let val = vm.call_fn("is_even", vec![Value::I64(n)]).unwrap();
+            eprintln!("IR-VM is_even({}) = {:?}", n, val);
+        }
+        let result_val = vm.call_fn("bench", vec![]).unwrap();
+        eprintln!("IR-VM bench() = {:?}", result_val);
+        // is_even(2)=1, is_even(3)=0, is_even(4)=1, is_even(5)=0 → total=2
+        assert_i64(&result_val, 2);
+
+        // ── Test via AST → Bytecode path ──
+        let mut compiler = BytecodeCompiler::new();
+        let functions = compiler.compile_program(&prog).unwrap();
+        eprintln!("\n=== AST BYTECODE ===");
+        for f in &functions {
+            eprintln!("Function: {} (params={}, locals={})", f.name, f.num_params, f.num_locals);
+            for (j, instr) in f.instructions.iter().enumerate() {
+                eprintln!("  [{:3}] {:?}", j, instr);
+            }
+        }
+        let mut vm2 = BytecodeVM::new();
+        vm2.load_functions(functions);
+        for n in 2..=5 {
+            let val = vm2.call_fn("is_even", vec![Value::I64(n)]).unwrap();
+            eprintln!("AST-VM is_even({}) = {:?}", n, val);
+        }
+        let result_val2 = vm2.call_fn("bench", vec![]).unwrap();
+        eprintln!("AST-VM bench() = {:?}", result_val2);
+        assert_i64(&result_val2, 2);
     }
 }

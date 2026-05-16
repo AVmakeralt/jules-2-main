@@ -48,6 +48,15 @@ impl IrTypeckResult {
     }
 }
 
+/// Severity of an IR type-check diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrTypeDiagSeverity {
+    /// A hard error — compilation cannot succeed.
+    Error,
+    /// A warning — potential problem but compilation can continue.
+    Warning,
+}
+
 /// A single IR type-check diagnostic.
 #[derive(Debug)]
 pub struct IrTypeDiag {
@@ -57,6 +66,8 @@ pub struct IrTypeDiag {
     pub kind: IrTypeDiagKind,
     /// Human-readable error message.
     pub message: String,
+    /// Severity of the diagnostic (error or warning).
+    pub severity: IrTypeDiagSeverity,
 }
 
 /// Category of IR type-check diagnostic.
@@ -191,12 +202,12 @@ impl TypeckCtx {
     // ── Diagnostic helpers ─────────────────────────────────────────────
 
     fn emit_error(&mut self, span: Span, kind: IrTypeDiagKind, message: String) {
-        self.diagnostics.push(IrTypeDiag { span, kind, message });
+        self.diagnostics.push(IrTypeDiag { span, kind, message, severity: IrTypeDiagSeverity::Error });
         self.errors += 1;
     }
 
     fn emit_warning(&mut self, span: Span, kind: IrTypeDiagKind, message: String) {
-        self.diagnostics.push(IrTypeDiag { span, kind, message });
+        self.diagnostics.push(IrTypeDiag { span, kind, message, severity: IrTypeDiagSeverity::Warning });
         self.warnings += 1;
     }
 

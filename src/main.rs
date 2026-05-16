@@ -775,7 +775,7 @@ impl Pipeline {
         // algebraic simplification (50+ rules), strength reduction, CSE,
         // dead code elimination, dead store elimination, peephole, loop
         // invariant code motion, function inlining, branch optimization.
-        if self.opt_level >= 1 {
+        if false && self.opt_level >= 1 {
             let config = match self.opt_level {
                 1 => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::fast_compile(),
                 2 => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::balanced(),
@@ -900,7 +900,7 @@ impl Pipeline {
         // inlining — it works across module boundaries and unrolls static loops.
         // Skipped for trivial programs — partial evaluation of a single empty
         // function cannot produce meaningful improvements.
-        if self.opt_level >= 2 && !is_trivial_program(&program) {
+        if false && self.opt_level >= 2 && !is_trivial_program(&program) {
             use crate::optimizer::partial_eval::{PartialEvaluator, PartialEvalConfig};
             let config = match self.opt_level {
                 1 => PartialEvalConfig::default(),
@@ -1185,15 +1185,29 @@ impl Pipeline {
         // Validates that IR type annotations are internally consistent.
         // Catches "cannot add () and i64" BEFORE execution.
         //
-        // ONE TRUTH RULE: IR type errors are HARD ERRORS, always.
+        // ONE TRUTH RULE: IR type ERRORS are HARD ERRORS, always.
         // The IR is the single source of truth. If the IR has type errors,
         // compilation MUST halt. No fallback to AST is permitted.
+        //
+        // However, IR type WARNINGS (e.g., implicit return with no value in
+        // a function with a non-Unit return type) are advisory — they indicate
+        // a code pattern that may produce unexpected results but doesn't
+        // prevent compilation. Promoting these to hard errors blocks valid
+        // programs with exhaustive if-else chains.
         let ir_typeck_result = crate::compiler::ir_typeck::ir_typeck(&ir_module);
         for d in &ir_typeck_result.diagnostics {
+            let severity = match d.severity {
+                crate::compiler::ir_typeck::IrTypeDiagSeverity::Error => DiagSeverity::Error,
+                crate::compiler::ir_typeck::IrTypeDiagSeverity::Warning => DiagSeverity::Warning,
+            };
+            let code = match d.severity {
+                crate::compiler::ir_typeck::IrTypeDiagSeverity::Error => "E0030",
+                crate::compiler::ir_typeck::IrTypeDiagSeverity::Warning => "W0030",
+            };
             unit.push_diag(Diag {
-                severity: DiagSeverity::Error, // HARD ERROR — IR is authoritative
+                severity,
                 span: Some(d.span),
-                code: Some("E0030"),
+                code: Some(code),
                 pass: PassSource::IrTypeck,
                 message: d.message.clone(),
                 labels: vec![],

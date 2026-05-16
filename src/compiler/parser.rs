@@ -771,6 +771,26 @@ impl Parser {
 // =============================================================================
 
 impl Parser {
+    /// Recursively convert the last `Stmt::If` in a block to an `Expr::IfExpr`
+    /// tail expression, so that nested if-else chains produce values correctly.
+    ///
+    /// Without this, a block like `{ if x < 5 { 1 } else { 2 } }` keeps the
+    /// inner if-else as a Stmt::If with no tail, so `lower_block` returns None
+    /// instead of the if-else's value. This causes "implicit return with no
+    /// value" errors for functions with return types.
+    fn convert_block_last_if_to_expr(block: &Block) -> Block {
+        let mut block = block.clone();
+        if block.tail.is_none() {
+            if let Some(stmt) = block.stmts.last().cloned() {
+                if let Some(expr) = Self::stmt_if_to_expr(&stmt) {
+                    block.stmts.pop();
+                    block.tail = Some(Box::new(expr));
+                }
+            }
+        }
+        block
+    }
+
     fn stmt_if_to_expr(stmt: &Stmt) -> Option<Expr> {
         match stmt {
             Stmt::If {
@@ -779,8 +799,16 @@ impl Parser {
                 then,
                 else_,
             } => {
+                // Recursively convert the last Stmt::If in the then-block
+                // so that nested if-else chains produce values.
+                let then_converted = Self::convert_block_last_if_to_expr(then);
+
                 let else_ = else_.as_ref().and_then(|branch| match branch.as_ref() {
-                    IfOrBlock::Block(b) => Some(Box::new(b.clone())),
+                    IfOrBlock::Block(b) => {
+                        // Recursively convert the last Stmt::If in the else-block
+                        let b_converted = Self::convert_block_last_if_to_expr(b);
+                        Some(Box::new(b_converted))
+                    }
                     IfOrBlock::If(inner) => {
                         let nested = Self::stmt_if_to_expr(inner)?;
                         Some(Box::new(Block {
@@ -793,7 +821,7 @@ impl Parser {
                 Some(Expr::IfExpr {
                     span: *span,
                     cond: Box::new(cond.clone()),
-                    then: Box::new(then.clone()),
+                    then: Box::new(then_converted),
                     else_,
                 })
             }
