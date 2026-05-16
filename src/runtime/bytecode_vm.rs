@@ -2104,14 +2104,29 @@ impl BytecodeVM {
         // Use the global constant pool if available (populated by load_functions),
         // otherwise fall back to the function-local constant pool.
         let constants = if !self.constants.is_empty() { &self.constants } else { &func.constants };
-        let slots = &mut self.memory_pool.slots;
+        // SAFETY: We use a raw pointer for the slot array instead of &mut Vec<Value>
+        // because the Call instruction recursively invokes execute() through vm_ptr,
+        // which modifies self.memory_pool.slots. A &mut reference would create
+        // aliasing UB: the compiler could cache slot values across recursive calls,
+        // not realizing that the callee modified the same memory. A raw pointer
+        // avoids this because the compiler makes no aliasing assumptions about it.
+        let mut slots_ptr: *mut Value = self.memory_pool.slots.as_mut_ptr();
+        let mut slots_len: usize = self.memory_pool.slots.len();
+        // Reconstruct a &mut [Value] slice from the raw pointer for the
+        // new instruction handlers (LoadConst, LoadConstInt, etc.).
+        // SAFETY: slots_ptr and slots_len come from the same Vec and are
+        // valid for the lifetime of this function. This slice MUST NOT be
+        // used across a Call instruction (which re-enters execute() and
+        // may reallocate the underlying Vec); the Call handler uses
+        // vm_ptr instead and refreshes slots_ptr/slots_len afterwards.
+        let slots: &mut [Value] = unsafe { std::slice::from_raw_parts_mut(slots_ptr, slots_len) };
         let mut pc: usize = 0;
         #[cfg(feature = "gnn-optimizer")]
         let mut branch_density: u8 = 0;
         // Sampling counter: profile every 256 instructions instead of every one.
         let mut profile_counter: u8 = 0;
         // Pre-compute slot pointer for write-intent prefetch in the dispatch loop.
-        let _slot_ptr = slots.as_mut_ptr();
+        let _slot_ptr = slots_ptr;
 
         // ── Entropy Watchdog ──────────────────────────────────────────────────
         // Replaces the naive PC-counter safety mechanism. Instead of counting
@@ -2184,7 +2199,7 @@ impl BytecodeVM {
                     // insn_base/pc/insn_len are ignored inside prefetch_dual now;
                     // pass them for API compatibility.
                     instructions.as_ptr(), pc, func_len,
-                    slot_ptr, pc, slots.len(),
+                    slot_ptr, pc, slots_len,
                 );
             }
 

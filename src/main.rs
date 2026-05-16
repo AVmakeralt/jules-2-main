@@ -126,6 +126,7 @@ pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
             // ══════════════════════════════════════════════════════════════════
             let mut interp = crate::interp::Interpreter::new();
             interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+            interp.set_native_jit_enabled(true); // Enable native JIT
             interp.load_program(&program);
             interp.call_fn(entry, vec![])
                 .map(|_| ())
@@ -135,6 +136,7 @@ pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
             // Legacy path (no IR) — use interpreter as the hot path.
             let mut interp = crate::interp::Interpreter::new();
             interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+            interp.set_native_jit_enabled(true); // Enable native JIT
             interp.load_program(&program);
             interp.call_fn(entry, vec![])
                 .map(|_| ())
@@ -712,6 +714,7 @@ pub fn validate_semantic_equivalence(
     // that gives it its performance advantage over the standalone BytecodeVM.
     // Without this, the tree-walker can't call user-defined functions.
     interp.set_jit_enabled(true);
+    interp.set_native_jit_enabled(true); // Enable native JIT
     interp.load_program(program);
     let interp_result = interp.call_fn(entry, args.clone());
 
@@ -2983,6 +2986,7 @@ fn cmd_run(args: &CliArgs) -> i32 {
     // typical programs.
     let mut interp = crate::interp::Interpreter::new();
     interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+    interp.set_native_jit_enabled(true); // Enable native JIT
     interp.load_program(&program);
     match interp.call_fn(&args.entry, vec![]) {
         Ok(val) => {
@@ -3838,6 +3842,7 @@ impl Repl {
         };
         let mut interp = crate::interp::Interpreter::new();
         interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+        interp.set_native_jit_enabled(true); // Enable native JIT
         interp.load_program(&program);
         interp.call_fn("main", vec![])
             .map(|_| ())
@@ -4905,6 +4910,7 @@ fn main() -> i32 {
         // The interpreter should be able to run it
         let mut interp = crate::interp::Interpreter::new();
         interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+        interp.set_native_jit_enabled(true); // Enable native JIT
         interp.load_program(&program);
         let val = interp.call_fn("main", vec![]).unwrap();
         match val {

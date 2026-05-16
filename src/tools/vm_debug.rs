@@ -72,6 +72,27 @@ fn bench() -> i32 {
 }
 "#, Some(200));
 
+    // Test 6: recursive fibonacci
+    test("fib-recursive-10", r#"
+fn fib(n: i32) -> i32 {
+    if n <= 1 {
+        return n;
+    }
+    fib(n - 1) + fib(n - 2)
+}
+fn bench() -> i32 {
+    fib(10)
+}
+"#, Some(55));
+
+    // Test 7: double call (calls same function twice)
+    test("double-call", r#"
+fn add1(x: i32) -> i32 { x + 1 }
+fn bench() -> i32 {
+    add1(add1(0))
+}
+"#, Some(2));
+
     println!("\n=== DEBUG COMPLETE ===");
 }
 

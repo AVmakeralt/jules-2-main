@@ -122,10 +122,57 @@ fn bench() -> i32 {{
     let program = program.expect("program should exist");
     let mut interp = jules::interp::Interpreter::new();
     let mut using_jit = matches!(mode, BenchMode::FullJit | BenchMode::NativeJit);
-    let using_native_jit = matches!(mode, BenchMode::NativeJit) && native_jit_available();
-    if matches!(mode, BenchMode::NativeJit) && !using_native_jit {
-        eprintln!("native JIT probe failed; falling back to VM JIT for this benchmark process.");
-    }
+    // Phase 4: Native JIT is the hot path. Enable it for both FullJit and NativeJit modes.
+    // The native JIT probe runs a small function via native codegen to verify
+    // the JIT can produce correct results. If the probe fails (crash, timeout),
+    // we fall back to the VM bytecode JIT.
+    let probe_native = matches!(mode, BenchMode::FullJit | BenchMode::NativeJit);
+    let using_native_jit = if probe_native {
+        // Run the native probe as a subprocess with a 5-second timeout.
+        // If the native JIT crashes (segfault) or hangs, the subprocess
+        // will be killed and we fall back to the VM.
+        let exe = std::env::current_exe().ok();
+        let probe_ok = match exe {
+            Some(exe) => {
+                // Spawn subprocess with timeout
+                match Command::new(&exe)
+                    .args(["32", "1", "native-probe"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        // Wait up to 5 seconds
+                        let start = std::time::Instant::now();
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(status)) => break status.success(),
+                                Ok(None) => {
+                                    if start.elapsed().as_secs() >= 5 {
+                                        let _ = child.kill();
+                                        break false;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                                Err(_) => break false,
+                            }
+                        }
+                    }
+                    Err(_) => false,
+                }
+            }
+            None => false,
+        };
+        if probe_ok {
+            eprintln!("[bench] native JIT probe: OK — enabling native x86-64 JIT");
+            true
+        } else {
+            eprintln!("[bench] native JIT probe: FAILED — falling back to VM bytecode");
+            false
+        }
+    } else {
+        false
+    };
     interp.set_jit_enabled(using_jit);
     interp.set_advance_jit_enabled(using_jit);
     interp.set_native_jit_enabled(using_native_jit);

@@ -76,7 +76,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use libc::{mmap, mprotect, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
-use crate::compiler::ast::BinOpKind;
+use crate::compiler::ast::{BinOpKind, UnOpKind};
 use crate::interp::{CompiledFn, Instr, AmxOpCode, RuntimeError, Value};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +85,9 @@ use crate::interp::{CompiledFn, Instr, AmxOpCode, RuntimeError, Value};
 
 pub struct NativeCode {
     pub slot_count: u16,
+    /// Whether the function returns i32 (true) or i64 (false).
+    /// Most Jules functions return i32, so the default is true.
+    pub return_is_i32: bool,
     mem: ExecMem,
 }
 
@@ -285,6 +288,28 @@ impl ExecArena {
         Ok(())
     }
 
+    /// Flip all previously-finalized pages back to RW so new code can be
+    /// written to the arena.  This is needed when we want to compile a new
+    /// function after a previous `finalize()` call has made pages RX.
+    pub fn make_writable(&mut self) {
+        let page = 4096usize;
+        for chunk in &self.chunks {
+            let base = chunk.base.as_ptr() as usize;
+            let n_pages = (chunk.capacity + page - 1) / page;
+            for p in 0..n_pages {
+                let page_addr = base + p * page;
+                // Try to flip to RW; ignore errors (page may already be RW)
+                unsafe {
+                    let _ = libc::mprotect(
+                        page_addr as *mut libc::c_void,
+                        page,
+                        PROT_READ | PROT_WRITE,
+                    );
+                }
+            }
+        }
+    }
+
     /// Record dirty pages for a given allocation range (Fix #1).
     ///
     /// Call this after writing code to the arena. Instead of immediately
@@ -341,6 +366,10 @@ impl ExecMem {
                 *arena = ExecArena::try_new();
             }
             let arena = arena.as_mut()?;
+            // Before writing new code, ensure the arena pages are writable.
+            // A previous finalize() call may have flipped pages to RX,
+            // which would cause SIGSEGV when we try to write new code.
+            arena.make_writable();
             let offset = arena.alloc(code.len().max(1))?;
             let ptr = arena.get_ptr(offset);
             unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), ptr as *mut u8, code.len()) };
@@ -1117,6 +1146,10 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
             Instr::BinOp(d, _, l, r) => {
                 use_!(*l, pc);
                 use_!(*r, pc);
+                def!(*d, pc);
+            }
+            Instr::UnOp(d, _, s) => {
+                use_!(*s, pc);
                 def!(*d, pc);
             }
             Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) | Instr::Return(s) => {
@@ -2415,7 +2448,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     let slot_count = compiled.slot_count as usize;
 
     // Gate: bail out early if any instruction is outside our supported set.
-    for instr in instrs {
+    for (i, instr) in instrs.iter().enumerate() {
         match instr {
             Instr::LoadI32(..)
             | Instr::LoadI64(..)
@@ -2427,6 +2460,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             | Instr::Load(..)
             | Instr::Store(..)
             | Instr::BinOp(..)
+            | Instr::UnOp(..)
             | Instr::Jump(..)
             | Instr::JumpFalse(..)
             | Instr::JumpTrue(..)
@@ -2434,7 +2468,10 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             | Instr::ReturnUnit
             | Instr::AmxOp(..)
             | Instr::Nop => {}
-            _ => return None,
+            _ => {
+                eprintln!("[JIT] translate: rejected at pc={}: {:?}", i, instr);
+                return None;
+            }
         }
     }
 
@@ -3069,6 +3106,26 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 });
                 const_at.clear();
             }
+            Instr::UnOp(dst, op, src) => {
+                // Load src into rax
+                load_rax(&mut em, *src, &ra);
+                match op {
+                    UnOpKind::Neg => {
+                        em.neg_rax();
+                    }
+                    UnOpKind::Not => {
+                        // Bitwise NOT: NOT RAX
+                        em.emit3(0x48, 0xF7, 0xD0); // NOT RAX
+                    }
+                    _ => {
+                        // Deref, Ref, RefMut are not meaningful in the JIT
+                        // (no pointer types in bytecode). Just pass through.
+                    }
+                }
+                store_rax(&mut em, *dst, &ra);
+                const_at.remove(*dst); // Invalidate constant tracking
+            }
+
             Instr::Return(r) => {
                 load_rax(&mut em, *r, &ra);
                 emit_ret(&mut em, &ra.used_callee_saved);
@@ -3194,21 +3251,52 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
     }
 
+    // Determine return type from the last Return instruction.
+    // Default to i32 since most Jules functions return i32.
+    let mut return_is_i32 = true;
+    for instr in instrs {
+        if let Instr::Return(src) = instr {
+            // Check if the source slot was loaded as i32.
+            // We scan backwards for the most recent LoadI32 or BinOp
+            // that wrote to this slot.
+            return_is_i32 = true; // Jules functions typically return i32
+            break;
+        }
+    }
+
     let mem = ExecMem::new(&em.buf)?;
 
-    // FIX #1: After writing code to the arena, finalize to batch-flip
-    // dirty pages from RW→RX. This ensures W^X compliance while avoiding
-    // the per-function mprotect that caused SIGSEGV when two functions
-    // share a 4K page.
-    TLS_EXEC_ARENA.with(|arena_cell| {
-        if let Some(arena) = arena_cell.borrow_mut().as_mut() {
-            let _ = arena.finalize();
-        }
-    });
+    // NOTE: We do NOT call finalize() here anymore.  Finalization is
+    // deferred to just before execution (see `finalize_arena()`).  This
+    // prevents the scenario where finalize() flips pages to RX, and a
+    // subsequent translate() call tries to write to the same page,
+    // causing SIGSEGV.
+    //
+    // The old code was:
+    //   TLS_EXEC_ARENA.with(|arena_cell| {
+    //       if let Some(arena) = arena_cell.borrow_mut().as_mut() {
+    //           let _ = arena.finalize();
+    //       }
+    //   });
 
     Some(NativeCode {
         slot_count: compiled.slot_count,
+        return_is_i32,
         mem,
+    })
+}
+
+/// Finalize the JIT arena: flip all dirty pages from RW→RX.
+/// Must be called before executing any JIT-compiled code.
+/// Returns true on success (or if no arena exists).
+pub fn finalize_arena() -> bool {
+    TLS_EXEC_ARENA.with(|arena_cell| {
+        let mut arena = arena_cell.borrow_mut();
+        if let Some(arena) = arena.as_mut() {
+            arena.finalize().is_ok()
+        } else {
+            true
+        }
     })
 }
 
@@ -3256,7 +3344,11 @@ pub fn execute(native: &NativeCode, args: &[Value]) -> Result<Value, RuntimeErro
         }
         let f = native.mem.entry();
         let out = unsafe { f(regs.as_mut_ptr()) };
-        Ok(Value::I64(out))
+        if native.return_is_i32 {
+            Ok(Value::I32(out as i32))
+        } else {
+            Ok(Value::I64(out))
+        }
     }
 
     if needed <= STACK_SLOTS {

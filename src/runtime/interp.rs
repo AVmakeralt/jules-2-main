@@ -4907,6 +4907,8 @@ pub struct Interpreter {
     #[cfg(feature = "phase3-jit")]
     pgo_window_done: bool,
     #[cfg(feature = "phase3-jit")]
+    pgo_second_window_done: bool,
+    #[cfg(feature = "phase3-jit")]
     pgo_call_counts: FxHashMap<String, u64>,
     /// Runtime function profiler (built-in hotspot weighting).
     runtime_profile_enabled: bool,
@@ -4963,13 +4965,15 @@ impl Interpreter {
             #[cfg(feature = "phase3-jit")]
             pgo_window_done: false,
             #[cfg(feature = "phase3-jit")]
+            pgo_second_window_done: false,
+            #[cfg(feature = "phase3-jit")]
             pgo_call_counts: FxHashMap::default(),
             runtime_profile_enabled: false,
             runtime_profile: FxHashMap::default(),
             jit_enabled: true,
             native_jit_enabled: std::env::var("JULES_ENABLE_NATIVE_JIT")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+                .unwrap_or(true),
             advance_jit_enabled: true,
             jit_native_calls: 0,
             jit_vm_calls: 0,
@@ -5025,6 +5029,7 @@ impl Interpreter {
             #[cfg(feature = "phase3-jit")]
             {
                 self.pgo_window_done = false;
+                self.pgo_second_window_done = false;
                 self.pgo_started_at = Instant::now();
                 self.pgo_call_counts.clear();
             }
@@ -5071,6 +5076,7 @@ impl Interpreter {
         {
             self.native_fns.clear();
             self.pgo_window_done = false;
+            self.pgo_second_window_done = false;
             self.pgo_started_at = Instant::now();
             self.pgo_call_counts.clear();
         }
@@ -5147,19 +5153,37 @@ impl Interpreter {
                 } else {
                     self.pgo_call_counts.insert(name.to_owned(), 1);
                 }
+                // PGO Phase 1: initial window after 5ms — compile top 5 hottest functions.
                 if !self.pgo_window_done
                     && self.pgo_started_at.elapsed() >= Duration::from_millis(5)
                 {
                     self.pgo_window_done = true;
-                    if let Some((hot_name, _)) = self
-                        .pgo_call_counts
-                        .iter()
-                        .max_by_key(|(_, count)| *count)
-                        .map(|(k, v)| (k.clone(), *v))
-                    {
-                        if let Some(hot_compiled) = self.compiled_fns.get(&hot_name).cloned() {
-                            if let Some(native) = crate::jit::phase3_jit::translate(&hot_compiled) {
-                                self.native_fns.insert(hot_name, Arc::new(native));
+                    // Sort by call count and compile the top 5 hottest functions.
+                    let mut hot_fns: Vec<_> = self.pgo_call_counts.iter().collect();
+                    hot_fns.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+                    for (hot_name, _) in hot_fns.into_iter().take(5) {
+                        if !self.native_fns.contains_key(hot_name) {
+                            if let Some(hot_compiled) = self.compiled_fns.get(hot_name).cloned() {
+                                if let Some(native) = crate::jit::phase3_jit::translate(&hot_compiled) {
+                                    self.native_fns.insert(hot_name.clone(), Arc::new(native));
+                                }
+                            }
+                        }
+                    }
+                }
+                // PGO Phase 2: second window at 50ms — compile any function
+                // called more than 10 times that isn't yet native-compiled.
+                if self.pgo_window_done
+                    && !self.pgo_second_window_done
+                    && self.pgo_started_at.elapsed() >= Duration::from_millis(50)
+                {
+                    self.pgo_second_window_done = true;
+                    for (fn_name, count) in &self.pgo_call_counts {
+                        if *count >= 10 && !self.native_fns.contains_key(fn_name) {
+                            if let Some(compiled) = self.compiled_fns.get(fn_name).cloned() {
+                                if let Some(native) = crate::jit::phase3_jit::translate(&compiled) {
+                                    self.native_fns.insert(fn_name.clone(), Arc::new(native));
+                                }
                             }
                         }
                     }
@@ -5171,6 +5195,8 @@ impl Interpreter {
                 #[cfg(feature = "phase3-jit")]
                 if self.native_jit_enabled {
                     if let Some(native) = self.native_fns.get(name).cloned() {
+                        // Ensure arena pages are executable before running native code.
+                        crate::jit::phase3_jit::finalize_arena();
                         if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
                             self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
@@ -5179,6 +5205,8 @@ impl Interpreter {
                     } else if let Some(native) = crate::jit::phase3_jit::translate(&compiled) {
                         let native = Arc::new(native);
                         self.native_fns.insert(name.to_owned(), native.clone());
+                        // Ensure arena pages are executable before running native code.
+                        crate::jit::phase3_jit::finalize_arena();
                         if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
                             self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
