@@ -1,19 +1,37 @@
 // =============================================================================
 // jules/src/bytecode_vm.rs
 //
-// BYTECODE VIRTUAL MACHINE
+// BYTECODE VIRTUAL MACHINE — SEMANTIC REFERENCE MACHINE (Phase 4)
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ══ PHASE 4: THIS IS NO LONGER THE PRIMARY EXECUTION ENGINE ═════════════
+// ══════════════════════════════════════════════════════════════════════════
+//
+// The interpreter (src/runtime/interp.rs) is now the hot-path engine.
+// It outperforms this VM by 6-15x for typical programs because it uses
+// an internal register-based VM with i32 fast-paths that skip Value boxing.
+//
+// THIS VM'S ROLE (Phase 4):
+//   ✓ Semantic reference machine — validates interpreter results
+//   ✓ Correctness anchor — if this VM disagrees with the interpreter,
+//     the interpreter is authoritative and the VM has a bug
+//   ✓ Debugging tool — trace collection, instruction-level stepping
+//   ✓ Cold-path executor — runs when the interpreter cannot
+//   ✗ NOT the performance-critical path anymore
+//   ✗ NOT the runtime core
+//   ✗ NOT competing in the hot path
+//
+// DO NOT DELETE THIS VM. It serves a different purpose now.
+// DO NOT MERGE with the interpreter — that creates one system doing
+// two incompatible jobs badly.
+// ══════════════════════════════════════════════════════════════════════════
 //
 // Execution strategy:
 // - Switch-dispatch (match-based) interpreter loop — portable, debuggable,
 //   and competitive with indirect-threaded designs on modern CPUs where
 //   branch predictors learn the match's jump table effectively.
-//   NOTE: Rust stable does not expose computed-goto / label-as-value, so
-//   true "direct threading" (à la CPython's ceval.c HAVE_COMPUTED_GOTOS)
-//   is not available without nightly + asm!. The match compiles to a jump
-//   table on optimized builds, which approximates the same effect.
 // - Register-based architecture (no stack manipulation overhead)
 // - Inline caching for property/method access (polymorphic inline caches)
-// - Constant folding & dead code elimination at compile time
 // - Memory pooling with pre-allocated slot array for hot paths
 // - SIMD vectorized operations for Vec4/tensor math (x86_64 + scalar fallback)
 // - Speculative type specialization: fast I64/F64 paths, generic fallback

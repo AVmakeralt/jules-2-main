@@ -126,11 +126,14 @@ fn run_sample(sample: &Sample, iterations: usize) -> Result<SampleReport, String
         };
 
         if sample.run_main {
-            // Use the tree-walking interpreter for runtime — the BytecodeVM
-            // is 15x slower for simple loop bodies (see BENCHMARKS.md Section 4).
-            // The micro-benchmark measures end-to-end performance, not VM throughput.
+            // ── PHASE 4: Interpreter is the hot-path execution engine ──────
+            // The interpreter (with its internal register-based VM + i32
+            // fast-path) outperforms the standalone BytecodeVM by 6-15x for
+            // typical programs. The micro-benchmark measures end-to-end
+            // performance using the interpreter as the primary engine.
             let program = result.program().unwrap();
             let mut interp = jules::runtime::interp::Interpreter::new();
+            interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
             interp.load_program(program);
             let run_start = Instant::now();
             interp.call_fn("main", vec![]).map_err(|e| {

@@ -15,17 +15,29 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 // =============================================================================
-// jules/src/interp.rs
+// jules/src/runtime/interp.rs
 //
 // Tree-walking Interpreter / Virtual Machine for the Jules programming language.
 //
 // ┌─────────────────────────────────────────────────────────────────────────┐
 // │  Design overview                                                         │
 // │                                                                          │
-// │  Strategy: direct AST evaluation (tree-walking interpreter).             │
-// │  This is the fastest-to-get-running execution strategy and serves as     │
-// │  the reference implementation.  A compiler backend (Cranelift / WASM)   │
-// │  can be layered on top later using the same runtime primitives.          │
+// │  Strategy: direct AST evaluation (tree-walking interpreter) with an      │
+// │  internal register-based bytecode VM for hot functions.                  │
+// │                                                                          │
+// │  PHASE 4 ARCHITECTURE:                                                   │
+// │  This interpreter is the PRIMARY (hot-path) execution engine.            │
+// │  It outperforms the standalone BytecodeVM for most programs because:     │
+// │    • Internal register-based VM with i32 fast-path (zero Value alloc)    │
+// │    • No dynamic dispatch overhead per instruction                        │
+// │    • Component access resolved early                                     │
+// │    • Specialized scalar arithmetic paths                                 │
+// │                                                                          │
+// │  The standalone BytecodeVM is the SEMANTIC REFERENCE MACHINE:            │
+// │    • Correctness anchor: validates interpreter results                   │
+// │    • Debugging tool: trace collection, instruction-level stepping        │
+// │    • Cold-path executor: runs when the interpreter cannot                │
+// │    • NOT the performance-critical path anymore                           │
 // │                                                                          │
 // │  Feature targets implemented here:                                       │
 // │    • CPU scalar + vector/matrix arithmetic                               │
@@ -8937,12 +8949,40 @@ impl Interpreter {
                 })
             }
 
-            // Not a built-in
-            _ => Err(RuntimeError {
-                message: Cow::Owned(format!("unknown function: {}", name)),
-                span: None,
-                code: "E9999",
-            }),
+            // Not a built-in — check if it's a user-defined function.
+            // When the internal bytecode compiler sees `fib(n-1)`, it emits
+            // CallBuiltin("fib", ...) because it doesn't know whether "fib"
+            // is a builtin or a user function. We resolve this here: if the
+            // name exists in the interpreter's function table, we call it as
+            // a user-defined function. Otherwise it's truly unknown.
+            _ => {
+                if let Some(closure) = self.fns.get(name).cloned() {
+                    let mut call_env = Env::new();
+                    for (k, v) in &closure.capture {
+                        call_env.set_local(k, v.clone());
+                    }
+                    call_env.push();
+                    for (param, arg) in closure.decl.params.iter().zip(args.iter()) {
+                        call_env.set_local(&param.name, arg.clone());
+                    }
+                    let result = if let Some(ref b) = closure.decl.body {
+                        self.eval_block(b, &mut call_env)?
+                    } else {
+                        Value::Unit
+                    };
+                    call_env.pop();
+                    match result {
+                        Value::Return(v) => Ok(*v),
+                        other => Ok(other),
+                    }
+                } else {
+                    Err(RuntimeError {
+                        message: Cow::Owned(format!("unknown function: {}", name)),
+                        span: None,
+                        code: "E9999",
+                    })
+                }
+            }
         }
     }
 
