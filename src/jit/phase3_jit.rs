@@ -270,18 +270,36 @@ impl ExecArena {
         Some(offset)
     }
 
-    /// Batch-flip all dirty pages from RW→RX (Fix #1).
+    /// Batch-flip all pages from RW→RX (Bug #2 fix).
     ///
     /// This must be called after a batch of JIT compilations, before any
-    /// compiled code is executed. Pages stay RW during compilation so that
-    /// multiple functions sharing a 4K page don't SIGSEGV when the second
-    /// function writes to an already-RX page.
+    /// compiled code is executed. We now flip ALL pages to RX, not just
+    /// dirty ones, because `make_writable()` flips ALL pages to RW. If we
+    /// only flipped dirty pages back, previously compiled functions on
+    /// non-dirty pages would remain RW (non-executable) → SIGSEGV.
     pub fn finalize(&mut self) -> Result<(), i32> {
         let page = 4096usize;
-        for &page_base in &self.dirty_pages {
-            let ok = unsafe { mprotect(page_base as *mut libc::c_void, page, PROT_READ | PROT_EXEC) };
-            if ok != 0 {
-                return Err(ok);
+        for chunk in &self.chunks {
+            let base = chunk.base.as_ptr() as usize;
+            let used = if chunk.start_offset == 0 && self.chunks.len() == 1 {
+                // Single chunk: only protect up to cursor
+                self.cursor
+            } else {
+                chunk.capacity
+            };
+            let n_pages = (used + page - 1) / page;
+            for p in 0..n_pages {
+                let page_addr = base + p * page;
+                let ok = unsafe {
+                    mprotect(
+                        page_addr as *mut libc::c_void,
+                        page,
+                        PROT_READ | PROT_EXEC,
+                    )
+                };
+                if ok != 0 {
+                    return Err(ok);
+                }
             }
         }
         self.dirty_pages.clear();
@@ -1182,18 +1200,45 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
 // ── Linear-scan allocator ─────────────────────────────────────────────────────
 
 fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
+    // FIX: Merge all intervals for the same slot into a single interval that
+    // spans from the earliest first-use to the latest last-use. This ensures
+    // each slot gets exactly ONE stable register/spill location for the entire
+    // function. Without this, the linear-scan allocator could assign different
+    // registers to the same slot at different times, but the code generator
+    // assumes each slot has ONE fixed location.
+    let mut merged: Vec<LiveInterval> = Vec::new();
+    {
+        let mut slot_first = vec![usize::MAX; slot_count + 1];
+        let mut slot_last = vec![0usize; slot_count + 1];
+        for iv in intervals {
+            let s = iv.slot as usize;
+            if s < slot_first.len() {
+                slot_first[s] = slot_first[s].min(iv.first);
+                slot_last[s] = slot_last[s].max(iv.last);
+            }
+        }
+        for s in 0..=slot_count {
+            if s < slot_first.len() && slot_first[s] <= slot_last[s] {
+                merged.push(LiveInterval {
+                    slot: s as u16,
+                    first: slot_first[s],
+                    last: slot_last[s],
+                });
+            }
+        }
+        // Sort by start position (required by linear scan)
+        merged.sort_by_key(|iv| iv.first);
+    }
+
     // Pre-allocate slots to slot_count + 1 with default spill locations.
-    // This eliminates all resizing during allocation.
     let cap = slot_count + 1;
     let mut slots: Vec<RegLoc> = (0..cap).map(|s| RegLoc::Spill((s as i32) * 8)).collect();
 
     // Free list: iterate ALLOC_POOL in reverse so pop() gives caller-saved first.
     let mut free: Vec<u8> = ALLOC_POOL.iter().rev().copied().collect();
     // Active set sorted by interval end (ascending).
-    // Pre-allocate to avoid reallocations.
-    let mut active: Vec<(usize, u16, u8)> = Vec::with_capacity(intervals.len().min(free.len()));
+    let mut active: Vec<(usize, u16, u8)> = Vec::with_capacity(merged.len().min(free.len()));
     let mut used_callee_saved: Vec<u8> = Vec::with_capacity(ALLOC_POOL.len());
-    // Bitmask to avoid O(n) contains() on used_callee_saved (regs 0-15 fit in u16).
     let mut callee_saved_mask: u16 = 0;
 
     #[inline(always)]
@@ -1201,7 +1246,7 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize) -> RegAlloc {
         matches!(reg, 3 | 12..=15)
     }
 
-    for iv in intervals {
+    for iv in &merged {
         // Expire intervals that ended strictly before this one's start.
         let expired = active.partition_point(|(end, _, _)| *end < iv.first);
         for i in 0..expired {
@@ -1383,6 +1428,57 @@ impl ConstTable {
     /// Clear all known constants (conservative: called at branch targets).
     fn clear(&mut self) {
         self.vals.fill(None);
+    }
+}
+
+/// Slot type tracking — records the *type* of each slot so we can
+/// distinguish integer from float operations without relying on the
+/// broken const_at heuristic (Bug #1 fix).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotType {
+    Unknown,
+    I32,
+    I64,
+    F32,
+    F64,
+    Bool,
+    Unit,
+}
+
+struct TypeTable {
+    tys: Vec<SlotType>,
+}
+
+impl TypeTable {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            tys: vec![SlotType::Unknown; n.max(1)],
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, slot: u16) -> SlotType {
+        self.tys.get(slot as usize).copied().unwrap_or(SlotType::Unknown)
+    }
+
+    #[inline(always)]
+    fn set(&mut self, slot: u16, ty: SlotType) {
+        let idx = slot as usize;
+        if idx >= self.tys.len() {
+            self.tys.resize(idx + 1, SlotType::Unknown);
+        }
+        self.tys[idx] = ty;
+    }
+
+    /// Clear all types (conservative: called at branch targets).
+    fn clear(&mut self) {
+        self.tys.fill(SlotType::Unknown);
+    }
+
+    /// Returns true if the slot is a known float type (F32 or F64).
+    #[inline(always)]
+    fn is_float(&self, slot: u16) -> bool {
+        matches!(self.get(slot), SlotType::F32 | SlotType::F64)
     }
 }
 
@@ -2480,24 +2576,14 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     vectorizer.analyze(instrs);
     let _vec_factor = vectorizer.vectorization_factor();
 
-    // ── Pass 0b: Loop-invariant code motion ──────────────────────────
+    // ── Pass 0b-g: Optimization passes (temporarily disabled for debugging) ──
     let mut opt_instrs = instrs.clone();
-    hoist_loop_invariants(&mut opt_instrs);
-
-    // ── Pass 0c: Common subexpression elimination ────────────────────
-    cse_optimize(&mut opt_instrs);
-
-    // ── Pass 0d: Strength reduction ──────────────────────────────────
-    strength_reduce(&mut opt_instrs);
-
-    // ── Pass 0e: Loop unrolling (small bodies only) ──────────────────
-    unroll_loops(&mut opt_instrs, 4);
-
-    // ── Pass 0f: Instruction scheduling ──────────────────────────────
-    schedule_instructions(&mut opt_instrs);
-
-    // ── Pass 0g: Peephole optimization ──────────────────────────────
-    peephole_optimize(&mut opt_instrs);
+    // hoist_loop_invariants(&mut opt_instrs);
+    // cse_optimize(&mut opt_instrs);
+    // strength_reduce(&mut opt_instrs);
+    // unroll_loops(&mut opt_instrs, 4);
+    // schedule_instructions(&mut opt_instrs);
+    // peephole_optimize(&mut opt_instrs);
     let instrs = &opt_instrs;
 
     // ── Pass 1: liveness + linear-scan register allocation ───────────────
@@ -2540,17 +2626,28 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // ── Main translation loop ─────────────────────────────────────────────
     // Flat Vec<Option<i64>> replaces HashMap — O(1) slot access, cache-friendly.
     let mut const_at = ConstTable::with_capacity(slot_count + 1);
+    // Type tracking table — fixes Bug #1: const_at-based float detection was
+    // catastrophically wrong because it assumed "no constant = float".  Now we
+    // track the actual type per slot so integer ops in loops work correctly.
+    let mut type_at = TypeTable::with_capacity(slot_count + 1);
 
     let mut pc = 0usize;
     while pc < instrs.len() {
         pc_to_off[pc] = em.pos();
 
         // ════════════════════════════════════════════════════════════════════
+        // FUSIONS — temporarily disabled for debugging
+        // ════════════════════════════════════════════════════════════════════
+        // All fusion patterns are disabled to isolate register allocator bugs.
+        // Re-enable after correctness is verified.
+        let _skip_fusions = true;
+
+        // ════════════════════════════════════════════════════════════════════
         // 3-INSTRUCTION FUSIONS
         // ════════════════════════════════════════════════════════════════════
 
         // ── Fusion: BinOp(t, Mul, x, N) + BinOp(r, Add, t, y) → LEA ────
-        if pc + 1 < instrs.len() {
+        if !_skip_fusions && pc + 1 < instrs.len() {
             if let (
                 Instr::BinOp(t, BinOpKind::Mul, mul_l, mul_r),
                 Instr::BinOp(r, BinOpKind::Add, add_l, add_r),
@@ -2590,7 +2687,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
 
         // ── Fusion: BinOp(t, op1, a, b) + BinOp(r, op2, t, c) → chain ──
-        if pc + 1 < instrs.len() {
+        if !_skip_fusions && pc + 1 < instrs.len() {
             if let (Instr::BinOp(t, op1, a, b), Instr::BinOp(r, op2, l2, r2)) =
                 (&instrs[pc], &instrs[pc + 1])
             {
@@ -2623,7 +2720,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         // ════════════════════════════════════════════════════════════════════
 
         // ── Fusion: Load*(tmp, c) + JumpFalse/JumpTrue → compile-time branch
-        if pc + 1 < instrs.len() {
+        if !_skip_fusions && pc + 1 < instrs.len() {
             let maybe_const = match &instrs[pc] {
                 Instr::LoadI32(tmp, v) => Some((*tmp, *v as i64)),
                 Instr::LoadI64(tmp, v) => Some((*tmp, *v)),
@@ -2675,7 +2772,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
 
         // ── Fusion: Load*(tmp, c) + BinOp(dst, op, x, tmp) → imm arithmetic
-        if pc + 1 < instrs.len() {
+        if !_skip_fusions && pc + 1 < instrs.len() {
             let maybe_imm = match &instrs[pc] {
                 Instr::LoadI32(tmp, v) => Some((*tmp, *v as i64)),
                 Instr::LoadI64(tmp, v) => Some((*tmp, *v)),
@@ -2714,7 +2811,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
 
         // ── Fusion: BinOp(t, op, l, r) + Store(slot, t) ─────────────────
-        if pc + 1 < instrs.len() {
+        if !_skip_fusions && pc + 1 < instrs.len() {
             if let (Instr::BinOp(t, op, l, r), Instr::Store(slot, src)) =
                 (&instrs[pc], &instrs[pc + 1])
             {
@@ -2733,7 +2830,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
 
         // ── Fusion: BinOp(t, op, l, r) + JumpFalse(t, off) ─────────────
-        if pc + 1 < instrs.len() {
+        if !_skip_fusions && pc + 1 < instrs.len() {
             if let (Instr::BinOp(t, op, l, r), Instr::JumpFalse(cond, off)) =
                 (&instrs[pc], &instrs[pc + 1])
             {
@@ -2760,7 +2857,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
 
         // ── Fusion: BinOp(t, op, l, r) + JumpTrue(t, off) ──────────────
-        if pc + 1 < instrs.len() {
+        if !_skip_fusions && pc + 1 < instrs.len() {
             if let (Instr::BinOp(t, op, l, r), Instr::JumpTrue(cond, off)) =
                 (&instrs[pc], &instrs[pc + 1])
             {
@@ -2787,7 +2884,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
 
         // ── Fusion: BinOp(t, op, l, r) + Return(t) ──────────────────────
-        if pc + 1 < instrs.len() {
+        if !_skip_fusions && pc + 1 < instrs.len() {
             if let (Instr::BinOp(t, op, l, r), Instr::Return(ret)) = (&instrs[pc], &instrs[pc + 1])
             {
                 if t == ret && is_supported_binop(*op) {
@@ -2809,7 +2906,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         //    When val == a or val == b, this computes min(a,b) or max(a,b).
         //    Uses emit_branchless_min/max for the min/max patterns, and
         //    emit_cmovcc_rr for the general conditional select.
-        if pc + 1 < instrs.len() {
+        if !_skip_fusions && pc + 1 < instrs.len() {
             if let (Instr::BinOp(cmp, op_cmp, a, b), Instr::BinOp(d, BinOpKind::Mul, l, r)) =
                 (&instrs[pc], &instrs[pc + 1])
             {
@@ -2912,6 +3009,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     store_rax(&mut em, *d, &ra);
                 }
                 const_at.insert(*d, cv);
+                type_at.set(*d, SlotType::I32);
             }
             Instr::LoadI64(d, v) => {
                 em.mov_rax_imm_opt(*v);
@@ -2919,6 +3017,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     store_rax(&mut em, *d, &ra);
                 }
                 const_at.insert(*d, *v);
+                type_at.set(*d, SlotType::I64);
             }
             Instr::LoadBool(d, v) => {
                 let cv = i64::from(*v);
@@ -2927,6 +3026,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     store_rax(&mut em, *d, &ra);
                 }
                 const_at.insert(*d, cv);
+                type_at.set(*d, SlotType::Bool);
             }
             Instr::LoadUnit(d) => {
                 em.xor_eax_eax();
@@ -2934,6 +3034,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     store_rax(&mut em, *d, &ra);
                 }
                 const_at.insert(*d, 0);
+                type_at.set(*d, SlotType::Unit);
             }
             Instr::Move(d, s) | Instr::Load(d, s) => {
                 load_rax(&mut em, *s, &ra);
@@ -2945,6 +3046,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 } else {
                     const_at.remove(*d);
                 }
+                type_at.set(*d, type_at.get(*s));
             }
             Instr::Store(slot, s) => {
                 load_rax(&mut em, *s, &ra);
@@ -2956,15 +3058,19 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 } else {
                     const_at.remove(*slot);
                 }
+                type_at.set(*slot, type_at.get(*s));
             }
             Instr::BinOp(d, op, l, r) => {
                 if !is_supported_binop(*op) {
                     return None;
                 }
-                // Check if this is a float operation by checking if either operand
-                // was loaded from a LoadF32/LoadF64 instruction
-                let is_float_op = matches!(op, BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul | BinOpKind::Div)
-                    && (const_at.get(*l).is_none() && const_at.get(*r).is_none());
+                // Bug #1 fix: Use type_at to detect float operations instead of
+                // the broken const_at heuristic. The old code assumed that if
+                // NEITHER operand had a compile-time constant, the op must be
+                // float — but after any Jump instruction, const_at is cleared,
+                // so every non-trivial integer op in a loop was misclassified.
+                // Now we check the actual tracked type of each slot.
+                let is_float_op = type_at.is_float(*l) || type_at.is_float(*r);
 
                 if is_float_op {
                     // Float BinOp path: load operands via XMM and use SSE arithmetic
@@ -2975,51 +3081,88 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     match op {
                         BinOpKind::Add => {
                             em.add_xmm0_xmm1_f64();
-                            // Also exercise f32 path for code coverage
-                            em.add_xmm0_xmm1_f32();
                         }
                         BinOpKind::Sub => {
                             em.sub_xmm0_xmm1_f64();
-                            em.sub_xmm0_xmm1_f32();
                         }
                         BinOpKind::Mul => {
                             em.mul_xmm0_xmm1_f64();
-                            em.mul_xmm0_xmm1_f32();
                         }
                         BinOpKind::Div => {
                             em.div_xmm0_xmm1_f64();
-                            em.div_xmm0_xmm1_f32();
                         }
                         BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge => {
-                            // Float comparison path using ucomisd/ucomiss
+                            // Float comparison path using ucomisd
                             em.ucomisd_xmm0_xmm1();
-                            em.ucomiss_xmm0_xmm1();
-                            // Convert float comparison result to integer
-                            em.cvttsd2si_eax_xmm0();
-                            em.cvttss2si_eax_xmm0();
+                            // Set al = 1 if condition true, 0 if false
+                            let cc = match op {
+                                BinOpKind::Eq => 0x94,  // SETE
+                                BinOpKind::Ne => 0x95,  // SETNE
+                                BinOpKind::Lt => 0x9C,  // SETL (below, unordered=false)
+                                BinOpKind::Le => 0x9E,  // SETLE
+                                BinOpKind::Gt => 0x9F,  // SETG (above, unordered=false)
+                                BinOpKind::Ge => 0x9D,  // SETGE
+                                _ => 0x94,
+                            };
+                            em.setcc_al(cc);
+                            em.movzx_rax_al();
                         }
                         _ => {}
                     }
-                    // Exercise int-to-float conversion emitters
-                    em.cvtsi2sd_xmm0_rax();
-                    em.cvtsi2ss_xmm0_rax();
-                    // Exercise movq for moving integer bits to XMM
-                    em.movq_xmm1_rax();
-                    // Store result
+                    // Store result: arithmetic via XMM0, comparison via RAX
                     if !is_straight_line_dead_def(instrs, pc, *d) {
-                        let off = match ra.location(*d) {
-                            RegLoc::Reg(_) => (*d as i32) * 8,
-                            RegLoc::Spill(off) => off,
-                        };
-                        em.store_mem_xmm0(off);
+                        if matches!(op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) {
+                            store_rax(&mut em, *d, &ra);
+                        } else {
+                            let off = match ra.location(*d) {
+                                RegLoc::Reg(_) => (*d as i32) * 8,
+                                RegLoc::Spill(off) => off,
+                            };
+                            em.store_mem_xmm0(off);
+                        }
+                    }
+                    // Propagate type: arithmetic on floats produces float;
+                    // comparisons produce I64 (boolean result as integer).
+                    if matches!(op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) {
+                        type_at.set(*d, SlotType::I64);
+                    } else {
+                        type_at.set(*d, SlotType::F64);
                     }
                 } else {
                     // Integer BinOp path (original)
                     load_rax(&mut em, *l, &ra);
                     load_rcx(&mut em, *r, &ra);
                     emit_binop_rax_rcx(&mut em, *op);
+                    // i32 truncation: After arithmetic on i32 values, we must
+                    // truncate the result to 32 bits. x86-64 IMUL/ADD/SUB are
+                    // 64-bit operations that don't automatically wrap at 32 bits.
+                    // MOVSXD RAX, EAX sign-extends the low 32 bits, effectively
+                    // truncating to i32 range (matching Rust's wrapping semantics).
+                    if !matches!(op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) {
+                        let lt = type_at.get(*l);
+                        let rt = type_at.get(*r);
+                        if matches!(lt, SlotType::I32 | SlotType::Bool) || matches!(rt, SlotType::I32 | SlotType::Bool) {
+                            em.emit3(0x48, 0x63, 0xC0); // MOVSXD RAX, EAX — truncate to i32
+                        }
+                    }
                     if !is_straight_line_dead_def(instrs, pc, *d) {
                         store_rax(&mut em, *d, &ra);
+                    }
+                    // Propagate type for integer operations:
+                    // comparisons produce Bool/I64, arithmetic produces the
+                    // wider of the two operand types, defaulting to I64.
+                    if matches!(op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) {
+                        type_at.set(*d, SlotType::I64); // boolean result as i64
+                    } else {
+                        // Arithmetic: propagate wider type
+                        let lt = type_at.get(*l);
+                        let rt = type_at.get(*r);
+                        let result_ty = match (lt, rt) {
+                            (SlotType::I32, SlotType::I32) => SlotType::I32,
+                            _ if lt == SlotType::Unknown && rt == SlotType::Unknown => SlotType::I64,
+                            _ => SlotType::I64,
+                        };
+                        type_at.set(*d, result_ty);
                     }
                 }
                 let folded = const_at
@@ -3042,10 +3185,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     };
                     em.store_mem_xmm0_f32(off);
                 }
-                // Also exercise the f32 load path (reads back what we just stored)
-                em.load_xmm0_mem_f32((*d as i32) * 8);
-                em.store_mem_xmm0_f32((*d as i32) * 8); // store back
                 // Don't track float constants in int const_at table.
+                type_at.set(*d, SlotType::F32);
             }
             Instr::LoadF64(d, v) => {
                 let bits = v.to_bits();
@@ -3057,6 +3198,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     };
                     em.store_mem_xmm0(off);
                 }
+                type_at.set(*d, SlotType::F64);
             }
             Instr::Jump(off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
@@ -3075,6 +3217,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     kind: BranchKind::Jmp,
                 });
                 const_at.clear();
+                type_at.clear();
             }
             Instr::JumpFalse(cond, off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
@@ -3090,6 +3233,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     kind: BranchKind::Jz,
                 });
                 const_at.clear();
+                type_at.clear();
             }
             Instr::JumpTrue(cond, off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
@@ -3105,6 +3249,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     kind: BranchKind::Jnz,
                 });
                 const_at.clear();
+                type_at.clear();
             }
             Instr::UnOp(dst, op, src) => {
                 // Load src into rax
@@ -3124,6 +3269,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 }
                 store_rax(&mut em, *dst, &ra);
                 const_at.remove(*dst); // Invalidate constant tracking
+                type_at.set(*dst, type_at.get(*src)); // Propagate type
             }
 
             Instr::Return(r) => {

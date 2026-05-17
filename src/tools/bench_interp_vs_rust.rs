@@ -367,8 +367,34 @@ fn bench() -> i32 {
     interp.set_advance_jit_enabled(true);
     interp.set_native_jit_enabled(true);
     interp.load_program(&program);
-    let _ = interp.call_fn("bench", Vec::new());
-    0
+    
+    // First get the expected result from the VM
+    interp.set_native_jit_enabled(false);
+    interp.set_jit_enabled(false);
+    let vm_result = interp.call_fn("bench", Vec::new());
+    eprintln!("[native-probe] VM result: {:?}", vm_result);
+    
+    // Now try the native JIT
+    interp.reset_jit_counters();
+    interp.set_jit_enabled(true);
+    interp.set_native_jit_enabled(true);
+    let jit_result = interp.call_fn("bench", Vec::new());
+    eprintln!("[native-probe] JIT result: {:?}", jit_result);
+    
+    let vm_ok = vm_result.is_ok();
+    let jit_ok = jit_result.is_ok();
+    if vm_ok && jit_ok {
+        // Both succeeded; compare as i64
+        let vm_val = match vm_result { Ok(jules::interp::Value::I32(v)) => v as i64, Ok(jules::interp::Value::I64(v)) => v, _ => i64::MIN };
+        let jit_val = match jit_result { Ok(jules::interp::Value::I32(v)) => v as i64, Ok(jules::interp::Value::I64(v)) => v, _ => i64::MIN };
+        if vm_val == jit_val { 0 } else {
+            eprintln!("[native-probe] MISMATCH: vm={} jit={}", vm_val, jit_val);
+            2
+        }
+    } else {
+        eprintln!("[native-probe] ERROR: vm={:?} jit={:?}", vm_result, jit_result);
+        2
+    }
 }
 
 fn call_bench_i64(interp: &mut jules::interp::Interpreter) -> i64 {

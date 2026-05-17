@@ -5170,6 +5170,9 @@ impl Interpreter {
                             }
                         }
                     }
+                    // Bug #3 fix: finalize arena after PGO compilation so pages
+                    // are executable when native code is actually called.
+                    crate::jit::phase3_jit::finalize_arena();
                 }
                 // PGO Phase 2: second window at 50ms — compile any function
                 // called more than 10 times that isn't yet native-compiled.
@@ -5187,6 +5190,8 @@ impl Interpreter {
                             }
                         }
                     }
+                    // Bug #3 fix: finalize arena after PGO Phase 2 compilation.
+                    crate::jit::phase3_jit::finalize_arena();
                 }
             }
 
@@ -5197,21 +5202,27 @@ impl Interpreter {
                     if let Some(native) = self.native_fns.get(name).cloned() {
                         // Ensure arena pages are executable before running native code.
                         crate::jit::phase3_jit::finalize_arena();
+                        eprintln!("[NATIVE-JIT] ENTERING NATIVE JIT for cached fn={}", name);
                         if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
                             self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
                         }
+                        eprintln!("[NATIVE-JIT] execute() failed for cached fn={}, falling through", name);
                     } else if let Some(native) = crate::jit::phase3_jit::translate(&compiled) {
                         let native = Arc::new(native);
                         self.native_fns.insert(name.to_owned(), native.clone());
                         // Ensure arena pages are executable before running native code.
                         crate::jit::phase3_jit::finalize_arena();
+                        eprintln!("[NATIVE-JIT] ENTERING NATIVE JIT for freshly compiled fn={}", name);
                         if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
                             self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
                         }
+                        eprintln!("[NATIVE-JIT] execute() failed for fn={}, falling through", name);
+                    } else {
+                        eprintln!("[NATIVE-JIT] translate() returned None for fn={}", name);
                     }
                 }
                 self.jit_vm_calls = self.jit_vm_calls.saturating_add(1);
