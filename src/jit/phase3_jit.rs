@@ -1141,8 +1141,13 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
     macro_rules! use_ {
         ($s:expr, $pc:expr) => {
             ensure!($s);
-            last_use[$s as usize] = $pc;
+            last_use[$s as usize] = pc_max(last_use[$s as usize], $pc);
         };
+    }
+
+    // Helper: max that treats UNDEF as -infinity
+    fn pc_max(a: usize, b: usize) -> usize {
+        if a == UNDEF { b } else if b == UNDEF { a } else { a.max(b) }
     }
 
     for (pc, instr) in instrs.iter().enumerate() {
@@ -1174,6 +1179,49 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
                 use_!(*s, pc);
             }
             _ => {}
+        }
+    }
+
+    // ── Loop-aware liveness extension ─────────────────────────────────────
+    // When a backward branch forms a loop, any slot that is defined inside
+    // the loop and used at or after the loop header must have its live range
+    // extended to cover the entire loop. Otherwise, the register allocator
+    // may assign the same register to two different slots whose intervals
+    // don't overlap in the linear PC order but DO overlap across loop
+    // iterations.
+    //
+    // We identify loops by scanning for backward branches, then extend any
+    // slot whose first_def is inside the loop body to have last_use at
+    // least as far as the loop's back-edge PC.
+    for (pc, instr) in instrs.iter().enumerate() {
+        let target = match instr {
+            Instr::Jump(off) => Some(((pc as i32) + 1 + *off) as usize),
+            Instr::JumpFalse(_, off) => Some(((pc as i32) + 1 + *off) as usize),
+            Instr::JumpTrue(_, off) => Some(((pc as i32) + 1 + *off) as usize),
+            _ => None,
+        };
+        if let Some(target) = target {
+            if target < pc {
+                // This is a backward branch: loop header = target, loop end = pc
+                // Extend any slot that is live inside the loop to cover the entire loop.
+                for slot in 0..first_def.len() {
+                    let fd = first_def[slot];
+                    let lu = last_use[slot];
+                    if fd == UNDEF && lu == UNDEF {
+                        continue;
+                    }
+                    // If the slot is used or defined anywhere inside [target, pc],
+                    // extend its last_use to at least pc (the back-edge).
+                    // This ensures the register allocator doesn't reuse the register
+                    // for another slot that becomes free mid-loop.
+                    let first = if fd == UNDEF { 0 } else { fd };
+                    let last = if lu == UNDEF { first } else { lu };
+                    if first <= pc && last >= target {
+                        // Slot is live inside the loop — extend to the back-edge.
+                        last_use[slot] = pc_max(last_use[slot], pc);
+                    }
+                }
+            }
         }
     }
 
@@ -1742,7 +1790,7 @@ fn emit_ret(em: &mut Emitter, callee_saved: &[u8]) {
 // targets closer).
 
 /// Kind of branch instruction at a fixup site.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum BranchKind {
     Jmp,
     Jz,
@@ -2623,6 +2671,28 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
     }
 
+    // ── Pre-pass: identify backward-branch targets (loop headers) ─────────
+    // When a backward branch targets a PC, that PC is a loop header. At loop
+    // headers, we must clear const_at and type_at because values that were
+    // constant on the first iteration may be modified inside the loop body.
+    // Without this, the JIT constant-folds comparisons like `i < 10` using
+    // the initial value of `i` (0), producing a constant 1 that never changes,
+    // causing an infinite loop.
+    let mut loop_headers = vec![false; instrs.len()];
+    for (pc, instr) in instrs.iter().enumerate() {
+        let target = match instr {
+            Instr::Jump(off) => Some(((pc as i32) + 1 + *off) as usize),
+            Instr::JumpFalse(_, off) => Some(((pc as i32) + 1 + *off) as usize),
+            Instr::JumpTrue(_, off) => Some(((pc as i32) + 1 + *off) as usize),
+            _ => None,
+        };
+        if let Some(target) = target {
+            if target < pc && target < loop_headers.len() {
+                loop_headers[target] = true;
+            }
+        }
+    }
+
     // ── Main translation loop ─────────────────────────────────────────────
     // Flat Vec<Option<i64>> replaces HashMap — O(1) slot access, cache-friendly.
     let mut const_at = ConstTable::with_capacity(slot_count + 1);
@@ -2633,6 +2703,14 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
     let mut pc = 0usize;
     while pc < instrs.len() {
+        // Clear constant/type tracking at loop headers. Values that were
+        // constant on entry may be mutated inside the loop body, so we
+        // must not propagate them across the back-edge.
+        if loop_headers[pc] {
+            const_at.clear();
+            type_at.clear();
+        }
+
         pc_to_off[pc] = em.pos();
 
         // ════════════════════════════════════════════════════════════════════
@@ -3381,7 +3459,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
     // ── Exercise CodeBuilder trait (ensures it's not dead-coded) ──────
     emit_nop_padding(&mut em, 0); // No-op padding (0 bytes) — just to use the trait
-    verify_code_builder_patch(&mut em);
+    // NOTE: verify_code_builder_patch is deliberately NOT called here.
+    // It inserts 4 garbage bytes (0x90 0x56 0x34 0x12) into the code stream
+    // which decode as NOP + PUSH RSI + XOR AL,0x12 — corrupting the stack
+    // and AL if the fallthrough path is ever reached.  The trait is still
+    // exercised by emit_nop_padding above.
 
     em.xor_eax_eax();
     emit_ret(&mut em, &ra.used_callee_saved);

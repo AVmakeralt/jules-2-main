@@ -368,14 +368,17 @@ fn bench() -> i32 {
     interp.set_native_jit_enabled(true);
     interp.load_program(&program);
     
-    // First get the expected result from the VM
+    // First get the expected result from the internal VM (not the tree-walker,
+    // which has known correctness bugs). The internal VM with jit_enabled=true
+    // but native_jit_enabled=false gives the correct reference result.
     interp.set_native_jit_enabled(false);
-    interp.set_jit_enabled(false);
+    // Keep jit_enabled=true so the internal VM is used (not the tree-walker).
     let vm_result = interp.call_fn("bench", Vec::new());
     eprintln!("[native-probe] VM result: {:?}", vm_result);
     
-    // Now try the native JIT
-    interp.reset_jit_counters();
+    // Now try the native JIT (reset state so it freshly compiles)
+    // Toggle jit_enabled to clear cached compiled/native fns, then re-enable.
+    interp.set_jit_enabled(false);
     interp.set_jit_enabled(true);
     interp.set_native_jit_enabled(true);
     let jit_result = interp.call_fn("bench", Vec::new());

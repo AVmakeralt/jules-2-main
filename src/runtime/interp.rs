@@ -5202,27 +5202,27 @@ impl Interpreter {
                     if let Some(native) = self.native_fns.get(name).cloned() {
                         // Ensure arena pages are executable before running native code.
                         crate::jit::phase3_jit::finalize_arena();
-                        eprintln!("[NATIVE-JIT] ENTERING NATIVE JIT for cached fn={}", name);
+                        // [NATIVE-JIT] executing cached native code for fn={name}
                         if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
                             self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
                         }
-                        eprintln!("[NATIVE-JIT] execute() failed for cached fn={}, falling through", name);
+                        // native execute() failed for cached fn={name}, falling through
                     } else if let Some(native) = crate::jit::phase3_jit::translate(&compiled) {
                         let native = Arc::new(native);
                         self.native_fns.insert(name.to_owned(), native.clone());
                         // Ensure arena pages are executable before running native code.
                         crate::jit::phase3_jit::finalize_arena();
-                        eprintln!("[NATIVE-JIT] ENTERING NATIVE JIT for freshly compiled fn={}", name);
+                        // [NATIVE-JIT] executing freshly compiled native code for fn={name}
                         if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
                             self.jit_native_calls = self.jit_native_calls.saturating_add(1);
                             self.record_runtime_profile(name, started.elapsed());
                             return Ok(v);
                         }
-                        eprintln!("[NATIVE-JIT] execute() failed for fn={}, falling through", name);
+                        // native execute() failed for fn={name}, falling through
                     } else {
-                        eprintln!("[NATIVE-JIT] translate() returned None for fn={}", name);
+                        // native translate() returned None for fn={name}
                     }
                 }
                 self.jit_vm_calls = self.jit_vm_calls.saturating_add(1);
