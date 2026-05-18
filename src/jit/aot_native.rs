@@ -3177,6 +3177,10 @@ impl NativeCodeGen {
 // =============================================================================
 
 fn emit_elf(code: &[u8], symbols: &[(String, usize)], output_path: &str) -> Result<(), String> {
+    emit_elf_with_entry(code, symbols, output_path, "main")
+}
+
+fn emit_elf_with_entry(code: &[u8], symbols: &[(String, usize)], output_path: &str, entry_name: &str) -> Result<(), String> {
     // ── Sections ──────────────────────────────────────────────────────────
     // .text  : executable code
     // .symtab: symbol table
@@ -3219,24 +3223,24 @@ fn emit_elf(code: &[u8], symbols: &[(String, usize)], output_path: &str) -> Resu
     let ehdr_size:   usize = 64;
     let phdr_size:   usize = 56;
     let phdr_count:  usize = 1;
-    // FIX #17: Use actual code size + alignment instead of full page padding.
-    // The old code padded to a full 4096-byte page, wasting disk space for
-    // small programs. Now we align to 16 bytes (sufficient for x86-64
-    // instruction alignment) and let the loader handle page alignment at
-    // runtime via the PT_LOAD segment's p_align field.
     let code_padded: usize = (code.len() + 15) & !15;
 
+    // FIX ELF ALIGNMENT: The Linux kernel requires p_offset ≡ p_vaddr (mod p_align).
+    // Standard approach: place code at a page-aligned file offset so that
+    // p_offset ≡ p_vaddr (mod p_align).  We set p_offset = PAGE_SIZE (4096),
+    // p_vaddr = LOAD_BASE (0x400000).  Both 4096 ≡ 0 (mod 4096) and
+    // 0x400000 ≡ 0 (mod 4096), so the alignment constraint is satisfied.
+    //
     // File layout:
     //   [0]               ELF header (64 bytes)
     //   [64]              PHDR table (1 × 56 bytes)
-    //   [120 → align 16]  padding
-    //   [code_off]        .text (code_padded bytes)
-    //   [symtab_off]      .symtab
-    //   [strtab_off]      .strtab
-    //   [shstrtab_off]    .shstrtab
-    //   [shdr_off]        Section header table (5 entries × 64 bytes)
+    //   [120..4095]       padding (zeros)
+    //   [4096]            .text (code_padded bytes)
+    //   [4096+cp]         .symtab, .strtab, .shstrtab, section headers
 
-    let code_off      = (ehdr_size + phdr_count * phdr_size + 15) & !15;
+    let code_off: usize = PAGE_SIZE;  // Page-aligned code offset
+    let segment_filesz = code_off + code_padded;  // Includes ELF header + code
+
     let symtab_off    = code_off + code_padded;
     let strtab_off    = symtab_off + symtab.len();
     let shstrtab_off  = strtab_off + strtab.len();
@@ -3256,10 +3260,11 @@ fn emit_elf(code: &[u8], symbols: &[(String, usize)], output_path: &str) -> Resu
         h[16..18].copy_from_slice(&2u16.to_le_bytes());  // ET_EXEC
         h[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
         h[20..24].copy_from_slice(&1u32.to_le_bytes());  // EV_CURRENT
-        // e_entry = virtual address of `main` (not LOAD_BASE + code_off which double-offsets)
+        // e_entry = virtual address of the entry point (default: _start, falls back to main)
         let main_offset = symbols.iter()
-            .find(|(name, _)| name == "main")
+            .find(|(name, _)| name == entry_name)
             .map(|(_, off)| *off)
+            .or_else(|| symbols.iter().find(|(name, _)| name == "main").map(|(_, off)| *off))
             .unwrap_or(0);
         let entry_vaddr = LOAD_BASE + main_offset as u64;
         h[24..32].copy_from_slice(&entry_vaddr.to_le_bytes());
@@ -3278,13 +3283,12 @@ fn emit_elf(code: &[u8], symbols: &[(String, usize)], output_path: &str) -> Resu
         let ph = &mut out[ehdr_size..ehdr_size + phdr_size];
         ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
         ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
-        ph[8..16].copy_from_slice(&(code_off as u64).to_le_bytes()); // p_offset
-        let load_vaddr = LOAD_BASE;
-        ph[16..24].copy_from_slice(&load_vaddr.to_le_bytes()); // p_vaddr  ← v1 fix
-        ph[24..32].copy_from_slice(&load_vaddr.to_le_bytes()); // p_paddr
-        ph[32..40].copy_from_slice(&(code_padded as u64).to_le_bytes()); // p_filesz
-        ph[40..48].copy_from_slice(&(code_padded as u64).to_le_bytes()); // p_memsz
-        ph[48..56].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());   // p_align
+        ph[8..16].copy_from_slice(&0u64.to_le_bytes());               // p_offset = 0
+        ph[16..24].copy_from_slice(&(LOAD_BASE - PAGE_SIZE as u64).to_le_bytes()); // p_vaddr (so code_off maps to LOAD_BASE)
+        ph[24..32].copy_from_slice(&(LOAD_BASE - PAGE_SIZE as u64).to_le_bytes()); // p_paddr
+        ph[32..40].copy_from_slice(&(segment_filesz as u64).to_le_bytes());        // p_filesz
+        ph[40..48].copy_from_slice(&(segment_filesz as u64).to_le_bytes());        // p_memsz
+        ph[48..56].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());             // p_align
     }
 
     // ── .text ─────────────────────────────────────────────────────────────
@@ -3327,7 +3331,7 @@ fn emit_elf(code: &[u8], symbols: &[(String, usize)], output_path: &str) -> Resu
     // §1: .text  (SHT_PROGBITS=1, SHF_ALLOC|SHF_EXECINSTR=6)
     write_shdr(&mut out, shdr_off, 1,
                sh_text_name as u32, 1, 6,
-               LOAD_BASE,           // vaddr of .text = base of PT_LOAD segment
+               LOAD_BASE,           // vaddr of .text = where code starts in memory
                code_off as u64, code.len() as u64,
                0, 0, 16, 0);
     // §2: .symtab (SHT_SYMTAB=2)
@@ -3481,6 +3485,30 @@ pub fn compile_to_native(
         codegen.compile_function(func)?;
     }
 
+    // ── Phase 18b: Emit _start stub ──────────────────────────────────────
+    // Linux expects execution to begin at _start (not main). We emit a tiny
+    // stub that: calls main → captures return value in rax → issues
+    // sys_exit(rax) syscall. Without this, the ELF entry point is main itself
+    // and the `ret` at the end of main returns to garbage on the stack → SIGSEGV.
+    {
+        let start_offset = codegen.emit.pos();
+        codegen.labels.insert("_start".to_string(), start_offset);
+        // call main (the label was already registered by compile_function)
+        if let Some(&main_off) = codegen.labels.get("main") {
+            let rel = (main_off as i64) - (codegen.emit.pos() as i64 + 5);
+            codegen.emit.b(0xE8);
+            codegen.emit.d(rel as i32);
+        } else {
+            // No main function — emit a call to a 0-offset placeholder
+            let p = codegen.emit.call_rel32();
+            codegen.fixups.push((p, "main".to_string()));
+        }
+        // sys_exit(rax): mov rdi, rax; mov rax, 60; syscall
+        codegen.emit.mov_rr(7, 0);           // mov rdi, rax (exit code = main's return value)
+        codegen.emit.mov_r_imm(0, 60);       // mov rax, 60 (sys_exit syscall number)
+        codegen.emit.syscall();
+    }
+
     // ── Phase 19: Collect symbol table ───────────────────────────────────
     let symbols: Vec<(String, usize)> = codegen.labels.iter()
         .filter(|(k, _)| !k.starts_with('B')) // skip block labels
@@ -3488,7 +3516,8 @@ pub fn compile_to_native(
         .collect();
 
     // ── Phase 20: ELF emission ────────────────────────────────────────────
-    emit_elf(&codegen.emit.code, &symbols, output_path)?;
+    // Use _start as the entry point (not main), so the process exits cleanly.
+    emit_elf_with_entry(&codegen.emit.code, &symbols, output_path, "_start")?;
 
     Ok(())
 }
