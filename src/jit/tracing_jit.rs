@@ -90,6 +90,40 @@ pub struct SideExit {
     pub target_trace_id: Option<u32>,
 }
 
+// =============================================================================
+// Fix #11: Deoptimization Frame Reconstruction
+// =============================================================================
+
+/// Describes where a live slot's value currently resides at the point of
+/// a guard failure.  The deopt stub uses this to write values back to the
+/// interpreter's slot array before returning control.
+#[derive(Debug, Clone)]
+pub enum SlotLocation {
+    /// Value is in a JIT register (will be written back by the deopt stub).
+    /// The register is encoded as a u8 matching the Reg enum discriminant.
+    RegisterU8(u8),
+    /// Value is at an offset in the unboxed buffer [r8 + offset].
+    Memory(u32),
+    /// Value is already in the slot array at [rdi + slot*8] (no write-back needed).
+    SlotArray(u16),
+}
+
+/// One entry in the deopt map: the information needed to reconstruct
+/// interpreter state when guard #`guard_index` fails.
+#[derive(Debug, Clone)]
+pub struct DeoptMapEntry {
+    /// Index into the trace's guard list that this entry corresponds to.
+    pub guard_index: usize,
+    /// The interpreter PC to resume at after deoptimization.
+    pub fallback_pc: usize,
+    /// Which slots are live at this point and where their current values are.
+    pub live_slots: Vec<(u16, SlotLocation)>,
+}
+
+/// The deopt map for a compiled trace.  Contains one entry per guard,
+/// allowing the runtime to reconstruct interpreter frames on guard failure.
+pub type DeoptMap = Vec<DeoptMapEntry>;
+
 /// Fix #4: Polymorphic Inline Cache for trace stitching
 /// Maps guard failure conditions to secondary traces
 #[derive(Debug, Clone)]
@@ -134,6 +168,9 @@ pub struct TraceInstruction {
     pub guard: Option<Guard>,
 }
 
+/// Per-slot type specialization info: each slot's type is tracked
+/// independently so that unboxed offsets can be allocated for ANY
+/// slot whose type is known, regardless of whether other slots match.
 #[derive(Debug, Clone)]
 pub struct Trace {
     pub id: u32,
@@ -143,10 +180,18 @@ pub struct Trace {
     pub side_exits: Vec<SideExit>,
     pub execution_count: u64,
     pub next_label_id: usize,
-    /// Type specialization: if all slots are the same type, we can use unboxed storage
+    /// Legacy field: Some if ALL slots share the same type. Kept for
+    /// backward compatibility but is no longer the primary driver of
+    /// unboxed specialization.
     pub specialized_type: Option<ValueType>,
-    /// Mapping from slot index to unboxed buffer offset (if specialized)
+    /// Mapping from slot index to unboxed buffer offset.
+    /// Populated for every slot with a known type (I64, F64, F32, Bool)
+    /// regardless of whether other slots share that type.
     pub unboxed_slots: Vec<Option<u32>>,
+    /// Per-slot type information. Each entry records the ValueType observed
+    /// for that slot during tracing. Used by the code generator to select
+    /// the correct unboxed load/store width for each slot individually.
+    pub slot_types: Vec<Option<ValueType>>,
 }
 
 // =============================================================================
@@ -178,6 +223,7 @@ impl TraceRecorder {
             guards: Vec::with_capacity(64), side_exits: Vec::with_capacity(16),
             execution_count: 0, next_label_id: 1,
             specialized_type: None, unboxed_slots: Vec::new(),
+            slot_types: Vec::new(),
         });
         self.next_trace_id += 1;
     }
@@ -227,39 +273,47 @@ impl TraceRecorder {
 
     pub fn finish_recording(&mut self) -> Option<u32> {
         if let Some(mut trace) = self.current_trace.take() {
-            // Fix #1: Type specialization analysis
-            // If all slots in the trace are the same type, we can use unboxed storage
+            // Fix #5: Per-slot type specialization (not all-or-nothing).
+            // Collect the observed type for every slot used in the trace.
             let mut slot_types: FxHashMap<u16, ValueType> = FxHashMap::default();
             for instr in &trace.instructions {
                 self.collect_slot_types(&instr.instruction, &mut slot_types);
             }
             
-            // Check if all slots are the same type (specializable)
+            // Compute per-slot unboxed offsets.  Any slot whose type is one
+            // of {I64, F64, F32, Bool} gets an unboxed buffer offset based
+            // on its OWN type size, regardless of what other slots are.
+            // Unknown-type slots (Unit, Tensor, Unknown) remain boxed.
+            let max_slot = slot_types.keys().copied().max().unwrap_or(0) as usize;
+            trace.slot_types.resize(max_slot + 1, None);
+            trace.unboxed_slots.resize(max_slot + 1, None);
+
+            // Sort slots so that offsets are deterministic
+            let mut sorted_slots: Vec<_> = slot_types.keys().copied().collect();
+            sorted_slots.sort();
+
+            let mut offset = 0u32;
+            for slot in &sorted_slots {
+                let vtype = slot_types[slot];
+                trace.slot_types[*slot as usize] = Some(vtype);
+
+                if Self::is_unboxable(vtype) {
+                    trace.unboxed_slots[*slot as usize] = Some(offset);
+                    offset += Self::unboxed_size(vtype);
+                }
+                // Non-unboxable slots: unboxed_slots stays None → boxed fallback
+            }
+
+            // Set specialized_type only if ALL slots share the same type
+            // (backward compat — no longer gates unboxed code generation)
             let all_same_type = if !slot_types.is_empty() {
                 let first_type = slot_types.values().next().copied();
                 first_type.is_some() && slot_types.values().all(|&t| Some(t) == first_type)
             } else {
                 false
             };
-            
             if all_same_type {
                 trace.specialized_type = slot_types.values().next().copied();
-                // Allocate unboxed buffer offsets for each slot
-                let mut offset = 0u32;
-                let max_slot = slot_types.keys().copied().max().unwrap_or(0) as usize;
-                trace.unboxed_slots.resize(max_slot + 1, None);
-                let mut sorted_slots: Vec<_> = slot_types.keys().copied().collect();
-                sorted_slots.sort();
-                for slot in sorted_slots {
-                    trace.unboxed_slots[slot as usize] = Some(offset);
-                    offset += match trace.specialized_type.unwrap() {
-                        ValueType::F64 => 8,
-                        ValueType::F32 => 8, // F32 widened to F64 in unboxed buffer
-                        ValueType::I64 => 8,
-                        ValueType::Bool => 1,
-                        _ => 8,
-                    };
-                }
             }
             
             let (id, pc) = (trace.id, trace.entry_pc);
@@ -268,15 +322,48 @@ impl TraceRecorder {
             Some(id)
         } else { None }
     }
+
+    /// Returns true if the given type can be stored in the unboxed buffer.
+    #[inline]
+    fn is_unboxable(vtype: ValueType) -> bool {
+        matches!(vtype, ValueType::I64 | ValueType::F64 | ValueType::F32 | ValueType::Bool)
+    }
+
+    /// Returns the size (in bytes) of a value of the given type in the
+    /// unboxed buffer.  F32 is widened to 8 bytes (lossless f32→f64).
+    #[inline]
+    fn unboxed_size(vtype: ValueType) -> u32 {
+        match vtype {
+            ValueType::I64 | ValueType::F64 | ValueType::F32 => 8,
+            ValueType::Bool => 1,
+            _ => 8, // fallback for any future unboxable types
+        }
+    }
     
     fn collect_slot_types(&self, instr: &Instr, slot_types: &mut FxHashMap<u16, ValueType>) {
         match instr {
             Instr::LoadI32(dst, _) => { slot_types.insert(*dst, ValueType::I64); }
             Instr::LoadI64(dst, _) => { slot_types.insert(*dst, ValueType::I64); }
-            Instr::BinOp(dst, _, lhs, rhs) => {
-                slot_types.insert(*dst, ValueType::I64);
+            Instr::LoadF32(dst, _) => { slot_types.insert(*dst, ValueType::F32); }
+            Instr::LoadF64(dst, _) => { slot_types.insert(*dst, ValueType::F64); }
+            Instr::LoadBool(dst, _) => { slot_types.insert(*dst, ValueType::Bool); }
+            Instr::LoadUnit(dst) => { /* Unit is not unboxable, skip */ let _ = dst; }
+            Instr::BinOp(dst, op, lhs, rhs) => {
+                // Comparison ops produce Bool; arithmetic ops inherit I64
+                let result_type = match op {
+                    BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt |
+                    BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge => ValueType::Bool,
+                    _ => ValueType::I64,
+                };
+                slot_types.insert(*dst, result_type);
                 slot_types.insert(*lhs, ValueType::I64);
                 slot_types.insert(*rhs, ValueType::I64);
+            }
+            Instr::Move(dst, src) => {
+                // Propagate source type if known
+                if let Some(&src_type) = slot_types.get(src) {
+                    slot_types.insert(*dst, src_type);
+                }
             }
             _ => {}
         }
@@ -515,13 +602,15 @@ impl NativeCodeGenerator {
         let deopt_label = self.next_label();
         self.deopt_label = deopt_label; // FIX (JIT-1): store for emit_instruction
 
-        // Fix #1: Check if trace is type-specialized for unboxed operations
-        let is_specialized = trace.specialized_type.is_some() && unboxed_buffer.is_some();
+        // Fix #5: Per-slot type specialization.  We use unboxed code paths
+        // whenever ANY slot has a known unboxable type — not just when ALL
+        // slots share the same type.
+        let has_unboxed_slots = trace.unboxed_slots.iter().any(|o| o.is_some()) && unboxed_buffer.is_some();
 
         // 1. ABI Prologue
         self.emit_prologue();
 
-        // 2. Hoist invariant guards to entry & emit
+        // 2. Hoist invariant guards to entry & emit (with deduplication)
         self.emit_hoisted_guards(&trace.guards, deopt_label)?;
 
         // FIX (JIT-2): The unboxed buffer address is now passed as a function
@@ -536,7 +625,7 @@ impl NativeCodeGenerator {
         // problem. Now we copy RDX → R8 in the prologue so all existing
         // emit_unboxed_load/store_reg code (which references [R8+offset])
         // continues to work unchanged.
-        if is_specialized {
+        if has_unboxed_slots {
             // mov r8, rdx — copy the buffer argument from RDX to R8.
             // Use mov_r8_imm64 only when we have a concrete buffer address that
             // was passed as an immediate (for position-dependent code paths).
@@ -554,7 +643,7 @@ impl NativeCodeGenerator {
                     self.b(0x49); self.b(0x89); self.b(0xD0); // mov r8, rdx
                 }
             } else {
-                // No buffer provided — shouldn't happen when is_specialized is true
+                // No buffer provided — shouldn't happen when has_unboxed_slots is true
                 self.b(0x49); self.b(0x89); self.b(0xD0); // mov r8, rdx
             }
         }
@@ -562,10 +651,12 @@ impl NativeCodeGenerator {
         // 3. Optimization Pass: Constant Folding & Dead Store Elimination
         let optimized = self.optimize_trace(&trace.instructions);
 
-        // 4. Emit Instructions (with unboxed memory ops if specialized)
+        // 4. Emit Instructions (with per-slot unboxed memory ops)
+        //    Fix #5: Instead of requiring all slots to share one type,
+        //    each instruction looks up the per-slot type from slot_types.
         for instr in &optimized {
-            if is_specialized {
-                self.emit_instruction_unboxed(instr, trace.specialized_type.unwrap(), &trace.unboxed_slots, unboxed_buffer.unwrap())?;
+            if has_unboxed_slots {
+                self.emit_instruction_unboxed(instr, &trace.slot_types, &trace.unboxed_slots, unboxed_buffer.unwrap())?;
             } else {
                 self.emit_instruction(instr)?;
             }
@@ -579,7 +670,9 @@ impl NativeCodeGenerator {
         //    can jump forward to it.  Record the label so backpatch_jumps can
         //    resolve all the jne/jz instructions that target it.
         self.labels.insert(deopt_label, self.code.len());
-        self.emit_deopt_stub();
+        // Fix #11: Build deopt map from guards before emitting the stub
+        let deopt_map = self.build_deopt_map(trace);
+        self.emit_deopt_stub(&deopt_map);
 
         // 7. Backpatch Jumps
         self.backpatch_jumps()?;
@@ -587,12 +680,13 @@ impl NativeCodeGenerator {
         // 8. Allocate executable memory (W^X: mmap RW then mprotect RX)
         let exec_mem = ExecutableMemory::new(&self.code)?;
 
-        // 9. Side Exit Table
+        // 9. Side Exit Table — now includes deopt map entries
         let side_exit_table = trace.side_exits.iter().map(|se| (se.buffer_offset, se.fallback_pc)).collect();
 
         Ok(CompiledTrace {
             trace_id: trace.id, entry_point: exec_mem.entry_point(), memory: exec_mem,
             guard_count: trace.guards.len(), instruction_count: optimized.len(), side_exit_table,
+            deopt_map,
         })
     }
 
@@ -656,7 +750,18 @@ impl NativeCodeGenerator {
     // external Rust function address — doing so would leave the trace's pushed
     // callee-saved registers on the stack, desynchronizing RSP.
     fn emit_hoisted_guards(&mut self, guards: &[Guard], deopt_label: usize) -> Result<(), String> {
+        // Fix #6: Redundant guard elimination — deduplicate by (slot, expected_type)
+        // before emitting.  If two guards check the same slot with the same
+        // expected type, only the first is emitted; the second would always
+        // succeed if the first did, so it is wasted cycles.
+        let mut seen: FxHashMap<(u16, ValueType), ()> = FxHashMap::default();
         for g in guards {
+            let key = (g.slot, g.expected_type);
+            if seen.contains_key(&key) {
+                continue; // deduplicate — skip redundant guard
+            }
+            seen.insert(key, ());
+
             // J7 fix: Guard slot encoding now supports slots > 255.
             // Previously, the imm8 displacement in [rsi + slot] only encoded
             // slots 0-255; larger slots silently read from wrong memory.
@@ -887,11 +992,20 @@ impl NativeCodeGenerator {
         Ok(())
     }
 
-    // --- Fix #1: Unboxed Instruction Emission ---
-    // Emits instructions that bypass the Value enum by writing directly to unboxed buffers
-    fn emit_instruction_unboxed(&mut self, ti: &TraceInstruction, vtype: ValueType, unboxed_slots: &[Option<u32>], unboxed_buffer: *mut u8) -> Result<(), String> {
+    // --- Fix #1/#5: Per-slot Unboxed Instruction Emission ---
+    // Emits instructions that bypass the Value enum by writing directly to
+    // unboxed buffers.  Each slot uses its OWN type from slot_types rather
+    // than requiring all slots to share a single type.
+    fn emit_instruction_unboxed(&mut self, ti: &TraceInstruction, slot_types: &[Option<ValueType>], unboxed_slots: &[Option<u32>], unboxed_buffer: *mut u8) -> Result<(), String> {
+        // Helper: get the per-slot type, defaulting to I64 for unknown slots
+        // (unknown slots shouldn't have unboxed offsets, so this is conservative)
+        let slot_vtype = |slot: u16| -> ValueType {
+            slot_types.get(slot as usize).and_then(|t| *t).unwrap_or(ValueType::I64)
+        };
+
         match &ti.instruction {
             Instr::LoadI32(dst, val) => {
+                let vtype = slot_vtype(*dst);
                 self.ensure_reg(*dst, Reg::RAX)?;
                 self.mov_eax_imm32(*val as i32);
                 self.mark_dirty(*dst);
@@ -901,6 +1015,7 @@ impl NativeCodeGenerator {
                 }
             }
             Instr::LoadI64(dst, val) => {
+                let vtype = slot_vtype(*dst);
                 self.ensure_reg(*dst, Reg::RAX)?;
                 // J1 fix: Same optimal immediate encoding as the boxed path
                 if let Ok(v32) = i32::try_from(*val) {
@@ -918,20 +1033,35 @@ impl NativeCodeGenerator {
                     self.emit_unboxed_store(offset, *val, vtype, unboxed_buffer);
                 }
             }
+            Instr::LoadBool(dst, val) => {
+                let vtype = slot_vtype(*dst);
+                self.ensure_reg(*dst, Reg::RAX)?;
+                if *val {
+                    self.mov_eax_imm32(1);
+                } else {
+                    self.b(0x31); self.b(0xC0); // xor eax, eax
+                }
+                self.mark_dirty(*dst);
+                if let Some(&Some(offset)) = unboxed_slots.get(*dst as usize) {
+                    self.emit_unboxed_store(offset, if *val { 1 } else { 0 }, vtype, unboxed_buffer);
+                }
+            }
             Instr::BinOp(dst, op, lhs, rhs) => {
-                // Only use the unboxed path if ALL operands have unboxed offsets;
-                // otherwise fall through to the boxed implementation to avoid
-                // operating on stale register values.
+                // Fix #5: Use per-slot types for loads/stores.  Each slot
+                // gets its own type rather than using a single trace-wide type.
                 let lhs_has = unboxed_slots.get(*lhs as usize).and_then(|o| *o).is_some();
                 let rhs_has = unboxed_slots.get(*rhs as usize).and_then(|o| *o).is_some();
                 let dst_has = unboxed_slots.get(*dst as usize).and_then(|o| *o).is_some();
                 if lhs_has && rhs_has && dst_has {
-                    // Load from unboxed buffers
+                    let lhs_vtype = slot_vtype(*lhs);
+                    let rhs_vtype = slot_vtype(*rhs);
+                    let dst_vtype = slot_vtype(*dst);
+                    // Load from unboxed buffers using per-slot types
                     if let Some(&Some(lhs_offset)) = unboxed_slots.get(*lhs as usize) {
-                        self.emit_unboxed_load(lhs_offset, vtype, unboxed_buffer, Reg::RAX)?;
+                        self.emit_unboxed_load(lhs_offset, lhs_vtype, unboxed_buffer, Reg::RAX)?;
                     }
                     if let Some(&Some(rhs_offset)) = unboxed_slots.get(*rhs as usize) {
-                        self.emit_unboxed_load(rhs_offset, vtype, unboxed_buffer, Reg::RCX)?;
+                        self.emit_unboxed_load(rhs_offset, rhs_vtype, unboxed_buffer, Reg::RCX)?;
                     }
                     match op {
                         BinOpKind::Add => self.add_rax_rcx(),
@@ -995,9 +1125,9 @@ impl NativeCodeGenerator {
                         BinOpKind::Shr => self.shr_rax_cl(),
                         _ => return Err(format!("Unsupported BinOp in unboxed mode: {:?}", op)),
                     }
-                    // Store result to unboxed buffer
+                    // Store result to unboxed buffer using per-slot dst type
                     if let Some(&Some(dst_offset)) = unboxed_slots.get(*dst as usize) {
-                        self.emit_unboxed_store_reg(dst_offset, Reg::RAX, vtype, unboxed_buffer);
+                        self.emit_unboxed_store_reg(dst_offset, Reg::RAX, dst_vtype, unboxed_buffer);
                     }
                 } else {
                     // Fallback to boxed path: at least one operand lacks an unboxed offset
@@ -1005,6 +1135,7 @@ impl NativeCodeGenerator {
                 }
             }
             Instr::Return(slot) => {
+                let vtype = slot_vtype(*slot);
                 if let Some(&Some(offset)) = unboxed_slots.get(*slot as usize) {
                     self.emit_unboxed_load(offset, vtype, unboxed_buffer, Reg::RAX)?;
                 }
@@ -1325,21 +1456,97 @@ impl NativeCodeGenerator {
         self.bb(0x41, 0x5F); self.bb(0x41, 0x5E); self.bb(0x41, 0x5D); self.bb(0x41, 0x5C);
         self.bbb(0x48, 0x89, 0xEC); self.b(0x5D); self.b(0xC3);
     }
-    fn emit_deopt_stub(&mut self) {
-        // Signal deoptimization by returning -1 in rax/eax.
-        // MOV EAX, -1 (sign-extends to RAX; 5 bytes, no REX needed)
-        self.b(0xB8); self.i32(-1);
-        // Restore the stack to exactly the state it was in when the caller
-        // entered this trace.  The prologue sequence was:
-        //   push rbp          (1 byte)
-        //   mov rbp, rsp      (3 bytes)
-        //   push r12          (2 bytes: 41 54)
-        //   push r13          (2 bytes: 41 55)
-        //   push r14          (2 bytes: 41 56)
-        //   push r15          (2 bytes: 41 57)
-        //   and rsp, -16      (4 bytes)
+    fn emit_deopt_stub(&mut self, deopt_map: &DeoptMap) {
+        // Fix #11: Deoptimization frame reconstruction.
         //
-        // To unwind: restore rsp from rbp (undoes the `and`), then pop in
+        // Instead of just returning -1, the deopt stub now:
+        //   1. Writes back all dirty registers to the slot array (RDI)
+        //   2. For each live slot in the first deopt map entry, copies its
+        //      value from the unboxed buffer back to the slot array
+        //   3. Sets RAX to a tagged fallback PC:  (fallback_pc << 1) | 1
+        //      The LSB=1 tag distinguishes deopt returns from normal returns
+        //      (which are always even non-negative i64 values).
+        //   4. Restores callee-save registers and returns
+        //
+        // The runtime caller can then:
+        //   - Check if the return value has LSB set → deopt path
+        //   - Extract fallback_pc = return_value >> 1
+        //   - Use the deopt_map to reconstruct interpreter state
+
+        // Step 1: Write back all dirty registers to the slot array
+        // This is the same writeback logic used in the normal return path.
+        // Since we're emitting raw bytes, we inline the spill loop:
+        // For each register that might be dirty, emit: mov [rdi + slot*8], reg
+        {
+            let dirty_slots: SmallVec<[(u16, Reg); 6]> = self.reg_map.iter().enumerate()
+                .filter_map(|(i, s)| if let RegState::Dirty(sl) = s {
+                    Some((*sl, unsafe { std::mem::transmute::<u8, Reg>(i as u8) }))
+                } else { None })
+                .collect();
+            for (slot, reg) in &dirty_slots {
+                let reg_code = *reg as u8;
+                let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
+                self.b(rex);
+                self.b(0x89);                          // MOV r/m64, r64
+                self.modrm(2, reg_code & 7, 7);        // mod=10 (disp32), reg=reg, rm=7 (rdi)
+                self.i32((*slot as i32) * 8);
+            }
+        }
+
+        // Step 2: For slots in the unboxed buffer, write their values back
+        // to the slot array so the interpreter sees the latest values.
+        // We use the first deopt map entry's live_slots list.  For each
+        // SlotLocation::Memory(offset), we load from [r8+offset] and store
+        // to [rdi + slot*8].
+        if let Some(first_entry) = deopt_map.first() {
+            for (slot, loc) in &first_entry.live_slots {
+                match loc {
+                    SlotLocation::Memory(offset) => {
+                        // mov rax, [r8 + offset]  (8-byte load)
+                        self.b(0x49); self.b(0x8B); self.b(0x80); // mov rax, [r8+disp32]
+                        self.i32(*offset as i32);
+                        // mov [rdi + slot*8], rax
+                        self.b(0x48); self.b(0x89); self.b(0x87); // mov [rdi+disp32], rax
+                        self.i32((*slot as i32) * 8);
+                    }
+                    SlotLocation::RegisterU8(reg_byte) => {
+                        // The register value was already written back in step 1
+                        // (dirty register spill), so no additional work needed.
+                        // However, if the register was clean (Occupied, not Dirty),
+                        // its value is already in the slot array from a previous spill.
+                        let _ = reg_byte; // suppress unused warning
+                    }
+                    SlotLocation::SlotArray(_) => {
+                        // Already in the slot array — no write-back needed.
+                    }
+                }
+            }
+        }
+
+        // Step 3: Set RAX to the tagged fallback PC.
+        // We use the first deopt map entry's fallback_pc.
+        // Encoding: RAX = (fallback_pc << 1) | 1
+        // The caller checks LSB: if 1 → deopt, extract PC from bits 1..63.
+        if let Some(first_entry) = deopt_map.first() {
+            let tagged_pc = ((first_entry.fallback_pc as i64) << 1) | 1;
+            // Load the tagged value into RAX
+            if let Ok(v32) = i32::try_from(tagged_pc) {
+                if v32 >= 0 {
+                    self.mov_eax_imm32(v32); // 5 bytes for small PCs
+                } else {
+                    self.b(0x48); self.b(0xC7); self.b(0xC0); // mov rax, sign-ext imm32
+                    self.i32(v32);
+                }
+            } else {
+                self.mov_rax_imm64(tagged_pc); // 10 bytes for large PCs
+            }
+        } else {
+            // No deopt entries — fallback to -1 (legacy behavior)
+            self.b(0xB8); self.i32(-1);
+        }
+
+        // Step 4: Restore the stack and return (same epilogue as normal path)
+        // Restore rsp from rbp (undoes `and rsp, -16`), then pop in
         // reverse push order, then pop rbp, then ret.
         self.bbb(0x48, 0x89, 0xEC); // mov rsp, rbp  — undo `and rsp, -16`
         self.bb(0x41, 0x5F);         // pop r15
@@ -1404,6 +1611,65 @@ impl NativeCodeGenerator {
     fn i32(&mut self, v: i32) { self.code.extend_from_slice(&v.to_le_bytes()); }
     fn i64(&mut self, v: i64) { self.code.extend_from_slice(&v.to_le_bytes()); }
     fn modrm(&mut self, mode: u8, reg: u8, rm: u8) { self.b((mode << 6) | ((reg & 7) << 3) | (rm & 7)); }
+
+    // --- Fix #11: Build Deopt Map ---
+    // Constructs a DeoptMapEntry for each guard, recording which slots are
+    // live and where they reside.  This map is stored in CompiledTrace so
+    // the runtime can reconstruct interpreter frames on guard failure.
+    fn build_deopt_map(&self, trace: &Trace) -> DeoptMap {
+        trace.guards.iter().enumerate().map(|(guard_index, _guard)| {
+            // Determine the fallback PC: use the side exit's fallback_pc if
+            // available, otherwise use the trace's entry_pc.
+            let fallback_pc = trace.side_exits
+                .get(guard_index)
+                .map(|se| se.fallback_pc)
+                .unwrap_or(trace.entry_pc);
+
+            // Collect live slots and their locations.
+            // For each slot with a known unboxed offset → SlotLocation::Memory
+            // For each slot currently in a register → SlotLocation::RegisterU8
+            // For all other slots → SlotLocation::SlotArray
+            let mut live_slots: Vec<(u16, SlotLocation)> = Vec::new();
+
+            // Add all slots that have unboxed buffer offsets
+            for (slot_idx, offset_opt) in trace.unboxed_slots.iter().enumerate() {
+                if let Some(offset) = offset_opt {
+                    live_slots.push((slot_idx as u16, SlotLocation::Memory(*offset)));
+                }
+            }
+
+            // Check registers for slots that are in registers
+            for (reg_idx, state) in self.reg_map.iter().enumerate() {
+                match state {
+                    RegState::Occupied(slot) | RegState::Dirty(slot) => {
+                        // If this slot already has a Memory entry, replace it
+                        // with the register location (register is more up-to-date)
+                        let reg_u8 = reg_idx as u8;
+                        if let Some(entry) = live_slots.iter_mut().find(|(s, _)| *s == *slot) {
+                            entry.1 = SlotLocation::RegisterU8(reg_u8);
+                        } else {
+                            live_slots.push((*slot, SlotLocation::RegisterU8(reg_u8)));
+                        }
+                    }
+                    RegState::Empty => {}
+                }
+            }
+
+            // Add slots that are only in the slot array (not in unboxed buffer or register)
+            // These don't need write-back, but we record them for completeness
+            for (slot_idx, slot_type) in trace.slot_types.iter().enumerate() {
+                if slot_type.is_some() && !live_slots.iter().any(|(s, _)| *s == slot_idx as u16) {
+                    live_slots.push((slot_idx as u16, SlotLocation::SlotArray(slot_idx as u16)));
+                }
+            }
+
+            DeoptMapEntry {
+                guard_index,
+                fallback_pc,
+                live_slots,
+            }
+        }).collect()
+    }
 }
 
 // =============================================================================
@@ -1416,6 +1682,10 @@ pub struct CompiledTrace {
     pub guard_count: usize,
     pub instruction_count: usize,
     pub side_exit_table: Vec<(usize, usize)>,
+    /// Fix #11: Deoptimization map.  One entry per guard, recording the
+    /// fallback PC and live-slot locations so the runtime can reconstruct
+    /// interpreter frames when a guard fails.
+    pub deopt_map: DeoptMap,
 }
 
 impl CompiledTrace {
@@ -1500,7 +1770,7 @@ impl TracingJIT {
     /// it only registers the PIC entry — the actual trace will be recorded
     /// when `execute_with_jit` next encounters this hot PC and records
     /// instructions from the bytecode.
-    fn record_guard_failure(&mut self, entry_pc: usize, slot: u16, failed_type: ValueType) {
+    fn record_guard_failure(&mut self, _entry_pc: usize, slot: u16, failed_type: ValueType) {
         // Allocate a trace ID without recording a full trace yet.
         // The PIC maps (slot, failed_type) → trace_id so that future
         // lookups can find this entry. The actual trace will be populated

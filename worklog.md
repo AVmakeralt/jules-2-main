@@ -7,6 +7,45 @@
 
 ---
 
+## [2026-03-05] - Global Dead Code Elimination Pass for JIT (Task ID: 2)
+**Status:** 🟢 Completed
+**System Layer:** JIT (phase3_jit.rs)
+
+### 1. The Mission
+Implement a global Dead Code Elimination (DCE) pass that runs after all other optimization passes in `translate()`. The previous DCE was only "straight-line" — it missed values computed but never used across any control-flow path.
+
+### 2. Changes Summary
+
+**src/jit/phase3_jit.rs** — Global DCE pass (+83 lines):
+
+- **Import:** Added `FxHashSet` to the `rustc_hash` import (line 79) for efficient slot membership testing.
+
+- **New function `global_dce(instrs: &mut Vec<Instr>)`** (lines 2953–3024):
+  - Iterative fixed-point algorithm: repeats until no more instructions are eliminated.
+  - **Step 1 (collect used slots):** Scans all instructions and builds an `FxHashSet<u16>` of every slot that is READ:
+    - `Move(_, s)`, `Load(_, s)`, `Store(_, s)`, `Return(s)` → reads `s`
+    - `BinOp(_, _, l, r)` → reads `l` and `r`
+    - `UnOp(_, _, s)` → reads `s`
+    - `JumpFalse(s, _)`, `JumpTrue(s, _)` → reads `s`
+  - **Step 2 (eliminate dead pure instructions):** For each instruction that writes to a slot NOT in `used`:
+    - Pure instructions (LoadI32, LoadI64, LoadF32, LoadF64, LoadBool, LoadUnit, Move, Load, Store, BinOp, UnOp) are replaced with `Instr::Nop`
+    - Side-effecting instructions (Jump, JumpFalse, JumpTrue, Return, ReturnUnit, AmxOp, Nop) are preserved
+  - **Iterative:** Removing a dead instruction may make its source operands dead too, so the loop repeats until no more instructions are removed.
+
+- **Wiring:** Added `global_dce(&mut opt_instrs);` call in `translate()` (line 3399), immediately after `peephole_optimize(&mut opt_instrs);`.
+
+### 3. Compilation Status
+- `cargo check` passes with 0 errors (29 pre-existing warnings, none from this change).
+
+### 4. No `todo!()` or `unimplemented!()` stubs added.
+
+### 5. Current Save Point
+- **Current State:** Global DCE pass implemented and wired. Compiles cleanly.
+- **Next Immediate Step:** Benchmark to measure dead instruction elimination rate on real workloads.
+- **Deletions:** None (only additions).
+
+---
+
 ## [2026-05-18] - Implement All 6 JIT Superpowers: Hardware Tuning, Adaptive Inlining, PIC, Trace Fixes, Tiered Compilation, Dynamic Constant Folding
 **Status:** 🟢 Completed
 **System Layer:** JIT / Optimizer / Runtime / Interpreter
