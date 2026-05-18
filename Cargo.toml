@@ -71,6 +71,10 @@ name = "quick-inferno"
 path = "benches/quick_inferno.rs"
 
 [[bin]]
+name = "bench-tracing-jit"
+path = "benches/bench_tracing_jit.rs"
+
+[[bin]]
 name = "vm-debug"
 path = "src/tools/vm_debug.rs"
 

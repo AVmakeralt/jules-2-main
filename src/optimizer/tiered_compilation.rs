@@ -34,7 +34,7 @@ use crate::compiler::ast::{FnDecl, Program};
 use std::borrow::Cow;
 use crate::interp::{compile_fn, CompiledFn, Interpreter, RuntimeError, Value};
 use crate::jit::phase3_jit as jit;
-use crate::jit::tracing_jit::TracingJIT;
+use crate::jit::tracing_jit::{TracingJIT, ValueType};
 
 // =============================================================================
 // §1  TIER DEFINITIONS
@@ -586,28 +586,30 @@ impl TieredExecutionManager {
 
         let entry_pc = Self::trace_entry_for(name);
         if let Some(compiled_fn) = self.tracing_bytecode.get(name) {
-            let mut slots = vec![Value::Unit; compiled_fn.slot_count as usize + 32];
-            for (i, arg) in args.into_iter().enumerate() {
-                if i < slots.len() {
-                    slots[i] = arg;
-                }
+            // FIX: The tracing JIT's compiled code expects a flat array of i64
+            // values, not an array of Value enums. The Value enum is ~24+ bytes
+            // per variant, but the JIT reads/writes at 8-byte offsets (slot*8).
+            // We must flatten the Value array into i64s for the JIT, then
+            // convert back afterward.
+            let slot_count = compiled_fn.slot_count as usize + 32;
+            let mut flat_slots: Vec<i64> = vec![0i64; slot_count];
+            for (i, arg) in args.iter().enumerate() {
+                flat_slots[i] = value_to_i64(arg);
             }
-            let mut types: Vec<u8> = slots
-                .iter()
-                .map(|v| v.value_type() as u8)
-                .collect();
+            let mut types: Vec<u8> = vec![ValueType::Unit as u8; slot_count];
+            for (i, arg) in args.iter().enumerate() {
+                types[i] = arg.value_type() as u8;
+            }
 
             match self
                 .tracing_jit
-                .execute_with_jit(entry_pc, &mut slots, &mut types, &compiled_fn.instrs)
+                .execute_with_jit_flat(entry_pc, &mut flat_slots, &mut types, &compiled_fn.instrs)
             {
                 Ok(v) => return Ok(v),
                 Err(_) => {}
             }
         }
         // Cascade fallback: Tier 3 → Tier 2 → Tier 1 → Tier 0
-        // Previously this jumped straight to Tier 0, skipping potentially
-        // available native code at Tier 1/2.
         if self.live_native_codes.contains_key(&(name.to_string(), Tier::Tier2_OptimizingJIT)) {
             return self.execute_tier2(name, fallback_args);
         }
@@ -828,6 +830,8 @@ impl TieredExecutionManager {
         }
 
         let entry_pc = Self::trace_entry_for(name);
+
+        // Record the trace if we haven't already
         if self.tracing_jit.recorder.find_trace(entry_pc).is_none() {
             self.tracing_jit.recorder.start_recording(entry_pc);
             if let Some(func) = self.tracing_bytecode.get(name) {
@@ -840,6 +844,30 @@ impl TieredExecutionManager {
                 let _ = trace_id;
             }
         }
+
+        // FIX: Attempt immediate compilation of the trace. The old code only
+        // recorded the trace and relied on execute_with_jit() to compile it
+        // after compile_trigger executions. But since we're explicitly called
+        // from force_compile_all(), we should compile immediately.
+        if let Some(tid) = self.tracing_jit.recorder.find_trace(entry_pc) {
+            // Check if already compiled
+            if !self.tracing_jit.compiled_cache.contains_key(&tid) {
+                if let Some(trace) = self.tracing_jit.recorder.get_trace(tid) {
+                    if !trace.instructions.is_empty() {
+                        match self.tracing_jit.codegen.compile_trace(trace, None) {
+                            Ok(ct) => {
+                                self.tracing_jit.traces_compiled += 1;
+                                self.tracing_jit.compiled_cache.insert(tid, ct);
+                            }
+                            Err(e) => {
+                                eprintln!("[tracing-jit] compilation failed for '{}': {}", name, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1057,5 +1085,24 @@ impl Deoptimizer {
 
     pub fn total_deopts(&self) -> u64 {
         self.deopt_count.load(Ordering::Relaxed)
+    }
+}
+
+/// Convert a Value to a flat i64 for the tracing JIT's slot array.
+/// The JIT operates on raw i64 values; it does not understand the Value enum.
+fn value_to_i64(v: &Value) -> i64 {
+    match v {
+        Value::I8(n) => *n as i64,
+        Value::I16(n) => *n as i64,
+        Value::I32(n) => *n as i64,
+        Value::I64(n) => *n,
+        Value::U8(n) => *n as i64,
+        Value::U16(n) => *n as i64,
+        Value::U32(n) => *n as i64,
+        Value::U64(n) => *n as i64,
+        Value::F32(f) => f.to_bits() as i64,
+        Value::F64(f) => f.to_bits() as i64,
+        Value::Bool(b) => if *b { 1 } else { 0 },
+        _ => 0,
     }
 }

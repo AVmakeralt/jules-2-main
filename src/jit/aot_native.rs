@@ -45,14 +45,7 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::compiler::ast::*;
-
-// FIX #1: Non-allocating small vector for instr_uses(). Most instructions have
-// ≤4 uses, so ArrayVec avoids the ~15K–50K Vec allocations per function that
-// the old Vec-based approach caused across all optimization passes.
-type SmallVars = smallvec::SmallVec<[VarId; 4]>;
-
-/// FIX #13: SmallVec for Phi incoming values — most Phi nodes have ≤2 incoming.
-type SmallPhi = smallvec::SmallVec<[(BlockId, VarId); 2]>;
+use crate::compiler::ir::{VarId, CodegenBlockId as BlockId, ICmpCond, IRInstr, IRFunction, SmallVars};
 
 /// FIX #2: Cached const-map built once and reused across passes.
 /// Replaces the O(B×I) linear scan in find_const_def() and the repeated
@@ -174,7 +167,7 @@ impl AotOptLevel {
                 peephole: true,
                 tco: true,
                 jump_threading: true,
-                inlining: true,
+                inlining: false,
                 max_inline_size: 32,
                 loop_unrolling: false,
                 max_unroll: 0,
@@ -196,7 +189,7 @@ impl AotOptLevel {
                 peephole: true,
                 tco: true,
                 jump_threading: true,
-                inlining: true,
+                inlining: false,
                 max_inline_size: 128,      // Aggressive: inline larger functions
                 loop_unrolling: true,     // TODO: not yet implemented
                 max_unroll: 8,              // Full unroll for small loops (TODO: not yet implemented)
@@ -268,20 +261,15 @@ impl OptConfig {
 }
 
 // =============================================================================
-// §1  INTERMEDIATE REPRESENTATION (SSA form)
+// §1  INTERMEDIATE REPRESENTATION (SSA form) — types imported from ir.rs
+// =============================================================================
+//
+// The core IR types (VarId, BlockId, ICmpCond, IRInstr, IRBlock, IRFunction,
+// SmallVars, SmallPhi) are now defined in crate::compiler::ir §23.
+// This module adds x86-specific and optimization-specific extension methods.
 // =============================================================================
 
-pub type VarId   = usize;
-pub type BlockId = usize;
-
-/// Integer comparison condition codes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ICmpCond {
-    Eq, Ne,
-    SLt, SLe, SGt, SGe,
-    ULt, ULe, UGt, UGe,
-}
-
+/// x86-specific extension: condition-code mapping for ICmpCond.
 impl ICmpCond {
     /// Unified x86 condition-code byte (covers both signed and unsigned)
     pub fn x86_cc(self) -> u8 {
@@ -298,170 +286,10 @@ impl ICmpCond {
             ICmpCond::UGe => cc::AE,
         }
     }
-    /// Invert the condition (for branch optimisation)
-    pub fn invert(self) -> Self {
-        match self {
-            ICmpCond::Eq  => ICmpCond::Ne,  ICmpCond::Ne  => ICmpCond::Eq,
-            ICmpCond::SLt => ICmpCond::SGe, ICmpCond::SGe => ICmpCond::SLt,
-            ICmpCond::SLe => ICmpCond::SGt, ICmpCond::SGt => ICmpCond::SLe,
-            ICmpCond::ULt => ICmpCond::UGe, ICmpCond::UGe => ICmpCond::ULt,
-            ICmpCond::ULe => ICmpCond::UGt, ICmpCond::UGt => ICmpCond::ULe,
-        }
-    }
 }
 
-/// SSA-form three-address IR instruction
-#[derive(Debug, Clone)]
-pub enum IRInstr {
-    // ── Constants ────────────────────────────────────────────────────────
-    Const   { dst: VarId, value: i64 },
-    ConstF64 { dst: VarId, value: f64 },
-
-    // ── Integer arithmetic ───────────────────────────────────────────────
-    Add  { dst: VarId, lhs: VarId, rhs: VarId },
-    Sub  { dst: VarId, lhs: VarId, rhs: VarId },
-    Mul  { dst: VarId, lhs: VarId, rhs: VarId },
-    SDiv { dst: VarId, lhs: VarId, rhs: VarId },
-    SRem { dst: VarId, lhs: VarId, rhs: VarId },
-    Neg  { dst: VarId, src: VarId },
-
-    // ── Bitwise ──────────────────────────────────────────────────────────
-    And  { dst: VarId, lhs: VarId, rhs: VarId },
-    Or   { dst: VarId, lhs: VarId, rhs: VarId },
-    Xor  { dst: VarId, lhs: VarId, rhs: VarId },
-    Shl  { dst: VarId, lhs: VarId, rhs: VarId },
-    AShr { dst: VarId, lhs: VarId, rhs: VarId },
-    LShr { dst: VarId, lhs: VarId, rhs: VarId },
-    Not  { dst: VarId, src: VarId },
-
-    // ── Comparison → bool (0 or 1) ───────────────────────────────────────
-    ICmp { dst: VarId, cond: ICmpCond, lhs: VarId, rhs: VarId },
-
-    // ── Copy (required for proper SSA destruction) ───────────────────────
-    Move { dst: VarId, src: VarId },
-
-    // ── Control flow ─────────────────────────────────────────────────────
-    Br     { target: BlockId },
-    CondBr { cond: VarId, if_true: BlockId, if_false: BlockId },
-    Ret    { value: Option<VarId> },
-
-    // ── Calls ────────────────────────────────────────────────────────────
-    // TODO: migrate `func: String` to `func: u32` (interned symbol) when the
-    // full string interning migration happens; this eliminates per-call heap
-    // allocations and enables symbol-table lookups by index.
-    Call     { dst: VarId, func: String, args: SmallVars },
-    TailCall { func: String, args: SmallVars },
-
-    // ── Memory ───────────────────────────────────────────────────────────
-    Alloca { dst: VarId, align: u32 },
-    Store  { ptr: VarId, value: VarId },
-    Load   { dst: VarId, ptr: VarId },
-
-    // ── SSA phi ──────────────────────────────────────────────────────────
-    Phi { dst: VarId, incoming: SmallPhi },
-
-    // ── Misc ─────────────────────────────────────────────────────────────
-    Label,
-    Comment(String),
-}
-
-impl IRInstr {
-    /// True when the instruction has observable side effects beyond its def
-    pub fn has_side_effects(&self) -> bool {
-        matches!(self,
-            IRInstr::Store {..} | IRInstr::Call {..} | IRInstr::TailCall {..} |
-            IRInstr::Ret {..}
-        )
-    }
-}
-
-/// Basic block in the CFG
-#[derive(Debug, Clone)]
-pub struct IRBlock {
-    pub id:           BlockId,
-    pub instrs:       Vec<IRInstr>,
-    pub successors:   Vec<BlockId>,
-    pub predecessors: Vec<BlockId>,
-    /// Estimated execution frequency (used by scheduler & layout)
-    pub freq:         f64,
-}
-
-impl IRBlock {
-    fn new(id: BlockId) -> Self {
-        Self { id, instrs: Vec::new(), successors: Vec::new(),
-               predecessors: Vec::new(), freq: 1.0 }
-    }
-    fn is_terminated(&self) -> bool {
-        self.instrs.iter().rev().any(|i| matches!(i,
-            IRInstr::Br {..} | IRInstr::CondBr {..} | IRInstr::Ret {..} |
-            IRInstr::TailCall {..}
-        ))
-    }
-}
-
-/// IR function in SSA form
-#[derive(Debug, Clone)]
-pub struct IRFunction {
-    pub name:         String,
-    pub params:       Vec<VarId>,
-    pub ret_ty:       Option<Type>,
-    pub blocks:       Vec<IRBlock>,  // FIX #5: Vec for O(1) access (BlockId is sequential usize)
-    pub entry_block:  BlockId,
-    pub next_var:     VarId,
-    pub next_block:   BlockId,
-    pub call_count:   usize,
-    pub called_by:    Vec<String>,
-    pub inline_cost:  usize,
-}
-
+/// Extension methods on IRFunction that depend on local optimization helpers.
 impl IRFunction {
-    pub fn new(name: String) -> Self {
-        let mut blocks = Vec::new();
-        blocks.push(IRBlock::new(0));
-        Self { name, params: Vec::new(), ret_ty: None, blocks,
-               entry_block: 0, next_var: 0, next_block: 1,
-               call_count: 0, called_by: Vec::new(), inline_cost: 0 }
-    }
-
-    pub fn fresh_var(&mut self) -> VarId {
-        let v = self.next_var; self.next_var += 1; v
-    }
-
-    pub fn fresh_block(&mut self) -> BlockId {
-        let id = self.next_block; self.next_block += 1;
-        self.blocks.push(IRBlock::new(id));
-        id
-    }
-
-    pub fn push_to(&mut self, block: BlockId, instr: IRInstr) {
-        // FIX #5: Direct Vec index access — blocks are always created via fresh_block()
-        if block < self.blocks.len() {
-            self.blocks[block].instrs.push(instr);
-        } else {
-            // Fallback: extend Vec to accommodate the block (shouldn't normally happen)
-            while self.blocks.len() <= block {
-                self.blocks.push(IRBlock::new(self.blocks.len()));
-            }
-            self.blocks[block].instrs.push(instr);
-        }
-    }
-
-    /// Rebuild predecessor lists from successor info
-    pub fn build_predecessors(&mut self) {
-        for b in self.blocks.iter_mut() { b.predecessors.clear(); }
-        // Collect edges first to avoid simultaneous mutable/immutable borrows
-        let edges: Vec<(BlockId, BlockId)> = self.blocks.iter().enumerate()
-            .flat_map(|(from, b)| b.successors.iter().map(move |&to| (from, to)))
-            .collect();
-        for (from, to) in edges {
-            if let Some(succ) = self.blocks.get_mut(to) {
-                if !succ.predecessors.contains(&from) {
-                    succ.predecessors.push(from);
-                }
-            }
-        }
-    }
-
     /// Estimate block execution frequencies via simple back-propagation
     pub fn estimate_frequencies(&mut self) {
         // Mark loop headers with high frequency
@@ -480,11 +308,6 @@ impl IRFunction {
                 b.freq = 100.0;
             }
         }
-    }
-
-    pub fn compute_inline_cost(&mut self) {
-        self.inline_cost = self.blocks.iter()
-            .map(|b| b.instrs.len()).sum();
     }
 
     /// All variable definitions in this function
@@ -873,10 +696,8 @@ impl LowerCtx {
                 self.emit(IRInstr::Const { dst: v, value: *value as i64 });
                 v
             }
-            Expr::FloatLit { value, .. } => {
-                let v = self.fresh_var();
-                self.emit(IRInstr::ConstF64 { dst: v, value: *value });
-                v
+            Expr::FloatLit { .. } => {
+                panic!("aot_native: Float literals not yet supported in AOT backend — use integer-only programs");
             }
             Expr::BoolLit { value, .. } => {
                 let v = self.fresh_var();
@@ -1141,7 +962,7 @@ pub fn run_sccp(func: &mut IRFunction) {
     // avoiding O(n) clones in the rewrite phase.
     for (bid, block) in func.blocks.iter_mut().enumerate() {
         if !executable.contains(&bid) {
-            block.instrs = vec![IRInstr::Br { target: func.entry_block }];
+            block.instrs = vec![IRInstr::Ret { value: None }];
             continue;
         }
         let mut new_instrs = Vec::with_capacity(block.instrs.len());
@@ -1331,6 +1152,11 @@ pub fn run_dce(func: &mut IRFunction) {
         new_instrs.reverse();
         block.instrs = new_instrs;
     }
+
+    // Remove dead blocks: blocks with no predecessors except the entry block.
+    func.build_predecessors();
+    let entry = func.entry_block;
+    func.blocks.retain(|b| !b.predecessors.is_empty() || b.id == entry);
 }
 
 // =============================================================================
@@ -2956,37 +2782,33 @@ impl NativeCodeGen {
                 self.put_from_reg(*dst, S0, alloc);
             }
             IRInstr::SDiv { dst, lhs, rhs } => {
-                // idiv implicitly uses rax (dividend) and rdx (sign extension),
-                // clobbering both.  Save them if they hold live values other than
-                // the operands / destination we are about to produce.
                 let lr = self.get_in_reg(*lhs, S0, alloc)?;
                 let rr = self.get_in_reg(*rhs, S1, alloc)?;
-                // Push rax / rdx only when they are not the scratch regs we
-                // already hold the operands in, to avoid double-saves.
-                let save_rax = lr != RET_REG && rr != RET_REG;
-                let save_rdx = lr != 2       && rr != 2;
-                if save_rax { self.emit.push_r(RET_REG); }
-                if save_rdx { self.emit.push_r(2); }
-                self.emit.mov_rr(RET_REG, lr); // rax = lhs
-                self.emit.cqo();               // sign-extend rax → rdx:rax
-                self.emit.idiv_r(rr);           // quotient in rax
-                // Write result before restoring (the result IS rax)
-                self.put_from_reg(*dst, RET_REG, alloc);
-                if save_rdx { self.emit.pop_r(2); }
-                if save_rax {
-                    // Only pop rax back if dst wasn't rax itself
-                    if !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == RET_REG) {
-                        self.emit.pop_r(RET_REG);
-                    } else {
-                        self.emit.add_rsp(8); // discard saved value; dst owns rax now
-                    }
-                }
-            }
-            IRInstr::SRem { dst, lhs, rhs } => {
-                // v1 bug fix: remainder is in rdx, not rax.
-                // Also save rax/rdx around the idiv for the same reasons as SDiv.
-                let lr = self.get_in_reg(*lhs, S0, alloc)?;
-                let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                // Check for zero divisor
+                self.emit.test_rr(rr, rr);
+                let skip_div = self.emit.jcc_rel32(cc::NE); // Jump if Not Equal (i.e., non-zero)
+                // Error path: divisor is zero, set result to 0
+                self.emit.mov_r_imm(S0, 0);
+                self.put_from_reg(*dst, S0, alloc);
+                let end_err = self.emit.jmp_rel32();
+                // Patch jump target for non-zero case
+                self.emit.patch_rel32(skip_div, self.emit.pos());
+                // Check for INT_MIN / -1 overflow (would raise SIGFPE)
+                // Compare lhs with INT_MIN, if equal check if rhs is -1
+                self.emit.mov_r_imm(S0, i64::MIN);
+                self.emit.cmp_rr(lr, S0);
+                let skip_overflow = self.emit.jcc_rel32(cc::NE);
+                // lhs IS i64::MIN, check if rhs is -1
+                self.emit.mov_r_imm(S0, -1i64);
+                self.emit.cmp_rr(rr, S0);
+                let skip_overflow2 = self.emit.jcc_rel32(cc::NE);
+                // INT_MIN / -1 = overflow → set result to INT_MIN (standard behavior)
+                self.emit.mov_r_imm(S0, i64::MIN);
+                self.put_from_reg(*dst, S0, alloc);
+                let end_overflow = self.emit.jmp_rel32();
+                self.emit.patch_rel32(skip_overflow, self.emit.pos());
+                self.emit.patch_rel32(skip_overflow2, self.emit.pos());
+                // Normal division path
                 let save_rax = lr != RET_REG && rr != RET_REG;
                 let save_rdx = lr != 2       && rr != 2;
                 if save_rax { self.emit.push_r(RET_REG); }
@@ -2994,8 +2816,53 @@ impl NativeCodeGen {
                 self.emit.mov_rr(RET_REG, lr);
                 self.emit.cqo();
                 self.emit.idiv_r(rr);
-                // remainder in rdx — write before restoring
-                self.put_from_reg(*dst, 2 /*rdx*/, alloc);
+                self.put_from_reg(*dst, RET_REG, alloc);
+                if save_rdx { self.emit.pop_r(2); }
+                if save_rax {
+                    if !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == RET_REG) {
+                        self.emit.pop_r(RET_REG);
+                    } else {
+                        self.emit.add_rsp(8);
+                    }
+                }
+                // Patch end of error handler to skip to here
+                self.emit.patch_rel32(end_err, self.emit.pos());
+                self.emit.patch_rel32(end_overflow, self.emit.pos());
+            }
+            IRInstr::SRem { dst, lhs, rhs } => {
+                let lr = self.get_in_reg(*lhs, S0, alloc)?;
+                let rr = self.get_in_reg(*rhs, S1, alloc)?;
+                // Check for zero divisor
+                self.emit.test_rr(rr, rr);
+                let skip_rem = self.emit.jcc_rel32(cc::NE);
+                // Error path: divisor is zero, set result to 0
+                self.emit.mov_r_imm(S0, 0);
+                self.put_from_reg(*dst, S0, alloc);
+                let end_err = self.emit.jmp_rel32();
+                self.emit.patch_rel32(skip_rem, self.emit.pos());
+                // Check for INT_MIN % -1 overflow (would raise SIGFPE)
+                self.emit.mov_r_imm(S0, i64::MIN);
+                self.emit.cmp_rr(lr, S0);
+                let skip_overflow = self.emit.jcc_rel32(cc::NE);
+                self.emit.mov_r_imm(S0, -1i64);
+                self.emit.cmp_rr(rr, S0);
+                let skip_overflow2 = self.emit.jcc_rel32(cc::NE);
+                // INT_MIN % -1 = 0 (mathematically correct, avoids SIGFPE)
+                self.emit.mov_r_imm(S0, 0);
+                self.put_from_reg(*dst, S0, alloc);
+                let end_overflow = self.emit.jmp_rel32();
+                self.emit.patch_rel32(skip_overflow, self.emit.pos());
+                self.emit.patch_rel32(skip_overflow2, self.emit.pos());
+                // Normal remainder path
+                let save_rax = lr != RET_REG && rr != RET_REG;
+                let save_rdx = lr != 2       && rr != 2;
+                if save_rax { self.emit.push_r(RET_REG); }
+                if save_rdx { self.emit.push_r(2); }
+                self.emit.mov_rr(RET_REG, lr);
+                self.emit.cqo();
+                self.emit.idiv_r(rr);
+                // remainder in rdx
+                self.put_from_reg(*dst, 2, alloc);
                 if save_rdx {
                     if !matches!(alloc.map.get(dst), Some(&Alloc::Reg(r)) if r == 2) {
                         self.emit.pop_r(2);
@@ -3004,6 +2871,8 @@ impl NativeCodeGen {
                     }
                 }
                 if save_rax { self.emit.pop_r(RET_REG); }
+                self.emit.patch_rel32(end_err, self.emit.pos());
+                self.emit.patch_rel32(end_overflow, self.emit.pos());
             }
             IRInstr::Neg { dst, src } => {
                 let sr = self.get_in_reg(*src, S0, alloc)?;
@@ -3282,6 +3151,9 @@ impl NativeCodeGen {
                     let p = self.emit.jmp_rel32();
                     self.fixups.push((p, lbl));
                 }
+            }
+            IRInstr::ConstF64 { .. } => {
+                return Err("Float constants not yet supported in AOT backend — use integer-only programs".to_string());
             }
             IRInstr::Comment(_) | IRInstr::Label => {}
             _ => {} // Alloca, Load, Store, Phi handled by mem2reg or lowering

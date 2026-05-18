@@ -3985,6 +3985,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
             Instr::Jump(off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
+                eprintln!("[JIT-CG] pc={}: Jump({}) target_pc={} cur_offset={}", pc, off, target, em.pos());
                 if target > instrs.len() {
                     return None;
                 }
@@ -4004,6 +4005,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
             Instr::JumpFalse(cond, off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
+                eprintln!("[JIT-CG] pc={}: JumpFalse({}, {}) target_pc={} cur_offset={}", pc, cond, off, target, em.pos());
                 if target > instrs.len() {
                     return None;
                 }

@@ -286,7 +286,7 @@ impl MicroSequenceDetector {
     }
     
     /// Analyze an instruction stream and detect recurring sequences.
-    pub fn analyze(&mut self, instructions: &[IrInstruction]) -> Vec<DetectedSequence> {
+    pub fn analyze(&mut self, instructions: &[FusionInstr]) -> Vec<DetectedSequence> {
         // Clear previous analysis
         self.sequences.clear();
         
@@ -320,45 +320,45 @@ impl MicroSequenceDetector {
             .collect()
     }
     
-    fn ir_to_micro_op(&self, instr: &IrInstruction) -> MicroOp {
+    fn ir_to_micro_op(&self, instr: &FusionInstr) -> MicroOp {
         match instr {
-            IrInstruction::Load { dst, src: _, .. } => MicroOp {
+            FusionInstr::Load { dst, src: _, .. } => MicroOp {
                 opcode: intern_str("load"),
                 read_regs: SmallVec::new(),
                 write_regs: smallvec![intern_str(dst)],
                 has_memory: true,
             },
-            IrInstruction::Store { dst, src, .. } => MicroOp {
+            FusionInstr::Store { dst, src, .. } => MicroOp {
                 opcode: intern_str("store"),
                 read_regs: smallvec![intern_str(src), intern_str(dst)],
                 write_regs: SmallVec::new(),
                 has_memory: true,
             },
-            IrInstruction::Add { dst, lhs, rhs } => MicroOp {
+            FusionInstr::Add { dst, lhs, rhs } => MicroOp {
                 opcode: intern_str("add"),
                 read_regs: smallvec![intern_str(lhs), intern_str(rhs)],
                 write_regs: smallvec![intern_str(dst)],
                 has_memory: false,
             },
-            IrInstruction::Sub { dst, lhs, rhs } => MicroOp {
+            FusionInstr::Sub { dst, lhs, rhs } => MicroOp {
                 opcode: intern_str("sub"),
                 read_regs: smallvec![intern_str(lhs), intern_str(rhs)],
                 write_regs: smallvec![intern_str(dst)],
                 has_memory: false,
             },
-            IrInstruction::Mul { dst, lhs, rhs } => MicroOp {
+            FusionInstr::Mul { dst, lhs, rhs } => MicroOp {
                 opcode: intern_str("mul"),
                 read_regs: smallvec![intern_str(lhs), intern_str(rhs)],
                 write_regs: smallvec![intern_str(dst)],
                 has_memory: false,
             },
-            IrInstruction::Cmp { lhs, rhs } => MicroOp {
+            FusionInstr::Cmp { lhs, rhs } => MicroOp {
                 opcode: intern_str("cmp"),
                 read_regs: smallvec![intern_str(lhs), intern_str(rhs)],
                 write_regs: SmallVec::new(),
                 has_memory: false,
             },
-            IrInstruction::Br { cond, .. } => MicroOp {
+            FusionInstr::Br { cond, .. } => MicroOp {
                 opcode: intern_str("br"),
                 read_regs: smallvec![intern_str(cond)],
                 write_regs: SmallVec::new(),
@@ -924,12 +924,23 @@ impl MacroOpEmitter {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IR Instruction Types
+// Fusion-Specific Instruction Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Intermediate representation instruction.
+/// Simplified instruction representation for the temporal fusion pipeline.
+///
+/// This is a **distinct type** from the canonical [`crate::compiler::ir::IRInstr`]
+/// (the SSA-form three-address code used by the codegen layer).  `FusionInstr`
+/// uses String-based register names because the fusion pipeline operates at the
+/// level of *named* machine registers and symbolic labels, not SSA virtual
+/// registers (`VarId`).  Converting between the two is a deliberate lowering
+/// step that strips type/ownership metadata and maps `VarId` operands to their
+/// allocated register names.
+///
+/// If you need the full IR with types, effects, and SSA form, use
+/// `crate::compiler::ir::IRInstr` instead.
 #[derive(Debug, Clone)]
-pub enum IrInstruction {
+pub enum FusionInstr {
     Load { dst: String, src: String, offset: i64 },
     Store { dst: String, src: String, offset: i64 },
     Add { dst: String, lhs: String, rhs: String },
@@ -976,7 +987,7 @@ impl TemporalFusionPipeline {
     }
     
     /// Run temporal fusion analysis on an instruction stream.
-    pub fn analyze(&mut self, instructions: &[IrInstruction]) -> TemporalFusionResult {
+    pub fn analyze(&mut self, instructions: &[FusionInstr]) -> TemporalFusionResult {
         let start_time = std::time::Instant::now();
         
         // Phase 1: Detect recurring micro-sequences
@@ -1068,7 +1079,7 @@ impl MlSuperoptIntegration {
     }
     
     /// Convert instruction stream to tilable units for MCTS.
-    pub fn to_tilable_units(&self, instructions: &[IrInstruction]) -> Vec<TilableUnit> {
+    pub fn to_tilable_units(&self, instructions: &[FusionInstr]) -> Vec<TilableUnit> {
         instructions.iter().map(|instr| {
             TilableUnit {
                 ir_instruction: instr.clone(),
@@ -1078,14 +1089,14 @@ impl MlSuperoptIntegration {
     }
     
     /// Classify an instruction for tiling decisions.
-    fn classify_for_tiling(&self, instr: &IrInstruction) -> TileClass {
+    fn classify_for_tiling(&self, instr: &FusionInstr) -> TileClass {
         match instr {
-            IrInstruction::Load { .. } => TileClass::Memory,
-            IrInstruction::Store { .. } => TileClass::Memory,
-            IrInstruction::Add { .. } | IrInstruction::Sub { .. } | IrInstruction::Mul { .. } => TileClass::Arithmetic,
-            IrInstruction::Cmp { .. } => TileClass::Compare,
-            IrInstruction::Br { .. } | IrInstruction::Jmp { .. } => TileClass::Control,
-            IrInstruction::Ret | IrInstruction::Call { .. } => TileClass::Control,
+            FusionInstr::Load { .. } => TileClass::Memory,
+            FusionInstr::Store { .. } => TileClass::Memory,
+            FusionInstr::Add { .. } | FusionInstr::Sub { .. } | FusionInstr::Mul { .. } => TileClass::Arithmetic,
+            FusionInstr::Cmp { .. } => TileClass::Compare,
+            FusionInstr::Br { .. } | FusionInstr::Jmp { .. } => TileClass::Control,
+            FusionInstr::Ret | FusionInstr::Call { .. } => TileClass::Control,
         }
     }
     
@@ -1112,7 +1123,7 @@ impl MlSuperoptIntegration {
 /// A unit that can be tiled by the MCTS search.
 #[derive(Debug, Clone)]
 pub struct TilableUnit {
-    pub ir_instruction: IrInstruction,
+    pub ir_instruction: FusionInstr,
     pub tile_class: TileClass,
 }
 
@@ -1142,11 +1153,11 @@ mod tests {
 
         // Repeat the load-add-store pattern enough times to exceed min_frequency
         let base = vec![
-            IrInstruction::Load { dst: "rax".to_string(), src: "rbx".to_string(), offset: 0 },
-            IrInstruction::Add { dst: "rax".to_string(), lhs: "rax".to_string(), rhs: "rcx".to_string() },
-            IrInstruction::Store { dst: "rbx".to_string(), src: "rax".to_string(), offset: 0 },
+            FusionInstr::Load { dst: "rax".to_string(), src: "rbx".to_string(), offset: 0 },
+            FusionInstr::Add { dst: "rax".to_string(), lhs: "rax".to_string(), rhs: "rcx".to_string() },
+            FusionInstr::Store { dst: "rbx".to_string(), src: "rax".to_string(), offset: 0 },
         ];
-        let instructions: Vec<IrInstruction> = (0..12)
+        let instructions: Vec<FusionInstr> = (0..12)
             .flat_map(|_| base.clone())
             .collect();
 

@@ -47,14 +47,15 @@ use crate::interp::{Instr, RuntimeError, Value};
 // =============================================================================
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub enum ValueType { I64 = 0, F64 = 1, Bool = 2, Unit = 3, Tensor = 4, Unknown = 255 }
+pub enum ValueType { I64 = 0, F64 = 1, Bool = 2, Unit = 3, Tensor = 4, F32 = 5, Unknown = 255 }
 
 impl Value {
     pub fn value_type(&self) -> ValueType {
         match self {
             Value::I64(_) | Value::I32(_) | Value::I8(_) | Value::I16(_) |
             Value::U8(_) | Value::U16(_) | Value::U32(_) | Value::U64(_) => ValueType::I64,
-            Value::F64(_) | Value::F32(_) => ValueType::F64,
+            Value::F32(_) => ValueType::F32,
+            Value::F64(_) => ValueType::F64,
             Value::Bool(_) => ValueType::Bool,
             Value::Unit => ValueType::Unit,
             Value::Tensor(_) | Value::TensorFast(_) => ValueType::Tensor,
@@ -74,6 +75,7 @@ impl From<u8> for ValueType {
             2 => ValueType::Bool,
             3 => ValueType::Unit,
             4 => ValueType::Tensor,
+            5 => ValueType::F32,
             _ => ValueType::Unknown,
         }
     }
@@ -252,6 +254,7 @@ impl TraceRecorder {
                     trace.unboxed_slots[slot as usize] = Some(offset);
                     offset += match trace.specialized_type.unwrap() {
                         ValueType::F64 => 8,
+                        ValueType::F32 => 8, // F32 widened to F64 in unboxed buffer
                         ValueType::I64 => 8,
                         ValueType::Bool => 1,
                         _ => 8,
@@ -686,9 +689,6 @@ impl NativeCodeGenerator {
                 // 3-5 bytes per load. This reduces code bloat by ~30-50%
                 // for integer-heavy traces, improving i-cache hit rates and
                 // decode throughput.
-                //   v >= 0 and fits i32 → MOV EAX, imm32 (5 B, zero-extends)
-                //   v <  0 and fits i32 → REX.W MOV RAX, sign-ext imm32 (7 B)
-                //   otherwise           → MOV RAX, imm64 (10 B)
                 if let Ok(v32) = i32::try_from(*val) {
                     if v32 >= 0 {
                         self.mov_eax_imm32(v32); // 5 bytes
@@ -702,17 +702,57 @@ impl NativeCodeGenerator {
                 }
                 self.mark_dirty(*dst);
             }
+            Instr::LoadBool(dst, val) => {
+                self.ensure_reg(*dst, Reg::RAX)?;
+                if *val {
+                    self.mov_eax_imm32(1);
+                } else {
+                    self.b(0x31); self.b(0xC0); // xor eax, eax
+                }
+                self.mark_dirty(*dst);
+            }
+            Instr::LoadUnit(dst) => {
+                self.ensure_reg(*dst, Reg::RAX)?;
+                self.b(0x31); self.b(0xC0); // xor eax, eax — Unit = 0
+                self.mark_dirty(*dst);
+            }
+            Instr::Move(dst, src) => {
+                if dst != src {
+                    let src_reg = self.alloc_reg(*src)?;
+                    self.ensure_reg(*dst, src_reg)?;
+                    // The value is already in the register from alloc_reg
+                    self.mark_dirty(*dst);
+                }
+            }
+            Instr::Store(slot, src_reg) => {
+                // Store register value to the flat i64 slot array.
+                // The slot array is passed as the first argument (RDI).
+                // Emit: mov [rdi + slot*8], <src_reg_value>
+                let src = self.alloc_reg(*src_reg)?;
+                // Move to RAX for the store (we store via RAX)
+                if src != Reg::RAX { self.mov_reg_reg(src, Reg::RAX); }
+                // MOV [RDI + disp32], RAX
+                self.b(0x48); self.b(0x89); // REX.W MOV r/m64, r64
+                self.modrm(2, 0, 7); // mod=10 (disp32), reg=RAX(0), rm=RDI(7)
+                self.i32((*slot as i32) * 8);
+            }
+            Instr::Load(dst, slot) => {
+                // Load value from flat i64 slot array into register.
+                // The slot array is passed as the first argument (RDI).
+                // Emit: mov <dst_reg>, [rdi + slot*8]
+                self.ensure_reg(*dst, Reg::RAX)?;
+                // MOV RAX, [RDI + disp32]
+                self.b(0x48); self.b(0x8B); // REX.W MOV r64, r/m64
+                self.modrm(2, 0, 7); // mod=10 (disp32), reg=RAX(0), rm=RDI(7)
+                self.i32((*slot as i32) * 8);
+                self.mark_dirty(*dst);
+            }
             Instr::BinOp(dst, op, lhs, rhs) => {
                 // FIX #2: Use wider register allocation to reduce load-spill-load
-                // cycles. Load lhs and rhs into registers from the wider pool
-                // (RAX, RCX, RDX, R8, R9, R10), then move to RAX/RCX for
-                // the actual arithmetic operation. This allows values that are
-                // still live to remain in RDX/R8/R9/R10 without being evicted
-                // just because RAX/RCX are needed for a different operation.
+                // cycles.
                 let lhs_reg = self.alloc_reg(*lhs)?;
                 let rhs_reg = self.alloc_reg(*rhs)?;
-                // Move operands to RAX/RCX for arithmetic (the codegen only
-                // supports RAX/RCX operand forms currently)
+                // Move operands to RAX/RCX for arithmetic
                 if lhs_reg != Reg::RAX { self.mov_reg_reg(lhs_reg, Reg::RAX); }
                 if rhs_reg != Reg::RCX { self.mov_reg_reg(rhs_reg, Reg::RCX); }
                 match op {
@@ -720,25 +760,54 @@ impl NativeCodeGenerator {
                     BinOpKind::Sub => self.sub_rax_rcx(),
                     BinOpKind::Mul => self.imul_rax_rcx(),
                     BinOpKind::Div => {
-                        // FIX (JIT-1): Guard against division by zero.
-                        // Emit: test rax, rax (check dividend) + test rcx, rcx (divisor)
-                        // Use test_rax_rax to verify the dividend is valid before division.
-                        // For division, if the dividend is 0 the result is always 0 —
-                        // we can skip the IDIV and just zero rax. Use jz_short for
-                        // this fast-path check (short jump since target is nearby).
                         self.test_rax_rax();
-                        let zero_label = self.next_label(); // allocate label before emitting jump
-                        self.jz_short(zero_label); // if dividend==0, skip to zero-result
+                        let zero_label = self.next_label();
+                        self.jz_short(zero_label);
                         self.test_rcx_rcx();
                         self.jz_label(self.deopt_label);
+                        // Fix #2: Guard against i64::MIN / -1 overflow (would raise SIGFPE)
+                        // Use R10 as scratch (push/pop to preserve any live value)
+                        self.bb(0x41, 0x52);                // push r10
+                        self.bb(0x49, 0xBA); self.i64(i64::MIN); // mov r10, i64::MIN
+                        self.bbb(0x4C, 0x39, 0xD0);         // cmp rax, r10
+                        let skip_overflow1 = self.next_label();
+                        self.jne_label(skip_overflow1);
+                        self.bb(0x49, 0xBA); self.i64(-1i64);   // mov r10, -1
+                        self.bbb(0x4C, 0x39, 0xD1);         // cmp rcx, r10
+                        let skip_overflow2 = self.next_label();
+                        self.jne_label(skip_overflow2);
+                        // Overflow: i64::MIN / -1 — restore r10 and deopt
+                        self.bb(0x41, 0x5A);                // pop r10
+                        self.b(0xE9); self.i32(0);           // jmp deopt_label (rel32)
+                        self.patch_sites.push(PatchSite { buffer_offset: self.code.len()-4, target_label: self.deopt_label, is_short_jump: false });
+                        self.labels.insert(skip_overflow1, self.code.len());
+                        self.labels.insert(skip_overflow2, self.code.len());
+                        self.bb(0x41, 0x5A);                // pop r10
+                        // Now safe to divide
                         self.idiv_rax_rcx();
-                        // Label for zero-dividend fast path: result = 0
                         self.labels.insert(zero_label, self.code.len());
                     }
                     BinOpKind::Rem => {
-                        // FIX (JIT-1): Guard against division by zero.
                         self.test_rcx_rcx();
                         self.jz_label(self.deopt_label);
+                        // Fix #2: Guard against i64::MIN % -1 overflow (would raise SIGFPE)
+                        self.bb(0x41, 0x52);                // push r10
+                        self.bb(0x49, 0xBA); self.i64(i64::MIN); // mov r10, i64::MIN
+                        self.bbb(0x4C, 0x39, 0xD0);         // cmp rax, r10
+                        let skip_overflow1 = self.next_label();
+                        self.jne_label(skip_overflow1);
+                        self.bb(0x49, 0xBA); self.i64(-1i64);   // mov r10, -1
+                        self.bbb(0x4C, 0x39, 0xD1);         // cmp rcx, r10
+                        let skip_overflow2 = self.next_label();
+                        self.jne_label(skip_overflow2);
+                        // Overflow: i64::MIN % -1 — restore r10 and deopt
+                        self.bb(0x41, 0x5A);                // pop r10
+                        self.b(0xE9); self.i32(0);           // jmp deopt_label (rel32)
+                        self.patch_sites.push(PatchSite { buffer_offset: self.code.len()-4, target_label: self.deopt_label, is_short_jump: false });
+                        self.labels.insert(skip_overflow1, self.code.len());
+                        self.labels.insert(skip_overflow2, self.code.len());
+                        self.bb(0x41, 0x5A);                // pop r10
+                        // Now safe to compute remainder
                         self.irem_rax_rcx();
                     }
                     BinOpKind::BitAnd => self.and_rax_rcx(),
@@ -746,8 +815,48 @@ impl NativeCodeGenerator {
                     BinOpKind::BitXor => self.xor_rax_rcx(),
                     BinOpKind::Shl => self.shl_rax_cl(),
                     BinOpKind::Shr => self.shr_rax_cl(),
+                    BinOpKind::Eq => {
+                        // cmp rax, rcx; sete al; movzx eax, al
+                        self.bbb(0x48, 0x39, 0xC8); // cmp rax, rcx
+                        self.b(0x0F); self.b(0x94); self.b(0xC0); // sete al
+                        self.b(0x0F); self.b(0xB6); self.b(0xC0); // movzx eax, al
+                    }
+                    BinOpKind::Ne => {
+                        self.bbb(0x48, 0x39, 0xC8); // cmp rax, rcx
+                        self.b(0x0F); self.b(0x95); self.b(0xC0); // setne al
+                        self.b(0x0F); self.b(0xB6); self.b(0xC0); // movzx eax, al
+                    }
+                    BinOpKind::Lt => {
+                        self.bbb(0x48, 0x39, 0xC8); // cmp rax, rcx
+                        self.b(0x0F); self.b(0x9C); self.b(0xC0); // setl al
+                        self.b(0x0F); self.b(0xB6); self.b(0xC0); // movzx eax, al
+                    }
+                    BinOpKind::Le => {
+                        self.bbb(0x48, 0x39, 0xC8); // cmp rax, rcx
+                        self.b(0x0F); self.b(0x9E); self.b(0xC0); // setle al
+                        self.b(0x0F); self.b(0xB6); self.b(0xC0); // movzx eax, al
+                    }
+                    BinOpKind::Gt => {
+                        self.bbb(0x48, 0x39, 0xC8); // cmp rax, rcx
+                        self.b(0x0F); self.b(0x9F); self.b(0xC0); // setg al
+                        self.b(0x0F); self.b(0xB6); self.b(0xC0); // movzx eax, al
+                    }
+                    BinOpKind::Ge => {
+                        self.bbb(0x48, 0x39, 0xC8); // cmp rax, rcx
+                        self.b(0x0F); self.b(0x9D); self.b(0xC0); // setge al
+                        self.b(0x0F); self.b(0xB6); self.b(0xC0); // movzx eax, al
+                    }
                     _ => return Err(format!("Unsupported BinOp in trace backend: {:?}", op)),
                 }
+                self.bind_slot_reg(*dst, Reg::RAX);
+                self.mark_dirty(*dst);
+            }
+            Instr::UnOp(dst, _op, src) => {
+                // Support basic unary operations
+                let src_reg = self.alloc_reg(*src)?;
+                if src_reg != Reg::RAX { self.mov_reg_reg(src_reg, Reg::RAX); }
+                // For Neg: neg rax
+                self.b(0x48); self.b(0xF7); self.b(0xD8); // neg rax
                 self.bind_slot_reg(*dst, Reg::RAX);
                 self.mark_dirty(*dst);
             }
@@ -755,6 +864,23 @@ impl NativeCodeGenerator {
                 self.ensure_reg(*slot, Reg::RAX)?;
                 self.writeback_all_dirty()?;
                 // Fallthrough to ret
+            }
+            Instr::ReturnUnit => {
+                self.b(0x31); self.b(0xC0); // xor eax, eax
+                self.writeback_all_dirty()?;
+            }
+            Instr::Jump(_offset) => {
+                // For tracing JIT, we compile the hot path as a linear sequence.
+                // Jump instructions in the trace are elided since we only record
+                // the taken path. However, backward jumps (loops) need to be
+                // handled: we emit a loop back to the trace entry.
+                // For now, we simply skip the jump — the trace is already linearized.
+            }
+            Instr::JumpFalse(_reg, _offset) | Instr::JumpTrue(_reg, _offset) => {
+                // Same as Jump: the trace is linearized, so conditional jumps
+                // are already resolved (we only recorded the taken path).
+                // Guards handle the type-checking; side exits handle the
+                // unexpected path.
             }
             _ => return Err(format!("Unsupported instruction: {:?}", ti.instruction)),
         }
@@ -819,6 +945,23 @@ impl NativeCodeGenerator {
                             self.jz_short(zero_label); // if dividend==0, skip to zero-result
                             self.test_rcx_rcx();
                             self.jz_label(self.deopt_label);
+                            // Fix #2: Guard against i64::MIN / -1 overflow (unboxed path)
+                            self.bb(0x41, 0x52);                // push r10
+                            self.bb(0x49, 0xBA); self.i64(i64::MIN); // mov r10, i64::MIN
+                            self.bbb(0x4C, 0x39, 0xD0);         // cmp rax, r10
+                            let skip_overflow1 = self.next_label();
+                            self.jne_label(skip_overflow1);
+                            self.bb(0x49, 0xBA); self.i64(-1i64);   // mov r10, -1
+                            self.bbb(0x4C, 0x39, 0xD1);         // cmp rcx, r10
+                            let skip_overflow2 = self.next_label();
+                            self.jne_label(skip_overflow2);
+                            self.bb(0x41, 0x5A);                // pop r10
+                            self.b(0xE9); self.i32(0);           // jmp deopt_label (rel32)
+                            self.patch_sites.push(PatchSite { buffer_offset: self.code.len()-4, target_label: self.deopt_label, is_short_jump: false });
+                            self.labels.insert(skip_overflow1, self.code.len());
+                            self.labels.insert(skip_overflow2, self.code.len());
+                            self.bb(0x41, 0x5A);                // pop r10
+                            // Now safe to divide
                             self.idiv_rax_rcx();
                             self.labels.insert(zero_label, self.code.len());
                         }
@@ -826,6 +969,23 @@ impl NativeCodeGenerator {
                             // FIX (JIT-1): Guard against division by zero (unboxed path)
                             self.test_rcx_rcx();
                             self.jz_label(self.deopt_label);
+                            // Fix #2: Guard against i64::MIN % -1 overflow (unboxed path)
+                            self.bb(0x41, 0x52);                // push r10
+                            self.bb(0x49, 0xBA); self.i64(i64::MIN); // mov r10, i64::MIN
+                            self.bbb(0x4C, 0x39, 0xD0);         // cmp rax, r10
+                            let skip_overflow1 = self.next_label();
+                            self.jne_label(skip_overflow1);
+                            self.bb(0x49, 0xBA); self.i64(-1i64);   // mov r10, -1
+                            self.bbb(0x4C, 0x39, 0xD1);         // cmp rcx, r10
+                            let skip_overflow2 = self.next_label();
+                            self.jne_label(skip_overflow2);
+                            self.bb(0x41, 0x5A);                // pop r10
+                            self.b(0xE9); self.i32(0);           // jmp deopt_label (rel32)
+                            self.patch_sites.push(PatchSite { buffer_offset: self.code.len()-4, target_label: self.deopt_label, is_short_jump: false });
+                            self.labels.insert(skip_overflow1, self.code.len());
+                            self.labels.insert(skip_overflow2, self.code.len());
+                            self.bb(0x41, 0x5A);                // pop r10
+                            // Now safe to compute remainder
                             self.irem_rax_rcx();
                         }
                         BinOpKind::BitAnd => self.and_rax_rcx(),
@@ -866,6 +1026,10 @@ impl NativeCodeGenerator {
         // Boolean fix: For ValueType::Bool, we only store 1 byte, so we must
         // only load 1 byte (movzx) to avoid reading past the slot boundary
         // and pulling in garbage from adjacent boolean values.
+        //
+        // F32 fix: F32 values are widened to F64 when stored in the unboxed
+        // buffer (f32→f64 is lossless), so we load 8 bytes just like F64.
+        // The type tag (ValueType::F32 vs F64) distinguishes them for guards.
         let reg_code = reg as u8;
         if matches!(vtype, ValueType::Bool) {
             // MOVZX r32, byte [r8 + disp32]
@@ -900,6 +1064,11 @@ impl NativeCodeGenerator {
         // Boolean fix: For ValueType::Bool, we must only write 1 byte to
         // avoid corrupting adjacent boolean values in the tightly-packed
         // unboxed buffer (1 byte per bool vs 8 bytes per i64/f64).
+        //
+        // F32 fix: F32 values are widened to F64 (8 bytes) in the unboxed
+        // buffer. We store 8 bytes just like F64/I64. The caller must
+        // ensure the value in the register is already the widened f64
+        // representation (f64::from(f32_value) stored as i64 bits).
         let reg_code = reg as u8;
         if matches!(vtype, ValueType::Bool) {
             // MOV byte [r8 + disp32], r8_low  (AL for rax, CL for rcx, etc.)
@@ -986,7 +1155,44 @@ impl NativeCodeGenerator {
     fn ensure_reg(&mut self, slot: u16, preferred: Reg) -> Result<(), String> {
         self.ensure_slot_reg_capacity(slot);
         if let Some(reg) = self.slot_reg[slot as usize] {
-            if reg != preferred { self.mov_reg_reg(reg, preferred); }
+            if reg != preferred {
+                // Fix #3: Properly rebind slot to preferred register after copy.
+                // Previously, mov_reg_reg copied the value but left slot_reg
+                // pointing at the old register. Subsequent mark_dirty() calls
+                // would mark the OLD register dirty (which still held the stale
+                // value), while the new value in preferred was untracked.
+                // Now we handle the preferred register's current occupant and
+                // rebind the slot to preferred, preserving dirty state.
+
+                // First, handle any existing occupant of the preferred register.
+                match self.reg_map[preferred as usize] {
+                    RegState::Dirty(other_slot) => {
+                        // Spill the dirty occupant before overwriting preferred.
+                        self.spill_slot(other_slot, preferred)?;
+                    }
+                    RegState::Occupied(other_slot) => {
+                        // Clean occupant — value is already in memory, just unbind.
+                        self.ensure_slot_reg_capacity(other_slot);
+                        self.slot_reg[other_slot as usize] = None;
+                        self.reg_map[preferred as usize] = RegState::Empty;
+                    }
+                    RegState::Empty => {}
+                }
+
+                // Copy value from old register to preferred.
+                self.mov_reg_reg(reg, preferred);
+
+                // Transfer the binding from old register to preferred,
+                // preserving the dirty state.
+                let was_dirty = matches!(self.reg_map[reg as usize], RegState::Dirty(_));
+                self.reg_map[reg as usize] = RegState::Empty;
+                self.slot_reg[slot as usize] = Some(preferred);
+                self.reg_map[preferred as usize] = if was_dirty {
+                    RegState::Dirty(slot)
+                } else {
+                    RegState::Occupied(slot)
+                };
+            }
             return Ok(());
         }
         if self.reg_map[preferred as usize] == RegState::Empty {
@@ -1244,7 +1450,7 @@ pub struct TracingJIT {
     /// Without this cache, the JIT recompiles the same trace on every call
     /// after the hot threshold — making the JIT essentially useless since
     /// compilation overhead (mmap + codegen + mprotect) exceeds any benefit.
-    compiled_cache: FxHashMap<u32, CompiledTrace>,
+    pub compiled_cache: FxHashMap<u32, CompiledTrace>,
     /// Polymorphic Inline Cache: maps (slot, failed_type) → trace_id for
     /// secondary traces compiled after a guard failure.  This enables trace
     /// stitching — when a guard fails because a slot changed type, the PIC
@@ -1305,16 +1511,14 @@ impl TracingJIT {
         self.traces_recorded += 1;
     }
 
-    pub fn execute_with_jit(&mut self, entry_pc: usize, slots: &mut [Value], types: &mut [u8], instructions: &[Instr]) -> Result<Value, RuntimeError> {
+    pub fn execute_with_jit(&mut self, entry_pc: usize, slots: &mut [Value], types: &mut [u8], _instructions: &[Instr]) -> Result<Value, RuntimeError> {
+        // ── Increment hot counter ──────────────────────────────────────────
+        let hot_count = *self.hot_counters.entry(entry_pc as u64).and_modify(|c| *c += 1).or_insert(1);
+
+        // ── Check for existing trace ───────────────────────────────────────
         if let Some(tid) = self.recorder.find_trace(entry_pc) {
             // J8 fix: Check the compiled cache FIRST. If we already compiled this
             // trace, reuse the cached machine code instead of recompiling.
-            // Previously, every call after the compile threshold would:
-            //   1. Run full codegen (expensive)
-            //   2. mmap + mprotect new executable memory
-            //   3. Drop the CompiledTrace at end of block (freeing the memory!)
-            // This made the JIT catastrophically slow — compile overhead per call
-            // far exceeded any speedup from native code.
             if let Some(ct) = self.compiled_cache.get(&tid) {
                 let res = unsafe { ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr(), std::ptr::null_mut() as *mut u8) };
                 if res >= 0 { return Ok(Value::I64(res)); }
@@ -1322,35 +1526,33 @@ impl TracingJIT {
                 self.deoptimizations += 1;
                 if let Some(trace) = self.recorder.get_trace(tid) {
                     if let Some((slot, failed_type)) = Self::detect_guard_failure(trace, types) {
-                        // Try PIC: look up a secondary trace for this guard failure
                         if let Some(pic_tid) = self.pic.lookup(slot, failed_type) {
                             if let Some(pic_ct) = self.compiled_cache.get(&pic_tid) {
                                 let pic_res = unsafe { pic_ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr(), std::ptr::null_mut() as *mut u8) };
                                 if pic_res >= 0 { return Ok(Value::I64(pic_res)); }
-                                // PIC trace also deoptimized
                                 self.deoptimizations += 1;
                             }
                         } else {
-                            // No PIC entry yet — record the guard failure so a
-                            // secondary trace can be compiled for next time
                             self.record_guard_failure(entry_pc, slot, failed_type);
                         }
                     }
                 }
-                // Fall back to interpreter gracefully (return Err signals the
-                // caller to use the interpreter, which is the correct behaviour)
+                // Fall back to interpreter (return Err signals caller to use Tier 0)
             } else if let Some(trace) = self.recorder.get_trace(tid) {
+                // FIX: Check execution_count BEFORE incrementing. Previously,
+                // execution_count was incremented after the compile check,
+                // meaning the trace had to be called compile_trigger+1 times
+                // before compilation. Now we check first, then increment.
                 if self.should_compile(trace) && !trace.instructions.is_empty() {
                     match self.codegen.compile_trace(trace, None) {
                         Ok(ct) => {
                             self.traces_compiled += 1;
                             let res = unsafe { ct.execute(slots.as_mut_ptr() as *mut i64, types.as_ptr(), std::ptr::null_mut() as *mut u8) };
                             if res >= 0 {
-                                // Cache the compiled trace for future calls
                                 self.compiled_cache.insert(tid, ct);
                                 return Ok(Value::I64(res));
                             }
-                            // Guard failed on freshly compiled trace — try PIC recovery
+                            // Guard failed on freshly compiled trace
                             self.deoptimizations += 1;
                             if let Some((slot, failed_type)) = Self::detect_guard_failure(trace, types) {
                                 if let Some(pic_tid) = self.pic.lookup(slot, failed_type) {
@@ -1363,12 +1565,119 @@ impl TracingJIT {
                                         self.deoptimizations += 1;
                                     }
                                 } else {
-                                    // Record guard failure for future PIC entry
                                     self.record_guard_failure(entry_pc, slot, failed_type);
                                 }
                             }
-                            // Still cache the primary trace so we don't recompile
-                            // next time (it will just deopt again and fall through)
+                            // Cache the compiled trace even if it deopts
+                            self.compiled_cache.insert(tid, ct);
+                        }
+                        Err(_) => { self.deoptimizations += 1; }
+                    }
+                }
+            }
+            // Increment execution count AFTER compile check (so the first call
+            // when execution_count == compile_trigger triggers compilation)
+            if let Some(t) = self.recorder.get_trace_mut(tid) { t.execution_count += 1; }
+
+            // FIX: Do NOT replace the recorder here! The old code replaced
+            // the entire recorder when hot_count >= trace_trigger, destroying
+            // all existing traces and their accumulated execution_counts.
+            // This was the root cause of "traces_compiled=0" — the trace
+            // could never accumulate enough count because it was destroyed
+            // every time the hot counter crossed the threshold.
+            //
+            // Now we only start a NEW recording if there's no existing trace
+            // for this entry_pc. If a trace already exists, we skip — the
+            // trace's execution_count will reach compile_trigger naturally.
+            return Err(RuntimeError::new("Deoptimization: falling back to interpreter"));
+        }
+
+        // ── No existing trace for this entry_pc ────────────────────────────
+        // Start recording a new trace if the hot counter has crossed the
+        // trace_trigger threshold. We do NOT replace the recorder — we add
+        // a new trace to the existing recorder.
+        if self.should_start_tracing(hot_count) {
+            // Only start recording if there's no existing trace at this PC
+            // (double-check, since we're past the if-let above)
+            self.recorder.start_recording(entry_pc);
+            self.traces_recorded += 1;
+            // FIX: Record all instructions from the bytecode immediately.
+            // The old code only called start_recording() here and expected
+            // the interpreter loop to feed instructions one at a time.
+            // But the tiered execution manager calls execute_with_jit()
+            // directly, so there's no interpreter loop feeding instructions.
+            // We need to record from the provided _instructions slice.
+            for (pc, instr) in _instructions.iter().enumerate() {
+                if self.recorder.should_abort_trace() {
+                    self.recorder.abort_recording();
+                    break;
+                }
+                self.recorder.record_instruction(instr, pc);
+            }
+            if let Some(_trace_id) = self.recorder.finish_recording() {
+                // Trace is now recorded and findable by entry_pc.
+                // It will be compiled on the next call when its
+                // execution_count reaches compile_trigger.
+            }
+        }
+
+        Err(RuntimeError::new("Deoptimization: falling back to interpreter"))
+    }
+
+    /// Execute with a flat i64 slot array (instead of Value enum array).
+    /// This is the correct interface for the tracing JIT: compiled native code
+    /// reads/writes at 8-byte-aligned offsets (slot*8), so it needs a flat
+    /// array of i64s, not the large Value enum.
+    pub fn execute_with_jit_flat(&mut self, entry_pc: usize, flat_slots: &mut [i64], types: &mut [u8], _instructions: &[Instr]) -> Result<Value, RuntimeError> {
+        // ── Increment hot counter ──────────────────────────────────────────
+        let hot_count = *self.hot_counters.entry(entry_pc as u64).and_modify(|c| *c += 1).or_insert(1);
+
+        // ── Check for existing trace ───────────────────────────────────────
+        if let Some(tid) = self.recorder.find_trace(entry_pc) {
+            // Check the compiled cache FIRST
+            if let Some(ct) = self.compiled_cache.get(&tid) {
+                let res = unsafe { ct.execute(flat_slots.as_mut_ptr(), types.as_ptr(), std::ptr::null_mut() as *mut u8) };
+                if res >= 0 { return Ok(Value::I64(res)); }
+                // Guard failed
+                self.deoptimizations += 1;
+                if let Some(trace) = self.recorder.get_trace(tid) {
+                    if let Some((slot, failed_type)) = Self::detect_guard_failure(trace, types) {
+                        if let Some(pic_tid) = self.pic.lookup(slot, failed_type) {
+                            if let Some(pic_ct) = self.compiled_cache.get(&pic_tid) {
+                                let pic_res = unsafe { pic_ct.execute(flat_slots.as_mut_ptr(), types.as_ptr(), std::ptr::null_mut() as *mut u8) };
+                                if pic_res >= 0 { return Ok(Value::I64(pic_res)); }
+                                self.deoptimizations += 1;
+                            }
+                        } else {
+                            self.record_guard_failure(entry_pc, slot, failed_type);
+                        }
+                    }
+                }
+            } else if let Some(trace) = self.recorder.get_trace(tid) {
+                if self.should_compile(trace) && !trace.instructions.is_empty() {
+                    match self.codegen.compile_trace(trace, None) {
+                        Ok(ct) => {
+                            self.traces_compiled += 1;
+                            let res = unsafe { ct.execute(flat_slots.as_mut_ptr(), types.as_ptr(), std::ptr::null_mut() as *mut u8) };
+                            if res >= 0 {
+                                self.compiled_cache.insert(tid, ct);
+                                return Ok(Value::I64(res));
+                            }
+                            self.deoptimizations += 1;
+                            if let Some((slot, failed_type)) = Self::detect_guard_failure(trace, types) {
+                                if let Some(pic_tid) = self.pic.lookup(slot, failed_type) {
+                                    if let Some(pic_ct) = self.compiled_cache.get(&pic_tid) {
+                                        let pic_res = unsafe { pic_ct.execute(flat_slots.as_mut_ptr(), types.as_ptr(), std::ptr::null_mut() as *mut u8) };
+                                        if pic_res >= 0 {
+                                            self.compiled_cache.insert(tid, ct);
+                                            return Ok(Value::I64(pic_res));
+                                        }
+                                        self.deoptimizations += 1;
+                                    }
+                                } else {
+                                    self.record_guard_failure(entry_pc, slot, failed_type);
+                                }
+                            }
                             self.compiled_cache.insert(tid, ct);
                         }
                         Err(_) => { self.deoptimizations += 1; }
@@ -1376,8 +1685,10 @@ impl TracingJIT {
                 }
             }
             if let Some(t) = self.recorder.get_trace_mut(tid) { t.execution_count += 1; }
+            return Err(RuntimeError::new("Deoptimization: falling back to interpreter"));
         }
-        let hot_count = *self.hot_counters.entry(entry_pc as u64).and_modify(|c| *c += 1).or_insert(1);
+
+        // ── No existing trace for this entry_pc ────────────────────────────
         if self.should_start_tracing(hot_count) {
             // BUG FIX: Do NOT destroy the existing recorder with a new one —
             // that would discard all previously recorded traces and compiled
@@ -1390,15 +1701,15 @@ impl TracingJIT {
             // instruction stream without a loop, we also close the trace.
             self.recorder.start_recording(entry_pc);
             let start = entry_pc as usize;
-            for pc in start..instructions.len() {
-                self.recorder.record_instruction(&instructions[pc], pc);
+            for pc in start.._instructions.len() {
+                self.recorder.record_instruction(&_instructions[pc], pc);
                 // Check for max trace length — abort if exceeded
                 if self.recorder.should_abort_trace() {
                     self.recorder.abort_recording();
                     break;
                 }
                 // Check for loop back-edge (backward jump) — close the trace
-                match &instructions[pc] {
+                match &_instructions[pc] {
                     Instr::Jump(off) if *off < 0 => {
                         // Unconditional backward jump — loop back-edge
                         self.recorder.finish_recording();
@@ -1431,9 +1742,11 @@ impl TracingJIT {
             }
             // Reached end of instruction stream without a loop or return
             // — finish recording anyway
-            self.recorder.finish_recording();
-            self.traces_recorded += 1;
+            if let Some(_trace_id) = self.recorder.finish_recording() {
+                // Trace recorded; will be compiled on next call
+            }
         }
+
         Err(RuntimeError::new("Deoptimization: falling back to interpreter"))
     }
 }

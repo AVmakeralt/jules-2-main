@@ -3,22 +3,84 @@
 // Mathematical proof that optimized code preserves original semantics
 // Ensures correctness is never traded for speed
 // =========================================================================
+//
+// This module uses canonical IR types from `crate::compiler::ir` wherever
+// possible instead of defining duplicates:
+//
+//   • BlockId  → ir::CodegenBlockId (= usize)
+//   • VarId    → ir::VarId           (= usize)
+//   • BinaryOp → BinOp { Arith(IrBinOp), Cmp(IrCmpOp) }
+//   • UnaryOp  → ir::IrUnOp
+//
+// Types unique to translation validation (InstrId, Instruction,
+// BasicBlock, ControlFlowGraph, AbstractValue, SymbolicState,
+// ValidationResult, TranslationValidator) remain defined here.
 
 use std::collections::{HashMap, HashSet};
 
-/// Basic block identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlockId(pub usize);
+// Re-export canonical types from ir.rs for use in this module and consumers.
+pub use crate::compiler::ir::{CodegenBlockId as BlockId, IrBinOp, IrCmpOp, IrUnOp, VarId};
 
-/// Instruction identifier
+/// Instruction identifier — unique to translation validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InstrId(pub usize);
 
-/// Variable identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VarId(pub usize);
+// =============================================================================
+// BinOp — combined arithmetic + comparison operator
+// =============================================================================
+//
+// The translation validation module treats arithmetic and comparison
+// operations uniformly inside `Instruction` and `AbstractValue`, so we
+// wrap the canonical `IrBinOp` and `IrCmpOp` in a single enum rather
+// than duplicating their variants.
+// =============================================================================
 
-/// Instruction operation
+/// Binary operator used in translation validation.
+///
+/// Wraps the canonical [`IrBinOp`] (arithmetic / bitwise) and
+/// [`IrCmpOp`] (comparison) from `ir.rs` so that `Instruction` and
+/// `AbstractValue` can treat them uniformly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinOp {
+    /// Arithmetic or bitwise binary operation.
+    Arith(IrBinOp),
+    /// Comparison binary operation.
+    Cmp(IrCmpOp),
+}
+
+impl BinOp {
+    /// Construct from the old-style flat variants used before the refactor.
+    ///
+    /// Provided for backward-compatible construction in tests and callers
+    /// that were using the previous monolithic `BinaryOp` enum.
+    pub fn add() -> Self { BinOp::Arith(IrBinOp::Add) }
+    pub fn sub() -> Self { BinOp::Arith(IrBinOp::Sub) }
+    pub fn mul() -> Self { BinOp::Arith(IrBinOp::Mul) }
+    pub fn div() -> Self { BinOp::Arith(IrBinOp::Div) }
+    pub fn rem() -> Self { BinOp::Arith(IrBinOp::Rem) }
+    pub fn and() -> Self { BinOp::Arith(IrBinOp::And) }
+    pub fn or()  -> Self { BinOp::Arith(IrBinOp::Or) }
+    pub fn xor() -> Self { BinOp::Arith(IrBinOp::BitXor) }
+    pub fn shl() -> Self { BinOp::Arith(IrBinOp::Shl) }
+    pub fn shr() -> Self { BinOp::Arith(IrBinOp::Shr) }
+    pub fn eq()  -> Self { BinOp::Cmp(IrCmpOp::Eq) }
+    pub fn ne()  -> Self { BinOp::Cmp(IrCmpOp::Ne) }
+    pub fn lt()  -> Self { BinOp::Cmp(IrCmpOp::Lt) }
+    pub fn le()  -> Self { BinOp::Cmp(IrCmpOp::Le) }
+    pub fn gt()  -> Self { BinOp::Cmp(IrCmpOp::Gt) }
+    pub fn ge()  -> Self { BinOp::Cmp(IrCmpOp::Ge) }
+}
+
+// =============================================================================
+// Instruction — validation-level instruction representation
+// =============================================================================
+//
+// This is a higher-level view than `ir::IRInstr`, designed for symbolic
+// execution and equivalence checking. Conversion functions from `IRInstr`
+// are provided below.
+// =============================================================================
+
+/// Instruction operation (validation-level representation).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Instruction {
     /// Load from memory
@@ -26,9 +88,9 @@ pub enum Instruction {
     /// Store to memory
     Store { addr: VarId, src: VarId },
     /// Binary operation
-    BinaryOp { dst: VarId, op: BinaryOp, left: VarId, right: VarId },
+    BinaryOp { dst: VarId, op: BinOp, left: VarId, right: VarId },
     /// Unary operation
-    UnaryOp { dst: VarId, op: UnaryOp, src: VarId },
+    UnaryOp { dst: VarId, op: IrUnOp, src: VarId },
     /// Move/copy
     Move { dst: VarId, src: VarId },
     /// Conditional branch
@@ -43,35 +105,83 @@ pub enum Instruction {
     Phi { dst: VarId, incoming: Vec<(BlockId, VarId)> },
 }
 
-/// Binary operation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BinaryOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    And,
-    Or,
-    Xor,
-    Shl,
-    Shr,
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
+// =============================================================================
+// Conversion from ir::IRInstr
+// =============================================================================
+
+impl Instruction {
+    /// Convert a codegen-level [`crate::compiler::ir::IRInstr`] into a
+    /// validation-level `Instruction`.
+    ///
+    /// Returns `None` for instructions that have no validation-level
+    /// equivalent (e.g., `Label`, `Comment`).
+    pub fn from_codegen_instr(instr: &crate::compiler::ir::IRInstr) -> Option<Self> {
+        use crate::compiler::ir::IRInstr;
+        match instr {
+            IRInstr::Const { dst, .. } | IRInstr::ConstF64 { dst, .. } => {
+                // Constants are materialised as moves from themselves;
+                // at the validation level we treat them as identity moves.
+                Some(Instruction::Move { dst: *dst, src: *dst })
+            }
+            IRInstr::Add { dst, lhs, rhs }  => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::add(), left: *lhs, right: *rhs }),
+            IRInstr::Sub { dst, lhs, rhs }  => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::sub(), left: *lhs, right: *rhs }),
+            IRInstr::Mul { dst, lhs, rhs }  => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::mul(), left: *lhs, right: *rhs }),
+            IRInstr::SDiv { dst, lhs, rhs } => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::div(), left: *lhs, right: *rhs }),
+            IRInstr::SRem { dst, lhs, rhs } => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::rem(), left: *lhs, right: *rhs }),
+            IRInstr::Neg { dst, src }       => Some(Instruction::UnaryOp { dst: *dst, op: IrUnOp::Neg, src: *src }),
+            IRInstr::And { dst, lhs, rhs }  => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::and(), left: *lhs, right: *rhs }),
+            IRInstr::Or  { dst, lhs, rhs }  => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::or(),  left: *lhs, right: *rhs }),
+            IRInstr::Xor { dst, lhs, rhs }  => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::xor(), left: *lhs, right: *rhs }),
+            IRInstr::Shl { dst, lhs, rhs }  => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::shl(), left: *lhs, right: *rhs }),
+            IRInstr::AShr { dst, lhs, rhs } => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::shr(), left: *lhs, right: *rhs }),
+            IRInstr::LShr { dst, lhs, rhs } => Some(Instruction::BinaryOp { dst: *dst, op: BinOp::shr(), left: *lhs, right: *rhs }),
+            IRInstr::Not { dst, src }       => Some(Instruction::UnaryOp { dst: *dst, op: IrUnOp::Not, src: *src }),
+            IRInstr::ICmp { dst, cond, lhs, rhs } => {
+                let op = match cond {
+                    crate::compiler::ir::ICmpCond::Eq  => BinOp::eq(),
+                    crate::compiler::ir::ICmpCond::Ne  => BinOp::ne(),
+                    crate::compiler::ir::ICmpCond::SLt => BinOp::lt(),
+                    crate::compiler::ir::ICmpCond::SLe => BinOp::le(),
+                    crate::compiler::ir::ICmpCond::SGt => BinOp::gt(),
+                    crate::compiler::ir::ICmpCond::SGe => BinOp::ge(),
+                    crate::compiler::ir::ICmpCond::ULt => BinOp::lt(),
+                    crate::compiler::ir::ICmpCond::ULe => BinOp::le(),
+                    crate::compiler::ir::ICmpCond::UGt => BinOp::gt(),
+                    crate::compiler::ir::ICmpCond::UGe => BinOp::ge(),
+                };
+                Some(Instruction::BinaryOp { dst: *dst, op, left: *lhs, right: *rhs })
+            }
+            IRInstr::Move { dst, src } => Some(Instruction::Move { dst: *dst, src: *src }),
+            IRInstr::Br { target } => Some(Instruction::Jump { target: *target }),
+            IRInstr::CondBr { cond, if_true, if_false } => {
+                Some(Instruction::Branch { cond: *cond, true_block: *if_true, false_block: *if_false })
+            }
+            IRInstr::Ret { value } => Some(Instruction::Return { value: *value }),
+            IRInstr::Call { dst, func, args } => {
+                Some(Instruction::Call { func: func.clone(), args: args.to_vec(), ret: Some(*dst) })
+            }
+            IRInstr::TailCall { func, args } => {
+                Some(Instruction::Call { func: func.clone(), args: args.to_vec(), ret: None })
+            }
+            IRInstr::Alloca { dst, .. } => Some(Instruction::Move { dst: *dst, src: *dst }),
+            IRInstr::Store { ptr, value } => Some(Instruction::Store { addr: *ptr, src: *value }),
+            IRInstr::Load { dst, ptr } => Some(Instruction::Load { dst: *dst, addr: *ptr }),
+            IRInstr::Phi { dst, incoming } => {
+                Some(Instruction::Phi { dst: *dst, incoming: incoming.to_vec() })
+            }
+            IRInstr::Label | IRInstr::Comment(_) => None,
+        }
+    }
 }
 
-/// Unary operation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum UnaryOp {
-    Neg,
-    Not,
-}
+// =============================================================================
+// BasicBlock — validation-level basic block
+// =============================================================================
 
-/// Basic block
+/// Basic block (validation-level representation).
+///
+/// This is a simplified view of `ir::IRBlock` that holds validation-level
+/// `Instruction`s instead of `IRInstr`s.
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
     /// Block ID
@@ -84,7 +194,14 @@ pub struct BasicBlock {
     pub predecessors: Vec<BlockId>,
 }
 
-/// Control flow graph
+// =============================================================================
+// ControlFlowGraph — validation-level CFG
+// =============================================================================
+
+/// Control flow graph (validation-level representation).
+///
+/// Can be constructed from an `ir::IRFunction` via
+/// [`ControlFlowGraph::from_codegen_function`].
 #[derive(Debug, Clone)]
 pub struct ControlFlowGraph {
     /// Basic blocks
@@ -94,6 +211,46 @@ pub struct ControlFlowGraph {
     /// Exit block
     pub exit: BlockId,
 }
+
+impl ControlFlowGraph {
+    /// Build a `ControlFlowGraph` from a codegen-level `ir::IRFunction`.
+    ///
+    /// Converts each `IRInstr` to a validation-level `Instruction` and
+    /// reconstructs the block structure with predecessors/successors.
+    pub fn from_codegen_function(func: &crate::compiler::ir::IRFunction) -> Self {
+        let mut blocks = HashMap::new();
+
+        for ir_block in &func.blocks {
+            let block_id = ir_block.id;
+            let instructions: Vec<Instruction> = ir_block.instrs.iter()
+                .filter_map(|instr| Instruction::from_codegen_instr(instr))
+                .collect();
+
+            blocks.insert(block_id, BasicBlock {
+                id: block_id,
+                instructions,
+                successors: ir_block.successors.clone(),
+                predecessors: ir_block.predecessors.clone(),
+            });
+        }
+
+        // Determine exit block: the block containing a Return instruction.
+        let exit = blocks.iter()
+            .find(|(_, b)| b.instructions.iter().any(|i| matches!(i, Instruction::Return { .. })))
+            .map(|(id, _)| *id)
+            .unwrap_or(func.entry_block);
+
+        ControlFlowGraph {
+            blocks,
+            entry: func.entry_block,
+            exit,
+        }
+    }
+}
+
+// =============================================================================
+// AbstractValue — symbolic execution domain
+// =============================================================================
 
 /// Abstract value for symbolic execution
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -105,9 +262,9 @@ pub enum AbstractValue {
     /// Variable reference
     Var(VarId),
     /// Binary expression
-    BinaryExpr { op: BinaryOp, left: Box<AbstractValue>, right: Box<AbstractValue> },
+    BinaryExpr { op: BinOp, left: Box<AbstractValue>, right: Box<AbstractValue> },
     /// Unary expression
-    UnaryExpr { op: UnaryOp, src: Box<AbstractValue> },
+    UnaryExpr { op: IrUnOp, src: Box<AbstractValue> },
     /// Phi expression
     Phi { incoming: Vec<(BlockId, AbstractValue)> },
 }
@@ -312,11 +469,11 @@ impl TranslationValidator {
             (AbstractValue::Var(v1), AbstractValue::Var(v2)) => {
                 self.var_mapping.get(v1) == Some(v2) || v1 == v2
             }
-            (AbstractValue::BinaryExpr { op: op1, left: l1, right: r1 }, 
+            (AbstractValue::BinaryExpr { op: op1, left: l1, right: r1 },
              AbstractValue::BinaryExpr { op: op2, left: l2, right: r2 }) => {
                 op1 == op2 && self.values_equivalent(l1, l2) && self.values_equivalent(r1, r2)
             }
-            (AbstractValue::UnaryExpr { op: op1, src: s1 }, 
+            (AbstractValue::UnaryExpr { op: op1, src: s1 },
              AbstractValue::UnaryExpr { op: op2, src: s2 }) => {
                 op1 == op2 && self.values_equivalent(s1, s2)
             }
@@ -419,11 +576,10 @@ impl TranslationValidator {
     /// Execute an instruction symbolically
     fn execute_instruction(&self, instr: &Instruction, state: &mut SymbolicState) {
         match instr {
-            Instruction::Load { dst, addr } => {
-                let addr_val = state.values.get(addr).cloned().unwrap_or(AbstractValue::Unknown);
+            Instruction::Load { dst, addr: _ } => {
                 state.values.insert(*dst, AbstractValue::Unknown);
             }
-            Instruction::Store { addr, src } => {
+            Instruction::Store { addr: _, src: _ } => {
                 // Store doesn't produce a value
             }
             Instruction::BinaryOp { dst, op, left, right } => {
@@ -446,14 +602,13 @@ impl TranslationValidator {
                 let src_val = state.values.get(src).cloned().unwrap_or(AbstractValue::Unknown);
                 state.values.insert(*dst, src_val);
             }
-            Instruction::Branch { cond, true_block, false_block } => {
-                let cond_val = state.values.get(cond).cloned().unwrap_or(AbstractValue::Unknown);
+            Instruction::Branch { cond: _, true_block: _, false_block: _ } => {
                 // Branch affects path condition
             }
             Instruction::Jump { .. } => {
                 // Jump doesn't affect state
             }
-            Instruction::Call { func, args, ret } => {
+            Instruction::Call { func: _, args: _, ret } => {
                 // Function call - treat as unknown
                 if let Some(ret_var) = ret {
                     state.values.insert(*ret_var, AbstractValue::Unknown);
@@ -466,7 +621,7 @@ impl TranslationValidator {
                 let phi_values: Vec<_> = incoming.iter()
                     .map(|(_, var)| state.values.get(var).cloned().unwrap_or(AbstractValue::Unknown))
                     .collect();
-                
+
                 if phi_values.len() == 1 {
                     state.values.insert(*dst, phi_values[0].clone());
                 } else {
@@ -619,41 +774,41 @@ mod tests {
     fn test_simple_validation() {
         let mut original = ControlFlowGraph {
             blocks: HashMap::new(),
-            entry: BlockId(0),
-            exit: BlockId(1),
+            entry: 0,
+            exit: 1,
         };
 
         let block0 = BasicBlock {
-            id: BlockId(0),
+            id: 0,
             instructions: vec![
                 Instruction::BinaryOp {
-                    dst: VarId(0),
-                    op: BinaryOp::Add,
-                    left: VarId(1),
-                    right: VarId(2),
+                    dst: 0,
+                    op: BinOp::add(),
+                    left: 1,
+                    right: 2,
                 },
             ],
-            successors: vec![BlockId(1)],
+            successors: vec![1],
             predecessors: vec![],
         };
 
         let block1 = BasicBlock {
-            id: BlockId(1),
-            instructions: vec![Instruction::Return { value: Some(VarId(0)) }],
+            id: 1,
+            instructions: vec![Instruction::Return { value: Some(0) }],
             successors: vec![],
-            predecessors: vec![BlockId(0)],
+            predecessors: vec![0],
         };
 
-        original.blocks.insert(BlockId(0), block0);
-        original.blocks.insert(BlockId(1), block1);
+        original.blocks.insert(0, block0);
+        original.blocks.insert(1, block1);
 
         let mut optimized = original.clone();
-        optimized.entry = BlockId(0);
-        optimized.exit = BlockId(1);
+        optimized.entry = 0;
+        optimized.exit = 1;
 
         let mut validator = TranslationValidator::new(original, optimized);
-        validator.set_block_mapping(BlockId(0), BlockId(0));
-        validator.set_block_mapping(BlockId(1), BlockId(1));
+        validator.set_block_mapping(0, 0);
+        validator.set_block_mapping(1, 1);
 
         let result = validator.validate();
         assert_eq!(result, ValidationResult::Valid);
@@ -663,70 +818,80 @@ mod tests {
     fn test_constant_propagation_validation() {
         let mut original = ControlFlowGraph {
             blocks: HashMap::new(),
-            entry: BlockId(0),
-            exit: BlockId(1),
+            entry: 0,
+            exit: 1,
         };
 
         let block0 = BasicBlock {
-            id: BlockId(0),
+            id: 0,
             instructions: vec![
                 Instruction::BinaryOp {
-                    dst: VarId(0),
-                    op: BinaryOp::Add,
-                    left: VarId(1),
-                    right: VarId(2),
+                    dst: 0,
+                    op: BinOp::add(),
+                    left: 1,
+                    right: 2,
                 },
             ],
-            successors: vec![BlockId(1)],
+            successors: vec![1],
             predecessors: vec![],
         };
 
         let block1 = BasicBlock {
-            id: BlockId(1),
-            instructions: vec![Instruction::Return { value: Some(VarId(0)) }],
+            id: 1,
+            instructions: vec![Instruction::Return { value: Some(0) }],
             successors: vec![],
-            predecessors: vec![BlockId(0)],
+            predecessors: vec![0],
         };
 
-        original.blocks.insert(BlockId(0), block0);
-        original.blocks.insert(BlockId(1), block1);
+        original.blocks.insert(0, block0);
+        original.blocks.insert(1, block1);
 
         let mut optimized = ControlFlowGraph {
             blocks: HashMap::new(),
-            entry: BlockId(0),
-            exit: BlockId(1),
+            entry: 0,
+            exit: 1,
         };
 
         // Optimized version with constant folded
         let opt_block0 = BasicBlock {
-            id: BlockId(0),
+            id: 0,
             instructions: vec![
                 Instruction::Move {
-                    dst: VarId(0),
-                    src: VarId(3), // Constant result
+                    dst: 0,
+                    src: 3, // Constant result
                 },
             ],
-            successors: vec![BlockId(1)],
+            successors: vec![1],
             predecessors: vec![],
         };
 
         let opt_block1 = BasicBlock {
-            id: BlockId(1),
-            instructions: vec![Instruction::Return { value: Some(VarId(0)) }],
+            id: 1,
+            instructions: vec![Instruction::Return { value: Some(0) }],
             successors: vec![],
-            predecessors: vec![BlockId(0)],
+            predecessors: vec![0],
         };
 
-        optimized.blocks.insert(BlockId(0), opt_block0);
-        optimized.blocks.insert(BlockId(1), opt_block1);
+        optimized.blocks.insert(0, opt_block0);
+        optimized.blocks.insert(1, opt_block1);
 
         let mut validator = TranslationValidator::new(original, optimized);
-        validator.set_block_mapping(BlockId(0), BlockId(0));
-        validator.set_block_mapping(BlockId(1), BlockId(1));
-        validator.set_var_mapping(VarId(0), VarId(0));
+        validator.set_block_mapping(0, 0);
+        validator.set_block_mapping(1, 1);
+        validator.set_var_mapping(0, 0);
 
         let result = validator.validate();
         // Should be valid or unknown (depends on constant folding proof)
         assert!(!matches!(result, ValidationResult::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_binop_roundtrip() {
+        // Verify that BinOp convenience constructors match the expected IrBinOp/IrCmpOp variants
+        assert_eq!(BinOp::add(), BinOp::Arith(IrBinOp::Add));
+        assert_eq!(BinOp::sub(), BinOp::Arith(IrBinOp::Sub));
+        assert_eq!(BinOp::eq(),  BinOp::Cmp(IrCmpOp::Eq));
+        assert_eq!(BinOp::ne(),  BinOp::Cmp(IrCmpOp::Ne));
+        assert_eq!(BinOp::lt(),  BinOp::Cmp(IrCmpOp::Lt));
     }
 }

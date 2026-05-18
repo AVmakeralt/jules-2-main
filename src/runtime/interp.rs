@@ -490,6 +490,7 @@ impl fmt::Display for Value {
             Value::Vec2(v) => write!(f, "vec2({}, {})", v[0], v[1]),
             Value::Vec3(v) => write!(f, "vec3({}, {}, {})", v[0], v[1], v[2]),
             Value::Vec4(v) => write!(f, "vec4({}, {}, {}, {})", v[0], v[1], v[2], v[3]),
+            Value::Mat2(m) => write!(f, "mat2({}, {}, {}, {})", m[0][0], m[0][1], m[1][0], m[1][1]),
             Value::Mat3(_) => write!(f, "mat3(…)"),
             Value::Mat4(_) => write!(f, "mat4(…)"),
             Value::Quat(q) => write!(f, "quat({}, {}, {}, {})", q[0], q[1], q[2], q[3]),
@@ -930,8 +931,9 @@ impl Tensor {
                 let row = &mut d[r * cols..(r + 1) * cols];
                 let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let sum: f32 = row.iter().map(|x| (x - max).exp()).sum();
+                let sum_safe = if sum == 0.0 { 1e-12 } else { sum };
                 for x in row.iter_mut() {
-                    *x = (*x - max).exp() / sum;
+                    *x = (*x - max).exp() / sum_safe;
                 }
             }
         }
@@ -2800,10 +2802,19 @@ impl Tensor {
             self.shape[self.shape.len() - 1],
         );
         let data = self.cpu_data();
-        let mut out = vec![0.0_f32; rows * cols];
-        for r in 0..rows {
-            for c in 0..cols {
-                out[c * rows + r] = data[r * cols + c];
+        let batch: usize = if self.shape.len() > 2 {
+            self.shape[..self.shape.len() - 2].iter().product()
+        } else {
+            1
+        };
+        let mut out = vec![0.0_f32; self.numel()];
+        for b in 0..batch {
+            let base_in = b * rows * cols;
+            let base_out = b * cols * rows; // transposed: cols rows
+            for r in 0..rows {
+                for c in 0..cols {
+                    out[base_out + c * rows + r] = data[base_in + r * cols + c];
+                }
             }
         }
         let mut shape = self.shape.clone();
@@ -4060,12 +4071,12 @@ pub fn vm_exec(
                                 }
                                 Value::I32(a.wrapping_rem(b))
                             }
-                            BinOpKind::Lt => Value::I32(if a < b { 1 } else { 0 }),
-                            BinOpKind::Le => Value::I32(if a <= b { 1 } else { 0 }),
-                            BinOpKind::Gt => Value::I32(if a > b { 1 } else { 0 }),
-                            BinOpKind::Ge => Value::I32(if a >= b { 1 } else { 0 }),
-                            BinOpKind::Eq => Value::I32(if a == b { 1 } else { 0 }),
-                            BinOpKind::Ne => Value::I32(if a != b { 1 } else { 0 }),
+                            BinOpKind::Lt => Value::Bool(a < b),
+                            BinOpKind::Le => Value::Bool(a <= b),
+                            BinOpKind::Gt => Value::Bool(a > b),
+                            BinOpKind::Ge => Value::Bool(a >= b),
+                            BinOpKind::Eq => Value::Bool(a == b),
+                            BinOpKind::Ne => Value::Bool(a != b),
                             _ => return rt_err!("op {:?} not defined for i32", op),
                         }
                     }
@@ -4089,12 +4100,12 @@ pub fn vm_exec(
                                 }
                                 Value::F32((a / b).floor())
                             }
-                            BinOpKind::Lt => Value::I32(if a < b { 1 } else { 0 }),
-                            BinOpKind::Le => Value::I32(if a <= b { 1 } else { 0 }),
-                            BinOpKind::Gt => Value::I32(if a > b { 1 } else { 0 }),
-                            BinOpKind::Ge => Value::I32(if a >= b { 1 } else { 0 }),
-                            BinOpKind::Eq => Value::I32(if a == b { 1 } else { 0 }),
-                            BinOpKind::Ne => Value::I32(if a != b { 1 } else { 0 }),
+                            BinOpKind::Lt => Value::Bool(a < b),
+                            BinOpKind::Le => Value::Bool(a <= b),
+                            BinOpKind::Gt => Value::Bool(a > b),
+                            BinOpKind::Ge => Value::Bool(a >= b),
+                            BinOpKind::Eq => Value::Bool(a == b),
+                            BinOpKind::Ne => Value::Bool(a != b),
                             _ => return rt_err!("op {:?} not defined for f32", op),
                         }
                     }
@@ -4117,12 +4128,12 @@ pub fn vm_exec(
                                 }
                                 Value::I64(a.wrapping_rem(b))
                             }
-                            BinOpKind::Lt => Value::I32(if a < b { 1 } else { 0 }),
-                            BinOpKind::Le => Value::I32(if a <= b { 1 } else { 0 }),
-                            BinOpKind::Gt => Value::I32(if a > b { 1 } else { 0 }),
-                            BinOpKind::Ge => Value::I32(if a >= b { 1 } else { 0 }),
-                            BinOpKind::Eq => Value::I32(if a == b { 1 } else { 0 }),
-                            BinOpKind::Ne => Value::I32(if a != b { 1 } else { 0 }),
+                            BinOpKind::Lt => Value::Bool(a < b),
+                            BinOpKind::Le => Value::Bool(a <= b),
+                            BinOpKind::Gt => Value::Bool(a > b),
+                            BinOpKind::Ge => Value::Bool(a >= b),
+                            BinOpKind::Eq => Value::Bool(a == b),
+                            BinOpKind::Ne => Value::Bool(a != b),
                             _ => return rt_err!("op {:?} not defined for i64", op),
                         }
                     }
@@ -4468,7 +4479,13 @@ pub fn vm_exec_i32(
             Instr::LoadUnit(d) => *reg_mut!(*d) = 0,
             Instr::LoadBool(d, b) => *reg_mut!(*d) = if *b { 1 } else { 0 },
             Instr::LoadI32(d, v) => *reg_mut!(*d) = *v,
-            Instr::LoadI64(d, v) => *reg_mut!(*d) = *v as i32,
+            Instr::LoadI64(d, v) => {
+                if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                    *reg_mut!(*d) = *v as i32;
+                } else {
+                    return None; // Fall back to full VM
+                }
+            }
             Instr::LoadF32(..)
             | Instr::LoadF64(..)
             | Instr::LoadStr(..)
@@ -7024,8 +7041,9 @@ impl Interpreter {
             }
             "math::random_seed" => {
                 if let Some(seed) = args.first().and_then(|v| v.as_i64()) {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    RAND_STATE.store(seed as u64, Relaxed);
+                    RNG_STATE.with(|state| {
+                        *state.borrow_mut() = seed as u64;
+                    });
                     Ok(Value::Bool(true))
                 } else {
                     rt_err!("math::random_seed(seed) requires integer seed")
@@ -9996,12 +10014,12 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
                     Ok(Value::I32(a % b))
                 }
             }
-            BinOpKind::Lt => Ok(Value::I32(if a < b { 1 } else { 0 })),
-            BinOpKind::Le => Ok(Value::I32(if a <= b { 1 } else { 0 })),
-            BinOpKind::Gt => Ok(Value::I32(if a > b { 1 } else { 0 })),
-            BinOpKind::Ge => Ok(Value::I32(if a >= b { 1 } else { 0 })),
-            BinOpKind::Eq => Ok(Value::I32(if a == b { 1 } else { 0 })),
-            BinOpKind::Ne => Ok(Value::I32(if a != b { 1 } else { 0 })),
+            BinOpKind::Lt => Ok(Value::Bool(a < b)),
+            BinOpKind::Le => Ok(Value::Bool(a <= b)),
+            BinOpKind::Gt => Ok(Value::Bool(a > b)),
+            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
+            BinOpKind::Eq => Ok(Value::Bool(a == b)),
+            BinOpKind::Ne => Ok(Value::Bool(a != b)),
             BinOpKind::BitAnd => Ok(Value::I32(a & b)),
             BinOpKind::BitOr => Ok(Value::I32(a | b)),
             BinOpKind::BitXor => Ok(Value::I32(a ^ b)),
@@ -10035,12 +10053,12 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
                     Ok(Value::F32((a / b).floor()))
                 }
             }
-            BinOpKind::Lt => Ok(Value::I32(if a < b { 1 } else { 0 })),
-            BinOpKind::Le => Ok(Value::I32(if a <= b { 1 } else { 0 })),
-            BinOpKind::Gt => Ok(Value::I32(if a > b { 1 } else { 0 })),
-            BinOpKind::Ge => Ok(Value::I32(if a >= b { 1 } else { 0 })),
-            BinOpKind::Eq => Ok(Value::I32(if a == b { 1 } else { 0 })),
-            BinOpKind::Ne => Ok(Value::I32(if a != b { 1 } else { 0 })),
+            BinOpKind::Lt => Ok(Value::Bool(a < b)),
+            BinOpKind::Le => Ok(Value::Bool(a <= b)),
+            BinOpKind::Gt => Ok(Value::Bool(a > b)),
+            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
+            BinOpKind::Eq => Ok(Value::Bool(a == b)),
+            BinOpKind::Ne => Ok(Value::Bool(a != b)),
             _ => Err(RuntimeError::new(format!(
                 "op {:?} not defined for f32",
                 op
@@ -10068,12 +10086,12 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
                     Ok(Value::I64(a % b))
                 }
             }
-            BinOpKind::Lt => Ok(Value::I32(if a < b { 1 } else { 0 })),
-            BinOpKind::Le => Ok(Value::I32(if a <= b { 1 } else { 0 })),
-            BinOpKind::Gt => Ok(Value::I32(if a > b { 1 } else { 0 })),
-            BinOpKind::Ge => Ok(Value::I32(if a >= b { 1 } else { 0 })),
-            BinOpKind::Eq => Ok(Value::I32(if a == b { 1 } else { 0 })),
-            BinOpKind::Ne => Ok(Value::I32(if a != b { 1 } else { 0 })),
+            BinOpKind::Lt => Ok(Value::Bool(a < b)),
+            BinOpKind::Le => Ok(Value::Bool(a <= b)),
+            BinOpKind::Gt => Ok(Value::Bool(a > b)),
+            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
+            BinOpKind::Eq => Ok(Value::Bool(a == b)),
+            BinOpKind::Ne => Ok(Value::Bool(a != b)),
             BinOpKind::BitAnd => Ok(Value::I64(a & b)),
             BinOpKind::BitOr => Ok(Value::I64(a | b)),
             BinOpKind::BitXor => Ok(Value::I64(a ^ b)),
@@ -10107,12 +10125,12 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
                     Ok(Value::F64((a / b).floor()))
                 }
             }
-            BinOpKind::Lt => Ok(Value::I32(if a < b { 1 } else { 0 })),
-            BinOpKind::Le => Ok(Value::I32(if a <= b { 1 } else { 0 })),
-            BinOpKind::Gt => Ok(Value::I32(if a > b { 1 } else { 0 })),
-            BinOpKind::Ge => Ok(Value::I32(if a >= b { 1 } else { 0 })),
-            BinOpKind::Eq => Ok(Value::I32(if a == b { 1 } else { 0 })),
-            BinOpKind::Ne => Ok(Value::I32(if a != b { 1 } else { 0 })),
+            BinOpKind::Lt => Ok(Value::Bool(a < b)),
+            BinOpKind::Le => Ok(Value::Bool(a <= b)),
+            BinOpKind::Gt => Ok(Value::Bool(a > b)),
+            BinOpKind::Ge => Ok(Value::Bool(a >= b)),
+            BinOpKind::Eq => Ok(Value::Bool(a == b)),
+            BinOpKind::Ne => Ok(Value::Bool(a != b)),
             _ => Err(RuntimeError::new(format!(
                 "op {:?} not defined for f64",
                 op
@@ -10864,16 +10882,16 @@ fn mat4_vec4_mul(m: [[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
 
 // ── PRNG (LCG, no external crate needed) ───────────────────────────────────
 
-static RAND_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(12345678);
+thread_local! {
+    static RNG_STATE: RefCell<u64> = RefCell::new(12345678);
+}
 
 fn pseudo_rand() -> f32 {
-    use std::sync::atomic::Ordering::Relaxed;
-    let s = RAND_STATE
-        .fetch_add(2891336453, Relaxed)
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    RAND_STATE.store(s, Relaxed);
-    (s >> 33) as f32 / u32::MAX as f32
+    RNG_STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*s >> 33) as f32 / u32::MAX as f32
+    })
 }
 
 fn pseudo_rand_small() -> f32 {
@@ -11347,7 +11365,7 @@ mod tests {
                 ty: None,
             }),
         };
-        assert!(matches!(eval(&e), Value::I32(1)));
+        assert!(matches!(eval(&e), Value::Bool(true)));
     }
 
     #[test]

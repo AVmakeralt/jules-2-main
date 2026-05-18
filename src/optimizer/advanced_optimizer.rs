@@ -2137,11 +2137,11 @@ impl PeepholeOptimizer {
                 if let Stmt::Let { pattern: Pattern::Ident { name, .. }, init, .. } = &mut block.stmts[i + 1] {
                     *name = y_name;
                     *init = Some(x_init);
+                    block.stmts.remove(i);
+                    self.optimizations += 1;
+                    // don't advance i — re-check this position
+                    continue;
                 }
-                block.stmts.remove(i);
-                self.optimizations += 1;
-                // don't advance i — re-check this position
-                continue;
             }
             i += 1;
         }

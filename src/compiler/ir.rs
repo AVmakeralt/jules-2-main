@@ -314,7 +314,7 @@ pub enum IrLValue {
 // =============================================================================
 
 /// Binary operators at the IR level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IrBinOp {
     Add,
     Sub,
@@ -332,14 +332,14 @@ pub enum IrBinOp {
 }
 
 /// Unary operators at the IR level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IrUnOp {
     Neg,
     Not,
 }
 
 /// Comparison operators at the IR level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IrCmpOp {
     Eq,
     Ne,
@@ -2856,4 +2856,209 @@ pub struct IrFunctionFull {
     pub capabilities: EffectCapSet,
     /// Visibility / access control.
     pub visibility: IrVisibility,
+}
+
+// =============================================================================
+// §23  CODEGEN IR — Low-level SSA IR for native code generation
+// =============================================================================
+//
+// These types form the codegen-level IR used by the AOT native compiler.
+// They are deliberately separate from the high-level IR types above:
+//
+//   • VarId (usize) vs ValueId (u32)  — VarId is a flat index for codegen;
+//     ValueId is a typed, span-tracked SSA reference in the high-level IR.
+//
+//   • CodegenBlockId (usize) vs BlockId (u32 struct)  — CodegenBlockId is
+//     a flat sequential index for O(1) Vec access; BlockId is a newtype
+//     used in the high-level IR for block-parameter CFG representation.
+// =============================================================================
+
+/// Variable identifier in the codegen IR (`usize` for fast Vec indexing).
+/// Distinct from [`ValueId`] which is a `u32` newtype used in the
+/// high-level typed IR above.
+pub type VarId = usize;
+
+/// Block identifier in the codegen IR (`usize` for fast Vec indexing).
+/// Distinct from [`BlockId`] which is a `u32` newtype struct used in the
+/// high-level typed IR above.
+pub type CodegenBlockId = usize;
+
+/// Non-allocating small vector for instruction use-lists.
+/// Most instructions have ≤4 uses, so SmallVec avoids heap allocation.
+pub type SmallVars = smallvec::SmallVec<[VarId; 4]>;
+
+/// SmallVec for Phi incoming values — most Phi nodes have ≤2 incoming edges.
+pub type SmallPhi = smallvec::SmallVec<[(CodegenBlockId, VarId); 2]>;
+
+/// Integer comparison condition codes for the codegen IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ICmpCond {
+    Eq, Ne,
+    SLt, SLe, SGt, SGe,
+    ULt, ULe, UGt, UGe,
+}
+
+impl ICmpCond {
+    /// Invert the condition (for branch optimisation).
+    pub fn invert(self) -> Self {
+        match self {
+            ICmpCond::Eq  => ICmpCond::Ne,  ICmpCond::Ne  => ICmpCond::Eq,
+            ICmpCond::SLt => ICmpCond::SGe, ICmpCond::SGe => ICmpCond::SLt,
+            ICmpCond::SLe => ICmpCond::SGt, ICmpCond::SGt => ICmpCond::SLe,
+            ICmpCond::ULt => ICmpCond::UGe, ICmpCond::UGe => ICmpCond::ULt,
+            ICmpCond::ULe => ICmpCond::UGt, ICmpCond::UGt => ICmpCond::ULe,
+        }
+    }
+}
+
+/// SSA-form three-address code IR instruction (codegen level).
+#[derive(Debug, Clone)]
+pub enum IRInstr {
+    // ── Constants ────────────────────────────────────────────────────────
+    Const   { dst: VarId, value: i64 },
+    ConstF64 { dst: VarId, value: f64 },
+
+    // ── Integer arithmetic ───────────────────────────────────────────────
+    Add  { dst: VarId, lhs: VarId, rhs: VarId },
+    Sub  { dst: VarId, lhs: VarId, rhs: VarId },
+    Mul  { dst: VarId, lhs: VarId, rhs: VarId },
+    SDiv { dst: VarId, lhs: VarId, rhs: VarId },
+    SRem { dst: VarId, lhs: VarId, rhs: VarId },
+    Neg  { dst: VarId, src: VarId },
+
+    // ── Bitwise ──────────────────────────────────────────────────────────
+    And  { dst: VarId, lhs: VarId, rhs: VarId },
+    Or   { dst: VarId, lhs: VarId, rhs: VarId },
+    Xor  { dst: VarId, lhs: VarId, rhs: VarId },
+    Shl  { dst: VarId, lhs: VarId, rhs: VarId },
+    AShr { dst: VarId, lhs: VarId, rhs: VarId },
+    LShr { dst: VarId, lhs: VarId, rhs: VarId },
+    Not  { dst: VarId, src: VarId },
+
+    // ── Comparison → bool (0 or 1) ───────────────────────────────────────
+    ICmp { dst: VarId, cond: ICmpCond, lhs: VarId, rhs: VarId },
+
+    // ── Copy (required for proper SSA destruction) ───────────────────────
+    Move { dst: VarId, src: VarId },
+
+    // ── Control flow ─────────────────────────────────────────────────────
+    Br     { target: CodegenBlockId },
+    CondBr { cond: VarId, if_true: CodegenBlockId, if_false: CodegenBlockId },
+    Ret    { value: Option<VarId> },
+
+    // ── Calls ────────────────────────────────────────────────────────────
+    Call     { dst: VarId, func: String, args: SmallVars },
+    TailCall { func: String, args: SmallVars },
+
+    // ── Memory ───────────────────────────────────────────────────────────
+    Alloca { dst: VarId, align: u32 },
+    Store  { ptr: VarId, value: VarId },
+    Load   { dst: VarId, ptr: VarId },
+
+    // ── SSA phi ──────────────────────────────────────────────────────────
+    Phi { dst: VarId, incoming: SmallPhi },
+
+    // ── Misc ─────────────────────────────────────────────────────────────
+    Label,
+    Comment(String),
+}
+
+impl IRInstr {
+    /// True when the instruction has observable side effects beyond its def.
+    pub fn has_side_effects(&self) -> bool {
+        matches!(self,
+            IRInstr::Store {..} | IRInstr::Call {..} | IRInstr::TailCall {..} |
+            IRInstr::Ret {..}
+        )
+    }
+}
+
+/// Basic block in the codegen CFG.
+#[derive(Debug, Clone)]
+pub struct IRBlock {
+    pub id:           CodegenBlockId,
+    pub instrs:       Vec<IRInstr>,
+    pub successors:   Vec<CodegenBlockId>,
+    pub predecessors: Vec<CodegenBlockId>,
+    /// Estimated execution frequency (used by scheduler & layout).
+    pub freq:         f64,
+}
+
+impl IRBlock {
+    pub(crate) fn new(id: CodegenBlockId) -> Self {
+        Self { id, instrs: Vec::new(), successors: Vec::new(),
+               predecessors: Vec::new(), freq: 1.0 }
+    }
+    pub fn is_terminated(&self) -> bool {
+        self.instrs.iter().rev().any(|i| matches!(i,
+            IRInstr::Br {..} | IRInstr::CondBr {..} | IRInstr::Ret {..} |
+            IRInstr::TailCall {..}
+        ))
+    }
+}
+
+/// IR function in SSA form (codegen level).
+#[derive(Debug, Clone)]
+pub struct IRFunction {
+    pub name:         String,
+    pub params:       Vec<VarId>,
+    pub ret_ty:       Option<crate::compiler::ast::Type>,
+    pub blocks:       Vec<IRBlock>,
+    pub entry_block:  CodegenBlockId,
+    pub next_var:     VarId,
+    pub next_block:   CodegenBlockId,
+    pub call_count:   usize,
+    pub called_by:    Vec<String>,
+    pub inline_cost:  usize,
+}
+
+impl IRFunction {
+    pub fn new(name: String) -> Self {
+        let mut blocks = Vec::new();
+        blocks.push(IRBlock::new(0));
+        Self { name, params: Vec::new(), ret_ty: None, blocks,
+               entry_block: 0, next_var: 0, next_block: 1,
+               call_count: 0, called_by: Vec::new(), inline_cost: 0 }
+    }
+
+    pub fn fresh_var(&mut self) -> VarId {
+        let v = self.next_var; self.next_var += 1; v
+    }
+
+    pub fn fresh_block(&mut self) -> CodegenBlockId {
+        let id = self.next_block; self.next_block += 1;
+        self.blocks.push(IRBlock::new(id));
+        id
+    }
+
+    pub fn push_to(&mut self, block: CodegenBlockId, instr: IRInstr) {
+        if block < self.blocks.len() {
+            self.blocks[block].instrs.push(instr);
+        } else {
+            while self.blocks.len() <= block {
+                self.blocks.push(IRBlock::new(self.blocks.len()));
+            }
+            self.blocks[block].instrs.push(instr);
+        }
+    }
+
+    /// Rebuild predecessor lists from successor info.
+    pub fn build_predecessors(&mut self) {
+        for b in self.blocks.iter_mut() { b.predecessors.clear(); }
+        let edges: Vec<(CodegenBlockId, CodegenBlockId)> = self.blocks.iter().enumerate()
+            .flat_map(|(from, b)| b.successors.iter().map(move |&to| (from, to)))
+            .collect();
+        for (from, to) in edges {
+            if let Some(succ) = self.blocks.get_mut(to) {
+                if !succ.predecessors.contains(&from) {
+                    succ.predecessors.push(from);
+                }
+            }
+        }
+    }
+
+    pub fn compute_inline_cost(&mut self) {
+        self.inline_cost = self.blocks.iter()
+            .map(|b| b.instrs.len()).sum();
+    }
 }
