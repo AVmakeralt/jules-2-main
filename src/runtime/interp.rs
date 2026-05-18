@@ -4926,6 +4926,8 @@ pub struct Interpreter {
     /// Level 4: Data-Dependent JIT Evolution engine.
     /// Tracks observed runtime values and creates specialized code versions.
     pub data_dependent_jit: crate::optimizer::data_dependent_jit::DataDependentJIT,
+    #[cfg(feature = "phase3-jit")]
+    pic: crate::optimizer::inline_cache::InlineCacheManager,
     ecs_query_scratch: Vec<EntityId>,
     /// Loop iteration counter — incremented every time a `while`/`loop` body
     /// completes one iteration.  Reset at the start of each top-level `while`/`loop`.
@@ -4979,6 +4981,8 @@ impl Interpreter {
             jit_vm_calls: 0,
             jit_fallback_calls: 0,
             data_dependent_jit: crate::optimizer::data_dependent_jit::DataDependentJIT::new(),
+            #[cfg(feature = "phase3-jit")]
+            pic: crate::optimizer::inline_cache::InlineCacheManager::new(10),
             ecs_query_scratch: Vec::new(),
             loop_step_counter: 0,
             max_loop_iterations: 10_000_000, // 10M iterations — generous but finite
@@ -5164,7 +5168,10 @@ impl Interpreter {
                     for (hot_name, _) in hot_fns.into_iter().take(5) {
                         if !self.native_fns.contains_key(hot_name) {
                             if let Some(hot_compiled) = self.compiled_fns.get(hot_name).cloned() {
-                                if let Some(native) = crate::jit::phase3_jit::translate(&hot_compiled) {
+                                // Superpower 2: adaptive inlining — inline
+                                // small leaf calls before JIT compilation.
+                                let inlined = crate::jit::phase3_jit::inline_small_calls(&hot_compiled, &self.compiled_fns);
+                                if let Some(native) = crate::jit::phase3_jit::translate(&inlined) {
                                     self.native_fns.insert(hot_name.clone(), Arc::new(native));
                                 }
                             }
@@ -5184,7 +5191,10 @@ impl Interpreter {
                     for (fn_name, count) in &self.pgo_call_counts {
                         if *count >= 10 && !self.native_fns.contains_key(fn_name) {
                             if let Some(compiled) = self.compiled_fns.get(fn_name).cloned() {
-                                if let Some(native) = crate::jit::phase3_jit::translate(&compiled) {
+                                // Superpower 2: adaptive inlining — inline
+                                // small leaf calls before JIT compilation.
+                                let inlined = crate::jit::phase3_jit::inline_small_calls(&compiled, &self.compiled_fns);
+                                if let Some(native) = crate::jit::phase3_jit::translate(&inlined) {
                                     self.native_fns.insert(fn_name.clone(), Arc::new(native));
                                 }
                             }
@@ -5198,10 +5208,38 @@ impl Interpreter {
             // If the arg count matches expectation, run the VM.
             if closure.capture.is_empty() && args.len() == closure.decl.params.len() {
                 #[cfg(feature = "phase3-jit")]
+                {
+                    // ── Inline Cache (PIC) integration ──────────────────────
+                    // Register this call site with the PIC (idempotent) and
+                    // derive a TypeId from the combined argument type tags.
+                    // This lets the PIC track type distributions and detect
+                    // hot/monomorphic call sites for speculative devirtualization.
+                    self.pic.register_call_site(name.to_owned());
+                    let type_id = {
+                        // Combine all arg type tags into a single u64 hash.
+                        // Uses FxHash-style mixing for speed.
+                        let mut hash: u64 = 0;
+                        for arg in &args {
+                            hash = hash.wrapping_mul(6364136223846793005)
+                                .wrapping_add(arg.type_tag() as u64);
+                        }
+                        crate::optimizer::inline_cache::TypeId::new(hash)
+                    };
+                    // Record the observed type in the PIC and check for a
+                    // cached specialized entry.  The PIC tracks hit rates
+                    // and type distributions that inform future optimizations.
+                    let _pic_result = self.pic.handle_call(name, type_id);
+                    // If the PIC has a specialized code address for this type
+                    // signature, it means this call site is hot and monomorphic
+                    // (or polymorphic with a known type set).  The code address
+                    // itself is a type-guard trampoline that verifies the type
+                    // at runtime — we don't call it directly here (the native
+                    // JIT path below handles execution), but the PIC data
+                    // could be used to inform specialization decisions.
+                }
+                #[cfg(feature = "phase3-jit")]
                 if self.native_jit_enabled {
                     if let Some(native) = self.native_fns.get(name).cloned() {
-                        // Ensure arena pages are executable before running native code.
-                        crate::jit::phase3_jit::finalize_arena();
                         // [NATIVE-JIT] executing cached native code for fn={name}
                         if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
                             self.jit_native_calls = self.jit_native_calls.saturating_add(1);
@@ -5209,20 +5247,25 @@ impl Interpreter {
                             return Ok(v);
                         }
                         // native execute() failed for cached fn={name}, falling through
-                    } else if let Some(native) = crate::jit::phase3_jit::translate(&compiled) {
-                        let native = Arc::new(native);
-                        self.native_fns.insert(name.to_owned(), native.clone());
-                        // Ensure arena pages are executable before running native code.
-                        crate::jit::phase3_jit::finalize_arena();
-                        // [NATIVE-JIT] executing freshly compiled native code for fn={name}
-                        if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
-                            self.jit_native_calls = self.jit_native_calls.saturating_add(1);
-                            self.record_runtime_profile(name, started.elapsed());
-                            return Ok(v);
-                        }
-                        // native execute() failed for fn={name}, falling through
                     } else {
-                        // native translate() returned None for fn={name}
+                        // Superpower 2: adaptive inlining — inline small
+                        // leaf calls before JIT compilation.
+                        let inlined = crate::jit::phase3_jit::inline_small_calls(&compiled, &self.compiled_fns);
+                        if let Some(native) = crate::jit::phase3_jit::translate(&inlined) {
+                            let native = Arc::new(native);
+                            self.native_fns.insert(name.to_owned(), native.clone());
+                            // Ensure arena pages are executable before running native code.
+                            crate::jit::phase3_jit::finalize_arena();
+                            // [NATIVE-JIT] executing freshly compiled native code for fn={name}
+                            if let Ok(v) = crate::jit::phase3_jit::execute(&native, &args) {
+                                self.jit_native_calls = self.jit_native_calls.saturating_add(1);
+                                self.record_runtime_profile(name, started.elapsed());
+                                return Ok(v);
+                            }
+                            // native execute() failed for fn={name}, falling through
+                        } else {
+                            // native translate() returned None for fn={name}
+                        }
                     }
                 }
                 self.jit_vm_calls = self.jit_vm_calls.saturating_add(1);

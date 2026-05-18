@@ -110,37 +110,62 @@ pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
     match result {
         PipelineResult::OkWithIr { program, ir_module: _ } => {
             // ══════════════════════════════════════════════════════════════════
-            // ══ PHASE 4: INTERPRETER IS THE HOT-PATH ENGINE ═══════════════════
+            // ══ PHASE 4: TIERED EXECUTION (phase3-jit) / INTERPRETER FALLBACK ══
             // ══════════════════════════════════════════════════════════════════
-            // The interpreter (with its internal register-based VM and i32
-            // fast-path) is the primary execution engine.  It outperforms
-            // the standalone BytecodeVM for most programs.
+            // When the phase3-jit feature is enabled, the TieredExecutionManager
+            // is the default execution path.  It provides:
+            //   Tier 0: Bytecode VM (fast cold start)
+            //   Tier 1: Baseline JIT (quick compilation)
+            //   Tier 2: Optimizing JIT (full optimization)
+            //   Tier 3: Tracing JIT (speculative optimization)
+            // with hotness counters, time-aware promotion, and deopt backoff.
             //
-            // The IR is still used for type-checking, borrow-checking, and
-            // optimization — but execution dispatches through the interpreter.
-            //
-            // The standalone BytecodeVM is reserved for:
-            //   - Semantic reference / correctness validation
-            //   - Debugging and trace collection
-            //   - Cold-path execution
+            // Without phase3-jit, falls back to the raw Interpreter.
             // ══════════════════════════════════════════════════════════════════
-            let mut interp = crate::interp::Interpreter::new();
-            interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
-            interp.set_native_jit_enabled(true); // Enable native JIT
-            interp.load_program(&program);
-            interp.call_fn(entry, vec![])
-                .map(|_| ())
-                .map_err(|e| e.message.into_owned())
+            #[cfg(feature = "phase3-jit")]
+            {
+                let policy = crate::tiered_compilation::PromotionPolicy::balanced();
+                let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
+                tiered_mgr.load_program(&program);
+                tiered_mgr.enabled = true;
+                tiered_mgr.call_function(entry, vec![])
+                    .map(|_| ())
+                    .map_err(|e| e.message.into_owned())
+            }
+            #[cfg(not(feature = "phase3-jit"))]
+            {
+                let mut interp = crate::interp::Interpreter::new();
+                interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+                interp.set_native_jit_enabled(true); // Enable native JIT
+                interp.load_program(&program);
+                interp.call_fn(entry, vec![])
+                    .map(|_| ())
+                    .map_err(|e| e.message.into_owned())
+            }
         }
         PipelineResult::Ok(program) => {
-            // Legacy path (no IR) — use interpreter as the hot path.
-            let mut interp = crate::interp::Interpreter::new();
-            interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
-            interp.set_native_jit_enabled(true); // Enable native JIT
-            interp.load_program(&program);
-            interp.call_fn(entry, vec![])
-                .map(|_| ())
-                .map_err(|e| e.message.into_owned())
+            // Legacy path (no IR) — use tiered execution when available,
+            // otherwise fall back to interpreter.
+            #[cfg(feature = "phase3-jit")]
+            {
+                let policy = crate::tiered_compilation::PromotionPolicy::balanced();
+                let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
+                tiered_mgr.load_program(&program);
+                tiered_mgr.enabled = true;
+                tiered_mgr.call_function(entry, vec![])
+                    .map(|_| ())
+                    .map_err(|e| e.message.into_owned())
+            }
+            #[cfg(not(feature = "phase3-jit"))]
+            {
+                let mut interp = crate::interp::Interpreter::new();
+                interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+                interp.set_native_jit_enabled(true); // Enable native JIT
+                interp.load_program(&program);
+                interp.call_fn(entry, vec![])
+                    .map(|_| ())
+                    .map_err(|e| e.message.into_owned())
+            }
         }
         PipelineResult::HaltedAt(_) => Err("pipeline did not produce a program".into()),
     }
@@ -903,7 +928,7 @@ impl Pipeline {
         // algebraic simplification (50+ rules), strength reduction, CSE,
         // dead code elimination, dead store elimination, peephole, loop
         // invariant code motion, function inlining, branch optimization.
-        if false && self.opt_level >= 1 {
+        if self.opt_level >= 1 {
             let config = match self.opt_level {
                 1 => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::fast_compile(),
                 2 => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::balanced(),

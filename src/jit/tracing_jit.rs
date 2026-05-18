@@ -1289,18 +1289,23 @@ impl TracingJIT {
     /// Record a guard failure in the PIC and trigger recording of a new
     /// trace for the failed type path.  The new trace will be compiled
     /// on the next execution when it becomes hot.
+    ///
+    /// Unlike the old version, this does NOT record an empty trace. Instead
+    /// it only registers the PIC entry — the actual trace will be recorded
+    /// when `execute_with_jit` next encounters this hot PC and records
+    /// instructions from the bytecode.
     fn record_guard_failure(&mut self, entry_pc: usize, slot: u16, failed_type: ValueType) {
-        // Start recording a secondary trace from this PC, specialised
-        // for the new type.  When it finishes, wire it into the PIC.
-        self.recorder.start_recording(entry_pc);
-        self.recorder.record_guard(slot, failed_type);
-        if let Some(new_trace_id) = self.recorder.finish_recording() {
-            self.pic.add_side_exit(slot, failed_type, new_trace_id);
-        }
+        // Allocate a trace ID without recording a full trace yet.
+        // The PIC maps (slot, failed_type) → trace_id so that future
+        // lookups can find this entry. The actual trace will be populated
+        // on the next hot-path execution.
+        let new_trace_id = self.recorder.next_trace_id;
+        self.recorder.next_trace_id += 1;
+        self.pic.add_side_exit(slot, failed_type, new_trace_id);
         self.traces_recorded += 1;
     }
 
-    pub fn execute_with_jit(&mut self, entry_pc: usize, slots: &mut [Value], types: &mut [u8], _instructions: &[Instr]) -> Result<Value, RuntimeError> {
+    pub fn execute_with_jit(&mut self, entry_pc: usize, slots: &mut [Value], types: &mut [u8], instructions: &[Instr]) -> Result<Value, RuntimeError> {
         if let Some(tid) = self.recorder.find_trace(entry_pc) {
             // J8 fix: Check the compiled cache FIRST. If we already compiled this
             // trace, reuse the cached machine code instead of recompiling.
@@ -1374,8 +1379,59 @@ impl TracingJIT {
         }
         let hot_count = *self.hot_counters.entry(entry_pc as u64).and_modify(|c| *c += 1).or_insert(1);
         if self.should_start_tracing(hot_count) {
-            self.recorder = TraceRecorder::with_max_trace_length(self.max_trace_length);
+            // BUG FIX: Do NOT destroy the existing recorder with a new one —
+            // that would discard all previously recorded traces and compiled
+            // caches. Instead, start recording on the existing recorder.
+            //
+            // Record a trace from the bytecode instruction stream, starting at
+            // entry_pc.  We walk forward through the instructions, recording
+            // each one, and stop when we encounter a backward jump (loop
+            // back-edge) which closes the trace.  If we reach the end of the
+            // instruction stream without a loop, we also close the trace.
             self.recorder.start_recording(entry_pc);
+            let start = entry_pc as usize;
+            for pc in start..instructions.len() {
+                self.recorder.record_instruction(&instructions[pc], pc);
+                // Check for max trace length — abort if exceeded
+                if self.recorder.should_abort_trace() {
+                    self.recorder.abort_recording();
+                    break;
+                }
+                // Check for loop back-edge (backward jump) — close the trace
+                match &instructions[pc] {
+                    Instr::Jump(off) if *off < 0 => {
+                        // Unconditional backward jump — loop back-edge
+                        self.recorder.finish_recording();
+                        self.traces_recorded += 1;
+                        return Err(RuntimeError::new("Deoptimization: falling back to interpreter"));
+                    }
+                    Instr::JumpFalse(_, off) if *off < 0 => {
+                        // Conditional backward jump — record as side exit (loop exit guard)
+                        let target_pc = (pc as i32 + 1 + off) as usize;
+                        self.recorder.record_side_exit(target_pc, true, None);
+                        self.recorder.finish_recording();
+                        self.traces_recorded += 1;
+                        return Err(RuntimeError::new("Deoptimization: falling back to interpreter"));
+                    }
+                    Instr::JumpTrue(_, off) if *off < 0 => {
+                        let target_pc = (pc as i32 + 1 + off) as usize;
+                        self.recorder.record_side_exit(target_pc, true, None);
+                        self.recorder.finish_recording();
+                        self.traces_recorded += 1;
+                        return Err(RuntimeError::new("Deoptimization: falling back to interpreter"));
+                    }
+                    Instr::Return(_) | Instr::ReturnUnit => {
+                        // End of function — close the trace
+                        self.recorder.finish_recording();
+                        self.traces_recorded += 1;
+                        return Err(RuntimeError::new("Deoptimization: falling back to interpreter"));
+                    }
+                    _ => {}
+                }
+            }
+            // Reached end of instruction stream without a loop or return
+            // — finish recording anyway
+            self.recorder.finish_recording();
             self.traces_recorded += 1;
         }
         Err(RuntimeError::new("Deoptimization: falling back to interpreter"))

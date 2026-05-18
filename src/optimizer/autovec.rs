@@ -781,8 +781,9 @@ impl AutoVectorizer {
                      mov {width_bytes}/8, rcx          ; iteration count = n / {elems}\n\
                      .map_iter_{location}:\n\
                      vmov{suffix} {reg}0, [{src_ptr}]  ; load {elems} x {etype} from source\n\
-                     v{instr}{suffix} {reg}0, {reg}0, {reg}0  ; {op_name} element-wise (self-op for unary map)\n\
-                     vmov{suffix} [{dst_ptr}], {reg}0  ; store result\n\
+                     vmov{suffix} {reg}1, {reg}0             ; copy source to dest register\n\
+                     v{instr}{suffix} {reg}1, {reg}1, {reg}0  ; {op_name}: dest = dest op src\n\
+                     vmov{suffix} [{dst_ptr}], {reg}1  ; store result\n\
                      add {width_bytes}, {src_ptr}\n\
                      add {width_bytes}, {dst_ptr}\n\
                      dec rcx\n\

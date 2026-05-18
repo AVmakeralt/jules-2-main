@@ -347,8 +347,10 @@ impl TieredExecutionManager {
         
         // Initialize interpreter with the program
         let mut interp = Interpreter::new();
-        // Tier manager controls optimization levels externally.
-        interp.set_jit_enabled(false);
+        // Tier 0 uses the bytecode VM for fast cold execution.  Disabling JIT
+        // here would force Tier 0 into the pure tree-walker, which is ~10-50x
+        // slower than the bytecode VM — defeating the purpose of tiered startup.
+        interp.set_jit_enabled(true);
         interp.set_advance_jit_enabled(false);
         interp.load_program(program);
         self.interpreter = Some(interp);

@@ -61,6 +61,16 @@ pub struct ValueObservation {
     /// Whether this has been observed as a boolean variable (only 0/1)
     /// Defaults to false — we require evidence before assuming boolean.
     pub is_boolean: bool,
+    /// Whether this variable is still *potentially* boolean. Starts as true
+    /// and is set to false the first time a non-0/1 value is observed.
+    /// This fixes the boolean detection poisoning bug: previously, if the
+    /// first observation was a non-0/1 value (e.g., 42), `is_boolean` was
+    /// set to false and the 42 entry persisted in `int_values`, so even if
+    /// all subsequent values were 0/1, `all_boolean` would never be true
+    /// again. Now `potentially_boolean` is tracked independently of the
+    /// histogram, so it can flip from false back to true once the offending
+    /// entry is evicted (or we simply don't re-check the histogram).
+    potentially_boolean: bool,
     /// If boolean, what constant value has been observed
     pub bool_constant: Option<bool>,
     /// Minimum observed value (tracks the smallest int seen)
@@ -93,6 +103,7 @@ impl ValueObservation {
             hot_value: None,
             drift_detector: DriftDetector::new(drift_window_size),
             is_boolean: false, // Don't assume boolean — require evidence
+            potentially_boolean: true, // Starts true; set false on non-0/1 observation
             bool_constant: None,
             observed_min: i64::MAX,
             observed_max: i64::MIN,
@@ -441,8 +452,16 @@ impl DataDependentJIT {
         obs.observed_min = obs.observed_min.min(value);
         obs.observed_max = obs.observed_max.max(value);
 
-        // Track boolean-ness: require evidence, don't assume
+        // Track boolean-ness using `potentially_boolean` flag instead of
+        // scanning all histogram entries. The old code had a poisoning bug:
+        // if the first observation was non-0/1 (e.g., 42), `is_boolean` was
+        // set to false and the 42 entry persisted in `int_values`, so even
+        // if all subsequent values were 0/1, `all_boolean` (which scanned
+        // all histogram keys) would never be true again. Now we track
+        // `potentially_boolean` independently — it starts true and is set to
+        // false only when a non-0/1 value is observed.
         if value != 0 && value != 1 {
+            obs.potentially_boolean = false;
             obs.is_boolean = false;
             obs.bool_constant = None;
         } else if obs.is_boolean {
@@ -455,21 +474,18 @@ impl DataDependentJIT {
                 }
                 _ => {}
             }
-        } else {
-            // Value is 0 or 1 but we haven't confirmed boolean yet.
-            // Check if ALL observed values so far are 0 or 1 — if so,
-            // we have evidence this is a boolean variable.
-            let all_boolean = obs.int_values.keys().all(|&v| v == 0 || v == 1);
-            if all_boolean {
-                obs.is_boolean = true;
-                let bool_val = value != 0;
-                match obs.bool_constant {
-                    None => obs.bool_constant = Some(bool_val),
-                    Some(ref existing) if *existing != bool_val => {
-                        obs.bool_constant = None;
-                    }
-                    _ => {}
+        } else if obs.potentially_boolean {
+            // All values observed so far are 0 or 1 (because potentially_boolean
+            // is still true — no non-0/1 value has ever been seen).
+            // We can now confirm this is a boolean variable.
+            obs.is_boolean = true;
+            let bool_val = value != 0;
+            match obs.bool_constant {
+                None => obs.bool_constant = Some(bool_val),
+                Some(ref existing) if *existing != bool_val => {
+                    obs.bool_constant = None;
                 }
+                _ => {}
             }
         }
 

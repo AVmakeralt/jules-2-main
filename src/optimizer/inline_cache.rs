@@ -747,24 +747,13 @@ impl CallSite {
         // ret (fast path: type matches, return to caller)
         code.push(0xC3);
 
-        // Slow path: load generic dispatch stub address into rax and jump.
-        // Instead of the crash-inducing 0xCAFE_CAFE_0000_0000 sentinel,
-        // we use a generic dispatch trampoline allocated in the CodeArena.
-        // If no trampoline is available, we use a safe "ret 0" that simply
-        // returns to the caller, which will then fall through to interpreter
-        // dispatch.  At least it won't crash by jumping to a garbage address.
-        code.push(0x48);
-        code.push(0xB8);
-        // The generic dispatch trampoline address will be patched by the
-        // RuntimeLinker when it's available.  For now, use a self-referencing
-        // address that returns immediately (ret = C3, which is safe).
-        // Write the entry_addr as the default: a stub that just returns 0.
-        // The RuntimeLinker will patch this with the real trampoline address
-        // via patch_call_site().
-        code.extend_from_slice(&0u64.to_le_bytes());
-
-        // jmp rax
-        code.extend_from_slice(&[0xFF, 0xE0]);
+        // Slow path: type guard failed, return to caller (interpreter fallback).
+        // Previously this did `mov rax, 0; jmp rax` which jumped to address 0
+        // and crashed.  The correct behaviour is to simply RET — returning
+        // control to the interpreter which will handle the miss in software.
+        // The interpreter sees the return (with no special return value) and
+        // falls through to its generic dispatch path.
+        code.push(0xC3); // RET — safe slow-path: return to interpreter
 
         // Pad remainder with NOPs
         while code.len() < code_size {

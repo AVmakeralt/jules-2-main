@@ -908,12 +908,20 @@ pub fn critical_path_length(dag: &DepDag, cost_db: &dyn Fn(Opcode) -> CostEntry)
         let cost = cost_db(dag.opcodes[node]);
         let node_latency = cost.latency as f64;
 
-        // dist[node] = latency[node] + max(weighted dist[pred] for all predecessors)
-        // Weight each predecessor's distance by the dependency kind's latency weight.
+        // dist[node] = latency[node] + max(dist[pred] + pred_latency * weight)
+        // The critical path to node is the predecessor's accumulated distance
+        // PLUS the edge weight (pred_latency × dependency kind weight), not the
+        // predecessor's distance SCALED by the weight. The old formula
+        // `dist[pred] * kind.latency_weight()` was wrong because it multiplied
+        // the entire predecessor distance by the weight instead of adding the
+        // weighted edge latency to it.
         let max_pred = dag.predecessors[node]
             .iter()
             .zip(dag.dep_kinds[node].iter())
-            .map(|(&pred, &kind)| dist[pred] * kind.latency_weight())
+            .map(|(&pred, &kind)| {
+                let pred_latency = cost_db(dag.opcodes[pred]).latency as f64;
+                dist[pred] + pred_latency * kind.latency_weight()
+            })
             .fold(0.0f64, f64::max);
 
         dist[node] = node_latency + max_pred;
