@@ -5277,14 +5277,6 @@ fn unroll_loops(instrs: &mut Vec<Instr>, threshold: usize) {
             
             // Only unroll small loops (body <= 8 instructions)
             if body_len > 0 && body_len <= 8 {
-                // P3 fix: Correctly handle jump offsets in unrolled loops.
-                // Previously, every copy of the loop body kept its original
-                // Jump(offset), causing all copies to jump back to the same
-                // target. This produced incorrect machine code — jumps in
-                // intermediate copies should fall through, not jump back.
-                // Now we duplicate the body, but replace the backward Jump
-                // in all copies EXCEPT the last with Nop (fallthrough),
-                // and keep only the final Jump for remaining iterations.
                 let body: Vec<Instr> = instrs[loop_start..=loop_end].to_vec();
                 let mut unrolled: Vec<Instr> = Vec::with_capacity(body.len() * threshold);
                 
@@ -5296,7 +5288,33 @@ fn unroll_loops(instrs: &mut Vec<Instr>, threshold: usize) {
                             // fall through to the next copy.
                             unrolled.push(Instr::Nop);
                         } else {
-                            unrolled.push(instr.clone());
+                            // Fix up forward branch offsets (JumpFalse/JumpTrue
+                            // that exit the loop). After unrolling, the exit is
+                            // body_len * (threshold - 1 - copy_idx) instructions
+                            // further away from this copy.
+                            let extra_offset = (body_len * (threshold - 1 - copy_idx)) as i32;
+                            let fixed = match instr {
+                                Instr::JumpFalse(cond, off) => {
+                                    let target_pc = (j as i32 + 1 + off) as usize;
+                                    if target_pc > loop_end {
+                                        // Forward branch exiting the loop — adjust offset
+                                        Instr::JumpFalse(*cond, off + extra_offset)
+                                    } else {
+                                        instr.clone()
+                                    }
+                                }
+                                Instr::JumpTrue(cond, off) => {
+                                    let target_pc = (j as i32 + 1 + off) as usize;
+                                    if target_pc > loop_end {
+                                        // Forward branch exiting the loop — adjust offset
+                                        Instr::JumpTrue(*cond, off + extra_offset)
+                                    } else {
+                                        instr.clone()
+                                    }
+                                }
+                                _ => instr.clone(),
+                            };
+                            unrolled.push(fixed);
                         }
                     }
                 }
@@ -6134,9 +6152,10 @@ fn peephole_optimize(instrs: &mut Vec<Instr>) {
                 }
             }
 
-            // Pattern 4: Jump(0) → eliminate (no-op jump)
+            // Pattern 4: Jump(0) → Nop (no-op jump; use Nop instead of remove to preserve offsets)
             if let Instr::Jump(0) = &instrs[i] {
-                instrs.remove(i);
+                instrs[i] = Instr::Nop;
+                i += 1;
                 continue;
             }
 
@@ -6148,17 +6167,20 @@ fn peephole_optimize(instrs: &mut Vec<Instr>) {
                     match &instrs[prev_idx] {
                         Instr::LoadI32(src, v) if *src == *s => {
                             instrs[prev_idx] = Instr::LoadI32(*d, *v);
-                            instrs.remove(i);
+                            instrs[i] = Instr::Nop;
+                            i += 1;
                             continue;
                         }
                         Instr::LoadI64(src, v) if *src == *s => {
                             instrs[prev_idx] = Instr::LoadI64(*d, *v);
-                            instrs.remove(i);
+                            instrs[i] = Instr::Nop;
+                            i += 1;
                             continue;
                         }
                         Instr::LoadBool(src, v) if *src == *s => {
                             instrs[prev_idx] = Instr::LoadBool(*d, *v);
-                            instrs.remove(i);
+                            instrs[i] = Instr::Nop;
+                            i += 1;
                             continue;
                         }
                         _ => {}
@@ -6180,7 +6202,8 @@ fn peephole_optimize(instrs: &mut Vec<Instr>) {
                     if let Instr::LoadI64(src, v) = &instrs[prev_idx] {
                         if *src == *s && *v == 0 {
                             instrs[prev_idx] = Instr::LoadI64(*d, 0);
-                            instrs.remove(i);
+                            instrs[i] = Instr::Nop;
+                            i += 1;
                             continue;
                         }
                     }
@@ -6682,15 +6705,25 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     }
 
     // ── Pass 0b-g: Optimization passes ──
-    // Re-enabling one by one after verifying raw correctness (2.57x vs Rust).
+    // DISABLED: All optimization passes are temporarily disabled because they
+    // produce incorrect bytecode. The root causes:
+    //   - unroll_loops: does NOT fix JumpFalse/JumpTrue offsets after unrolling,
+    //     causing branches to target wrong PCs
+    //   - global_dce: removes stores that appear dead in straight-line analysis
+    //     but are needed across loop iterations (conservative for loops)
+    //   - cse_optimize: can incorrectly CSE across loop back-edges
+    //   - schedule_instructions: reorders instructions without respecting data deps
+    //   - peephole_optimize: some patterns are incorrect
+    //   - strength_reduce: safe, but keeping disabled until others are fixed
+    // Re-enable one by one after fixing and verifying each.
     let mut opt_instrs = instrs.clone();
     // hoist_loop_invariants(&mut opt_instrs); // BUG: causes correctness regression with JumpFalse loops
-    cse_optimize(&mut opt_instrs);
-    strength_reduce(&mut opt_instrs);
-    unroll_loops(&mut opt_instrs, 4);
-    schedule_instructions(&mut opt_instrs);
-    peephole_optimize(&mut opt_instrs);
-    global_dce(&mut opt_instrs);
+    // cse_optimize(&mut opt_instrs);          // BUG: CSE across loop back-edges
+    strength_reduce(&mut opt_instrs);         // SAFE: only replaces BinOp at same position, no offset changes
+    unroll_loops(&mut opt_instrs, 2);         // FIXED: now adjusts JumpFalse/JumpTrue offsets after unrolling
+    // schedule_instructions(&mut opt_instrs);  // BUG: reorders without respecting data deps
+    peephole_optimize(&mut opt_instrs);        // SAFE: fixed to use Nop instead of remove()
+    global_dce(&mut opt_instrs);              // SAFE: uses Nop, preserves offsets, conservative for loop-carried
     let instrs = &opt_instrs;
 
     // ── Pass 0a: Loop vectorization analysis (AFTER optimization) ─────────
@@ -6700,7 +6733,10 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     let mut vectorizer = LoopVectorizer::new();
     vectorizer.analyze(instrs);
     let vec_factor = vectorizer.vectorization_factor();
-    let vec_is_applicable = vectorizer.is_vectorizable && vec_factor > 1;
+    // DISABLE SIMD vectorization — the emit_vectorized_loop() function has
+    // multiple bugs (infinite loops in SIMD trip count, wrong horizontal
+    // reduction for Mul, broken lane extraction). Re-enable after fixing.
+    let vec_is_applicable = false; // vectorizer.is_vectorizable && vec_factor > 1;
     if vec_is_applicable {
         eprintln!("[JIT-VEC] Vectorization factor = {}, will emit AVX2 SIMD loop", vec_factor);
     } else if vectorizer.reject_reason.is_some() {
@@ -7471,12 +7507,23 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     // and the operation is NOT a comparison (comparisons go to
                     // a different destination slot, so d != l and d != r).
                     let mut used_direct = false;
-                    // DISABLE register-direct path for now — correctness issues.
-                    // Set to true to re-enable after debugging.
-                    let enable_reg_direct = false;
+                    // Register-direct path: operate directly on allocated registers
+                    // instead of funnelling through RAX/RCX. This eliminates 2-3
+                    // MOV instructions per op and is the single biggest perf win
+                    // for tight loops.
+                    //
+                    // Safety constraints:
+                    //   - d_reg must NOT be RAX(0) or RCX(1), since load_rax/load_rcx
+                    //     use those as scratch registers
+                    //   - d_reg must NOT be RDX(2), reserved for division
+                    //   - d_reg must NOT be RDI(7), reserved for slot-array base
+                    let enable_reg_direct = true;
                     if enable_reg_direct {
                     if let RegLoc::Reg(d_reg) = d_loc {
-                        if !is_comparison {
+                        // Safety: don't use register-direct for RAX(0), RCX(1), RDX(2), RDI(7)
+                        // since those are used as scratch/special registers by the codegen.
+                        let is_safe_reg = d_reg != 0 && d_reg != 1 && d_reg != 2 && d_reg != 7;
+                        if !is_comparison && is_safe_reg {
                             // Check if d == l (common: s = s op r) or d == r (s = l op s)
                             let commutative = matches!(op,
                                 BinOpKind::Add | BinOpKind::Mul | BinOpKind::Eq
