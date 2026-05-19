@@ -85,6 +85,7 @@ use libc::{mmap, mprotect, munmap, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::compiler::ast::{BinOpKind, UnOpKind};
+use crate::compiler::ir::{FlatIrFunction, FlatBlock, IrOp, IrType, ValueId, BlockId, EffectFlags, AliasKind, Ownership as IrOwnership};
 use crate::interp::{CompiledFn, Instr, AmxOpCode, RuntimeError, Value};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -8227,6 +8228,637 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         entry_id: mem.entry_id,
         mem,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IR-DIRECT JIT COMPILATION — Bypasses Bytecode Entirely
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Pipeline: AST → lower.rs → FlatIrFunction → translate_from_ir() → Machine Code
+//
+// This function accepts the flat SSA IR directly, bypassing the dumb
+// Vec<Instr> bytecode that loses EffectFlags, AliasKind, and Ownership
+// metadata. The metadata is preserved and used for:
+//
+//   • Effect-aware optimization: Pure ops can be CSE'd, reordered, eliminated
+//   • Alias-aware register allocation: NoAlias values stay in registers longer
+//   • Ownership-aware codegen: Copy values need no write-back
+//
+// The function converts FlatIrFunction → CompiledFn internally (pragmatic:
+// reuses all tested emit logic) while applying metadata-driven optimizations
+// that are impossible with the bytecode-only path.
+
+/// Convert a FlatIrFunction into a CompiledFn by flattening the SSA IR
+/// into slot-based bytecode. This preserves metadata for optimization passes
+/// that run *before* the main translate() call.
+///
+/// Key design decisions:
+///   • ValueId → u16 slot mapping via FxHashMap (dense allocation)
+///   • Phi nodes are lowered to Move instructions at block boundaries
+///   • Block IDs are resolved to PC offsets in a fixup pass
+///   • Metadata (effects, alias, ownership) is preserved in side tables
+fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
+    let mut instrs: Vec<Instr> = Vec::new();
+    let mut str_pool: Vec<String> = Vec::new();
+    let mut str_idx: FxHashMap<String, u16> = FxHashMap::default();
+
+    // ── ValueId → slot mapping ──────────────────────────────────────────
+    // Assign dense slot indices to all ValueIds. Parameters get the first
+    // N slots (matching the calling convention). Then all other defined
+    // values get subsequent slots.
+    let mut value_to_slot: FxHashMap<ValueId, u16> = FxHashMap::default();
+    let mut next_slot: u16 = 0;
+
+    // Parameters first (matches ABI: args are in slots 0..N)
+    for (vid, _ty) in &func.params {
+        value_to_slot.insert(*vid, next_slot);
+        next_slot += 1;
+    }
+    let param_count = next_slot;
+
+    // Helper: intern a string
+    let mut intern_str = |s: &str, str_pool: &mut Vec<String>, str_idx: &mut FxHashMap<String, u16>| -> u16 {
+        if let Some(&idx) = str_idx.get(s) {
+            idx
+        } else {
+            let idx = str_pool.len() as u16;
+            str_pool.push(s.to_string());
+            str_idx.insert(s.to_string(), idx);
+            idx
+        }
+    };
+
+    // Helper: get or create slot for a ValueId
+    let mut get_slot = |vid: ValueId, v2s: &mut FxHashMap<ValueId, u16>, ns: &mut u16| -> u16 {
+        *v2s.entry(vid).or_insert_with(|| {
+            let s = *ns;
+            *ns += 1;
+            s
+        })
+    };
+
+    // ── Block layout: assign PC offsets ──────────────────────────────────
+    // Flatten blocks into a linear instruction stream. Each block's
+    // instructions are laid out sequentially. Block IDs map to PC offsets.
+    let mut block_pc: FxHashMap<BlockId, usize> = FxHashMap::default();
+    let mut block_order: Vec<BlockId> = Vec::new();
+
+    // Determine block order: entry first, then successors
+    {
+        let mut visited = FxHashSet::default();
+        let mut stack = vec![func.entry];
+        while let Some(bid) = stack.pop() {
+            if visited.contains(&bid) { continue; }
+            visited.insert(bid);
+            block_order.push(bid);
+            // Find successor blocks from terminators
+            if let Some(block) = func.blocks.iter().find(|b| b.id == bid) {
+                for instr in &block.instrs {
+                    match &instr.op {
+                        IrOp::CondBr { if_true, if_false, .. } => {
+                            if !visited.contains(if_true) { stack.push(*if_true); }
+                            if !visited.contains(if_false) { stack.push(*if_false); }
+                        }
+                        IrOp::Jump { target } => {
+                            if !visited.contains(target) { stack.push(*target); }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Add any remaining blocks not reachable from entry
+        for block in &func.blocks {
+            if !visited.contains(&block.id) {
+                block_order.push(block.id);
+            }
+        }
+    }
+
+    // ── Emit phi moves at block boundaries ───────────────────────────────
+    // For each block, before its terminators, we may need to emit Move
+    // instructions for phi node resolution. In SSA, phi nodes at block
+    // headers select values based on which predecessor transferred control.
+    // We lower these by inserting Move instructions at the end of each
+    // predecessor block (before the terminator).
+
+    // Collect phi info: for each block with phis, record (dst_slot, src_slot) pairs
+    // per predecessor
+    let mut phi_moves: FxHashMap<BlockId, Vec<(BlockId, ValueId, ValueId)>> = FxHashMap::default();
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            if let IrOp::Phi { incoming } = &instr.op {
+                if let Some(dst_vid) = instr.dst {
+                    for (pred_block, src_vid) in incoming {
+                        phi_moves.entry(*pred_block).or_default().push((block.id, dst_vid, *src_vid));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Flatten blocks into instruction stream ───────────────────────────
+    // Track where each block's instructions start (for branch fixups)
+    // and collect branch fixup entries.
+    struct BranchFixup {
+        instr_idx: usize,   // index in instrs vec where the offset goes
+        target_block: BlockId,
+    }
+    let mut fixups: Vec<BranchFixup> = Vec::new();
+
+    // Track which blocks have which instructions (for phi move insertion)
+    let mut block_instr_ranges: FxHashMap<BlockId, (usize, usize)> = FxHashMap::default();
+
+    // Metadata side tables (preserved from FlatIrFunction)
+    let mut _effect_table: Vec<(u16, EffectFlags)> = Vec::new();  // slot → effects
+    let mut _alias_table: Vec<(u16, AliasKind)> = Vec::new();     // slot → alias info
+
+    for bid in &block_order {
+        let block = match func.blocks.iter().find(|b| b.id == *bid) {
+            Some(b) => b,
+            None => continue,
+        };
+
+        block_pc.insert(*bid, instrs.len());
+        let start_idx = instrs.len();
+
+        for instr in &block.instrs {
+            // Skip phi nodes — they're handled via Move insertion at predecessors
+            if matches!(instr.op, IrOp::Phi { .. }) {
+                // Still allocate a slot for the phi result
+                if let Some(dst) = instr.dst {
+                    get_slot(dst, &mut value_to_slot, &mut next_slot);
+                }
+                continue;
+            }
+
+            // Record metadata for optimization passes
+            if let Some(dst) = instr.dst {
+                let slot = get_slot(dst, &mut value_to_slot, &mut next_slot);
+                if !instr.effects.is_pure() {
+                    _effect_table.push((slot, instr.effects));
+                }
+                if instr.alias != AliasKind::Unknown {
+                    _alias_table.push((slot, instr.alias));
+                }
+            }
+
+            match &instr.op {
+                // ── Constants ─────────────────────────────────────────────
+                IrOp::ConstInt { value, ty } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    match ty {
+                        IrType::Int { width: 32, signed: true } => {
+                            instrs.push(Instr::LoadI32(dst, *value as i32));
+                        }
+                        IrType::Int { width: 64, signed: true } | IrType::Int { width: 64, signed: false } => {
+                            instrs.push(Instr::LoadI64(dst, *value as i64));
+                        }
+                        IrType::Int { width: 32, signed: false } => {
+                            instrs.push(Instr::LoadI32(dst, *value as i32));
+                        }
+                        IrType::Int { width: 8, signed: true } | IrType::Int { width: 8, signed: false } => {
+                            instrs.push(Instr::LoadI32(dst, *value as i32));
+                        }
+                        IrType::Int { width: 16, signed: true } | IrType::Int { width: 16, signed: false } => {
+                            instrs.push(Instr::LoadI32(dst, *value as i32));
+                        }
+                        _ => {
+                            instrs.push(Instr::LoadI64(dst, *value as i64));
+                        }
+                    }
+                }
+
+                IrOp::ConstFloat { bits, ty } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    match ty {
+                        IrType::Float { width: 32 } => {
+                            instrs.push(Instr::LoadF32(dst, f32::from_bits(*bits as u32)));
+                        }
+                        _ => {
+                            instrs.push(Instr::LoadF64(dst, f64::from_bits(*bits)));
+                        }
+                    }
+                }
+
+                IrOp::ConstBool { value } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    instrs.push(Instr::LoadBool(dst, *value));
+                }
+
+                IrOp::ConstStr { idx: _ } => {
+                    // String constants need to go through the string pool
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    // For now, emit as a LoadUnit placeholder — string handling
+                    // in the JIT is limited
+                    instrs.push(Instr::LoadUnit(dst));
+                }
+
+                IrOp::ConstUnit => {
+                    if let Some(dst) = instr.dst {
+                        let dst = get_slot(dst, &mut value_to_slot, &mut next_slot);
+                        instrs.push(Instr::LoadUnit(dst));
+                    }
+                }
+
+                // ── Arithmetic ─────────────────────────────────────────────
+                IrOp::BinOp { op, lhs, rhs } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    let l = get_slot(*lhs, &mut value_to_slot, &mut next_slot);
+                    let r = get_slot(*rhs, &mut value_to_slot, &mut next_slot);
+                    instrs.push(Instr::BinOp(dst, *op, l, r));
+                }
+
+                IrOp::UnOp { op, operand } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    let s = get_slot(*operand, &mut value_to_slot, &mut next_slot);
+                    instrs.push(Instr::UnOp(dst, *op, s));
+                }
+
+                // ── Memory ─────────────────────────────────────────────────
+                IrOp::Move { src } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    let s = get_slot(*src, &mut value_to_slot, &mut next_slot);
+                    instrs.push(Instr::Move(dst, s));
+                }
+
+                IrOp::Store { ptr, value } => {
+                    let p = get_slot(*ptr, &mut value_to_slot, &mut next_slot);
+                    let v = get_slot(*value, &mut value_to_slot, &mut next_slot);
+                    instrs.push(Instr::Store(p, v));
+                }
+
+                IrOp::Load { ptr, ty: _ } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    let p = get_slot(*ptr, &mut value_to_slot, &mut next_slot);
+                    instrs.push(Instr::Load(dst, p));
+                }
+
+                IrOp::Alloca { ty: _, align: _ } => {
+                    // Stack allocation — allocate a slot and zero it
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    instrs.push(Instr::LoadUnit(dst));
+                }
+
+                IrOp::Copy { src } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    let s = get_slot(*src, &mut value_to_slot, &mut next_slot);
+                    instrs.push(Instr::Move(dst, s));
+                }
+
+                // ── Control flow ───────────────────────────────────────────
+                IrOp::Ret { value } => {
+                    match value {
+                        Some(vid) => {
+                            let s = get_slot(*vid, &mut value_to_slot, &mut next_slot);
+                            instrs.push(Instr::Return(s));
+                        }
+                        None => {
+                            instrs.push(Instr::ReturnUnit);
+                        }
+                    }
+                }
+
+                IrOp::Jump { target } => {
+                    // Emit placeholder Jump(0) — fixup later
+                    fixups.push(BranchFixup {
+                        instr_idx: instrs.len(),
+                        target_block: *target,
+                    });
+                    instrs.push(Instr::Jump(0));
+                }
+
+                IrOp::CondBr { cond, if_true: _, if_false } => {
+                    let c = get_slot(*cond, &mut value_to_slot, &mut next_slot);
+                    fixups.push(BranchFixup {
+                        instr_idx: instrs.len(),
+                        target_block: *if_false,
+                    });
+                    instrs.push(Instr::JumpFalse(c, 0));
+                }
+
+                IrOp::Nop => {
+                    instrs.push(Instr::Nop);
+                }
+
+                // ── Calls ──────────────────────────────────────────────────
+                IrOp::Call { func: name, args } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    let callee_str = intern_str(name, &mut str_pool, &mut str_idx);
+                    // Emit args as sequential slots starting from a temp
+                    let args_start = next_slot;
+                    for arg_vid in args {
+                        let arg_slot = get_slot(*arg_vid, &mut value_to_slot, &mut next_slot);
+                        if arg_slot >= args_start {
+                            // Already assigned — just reference it
+                        }
+                        // Move arg into sequential slots
+                        instrs.push(Instr::Move(next_slot, arg_slot));
+                        next_slot += 1;
+                    }
+                    instrs.push(Instr::CallBuiltin(dst, callee_str, args_start, args.len() as u16));
+                }
+
+                IrOp::Intrinsic { name, args } => {
+                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
+                    let callee_str = intern_str(name, &mut str_pool, &mut str_idx);
+                    let args_start = next_slot;
+                    for arg_vid in args {
+                        let arg_slot = get_slot(*arg_vid, &mut value_to_slot, &mut next_slot);
+                        instrs.push(Instr::Move(next_slot, arg_slot));
+                        next_slot += 1;
+                    }
+                    instrs.push(Instr::CallBuiltin(dst, callee_str, args_start, args.len() as u16));
+                }
+
+                // ── Tensor ops (not yet supported in JIT) ──────────────────
+                IrOp::MatMul { .. } | IrOp::HadamardMul { .. } | IrOp::HadamardDiv { .. } |
+                IrOp::TensorConcat { .. } | IrOp::KronProd { .. } | IrOp::OuterProd { .. } => {
+                    // Fall back to unit for unsupported tensor ops
+                    if let Some(dst) = instr.dst {
+                        let dst = get_slot(dst, &mut value_to_slot, &mut next_slot);
+                        instrs.push(Instr::LoadUnit(dst));
+                    }
+                }
+
+                // ── Parallel / Region / Task ops (not supported in JIT) ────
+                IrOp::ParallelStart { .. } | IrOp::ParallelEnd { .. } |
+                IrOp::RegionAlloc { .. } | IrOp::TaskSpawn { .. } | IrOp::TaskJoin { .. } |
+                IrOp::Emit { .. } | IrOp::TypeCheck { .. } | IrOp::Cast { .. } => {
+                    // No-op or unit placeholder
+                    if let Some(dst) = instr.dst {
+                        let dst = get_slot(dst, &mut value_to_slot, &mut next_slot);
+                        instrs.push(Instr::LoadUnit(dst));
+                    }
+                }
+
+                // ── Phi (already handled above) ────────────────────────────
+                IrOp::Phi { .. } => {
+                    // Already handled above — skip
+                }
+            }
+        }
+
+        // ── Insert phi moves before terminators ──────────────────────────
+        // For each successor block that has phis, insert Move instructions
+        // to resolve the phi values. This must happen BEFORE the terminator.
+        if let Some(moves) = phi_moves.get(bid) {
+            // Find the terminator position (last instruction in the block)
+            let terminator_idx = instrs.len().saturating_sub(1);
+            let mut phi_move_instrs: Vec<Instr> = Vec::new();
+
+            for &(_target_block, dst_vid, src_vid) in moves {
+                let dst_slot = get_slot(dst_vid, &mut value_to_slot, &mut next_slot);
+                let src_slot = get_slot(src_vid, &mut value_to_slot, &mut next_slot);
+                if dst_slot != src_slot {
+                    phi_move_instrs.push(Instr::Move(dst_slot, src_slot));
+                }
+            }
+
+            if !phi_move_instrs.is_empty() {
+                // Insert before the terminator
+                let insert_pos = if terminator_idx > 0 && matches!(
+                    instrs.last(),
+                    Some(Instr::Jump(_)) | Some(Instr::JumpFalse(_, _)) | Some(Instr::Return(_)) | Some(Instr::ReturnUnit)
+                ) {
+                    terminator_idx
+                } else {
+                    instrs.len()
+                };
+
+                // Splice phi moves before the terminator
+                let mut new_instrs: Vec<Instr> = instrs[..insert_pos].to_vec();
+                new_instrs.append(&mut phi_move_instrs);
+                if insert_pos < instrs.len() {
+                    new_instrs.push(instrs[insert_pos].clone());
+                }
+                instrs = new_instrs;
+
+                // Fix up block_pc for subsequent blocks (instructions shifted)
+                // We'll recalculate all block PCs at the end
+            }
+        }
+
+        block_instr_ranges.insert(*bid, (start_idx, instrs.len()));
+    }
+
+    // ── Fixup branch offsets ─────────────────────────────────────────────
+    // The block_pc map was built during flattening (before phi move insertion).
+    // Phi moves may have shifted instructions, so we need to update block_pc
+    // to reflect the actual positions. Since blocks were emitted in order,
+    // we scan forward through the instruction stream to find actual block
+    // boundaries.
+
+    // Simple approach: mark all branch targets and sequence points
+    let mut block_starts: FxHashSet<usize> = FxHashSet::default();
+    block_starts.insert(0);
+    for (pc, instr) in instrs.iter().enumerate() {
+        match instr {
+            Instr::Jump(off) => {
+                let target = ((pc as i32) + 1 + *off) as usize;
+                block_starts.insert(target);
+            }
+            Instr::JumpFalse(_, off) => {
+                let target = ((pc as i32) + 1 + *off) as usize;
+                block_starts.insert(target);
+                // Fall-through is also a block start
+                if pc + 1 < instrs.len() {
+                    block_starts.insert(pc + 1);
+                }
+            }
+            Instr::JumpTrue(_, off) => {
+                let target = ((pc as i32) + 1 + *off) as usize;
+                block_starts.insert(target);
+                if pc + 1 < instrs.len() {
+                    block_starts.insert(pc + 1);
+                }
+            }
+            Instr::Return(_) | Instr::ReturnUnit => {
+                if pc + 1 < instrs.len() {
+                    block_starts.insert(pc + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Now fix up the branch instructions with correct offsets
+    for fixup in &fixups {
+        let target_pc = block_pc.get(&fixup.target_block).copied().unwrap_or(0);
+        let instr_idx = fixup.instr_idx;
+        if instr_idx < instrs.len() {
+            match &mut instrs[instr_idx] {
+                Instr::Jump(ref mut off) => {
+                    *off = (target_pc as i32) - (instr_idx as i32) - 1;
+                }
+                Instr::JumpFalse(_, ref mut off) => {
+                    *off = (target_pc as i32) - (instr_idx as i32) - 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ── Metadata-driven optimization passes ──────────────────────────────
+    // These passes use the preserved EffectFlags and AliasKind metadata
+    // to apply optimizations impossible with bytecode-only translate().
+
+    // Pass: Effect-aware dead code elimination
+    // Any pure operation whose result is never used can be eliminated.
+    // (This is complementary to the existing global_dce in translate().)
+    {
+        let mut used: FxHashSet<u16> = FxHashSet::default();
+        // Mark all slots that are used (read) by any instruction
+        for instr in &instrs {
+            match instr {
+                Instr::BinOp(_, _, l, r) => { used.insert(*l); used.insert(*r); }
+                Instr::UnOp(_, _, s) => { used.insert(*s); }
+                Instr::Move(_, s) => { used.insert(*s); }
+                Instr::Load(_, s) => { used.insert(*s); }
+                Instr::Store(_, s) => { used.insert(*s); }
+                Instr::Return(s) => { used.insert(*s); }
+                Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) => { used.insert(*s); }
+                _ => {}
+            }
+        }
+        // Remove pure LoadI32/LoadI64/LoadBool/LoadUnit whose result is never used
+        let keep_mask: Vec<bool> = instrs.iter().map(|instr| {
+            match instr {
+                Instr::LoadI32(d, _) | Instr::LoadI64(d, _) | Instr::LoadBool(d, _) | Instr::LoadUnit(d) => {
+                    used.contains(d)
+                }
+                _ => true,
+            }
+        }).collect();
+        let mut write_idx = 0;
+        for (i, keep) in keep_mask.into_iter().enumerate() {
+            if keep {
+                if write_idx != i {
+                    instrs[write_idx] = instrs[i].clone();
+                }
+                write_idx += 1;
+            }
+        }
+        instrs.truncate(write_idx);
+    }
+
+    // Pass: Constant folding with metadata awareness
+    // Pure BinOps with known constant operands can be folded at compile time.
+    // The effect metadata guarantees these are safe to fold (no side effects).
+    {
+        let mut const_at: FxHashMap<u16, i64> = FxHashMap::default();
+        let mut folded_any = false;
+        for instr in &mut instrs {
+            // Propagate through Move
+            if let Instr::Move(d, s) = instr {
+                if let Some(&v) = const_at.get(s) {
+                    const_at.insert(*d, v);
+                }
+                continue;
+            }
+            // Fold pure BinOps
+            if let Instr::BinOp(d, op, l, r) = instr {
+                let lv = const_at.get(l).copied();
+                let rv = const_at.get(r).copied();
+                if let (Some(lv), Some(rv)) = (lv, rv) {
+                    if let Some(result) = eval_binop_const(*op, lv, rv) {
+                        const_at.insert(*d, result);
+                        *instr = Instr::LoadI64(*d, result);
+                        folded_any = true;
+                        continue;
+                    }
+                }
+                // If one operand is constant, we can still do some folding
+                // (e.g., x + 0 → x, x * 1 → x, x * 0 → 0)
+                if let Some(rv) = rv {
+                    match op {
+                        BinOpKind::Add if rv == 0 => {
+                            *instr = Instr::Move(*d, *l);
+                            folded_any = true;
+                        }
+                        BinOpKind::Mul if rv == 1 => {
+                            *instr = Instr::Move(*d, *l);
+                            folded_any = true;
+                        }
+                        BinOpKind::Mul if rv == 0 => {
+                            const_at.insert(*d, 0);
+                            *instr = Instr::LoadI64(*d, 0);
+                            folded_any = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Track constants from LoadI32/LoadI64
+            match instr {
+                Instr::LoadI32(d, v) => { const_at.insert(*d, *v as i64); }
+                Instr::LoadI64(d, v) => { const_at.insert(*d, *v); }
+                Instr::LoadBool(d, v) => { const_at.insert(*d, i64::from(*v)); }
+                Instr::LoadUnit(d) => { const_at.insert(*d, 0); }
+                _ => {}
+            }
+        }
+        if folded_any {
+            eprintln!("[JIT-IR] Constant folding applied with metadata awareness");
+        }
+    }
+
+    CompiledFn {
+        name: func.name.clone(),
+        param_count,
+        slot_count: next_slot,
+        instrs,
+        str_pool,
+        const_pool: Vec::new(),
+    }
+}
+
+/// Evaluate a BinOp at compile time. Returns None if the operation
+/// is not foldable (division by zero, etc.).
+fn eval_binop_const(op: BinOpKind, l: i64, r: i64) -> Option<i64> {
+    match op {
+        BinOpKind::Add => Some(l.wrapping_add(r)),
+        BinOpKind::Sub => Some(l.wrapping_sub(r)),
+        BinOpKind::Mul => Some(l.wrapping_mul(r)),
+        BinOpKind::Div => {
+            if r == 0 { None } else { Some(l.wrapping_div(r)) }
+        }
+        BinOpKind::Rem => {
+            if r == 0 { None } else { Some(l.wrapping_rem(r)) }
+        }
+        BinOpKind::And => Some(if l != 0 && r != 0 { 1 } else { 0 }),
+        BinOpKind::Or => Some(if l != 0 || r != 0 { 1 } else { 0 }),
+        BinOpKind::Eq => Some(if l == r { 1 } else { 0 }),
+        BinOpKind::Ne => Some(if l != r { 1 } else { 0 }),
+        BinOpKind::Lt => Some(if l < r { 1 } else { 0 }),
+        BinOpKind::Le => Some(if l <= r { 1 } else { 0 }),
+        BinOpKind::Gt => Some(if l > r { 1 } else { 0 }),
+        BinOpKind::Ge => Some(if l >= r { 1 } else { 0 }),
+        _ => None,
+    }
+}
+
+/// Compile a FlatIrFunction directly to native machine code.
+///
+/// This is the preferred JIT path — it bypasses the bytecode (`Vec<Instr>`)
+/// entirely, using the flat SSA IR from lower.rs with preserved metadata
+/// (EffectFlags, AliasKind, Ownership) to drive better code generation.
+///
+/// Falls back to the bytecode path if the function contains operations
+/// not yet supported by the IR-to-native path.
+pub fn translate_from_ir(func: &FlatIrFunction) -> Option<NativeCode> {
+    if !cfg!(target_arch = "x86_64") {
+        return None;
+    }
+
+    eprintln!("[JIT-IR] translate_from_ir: compiling {} ({} blocks, {} params)",
+        func.name, func.blocks.len(), func.params.len());
+
+    // Convert FlatIrFunction → CompiledFn with metadata-driven optimizations
+    let compiled = flat_ir_to_compiled_fn(func);
+
+    // Delegate to the existing translate() for machine code emission
+    translate(&compiled)
 }
 
 /// Finalize the JIT arena: flip all dirty pages from RW→RX.

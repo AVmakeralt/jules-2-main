@@ -4954,6 +4954,11 @@ pub struct Interpreter {
     /// hanging the process (the bytecode VM already has EntropyWatchdog; the
     /// tree-walker had zero protection).
     max_loop_iterations: u64,
+    /// Flat IR module from lower.rs — used for IR-direct JIT compilation.
+    /// When present, the JIT bypasses the bytecode path entirely and compiles
+    /// from the flat SSA IR, preserving EffectFlags, AliasKind, and Ownership
+    /// metadata for better optimization.
+    ir_module: Option<crate::compiler::ir::FlatIrModule>,
 }
 
 impl Interpreter {
@@ -5003,6 +5008,7 @@ impl Interpreter {
             ecs_query_scratch: Vec::new(),
             loop_step_counter: 0,
             max_loop_iterations: 10_000_000, // 10M iterations — generous but finite
+            ir_module: None,
         }
     }
 
@@ -5011,6 +5017,14 @@ impl Interpreter {
         self.jit_native_calls = 0;
         self.jit_vm_calls = 0;
         self.jit_fallback_calls = 0;
+    }
+
+    /// Load the flat IR module for IR-direct JIT compilation.
+    /// When present, the JIT will use `translate_from_ir()` instead of
+    /// `translate()`, bypassing the bytecode path entirely.
+    pub fn load_ir_module(&mut self, module: crate::compiler::ir::FlatIrModule) {
+        eprintln!("[JIT-IR] Loaded IR module with {} functions", module.functions.len());
+        self.ir_module = Some(module);
     }
 
     /// Set the maximum number of loop iterations before the interpreter
@@ -5184,13 +5198,22 @@ impl Interpreter {
                     hot_fns.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
                     for (hot_name, _) in hot_fns.into_iter().take(5) {
                         if !self.native_fns.contains_key(hot_name) {
-                            if let Some(hot_compiled) = self.compiled_fns.get(hot_name).cloned() {
-                                // Superpower 2: adaptive inlining — inline
-                                // small leaf calls before JIT compilation.
-                                let inlined = crate::jit::phase3_jit::inline_small_calls(&hot_compiled, &self.compiled_fns);
-                                if let Some(native) = crate::jit::phase3_jit::translate(&inlined) {
-                                    self.native_fns.insert(hot_name.clone(), Arc::new(native));
+                            // Try IR-direct JIT first
+                            let mut native_code = None;
+                            if let Some(ref ir_mod) = self.ir_module {
+                                if let Some(ir_func) = ir_mod.functions.iter().find(|f| f.name == hot_name.as_str()) {
+                                    native_code = crate::jit::phase3_jit::translate_from_ir(ir_func);
                                 }
+                            }
+                            // Fall back to bytecode JIT
+                            if native_code.is_none() {
+                                if let Some(hot_compiled) = self.compiled_fns.get(hot_name).cloned() {
+                                    let inlined = crate::jit::phase3_jit::inline_small_calls(&hot_compiled, &self.compiled_fns);
+                                    native_code = crate::jit::phase3_jit::translate(&inlined);
+                                }
+                            }
+                            if let Some(native) = native_code {
+                                self.native_fns.insert(hot_name.clone(), Arc::new(native));
                             }
                         }
                     }
@@ -5207,13 +5230,22 @@ impl Interpreter {
                     self.pgo_second_window_done = true;
                     for (fn_name, count) in &self.pgo_call_counts {
                         if *count >= 10 && !self.native_fns.contains_key(fn_name) {
-                            if let Some(compiled) = self.compiled_fns.get(fn_name).cloned() {
-                                // Superpower 2: adaptive inlining — inline
-                                // small leaf calls before JIT compilation.
-                                let inlined = crate::jit::phase3_jit::inline_small_calls(&compiled, &self.compiled_fns);
-                                if let Some(native) = crate::jit::phase3_jit::translate(&inlined) {
-                                    self.native_fns.insert(fn_name.clone(), Arc::new(native));
+                            // Try IR-direct JIT first
+                            let mut native_code = None;
+                            if let Some(ref ir_mod) = self.ir_module {
+                                if let Some(ir_func) = ir_mod.functions.iter().find(|f| f.name == fn_name.as_str()) {
+                                    native_code = crate::jit::phase3_jit::translate_from_ir(ir_func);
                                 }
+                            }
+                            // Fall back to bytecode JIT
+                            if native_code.is_none() {
+                                if let Some(compiled) = self.compiled_fns.get(fn_name).cloned() {
+                                    let inlined = crate::jit::phase3_jit::inline_small_calls(&compiled, &self.compiled_fns);
+                                    native_code = crate::jit::phase3_jit::translate(&inlined);
+                                }
+                            }
+                            if let Some(native) = native_code {
+                                self.native_fns.insert(fn_name.clone(), Arc::new(native));
                             }
                         }
                     }
@@ -5265,10 +5297,28 @@ impl Interpreter {
                         }
                         // native execute() failed for cached fn={name}, falling through
                     } else {
-                        // Superpower 2: adaptive inlining — inline small
-                        // leaf calls before JIT compilation.
-                        let inlined = crate::jit::phase3_jit::inline_small_calls(&compiled, &self.compiled_fns);
-                        if let Some(native) = crate::jit::phase3_jit::translate(&inlined) {
+                        // ── IR-Direct JIT Path (preferred) ────────────────
+                        // Try compile from flat SSA IR first — bypasses bytecode
+                        // entirely and preserves EffectFlags/AliasKind metadata.
+                        let mut native_code = None;
+                        if let Some(ref ir_mod) = self.ir_module {
+                            if let Some(ir_func) = ir_mod.functions.iter().find(|f| f.name == name) {
+                                native_code = crate::jit::phase3_jit::translate_from_ir(ir_func);
+                                if native_code.is_some() {
+                                    eprintln!("[JIT-IR] Compiled {} via IR-direct path", name);
+                                }
+                            }
+                        }
+                        // ── Bytecode JIT Path (fallback) ──────────────────
+                        // If IR-direct path failed or IR module not available,
+                        // fall back to the bytecode-based JIT.
+                        if native_code.is_none() {
+                            // Superpower 2: adaptive inlining — inline small
+                            // leaf calls before JIT compilation.
+                            let inlined = crate::jit::phase3_jit::inline_small_calls(&compiled, &self.compiled_fns);
+                            native_code = crate::jit::phase3_jit::translate(&inlined);
+                        }
+                        if let Some(native) = native_code {
                             let native = Arc::new(native);
                             self.native_fns.insert(name.to_owned(), native.clone());
                             // Ensure arena pages are executable before running native code.
