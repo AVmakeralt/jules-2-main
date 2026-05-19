@@ -152,8 +152,14 @@ fn bench() -> i32 {{
 
 fn rust_lcg(n: i32) -> i64 {
     let mut s: i32 = 42;
-    for _ in 0..n { s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); }
-    black_box(s as i64)
+    let mut i: i32 = 0;
+    while i < n {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        i = i.wrapping_add(1);
+        // Black-box the state to prevent LLVM from vectorizing/eliminating the loop
+        std::hint::black_box(&mut s);
+    }
+    s as i64
 }
 fn rust_sum(n: i32) -> i64 {
     let mut s: i32 = 0; let mut i: i32 = 0;
@@ -162,12 +168,17 @@ fn rust_sum(n: i32) -> i64 {
 }
 fn rust_count(n: i32) -> i64 {
     let mut count: i32 = 0; let mut i: i32 = 0;
-    while i < n { count = count.wrapping_add(1); i = i.wrapping_add(1); }
-    black_box(count as i64)
+    while i < n {
+        count = count.wrapping_add(1); i = i.wrapping_add(1);
+        // Black-box to prevent LLVM from computing count=n directly
+        std::hint::black_box(&mut count);
+    }
+    count as i64
 }
 fn rust_muladd(n: i32) -> i64 {
     let mut a: i32 = 1; let mut b: i32 = 2;
-    for _ in 0..n { let tmp = a.wrapping_mul(3).wrapping_add(b); a = b; b = tmp; }
+    let mut i: i32 = 0;
+    while i < n { let tmp = a.wrapping_mul(3).wrapping_add(b); a = b; b = tmp; i = i.wrapping_add(1); }
     black_box(a as i64)
 }
 
