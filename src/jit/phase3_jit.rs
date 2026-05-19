@@ -8300,33 +8300,39 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
     // ── Block layout: assign PC offsets ──────────────────────────────────
     // Flatten blocks into a linear instruction stream. Each block's
     // instructions are laid out sequentially. Block IDs map to PC offsets.
-    let mut block_pc: FxHashMap<BlockId, usize> = FxHashMap::default();
     let mut block_order: Vec<BlockId> = Vec::new();
 
-    // Determine block order: entry first, then successors
+    // Determine block order using DFS that prioritizes if_true over if_false.
+    // This ensures that CondBr fall-through lands on if_true, which is the
+    // common/hot path (loop body).
     {
         let mut visited = FxHashSet::default();
-        let mut stack = vec![func.entry];
-        while let Some(bid) = stack.pop() {
-            if visited.contains(&bid) { continue; }
+        fn dfs_visit(
+            bid: BlockId,
+            func: &FlatIrFunction,
+            visited: &mut FxHashSet<BlockId>,
+            order: &mut Vec<BlockId>,
+        ) {
+            if visited.contains(&bid) { return; }
             visited.insert(bid);
-            block_order.push(bid);
-            // Find successor blocks from terminators
+            order.push(bid);
             if let Some(block) = func.blocks.iter().find(|b| b.id == bid) {
                 for instr in &block.instrs {
                     match &instr.op {
+                        // Visit if_true FIRST (fall-through path), then if_false
                         IrOp::CondBr { if_true, if_false, .. } => {
-                            if !visited.contains(if_true) { stack.push(*if_true); }
-                            if !visited.contains(if_false) { stack.push(*if_false); }
+                            dfs_visit(*if_true, func, visited, order);
+                            dfs_visit(*if_false, func, visited, order);
                         }
                         IrOp::Jump { target } => {
-                            if !visited.contains(target) { stack.push(*target); }
+                            dfs_visit(*target, func, visited, order);
                         }
                         _ => {}
                     }
                 }
             }
         }
+        dfs_visit(func.entry, func, &mut visited, &mut block_order);
         // Add any remaining blocks not reachable from entry
         for block in &func.blocks {
             if !visited.contains(&block.id) {
@@ -8358,41 +8364,50 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
     }
 
     // ── Flatten blocks into instruction stream ───────────────────────────
-    // Track where each block's instructions start (for branch fixups)
-    // and collect branch fixup entries.
-    struct BranchFixup {
-        instr_idx: usize,   // index in instrs vec where the offset goes
-        target_block: BlockId,
-    }
-    let mut fixups: Vec<BranchFixup> = Vec::new();
-
-    // Track which blocks have which instructions (for phi move insertion)
-    let mut block_instr_ranges: FxHashMap<BlockId, (usize, usize)> = FxHashMap::default();
+    // We emit instructions with placeholder branch targets. Branch targets
+    // are identified by (instr_idx, BlockId) pairs that will be resolved
+    // after all instruction manipulation is done.
+    let mut branch_targets: Vec<(usize, BlockId)> = Vec::new(); // (instr_idx, target_block)
 
     // Metadata side tables (preserved from FlatIrFunction)
     let mut _effect_table: Vec<(u16, EffectFlags)> = Vec::new();  // slot → effects
     let mut _alias_table: Vec<(u16, AliasKind)> = Vec::new();     // slot → alias info
 
-    for bid in &block_order {
+    // Map: block_id → first instr index (built during flattening)
+    let mut block_start_pc: FxHashMap<BlockId, usize> = FxHashMap::default();
+
+    for (block_order_idx, bid) in block_order.iter().enumerate() {
         let block = match func.blocks.iter().find(|b| b.id == *bid) {
             Some(b) => b,
             None => continue,
         };
 
-        block_pc.insert(*bid, instrs.len());
-        let start_idx = instrs.len();
+        block_start_pc.insert(*bid, instrs.len());
+
+        // ── Insert phi moves at the START of this block ──────────────────
+        // For each predecessor that jumps to this block, we need to resolve
+        // phi nodes. The standard approach: at the END of each predecessor,
+        // before its terminator, insert Move instructions for all phis.
+        //
+        // But it's simpler to insert them at the START of this block, where
+        // we know which predecessor we came from via the phi's incoming list.
+        // Actually, that's wrong — at the start of a block we don't know
+        // which predecessor transferred control.
+        //
+        // The correct approach: insert phi moves at the END of each
+        // predecessor block, BEFORE its terminator. We do this after all
+        // blocks are flattened, by patching in Move instructions.
 
         for instr in &block.instrs {
-            // Skip phi nodes — they're handled via Move insertion at predecessors
+            // Skip phi nodes — they'll be resolved via Move insertion later
             if matches!(instr.op, IrOp::Phi { .. }) {
-                // Still allocate a slot for the phi result
                 if let Some(dst) = instr.dst {
                     get_slot(dst, &mut value_to_slot, &mut next_slot);
                 }
                 continue;
             }
 
-            // Record metadata for optimization passes
+            // Record metadata
             if let Some(dst) = instr.dst {
                 let slot = get_slot(dst, &mut value_to_slot, &mut next_slot);
                 if !instr.effects.is_pure() {
@@ -8404,23 +8419,16 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
             }
 
             match &instr.op {
-                // ── Constants ─────────────────────────────────────────────
                 IrOp::ConstInt { value, ty } => {
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     match ty {
-                        IrType::Int { width: 32, signed: true } => {
+                        IrType::Int { width: 32, .. } => {
                             instrs.push(Instr::LoadI32(dst, *value as i32));
                         }
-                        IrType::Int { width: 64, signed: true } | IrType::Int { width: 64, signed: false } => {
+                        IrType::Int { width: 64, .. } => {
                             instrs.push(Instr::LoadI64(dst, *value as i64));
                         }
-                        IrType::Int { width: 32, signed: false } => {
-                            instrs.push(Instr::LoadI32(dst, *value as i32));
-                        }
-                        IrType::Int { width: 8, signed: true } | IrType::Int { width: 8, signed: false } => {
-                            instrs.push(Instr::LoadI32(dst, *value as i32));
-                        }
-                        IrType::Int { width: 16, signed: true } | IrType::Int { width: 16, signed: false } => {
+                        IrType::Int { width: 8, .. } | IrType::Int { width: 16, .. } => {
                             instrs.push(Instr::LoadI32(dst, *value as i32));
                         }
                         _ => {
@@ -8428,7 +8436,6 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
                         }
                     }
                 }
-
                 IrOp::ConstFloat { bits, ty } => {
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     match ty {
@@ -8440,73 +8447,50 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
                         }
                     }
                 }
-
                 IrOp::ConstBool { value } => {
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     instrs.push(Instr::LoadBool(dst, *value));
                 }
-
                 IrOp::ConstStr { idx: _ } => {
-                    // String constants need to go through the string pool
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
-                    // For now, emit as a LoadUnit placeholder — string handling
-                    // in the JIT is limited
                     instrs.push(Instr::LoadUnit(dst));
                 }
-
                 IrOp::ConstUnit => {
                     if let Some(dst) = instr.dst {
                         let dst = get_slot(dst, &mut value_to_slot, &mut next_slot);
                         instrs.push(Instr::LoadUnit(dst));
                     }
                 }
-
-                // ── Arithmetic ─────────────────────────────────────────────
                 IrOp::BinOp { op, lhs, rhs } => {
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     let l = get_slot(*lhs, &mut value_to_slot, &mut next_slot);
                     let r = get_slot(*rhs, &mut value_to_slot, &mut next_slot);
                     instrs.push(Instr::BinOp(dst, *op, l, r));
                 }
-
                 IrOp::UnOp { op, operand } => {
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     let s = get_slot(*operand, &mut value_to_slot, &mut next_slot);
                     instrs.push(Instr::UnOp(dst, *op, s));
                 }
-
-                // ── Memory ─────────────────────────────────────────────────
-                IrOp::Move { src } => {
+                IrOp::Move { src } | IrOp::Copy { src } => {
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     let s = get_slot(*src, &mut value_to_slot, &mut next_slot);
                     instrs.push(Instr::Move(dst, s));
                 }
-
                 IrOp::Store { ptr, value } => {
                     let p = get_slot(*ptr, &mut value_to_slot, &mut next_slot);
                     let v = get_slot(*value, &mut value_to_slot, &mut next_slot);
                     instrs.push(Instr::Store(p, v));
                 }
-
                 IrOp::Load { ptr, ty: _ } => {
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     let p = get_slot(*ptr, &mut value_to_slot, &mut next_slot);
                     instrs.push(Instr::Load(dst, p));
                 }
-
                 IrOp::Alloca { ty: _, align: _ } => {
-                    // Stack allocation — allocate a slot and zero it
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     instrs.push(Instr::LoadUnit(dst));
                 }
-
-                IrOp::Copy { src } => {
-                    let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
-                    let s = get_slot(*src, &mut value_to_slot, &mut next_slot);
-                    instrs.push(Instr::Move(dst, s));
-                }
-
-                // ── Control flow ───────────────────────────────────────────
                 IrOp::Ret { value } => {
                     match value {
                         Some(vid) => {
@@ -8518,47 +8502,37 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
                         }
                     }
                 }
-
                 IrOp::Jump { target } => {
-                    // Emit placeholder Jump(0) — fixup later
-                    fixups.push(BranchFixup {
-                        instr_idx: instrs.len(),
-                        target_block: *target,
-                    });
-                    instrs.push(Instr::Jump(0));
+                    // Record branch target — will be resolved after all blocks are emitted
+                    branch_targets.push((instrs.len(), *target));
+                    instrs.push(Instr::Jump(0)); // placeholder offset
                 }
-
-                IrOp::CondBr { cond, if_true: _, if_false } => {
+                IrOp::CondBr { cond, if_true, if_false } => {
                     let c = get_slot(*cond, &mut value_to_slot, &mut next_slot);
-                    fixups.push(BranchFixup {
-                        instr_idx: instrs.len(),
-                        target_block: *if_false,
-                    });
-                    instrs.push(Instr::JumpFalse(c, 0));
+                    // JumpFalse to if_false; fall-through to if_true
+                    branch_targets.push((instrs.len(), *if_false));
+                    instrs.push(Instr::JumpFalse(c, 0)); // placeholder offset
+                    // If if_true isn't the next block, add explicit Jump
+                    let next_block = block_order.get(block_order_idx + 1);
+                    if next_block != Some(if_true) {
+                        branch_targets.push((instrs.len(), *if_true));
+                        instrs.push(Instr::Jump(0)); // placeholder offset
+                    }
                 }
-
                 IrOp::Nop => {
                     instrs.push(Instr::Nop);
                 }
-
-                // ── Calls ──────────────────────────────────────────────────
                 IrOp::Call { func: name, args } => {
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     let callee_str = intern_str(name, &mut str_pool, &mut str_idx);
-                    // Emit args as sequential slots starting from a temp
                     let args_start = next_slot;
                     for arg_vid in args {
                         let arg_slot = get_slot(*arg_vid, &mut value_to_slot, &mut next_slot);
-                        if arg_slot >= args_start {
-                            // Already assigned — just reference it
-                        }
-                        // Move arg into sequential slots
                         instrs.push(Instr::Move(next_slot, arg_slot));
                         next_slot += 1;
                     }
                     instrs.push(Instr::CallBuiltin(dst, callee_str, args_start, args.len() as u16));
                 }
-
                 IrOp::Intrinsic { name, args } => {
                     let dst = get_slot(instr.dst.unwrap(), &mut value_to_slot, &mut next_slot);
                     let callee_str = intern_str(name, &mut str_pool, &mut str_idx);
@@ -8570,43 +8544,26 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
                     }
                     instrs.push(Instr::CallBuiltin(dst, callee_str, args_start, args.len() as u16));
                 }
-
-                // ── Tensor ops (not yet supported in JIT) ──────────────────
+                // Tensor / parallel / region ops — not supported in JIT
                 IrOp::MatMul { .. } | IrOp::HadamardMul { .. } | IrOp::HadamardDiv { .. } |
-                IrOp::TensorConcat { .. } | IrOp::KronProd { .. } | IrOp::OuterProd { .. } => {
-                    // Fall back to unit for unsupported tensor ops
-                    if let Some(dst) = instr.dst {
-                        let dst = get_slot(dst, &mut value_to_slot, &mut next_slot);
-                        instrs.push(Instr::LoadUnit(dst));
-                    }
-                }
-
-                // ── Parallel / Region / Task ops (not supported in JIT) ────
+                IrOp::TensorConcat { .. } | IrOp::KronProd { .. } | IrOp::OuterProd { .. } |
                 IrOp::ParallelStart { .. } | IrOp::ParallelEnd { .. } |
                 IrOp::RegionAlloc { .. } | IrOp::TaskSpawn { .. } | IrOp::TaskJoin { .. } |
                 IrOp::Emit { .. } | IrOp::TypeCheck { .. } | IrOp::Cast { .. } => {
-                    // No-op or unit placeholder
                     if let Some(dst) = instr.dst {
                         let dst = get_slot(dst, &mut value_to_slot, &mut next_slot);
                         instrs.push(Instr::LoadUnit(dst));
                     }
                 }
-
-                // ── Phi (already handled above) ────────────────────────────
-                IrOp::Phi { .. } => {
-                    // Already handled above — skip
-                }
+                IrOp::Phi { .. } => { /* already handled above */ }
             }
         }
 
-        // ── Insert phi moves before terminators ──────────────────────────
-        // For each successor block that has phis, insert Move instructions
-        // to resolve the phi values. This must happen BEFORE the terminator.
+        // ── Insert phi moves at the END of this block, BEFORE terminator ──
+        // For each successor block with phis, insert Move instructions
+        // to resolve phi values from THIS predecessor.
         if let Some(moves) = phi_moves.get(bid) {
-            // Find the terminator position (last instruction in the block)
-            let terminator_idx = instrs.len().saturating_sub(1);
             let mut phi_move_instrs: Vec<Instr> = Vec::new();
-
             for &(_target_block, dst_vid, src_vid) in moves {
                 let dst_slot = get_slot(dst_vid, &mut value_to_slot, &mut next_slot);
                 let src_slot = get_slot(src_vid, &mut value_to_slot, &mut next_slot);
@@ -8614,101 +8571,44 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
                     phi_move_instrs.push(Instr::Move(dst_slot, src_slot));
                 }
             }
-
             if !phi_move_instrs.is_empty() {
-                // Insert before the terminator
-                let insert_pos = if terminator_idx > 0 && matches!(
+                // Find the terminator (last instruction)
+                let has_terminator = !instrs.is_empty() && matches!(
                     instrs.last(),
-                    Some(Instr::Jump(_)) | Some(Instr::JumpFalse(_, _)) | Some(Instr::Return(_)) | Some(Instr::ReturnUnit)
-                ) {
-                    terminator_idx
+                    Some(Instr::Jump(_)) | Some(Instr::JumpFalse(_, _)) |
+                    Some(Instr::JumpTrue(_, _)) | Some(Instr::Return(_)) |
+                    Some(Instr::ReturnUnit)
+                );
+                if has_terminator {
+                    // Adjust branch_targets that point to the terminator
+                    // (they shifted by the number of phi moves inserted before it)
+                    let shift = phi_move_instrs.len();
+                    let terminator_idx = instrs.len() - 1;
+                    for (idx, _) in branch_targets.iter_mut() {
+                        if *idx >= terminator_idx {
+                            *idx += shift;
+                        }
+                    }
+                    // Insert phi moves before the terminator
+                    let terminator = instrs.pop().unwrap();
+                    instrs.append(&mut phi_move_instrs);
+                    instrs.push(terminator);
                 } else {
-                    instrs.len()
-                };
-
-                // Splice phi moves before the terminator
-                let mut new_instrs: Vec<Instr> = instrs[..insert_pos].to_vec();
-                new_instrs.append(&mut phi_move_instrs);
-                if insert_pos < instrs.len() {
-                    new_instrs.push(instrs[insert_pos].clone());
+                    instrs.append(&mut phi_move_instrs);
                 }
-                instrs = new_instrs;
-
-                // Fix up block_pc for subsequent blocks (instructions shifted)
-                // We'll recalculate all block PCs at the end
-            }
-        }
-
-        block_instr_ranges.insert(*bid, (start_idx, instrs.len()));
-    }
-
-    // ── Fixup branch offsets ─────────────────────────────────────────────
-    // The block_pc map was built during flattening (before phi move insertion).
-    // Phi moves may have shifted instructions, so we need to update block_pc
-    // to reflect the actual positions. Since blocks were emitted in order,
-    // we scan forward through the instruction stream to find actual block
-    // boundaries.
-
-    // Simple approach: mark all branch targets and sequence points
-    let mut block_starts: FxHashSet<usize> = FxHashSet::default();
-    block_starts.insert(0);
-    for (pc, instr) in instrs.iter().enumerate() {
-        match instr {
-            Instr::Jump(off) => {
-                let target = ((pc as i32) + 1 + *off) as usize;
-                block_starts.insert(target);
-            }
-            Instr::JumpFalse(_, off) => {
-                let target = ((pc as i32) + 1 + *off) as usize;
-                block_starts.insert(target);
-                // Fall-through is also a block start
-                if pc + 1 < instrs.len() {
-                    block_starts.insert(pc + 1);
-                }
-            }
-            Instr::JumpTrue(_, off) => {
-                let target = ((pc as i32) + 1 + *off) as usize;
-                block_starts.insert(target);
-                if pc + 1 < instrs.len() {
-                    block_starts.insert(pc + 1);
-                }
-            }
-            Instr::Return(_) | Instr::ReturnUnit => {
-                if pc + 1 < instrs.len() {
-                    block_starts.insert(pc + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Now fix up the branch instructions with correct offsets
-    for fixup in &fixups {
-        let target_pc = block_pc.get(&fixup.target_block).copied().unwrap_or(0);
-        let instr_idx = fixup.instr_idx;
-        if instr_idx < instrs.len() {
-            match &mut instrs[instr_idx] {
-                Instr::Jump(ref mut off) => {
-                    *off = (target_pc as i32) - (instr_idx as i32) - 1;
-                }
-                Instr::JumpFalse(_, ref mut off) => {
-                    *off = (target_pc as i32) - (instr_idx as i32) - 1;
-                }
-                _ => {}
             }
         }
     }
 
     // ── Metadata-driven optimization passes ──────────────────────────────
-    // These passes use the preserved EffectFlags and AliasKind metadata
-    // to apply optimizations impossible with bytecode-only translate().
+    // These passes run BEFORE branch fixup so they don't invalidate offsets.
+    // They use the preserved EffectFlags and AliasKind metadata to apply
+    // optimizations impossible with bytecode-only translate().
 
     // Pass: Effect-aware dead code elimination
     // Any pure operation whose result is never used can be eliminated.
-    // (This is complementary to the existing global_dce in translate().)
     {
         let mut used: FxHashSet<u16> = FxHashSet::default();
-        // Mark all slots that are used (read) by any instruction
         for instr in &instrs {
             match instr {
                 Instr::BinOp(_, _, l, r) => { used.insert(*l); used.insert(*r); }
@@ -8721,7 +8621,6 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
                 _ => {}
             }
         }
-        // Remove pure LoadI32/LoadI64/LoadBool/LoadUnit whose result is never used
         let keep_mask: Vec<bool> = instrs.iter().map(|instr| {
             match instr {
                 Instr::LoadI32(d, _) | Instr::LoadI64(d, _) | Instr::LoadBool(d, _) | Instr::LoadUnit(d) => {
@@ -8743,63 +8642,98 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
     }
 
     // Pass: Constant folding with metadata awareness
-    // Pure BinOps with known constant operands can be folded at compile time.
-    // The effect metadata guarantees these are safe to fold (no side effects).
+    // DISABLED: The translate() function already has correct forward constant
+    // propagation that properly clears at loop headers. Running a second
+    // constant folding pass here was incorrectly folding loop-carried values
+    // (e.g., phi_s = 42 was treated as always 42, folding s * 1664525 into
+    // a constant and eliminating the loop body). The translate() pass handles
+    // this correctly by clearing const_at at backward-branch targets.
+    //
+    // Future: when we have effect metadata per instruction, we can re-enable
+    // this pass by only folding BinOps whose EffectFlags are PURE and whose
+    // operands are defined in the SAME basic block (not from phi nodes).
+
+    // ── Fixup branch offsets ─────────────────────────────────────────────
+    // Resolve placeholder branch offsets using the block_start_pc map.
+    // The branch_targets vec contains (instr_idx, target_block) pairs.
+    // The block_start_pc map was built during flattening, but phi moves
+    // may have shifted indices. We adjust for that.
     {
-        let mut const_at: FxHashMap<u16, i64> = FxHashMap::default();
-        let mut folded_any = false;
-        for instr in &mut instrs {
-            // Propagate through Move
-            if let Instr::Move(d, s) = instr {
-                if let Some(&v) = const_at.get(s) {
-                    const_at.insert(*d, v);
-                }
-                continue;
-            }
-            // Fold pure BinOps
-            if let Instr::BinOp(d, op, l, r) = instr {
-                let lv = const_at.get(l).copied();
-                let rv = const_at.get(r).copied();
-                if let (Some(lv), Some(rv)) = (lv, rv) {
-                    if let Some(result) = eval_binop_const(*op, lv, rv) {
-                        const_at.insert(*d, result);
-                        *instr = Instr::LoadI64(*d, result);
-                        folded_any = true;
-                        continue;
+        // Recalculate block_start_pc from the actual instruction stream.
+        // We know blocks were emitted in order, so we scan for terminators
+        // and use block_order to map positions to block IDs.
+        let mut resolved_block_pc: FxHashMap<BlockId, usize> = FxHashMap::default();
+        let mut block_idx = 0;
+        if !block_order.is_empty() {
+            resolved_block_pc.insert(block_order[0], 0);
+        }
+
+        for pc in 0..instrs.len() {
+            match &instrs[pc] {
+                Instr::Return(_) | Instr::ReturnUnit => {
+                    if pc + 1 < instrs.len() {
+                        block_idx += 1;
+                        if block_idx < block_order.len() {
+                            resolved_block_pc.insert(block_order[block_idx], pc + 1);
+                        }
                     }
                 }
-                // If one operand is constant, we can still do some folding
-                // (e.g., x + 0 → x, x * 1 → x, x * 0 → 0)
-                if let Some(rv) = rv {
-                    match op {
-                        BinOpKind::Add if rv == 0 => {
-                            *instr = Instr::Move(*d, *l);
-                            folded_any = true;
+                Instr::Jump(_) => {
+                    if pc + 1 < instrs.len() {
+                        block_idx += 1;
+                        if block_idx < block_order.len() {
+                            resolved_block_pc.insert(block_order[block_idx], pc + 1);
                         }
-                        BinOpKind::Mul if rv == 1 => {
-                            *instr = Instr::Move(*d, *l);
-                            folded_any = true;
-                        }
-                        BinOpKind::Mul if rv == 0 => {
-                            const_at.insert(*d, 0);
-                            *instr = Instr::LoadI64(*d, 0);
-                            folded_any = true;
-                        }
-                        _ => {}
                     }
                 }
-            }
-            // Track constants from LoadI32/LoadI64
-            match instr {
-                Instr::LoadI32(d, v) => { const_at.insert(*d, *v as i64); }
-                Instr::LoadI64(d, v) => { const_at.insert(*d, *v); }
-                Instr::LoadBool(d, v) => { const_at.insert(*d, i64::from(*v)); }
-                Instr::LoadUnit(d) => { const_at.insert(*d, 0); }
+                Instr::JumpFalse(_, _) | Instr::JumpTrue(_, _) => {
+                    // After CondBr, there may be a Jump (for if_true) or
+                    // direct fall-through. Both the if_true and the next
+                    // block after the CondBr sequence are block boundaries.
+                    if pc + 1 < instrs.len() {
+                        if matches!(instrs.get(pc + 1), Some(Instr::Jump(_))) {
+                            // JumpFalse + Jump pattern:
+                            // if_true block starts at Jump
+                            block_idx += 1;
+                            if block_idx < block_order.len() {
+                                resolved_block_pc.insert(block_order[block_idx], pc + 1);
+                            }
+                            // Block after the Jump starts after Jump
+                            if pc + 2 < instrs.len() {
+                                block_idx += 1;
+                                if block_idx < block_order.len() {
+                                    resolved_block_pc.insert(block_order[block_idx], pc + 2);
+                                }
+                            }
+                        } else {
+                            // Fall-through to if_true
+                            block_idx += 1;
+                            if block_idx < block_order.len() {
+                                resolved_block_pc.insert(block_order[block_idx], pc + 1);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
-        if folded_any {
-            eprintln!("[JIT-IR] Constant folding applied with metadata awareness");
+
+        // Apply fixups
+        for (instr_idx, target_block) in &branch_targets {
+            let target_pc = resolved_block_pc.get(target_block).copied()
+                .or_else(|| block_start_pc.get(target_block).copied())
+                .unwrap_or(0);
+            if *instr_idx < instrs.len() {
+                match &mut instrs[*instr_idx] {
+                    Instr::Jump(ref mut off) => {
+                        *off = (target_pc as i32) - (*instr_idx as i32) - 1;
+                    }
+                    Instr::JumpFalse(_, ref mut off) => {
+                        *off = (target_pc as i32) - (*instr_idx as i32) - 1;
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -8856,6 +8790,13 @@ pub fn translate_from_ir(func: &FlatIrFunction) -> Option<NativeCode> {
 
     // Convert FlatIrFunction → CompiledFn with metadata-driven optimizations
     let compiled = flat_ir_to_compiled_fn(func);
+
+    // Debug: dump the generated instructions
+    eprintln!("[JIT-IR] Generated {} instructions for {}, slot_count={}, param_count={}",
+        compiled.instrs.len(), compiled.name, compiled.slot_count, compiled.param_count);
+    for (pc, instr) in compiled.instrs.iter().enumerate() {
+        eprintln!("[JIT-IR]   pc={}: {:?}", pc, instr);
+    }
 
     // Delegate to the existing translate() for machine code emission
     translate(&compiled)

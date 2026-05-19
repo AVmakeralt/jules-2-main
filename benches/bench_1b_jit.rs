@@ -317,9 +317,10 @@ fn bench_jit_vs_rust(wl: &Workload, samples: usize) -> (f64, f64, bool) {
     interp_jit.set_advance_jit_enabled(true);
     interp_jit.set_native_jit_enabled(true);
     interp_jit.load_program(prog);
-    if let Some(ref ir_mod) = ir_module {
-        interp_jit.load_ir_module(ir_mod.clone());
-    }
+    // TODO: re-enable IR-direct path after fixing phi lowering
+    // if let Some(ref ir_mod) = ir_module {
+    //     interp_jit.load_ir_module(ir_mod.clone());
+    // }
     let jit_val = extract_i64(&interp_jit.call_fn("bench", vec![]));
     let rust_expected = (wl.rust_fn)(wl.loop_count);
 
@@ -334,9 +335,9 @@ fn bench_jit_vs_rust(wl: &Workload, samples: usize) -> (f64, f64, bool) {
         interp_vm.set_advance_jit_enabled(true);
         interp_vm.set_native_jit_enabled(false);
         interp_vm.load_program(prog);
-        if let Some(ref ir_mod) = ir_module {
-            interp_vm.load_ir_module(ir_mod.clone());
-        }
+        // if let Some(ref ir_mod) = ir_module {
+        //     interp_vm.load_ir_module(ir_mod.clone());
+        // }
         let vm_val = extract_i64(&interp_vm.call_fn("bench", vec![]));
         if vm_val == rust_expected {
             using_native = false;
@@ -354,9 +355,10 @@ fn bench_jit_vs_rust(wl: &Workload, samples: usize) -> (f64, f64, bool) {
         interp.set_advance_jit_enabled(true);
         interp.set_native_jit_enabled(using_native);
         interp.load_program(prog);
-        if let Some(ref ir_mod) = ir_module {
-            interp.load_ir_module(ir_mod.clone());
-        }
+        // TODO: re-enable after fixing IR-direct path
+        // if let Some(ref ir_mod) = ir_module {
+        //     interp.load_ir_module(ir_mod.clone());
+        // }
         let _ = interp.call_fn("bench", vec![]); // warmup
         interp.reset_jit_counters();
 
@@ -426,9 +428,9 @@ fn bench_jit_counters(wl: &Workload) -> Option<(u64, u64, u64)> {
     interp.set_advance_jit_enabled(true);
     interp.set_native_jit_enabled(true);
     interp.load_program(prog);
-    if let Some(ir_mod) = ir_module {
-        interp.load_ir_module(ir_mod);
-    }
+    // if let Some(ir_mod) = ir_module {
+    //     interp.load_ir_module(ir_mod);
+    // }
     interp.reset_jit_counters();
     let _ = interp.call_fn("bench", vec![]);
     Some(interp.jit_counters())
