@@ -75,6 +75,10 @@ name = "bench-tracing-jit"
 path = "benches/bench_tracing_jit.rs"
 
 [[bin]]
+name = "bench-1b-jit"
+path = "benches/bench_1b_jit.rs"
+
+[[bin]]
 name = "vm-debug"
 path = "src/tools/vm_debug.rs"
 
