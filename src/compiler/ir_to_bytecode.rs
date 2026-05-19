@@ -330,7 +330,7 @@ impl FunctionCompiler {
                     }
 
                     // ── Conditional branch ─────────────────────────────────
-                    IrOp::CondBr { cond, if_true, if_false } => {
+                    IrOp::CondBr { cond, if_true, if_false, .. } => {
                         let cond_slot = self.slot_for(*cond);
 
                         // Phi resolution for the FALSE branch: emit moves from
@@ -365,7 +365,7 @@ impl FunctionCompiler {
                     }
 
                     // ── Unconditional jump ─────────────────────────────────
-                    IrOp::Jump { target } => {
+                    IrOp::Jump { target, .. } => {
                         // Before emitting the jump, insert phi-resolution Moves
                         // for the target block's phi nodes. The incoming values
                         // come from the current block's definitions.
@@ -876,7 +876,9 @@ mod tests {
                 make_instr(None, IrOp::CondBr {
                     cond: v1,
                     if_true: BlockId(1),
+                    if_true_args: vec![],
                     if_false: BlockId(2),
+                    if_false_args: vec![],
                 }),
             ],
             span: dummy_span(),

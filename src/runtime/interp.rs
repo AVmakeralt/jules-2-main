@@ -5235,8 +5235,8 @@ impl Interpreter {
                         if !self.native_fns.contains_key(hot_name) {
                             // Try IR-direct JIT first
                             let mut native_code = None;
-                            if let Some(ref ir_mod) = self.ir_module {
-                                if let Some(ir_func) = ir_mod.functions.iter().find(|f| f.name == hot_name.as_str()) {
+                            if let Some(ref mut ir_mod) = self.ir_module {
+                                if let Some(ir_func) = ir_mod.functions.iter_mut().find(|f| f.name == hot_name.as_str()) {
                                     native_code = crate::jit::phase3_jit::translate_from_ir(ir_func);
                                 }
                             }
@@ -5267,8 +5267,8 @@ impl Interpreter {
                         if *count >= 10 && !self.native_fns.contains_key(fn_name) {
                             // Try IR-direct JIT first
                             let mut native_code = None;
-                            if let Some(ref ir_mod) = self.ir_module {
-                                if let Some(ir_func) = ir_mod.functions.iter().find(|f| f.name == fn_name.as_str()) {
+                            if let Some(ref mut ir_mod) = self.ir_module {
+                                if let Some(ir_func) = ir_mod.functions.iter_mut().find(|f| f.name == fn_name.as_str()) {
                                     native_code = crate::jit::phase3_jit::translate_from_ir(ir_func);
                                 }
                             }
@@ -5335,9 +5335,11 @@ impl Interpreter {
                         // ── IR-Direct JIT Path (preferred) ────────────────
                         // Try compile from flat SSA IR first — bypasses bytecode
                         // entirely and preserves EffectFlags/AliasKind metadata.
+                        // The SSA path uses Block Parameters + Edge Moves for
+                        // zero-cost control-flow dataflow.
                         let mut native_code = None;
-                        if let Some(ref ir_mod) = self.ir_module {
-                            if let Some(ir_func) = ir_mod.functions.iter().find(|f| f.name == name) {
+                        if let Some(ref mut ir_mod) = self.ir_module {
+                            if let Some(ir_func) = ir_mod.functions.iter_mut().find(|f| f.name == name) {
                                 native_code = crate::jit::phase3_jit::translate_from_ir(ir_func);
                                 if native_code.is_some() {
                                     eprintln!("[JIT-IR] Compiled {} via IR-direct path", name);
@@ -8079,7 +8081,7 @@ impl Interpreter {
             // ── Collection functions ──────────────────────────────────────────
             "len" => match args.first() {
                 Some(Value::Array(a)) => Ok(Value::I64(a.borrow().len() as i64)),
-                Some(Value::Str(s)) => Ok(Value::I32(s.chars().count() as i32)),
+                Some(Value::Str(s)) => Ok(Value::I64(s.chars().count() as i64)),
                 Some(v) => rt_err!("len() not applicable to {}", v.type_name()),
                 None => rt_err!("len() requires an argument"),
             },
@@ -9594,7 +9596,7 @@ impl Interpreter {
                     unreachable!()
                 }
             }
-            (Value::Str(s), "len") => Ok(Value::I32(s.chars().count() as i32)),
+            (Value::Str(s), "len") => Ok(Value::I64(s.chars().count() as i64)),
 
             // ── String methods ─────────────────────────────────────────────────
             (Value::Str(s), "to_upper") => Ok(Value::Str(s.to_uppercase())),

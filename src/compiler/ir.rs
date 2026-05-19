@@ -21,6 +21,7 @@ use std::fmt;
 use crate::compiler::ast::Attribute;
 use crate::compiler::lexer::Span;
 use crate::compiler::typeck::{Diagnostic, Dim, Ty};
+use rustc_hash::FxHashMap;
 
 // =============================================================================
 // §1  CORE ENUMERATIONS
@@ -2531,9 +2532,16 @@ pub enum IrOp {
     // Tasks
     TaskSpawn { func: String, args: Vec<ValueId>, ownership: TaskOwnership },
     TaskJoin { task: ValueId },
-    // Control flow (flat IR)
-    CondBr { cond: ValueId, if_true: BlockId, if_false: BlockId },
-    Jump { target: BlockId },
+    // Control flow (flat IR) — Block Parameter passing
+    /// Conditional branch with block-parameter arguments.
+    /// `if_true_args` / `if_false_args` are passed to the target block's parameters.
+    CondBr { cond: ValueId, if_true: BlockId, if_true_args: Vec<ValueId>, if_false: BlockId, if_false_args: Vec<ValueId> },
+    /// Unconditional jump with block-parameter arguments.
+    /// `args` are passed to the target block's parameters.
+    Jump { target: BlockId, args: Vec<ValueId> },
+    /// LEGACY Phi node — DEPRECATED. New code uses Block Parameters instead.
+    /// Retained for backward compatibility with the bytecode VM path.
+    /// The JIT path (translate_ssa) ignores this and uses Block Parameters.
     Phi { incoming: Vec<(BlockId, ValueId)> },
     // Type operations
     TypeCheck { value: ValueId, expected: IrType },
@@ -2630,20 +2638,64 @@ pub struct IrInstr {
 }
 
 /// A basic block for the flat instruction IR.
+///
+/// Block Parameters replace traditional Phi nodes (Cranelift/Swift SIL/MLIR approach).
+/// When control flow transfers to this block, the caller passes concrete values
+/// for each parameter via Jump/CondBr args. This eliminates the Phi node swap
+/// paradox and makes dataflow explicit on the edges.
+///
+/// During register allocation, block parameters and their incoming arguments form
+/// Affinity Groups — if the RA assigns them to the same physical register, the
+/// Edge Move is completely erased (zero-cost coalescing).
 #[derive(Debug, Clone)]
 pub struct FlatBlock {
     pub id: BlockId,
+    /// Block parameters — (value id, type) pairs.
+    /// These replace Phi nodes: instead of magical "simultaneous assignment"
+    /// at join points, values are explicitly passed on the control-flow edge.
+    pub params: Vec<(ValueId, IrType)>,
     pub instrs: Vec<IrInstr>,
     pub span: Span,
 }
 
 impl FlatBlock {
     pub fn new(id: BlockId) -> Self {
-        FlatBlock { id, instrs: vec![], span: Span::dummy() }
+        FlatBlock { id, params: vec![], instrs: vec![], span: Span::dummy() }
     }
 
     pub fn is_terminated(&self) -> bool {
         self.instrs.last().map_or(false, |i| i.op.is_terminator())
+    }
+
+    /// Returns the number of predecessors this block has.
+    /// A block with 0 or 1 predecessors never needs critical edge splitting.
+    pub fn predecessor_count(&self, func: &FlatIrFunction) -> usize {
+        let mut count = 0;
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                match &instr.op {
+                    IrOp::Jump { target, .. } if *target == self.id => count += 1,
+                    IrOp::CondBr { if_true, if_false, .. } => {
+                        if *if_true == self.id { count += 1; }
+                        if *if_false == self.id { count += 1; }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        count
+    }
+
+    /// Returns the number of successors this block has.
+    pub fn successor_count(&self) -> usize {
+        for instr in &self.instrs {
+            match &instr.op {
+                IrOp::Jump { .. } => return 1,
+                IrOp::CondBr { .. } => return 2,
+                _ => {}
+            }
+        }
+        0
     }
 }
 
@@ -2681,6 +2733,233 @@ pub struct FlatIrModule {
     /// executed. The pipeline should report these before running IR type
     /// checking or borrow checking.
     pub lowering_errors: Vec<(crate::compiler::lexer::Span, String)>,
+}
+
+// =============================================================================
+// §20b  CRITICAL EDGE SPLITTING — Mandatory for Block Parameters
+// =============================================================================
+
+impl FlatIrFunction {
+    /// Split all critical edges in the CFG by inserting empty "Trampoline Blocks".
+    ///
+    /// A critical edge connects a block with >1 successors to a block with
+    /// >1 predecessors. If we try to insert Edge Moves for the target block's
+    /// parameters at the end of the source block, those moves will also
+    /// execute if the source jumps to a DIFFERENT successor, corrupting state.
+    ///
+    /// After splitting, the JIT is guaranteed that every block terminator either:
+    ///   1. Has only one successor (so Edge Moves won't bleed into other paths), OR
+    ///   2. Has only one predecessor (so the target block's params come from one source).
+    ///
+    /// This allows the JIT to blindly emit Edge Moves right before the JMP/Jcc
+    /// without any safety checks, unlocking massive instruction scheduling freedom.
+    ///
+    /// Returns the number of edges split.
+    pub fn split_critical_edges(&mut self) -> usize {
+        // Step 1: Collect all critical edges (source_block_id, successor_block_id)
+        let mut critical_edges: Vec<(BlockId, BlockId, Vec<ValueId>)> = Vec::new();
+        for block in &self.blocks {
+            let succ_count = block.successor_count();
+            if succ_count <= 1 { continue; }
+            for instr in &block.instrs {
+                match &instr.op {
+                    IrOp::CondBr { if_true, if_true_args, if_false, if_false_args, .. } => {
+                        // Check if if_true has multiple predecessors
+                        let true_bid = *if_true;
+                        let true_preds = self.predecessor_count_for(true_bid);
+                        if true_preds > 1 {
+                            critical_edges.push((block.id, true_bid, if_true_args.clone()));
+                        }
+                        // Check if if_false has multiple predecessors
+                        let false_bid = *if_false;
+                        let false_preds = self.predecessor_count_for(false_bid);
+                        if false_preds > 1 {
+                            critical_edges.push((block.id, false_bid, if_false_args.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let split_count = critical_edges.len();
+        if split_count == 0 { return 0; }
+
+        // Step 2: For each critical edge, create a trampoline block
+        // and redirect the source to jump to the trampoline instead.
+        for (src_id, dst_id, dst_args) in &critical_edges {
+            let trampoline_id = BlockId(self.next_block_id());
+            // Create the trampoline: just a Jump to the real target, passing the args
+            let trampoline = FlatBlock {
+                id: trampoline_id,
+                params: vec![],  // Trampoline has no params — it just forwards
+                instrs: vec![IrInstr {
+                    dst: None,
+                    op: IrOp::Jump { target: *dst_id, args: dst_args.clone() },
+                    span: Span::dummy(),
+                    effects: EffectFlags::TERMINATES,
+                    ownership: crate::compiler::ir::Ownership::Copy,
+                    cost: CostHint::Cheap,
+                    alias: AliasKind::Unknown,
+                }],
+                span: Span::dummy(),
+            };
+            self.blocks.push(trampoline);
+
+            // Redirect the source block's branch to the trampoline
+            for block in &mut self.blocks {
+                if block.id != *src_id { continue; }
+                for instr in &mut block.instrs {
+                    match &mut instr.op {
+                        IrOp::CondBr { if_true, if_true_args, if_false, if_false_args, .. } => {
+                            if *if_true == *dst_id {
+                                *if_true = trampoline_id;
+                                // The args now go to the trampoline's Jump
+                                // but the trampoline just forwards them, so keep args as-is
+                            }
+                            if *if_false == *dst_id {
+                                *if_false = trampoline_id;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        split_count
+    }
+
+    /// Helper: count predecessors for a block (used by split_critical_edges)
+    fn predecessor_count_for(&self, bid: BlockId) -> usize {
+        let mut count = 0;
+        for block in &self.blocks {
+            for instr in &block.instrs {
+                match &instr.op {
+                    IrOp::Jump { target, .. } if *target == bid => count += 1,
+                    IrOp::CondBr { if_true, if_false, .. } => {
+                        if *if_true == bid { count += 1; }
+                        if *if_false == bid { count += 1; }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        count
+    }
+
+    /// Get the next available block ID for this function
+    fn next_block_id(&self) -> u32 {
+        self.blocks.iter().map(|b| b.id.0).max().unwrap_or(0) + 1
+    }
+
+    /// Convert all Phi nodes in this function to Block Parameters.
+    /// This is the "eradication" pass — after this, no Phi nodes remain.
+    ///
+    /// Algorithm:
+    /// 1. For each block, collect all Phi instructions.
+    /// 2. Convert each Phi into a Block Parameter on the target block.
+    /// 3. Convert each incoming (pred_block, value) into an argument on
+    ///    the Jump/CondBr in the predecessor.
+    /// 4. Remove all Phi instructions from the block.
+    ///
+    /// After this pass, control-flow dataflow is entirely on the edges,
+    /// enabling zero-cost Edge Move coalescing during register allocation.
+    pub fn phis_to_block_params(&mut self) -> usize {
+        let mut phi_count = 0;
+
+        // Step 1: Collect all phi information per block
+        // Map: block_id → Vec<(param_value_id, param_type, Vec<(pred_block_id, incoming_value_id)>)>
+        let mut block_phis: FxHashMap<BlockId, Vec<(ValueId, IrType, Vec<(BlockId, ValueId)>)>> =
+            FxHashMap::default();
+
+        for block in &self.blocks {
+            for instr in &block.instrs {
+                if let IrOp::Phi { incoming } = &instr.op {
+                    if let Some(dst) = instr.dst {
+                        // Determine the type from the incoming values (best effort)
+                        let ty = IrType::Int { width: 64, signed: true }; // Default
+                        let entries = incoming.iter().map(|&(bid, vid)| (bid, vid)).collect();
+                        block_phis.entry(block.id).or_default().push((dst, ty, entries));
+                        phi_count += 1;
+                    }
+                }
+            }
+        }
+
+        if phi_count == 0 { return 0; }
+
+        // Step 2: Add block parameters from phis
+        for block in &mut self.blocks {
+            if let Some(phis) = block_phis.get(&block.id) {
+                for &(vid, ref ty, _) in phis {
+                    block.params.push((vid, ty.clone()));
+                }
+            }
+        }
+
+        // Step 3: Add args to Jump/CondBr terminators in predecessor blocks
+        // For each predecessor block's terminator, we need to append the
+        // incoming values for each phi in the order they appear in the target's params.
+        for block in &mut self.blocks {
+            let mut new_terminator = None;
+            let term_idx = block.instrs.iter().rposition(|i| i.op.is_terminator());
+
+            if let Some(idx) = term_idx {
+                match &block.instrs[idx].op {
+                    IrOp::Jump { target, args } => {
+                        let mut new_args = args.clone();
+                        if let Some(phis) = block_phis.get(target) {
+                            for &(_, _, ref incoming) in phis {
+                                // Find the incoming value from this predecessor
+                                if let Some((_, vid)) = incoming.iter().find(|(bid, _)| *bid == block.id) {
+                                    new_args.push(*vid);
+                                }
+                            }
+                        }
+                        new_terminator = Some(IrOp::Jump { target: *target, args: new_args });
+                    }
+                    IrOp::CondBr { cond, if_true, if_true_args, if_false, if_false_args } => {
+                        let mut new_true_args = if_true_args.clone();
+                        let mut new_false_args = if_false_args.clone();
+                        if let Some(phis) = block_phis.get(if_true) {
+                            for &(_, _, ref incoming) in phis {
+                                if let Some((_, vid)) = incoming.iter().find(|(bid, _)| *bid == block.id) {
+                                    new_true_args.push(*vid);
+                                }
+                            }
+                        }
+                        if let Some(phis) = block_phis.get(if_false) {
+                            for &(_, _, ref incoming) in phis {
+                                if let Some((_, vid)) = incoming.iter().find(|(bid, _)| *bid == block.id) {
+                                    new_false_args.push(*vid);
+                                }
+                            }
+                        }
+                        new_terminator = Some(IrOp::CondBr {
+                            cond: *cond,
+                            if_true: *if_true,
+                            if_true_args: new_true_args,
+                            if_false: *if_false,
+                            if_false_args: new_false_args,
+                        });
+                    }
+                    _ => {}
+                }
+
+                if let Some(new_term) = new_terminator {
+                    block.instrs[idx].op = new_term;
+                }
+            }
+        }
+
+        // Step 4: Remove all Phi instructions from blocks
+        for block in &mut self.blocks {
+            block.instrs.retain(|instr| !matches!(instr.op, IrOp::Phi { .. }));
+        }
+
+        phi_count
+    }
 }
 
 // =============================================================================

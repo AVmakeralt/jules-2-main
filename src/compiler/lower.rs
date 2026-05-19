@@ -762,7 +762,7 @@ impl LowerCtx {
                 if let Some(ctx) = self.loop_stack.last() {
                     let break_block = ctx.break_block;
                     self.emit_terminator(
-                        IrOp::Jump { target: break_block },
+                        IrOp::Jump { target: break_block, args: vec![] },
                         *span,
                         EffectFlags::TERMINATES,
                     );
@@ -784,7 +784,7 @@ impl LowerCtx {
                 if let Some(ctx) = self.loop_stack.last() {
                     let continue_block = ctx.continue_block;
                     self.emit_terminator(
-                        IrOp::Jump { target: continue_block },
+                        IrOp::Jump { target: continue_block, args: vec![] },
                         *span,
                         EffectFlags::TERMINATES,
                     );
@@ -875,7 +875,7 @@ impl LowerCtx {
 
                 // Jump to header
                 self.emit_terminator(
-                    IrOp::Jump { target: header_block },
+                    IrOp::Jump { target: header_block, args: vec![] },
                     *span,
                     EffectFlags::TERMINATES,
                 );
@@ -908,20 +908,20 @@ impl LowerCtx {
                     );
                     if let Some(hn) = has_next {
                         self.emit_terminator(
-                            IrOp::CondBr { cond: hn, if_true: body_block, if_false: exit_block },
+                            IrOp::CondBr { cond: hn, if_true: body_block, if_true_args: vec![], if_false: exit_block, if_false_args: vec![] },
                             *span,
                             EffectFlags::TERMINATES,
                         );
                     } else {
                         self.emit_terminator(
-                            IrOp::Jump { target: body_block },
+                            IrOp::Jump { target: body_block, args: vec![] },
                             *span,
                             EffectFlags::TERMINATES,
                         );
                     }
                 } else {
                     self.emit_terminator(
-                        IrOp::Jump { target: exit_block },
+                        IrOp::Jump { target: exit_block, args: vec![] },
                         *span,
                         EffectFlags::TERMINATES,
                     );
@@ -935,7 +935,7 @@ impl LowerCtx {
                 self.lower_block(body);
                 if !self.is_terminated() {
                     self.emit_terminator(
-                        IrOp::Jump { target: header_block },
+                        IrOp::Jump { target: header_block, args: vec![] },
                         body.span,
                         EffectFlags::TERMINATES,
                     );
@@ -1879,7 +1879,7 @@ impl LowerCtx {
         // Emit CondBr in current block
         if let Some(cv) = cond_vid {
             self.emit_terminator(
-                IrOp::CondBr { cond: cv, if_true: then_block, if_false: else_block },
+                IrOp::CondBr { cond: cv, if_true: then_block, if_true_args: vec![], if_false: else_block, if_false_args: vec![] },
                 span,
                 EffectFlags::TERMINATES,
             );
@@ -1891,7 +1891,7 @@ impl LowerCtx {
         let then_env = self.snapshot_env();
         if !self.is_terminated() {
             self.emit_terminator(
-                IrOp::Jump { target: merge_block },
+                IrOp::Jump { target: merge_block, args: vec![] },
                 then.span,
                 EffectFlags::TERMINATES,
             );
@@ -1905,7 +1905,7 @@ impl LowerCtx {
         let else_env = self.snapshot_env();
         if !self.is_terminated() {
             self.emit_terminator(
-                IrOp::Jump { target: merge_block },
+                IrOp::Jump { target: merge_block, args: vec![] },
                 else_.as_ref().map(|b| b.span).unwrap_or(span),
                 EffectFlags::TERMINATES,
             );
@@ -1984,7 +1984,7 @@ impl LowerCtx {
 
         if let Some(cv) = cond_vid {
             self.emit_terminator(
-                IrOp::CondBr { cond: cv, if_true: then_block, if_false: else_block },
+                IrOp::CondBr { cond: cv, if_true: then_block, if_true_args: vec![], if_false: else_block, if_false_args: vec![] },
                 span,
                 EffectFlags::TERMINATES,
             );
@@ -1996,7 +1996,7 @@ impl LowerCtx {
         let then_env = self.snapshot_env();
         if !self.is_terminated() {
             self.emit_terminator(
-                IrOp::Jump { target: merge_block },
+                IrOp::Jump { target: merge_block, args: vec![] },
                 then.span,
                 EffectFlags::TERMINATES,
             );
@@ -2021,7 +2021,7 @@ impl LowerCtx {
         let else_env = self.snapshot_env();
         if !self.is_terminated() {
             self.emit_terminator(
-                IrOp::Jump { target: merge_block },
+                IrOp::Jump { target: merge_block, args: vec![] },
                 span,
                 EffectFlags::TERMINATES,
             );
@@ -2052,7 +2052,7 @@ impl LowerCtx {
 
         // Jump from current block to header
         self.emit_terminator(
-            IrOp::Jump { target: header_block },
+            IrOp::Jump { target: header_block, args: vec![] },
             span,
             EffectFlags::TERMINATES,
         );
@@ -2086,7 +2086,7 @@ impl LowerCtx {
         let back_edge_block = self.current_block_id;
         if !self.is_terminated() {
             self.emit_terminator(
-                IrOp::Jump { target: header_block },
+                IrOp::Jump { target: header_block, args: vec![] },
                 body.span,
                 EffectFlags::TERMINATES,
             );
@@ -2106,7 +2106,7 @@ impl LowerCtx {
         let cond_vid = self.lower_expr(cond);
         if let Some(cv) = cond_vid {
             self.emit_terminator(
-                IrOp::CondBr { cond: cv, if_true: body_block, if_false: exit_block },
+                IrOp::CondBr { cond: cv, if_true: body_block, if_true_args: vec![], if_false: exit_block, if_false_args: vec![] },
                 span,
                 EffectFlags::TERMINATES,
             );
@@ -2141,7 +2141,7 @@ impl LowerCtx {
         let pre_loop_env = self.snapshot_env();
 
         self.emit_terminator(
-            IrOp::Jump { target: header_block },
+            IrOp::Jump { target: header_block, args: vec![] },
             span,
             EffectFlags::TERMINATES,
         );
@@ -2158,7 +2158,7 @@ impl LowerCtx {
         let back_edge_block = self.current_block_id;
         if !self.is_terminated() {
             self.emit_terminator(
-                IrOp::Jump { target: header_block },
+                IrOp::Jump { target: header_block, args: vec![] },
                 body.span,
                 EffectFlags::TERMINATES,
             );
@@ -2198,7 +2198,7 @@ impl LowerCtx {
 
         // Jump to header
         self.emit_terminator(
-            IrOp::Jump { target: header_block },
+            IrOp::Jump { target: header_block, args: vec![] },
             span,
             EffectFlags::TERMINATES,
         );
@@ -2222,14 +2222,14 @@ impl LowerCtx {
         };
         if let Some(hn) = has_next {
             self.emit_terminator(
-                IrOp::CondBr { cond: hn, if_true: body_block, if_false: exit_block },
+                IrOp::CondBr { cond: hn, if_true: body_block, if_true_args: vec![], if_false: exit_block, if_false_args: vec![] },
                 span,
                 EffectFlags::TERMINATES,
             );
         } else {
             // No iterator — just exit
             self.emit_terminator(
-                IrOp::Jump { target: exit_block },
+                IrOp::Jump { target: exit_block, args: vec![] },
                 span,
                 EffectFlags::TERMINATES,
             );
@@ -2259,7 +2259,7 @@ impl LowerCtx {
         let back_edge_block = self.current_block_id;
         if !self.is_terminated() {
             self.emit_terminator(
-                IrOp::Jump { target: header_block },
+                IrOp::Jump { target: header_block, args: vec![] },
                 body.span,
                 EffectFlags::TERMINATES,
             );
@@ -2310,7 +2310,7 @@ impl LowerCtx {
                 );
                 if let Some(mv) = matches {
                     self.emit_terminator(
-                        IrOp::CondBr { cond: mv, if_true: arm_block, if_false: next_arm_block },
+                        IrOp::CondBr { cond: mv, if_true: arm_block, if_true_args: vec![], if_false: next_arm_block, if_false_args: vec![] },
                         arm.span,
                         EffectFlags::TERMINATES,
                     );
@@ -2322,7 +2322,7 @@ impl LowerCtx {
             self.lower_expr(&arm.body);
             if !self.is_terminated() {
                 self.emit_terminator(
-                    IrOp::Jump { target: exit_block },
+                    IrOp::Jump { target: exit_block, args: vec![] },
                     arm.span,
                     EffectFlags::TERMINATES,
                 );
@@ -2334,7 +2334,7 @@ impl LowerCtx {
         // If no arm matched, jump to exit
         if !self.is_terminated() {
             self.emit_terminator(
-                IrOp::Jump { target: exit_block },
+                IrOp::Jump { target: exit_block, args: vec![] },
                 span,
                 EffectFlags::TERMINATES,
             );

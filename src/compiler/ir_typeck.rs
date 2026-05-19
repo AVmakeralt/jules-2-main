@@ -350,11 +350,11 @@ impl TypeckCtx {
                 None
             }
             IrOp::Nop => None,
-            IrOp::CondBr { cond, if_true: _, if_false: _ } => {
+            IrOp::CondBr { cond, if_true: _, if_true_args: _, if_false: _, if_false_args: _ } => {
                 self.check_condbr(*cond, span);
                 None
             }
-            IrOp::Jump { target: _ } => None,
+            IrOp::Jump { .. } => None,
 
             // ── Phi ───────────────────────────────────────────────────
             IrOp::Phi { incoming } => {
@@ -1328,7 +1328,7 @@ mod tests {
                 ),
                 make_instr(
                     None,
-                    IrOp::CondBr { cond: ValueId(0), if_true: BlockId(1), if_false: BlockId(2) },
+                    IrOp::CondBr { cond: ValueId(0), if_true: BlockId(1), if_true_args: vec![], if_false: BlockId(2), if_false_args: vec![] },
                 ),
             ])],
         );
@@ -1351,7 +1351,7 @@ mod tests {
                 ),
                 make_instr(
                     None,
-                    IrOp::CondBr { cond: ValueId(0), if_true: BlockId(1), if_false: BlockId(2) },
+                    IrOp::CondBr { cond: ValueId(0), if_true: BlockId(1), if_true_args: vec![], if_false: BlockId(2), if_false_args: vec![] },
                 ),
             ])],
         );
@@ -1446,7 +1446,9 @@ mod tests {
                     make_instr(None, IrOp::CondBr {
                         cond: ValueId(0),
                         if_true: BlockId(1),
+                        if_true_args: vec![],
                         if_false: BlockId(2),
+                        if_false_args: vec![],
                     }),
                 ]),
                 // Block 1 (outer_then) — branches into inner if-else
@@ -1454,13 +1456,15 @@ mod tests {
                     make_instr(None, IrOp::CondBr {
                         cond: ValueId(0),
                         if_true: BlockId(4),
+                        if_true_args: vec![],
                         if_false: BlockId(5),
+                        if_false_args: vec![],
                     }),
                 ]),
                 // Block 2 (outer_else)
                 make_block(2, vec![
                     make_instr(Some(ValueId(1)), IrOp::ConstInt { value: 99, ty: i32_ty.clone() }),
-                    make_instr(None, IrOp::Jump { target: BlockId(3) }),
+                    make_instr(None, IrOp::Jump { target: BlockId(3), args: vec![] }),
                 ]),
                 // Block 3 (outer_merge) — phi references v3 from block 6 (forward ref!)
                 make_block(3, vec![
@@ -1472,19 +1476,19 @@ mod tests {
                 // Block 4 (inner_then)
                 make_block(4, vec![
                     make_instr(Some(ValueId(4)), IrOp::ConstInt { value: 1, ty: i32_ty.clone() }),
-                    make_instr(None, IrOp::Jump { target: BlockId(6) }),
+                    make_instr(None, IrOp::Jump { target: BlockId(6), args: vec![] }),
                 ]),
                 // Block 5 (inner_else)
                 make_block(5, vec![
                     make_instr(Some(ValueId(5)), IrOp::ConstInt { value: 2, ty: i32_ty.clone() }),
-                    make_instr(None, IrOp::Jump { target: BlockId(6) }),
+                    make_instr(None, IrOp::Jump { target: BlockId(6), args: vec![] }),
                 ]),
                 // Block 6 (inner_merge) — v3 defined here, referenced by block 3's phi
                 make_block(6, vec![
                     make_instr(Some(ValueId(3)), IrOp::Phi {
                         incoming: vec![(BlockId(4), ValueId(4)), (BlockId(5), ValueId(5))],
                     }),
-                    make_instr(None, IrOp::Jump { target: BlockId(3) }),
+                    make_instr(None, IrOp::Jump { target: BlockId(3), args: vec![] }),
                 ]),
             ],
         );
