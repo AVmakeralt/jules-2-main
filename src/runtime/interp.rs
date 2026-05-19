@@ -221,6 +221,9 @@ pub struct DataLoader {
     pub batch_size: usize,
     pub index: usize,
     pub shuffle: bool,
+    /// Monotonically increasing epoch counter; mixed into the shuffle seed
+    /// so each reset produces a different permutation.
+    pub epoch: u64,
 }
 
 impl DataLoader {
@@ -242,13 +245,15 @@ impl DataLoader {
 
     pub fn reset(&mut self) {
         self.index = 0;
+        self.epoch = self.epoch.wrapping_add(1);
         if self.shuffle {
             // Deterministic Fisher-Yates shuffle.
-            // Seed derived from sample count so different-sized datasets get
-            // different permutations, while remaining reproducible across resets.
+            // Seed derived from sample count + epoch so each reset produces
+            // a different permutation while remaining reproducible.
             let mut seed: u64 = 4211_u64
                 .wrapping_mul(6364136223846793005)
-                .wrapping_add(self.samples.len() as u64 | 1);
+                .wrapping_add(self.samples.len() as u64 | 1)
+                .wrapping_add(self.epoch.wrapping_mul(2654435761));
             for i in (1..self.samples.len()).rev() {
                 seed = seed
                     .wrapping_mul(6364136223846793005)
@@ -601,6 +606,10 @@ impl Tensor {
     #[inline]
     pub fn zeros(shape: impl Into<SmallVec<[usize; 4]>>) -> Self {
         let shape = shape.into();
+        // NOTE: .max(1) prevents zero-size allocation for shapes like [0, 3].
+        // This differs from NumPy which supports empty tensors. If zero-element
+        // tensors are needed in the future, remove the .max(1) and handle the
+        // empty case throughout all tensor operations.
         let n = shape.iter().product::<usize>().max(1);
         let mut data = Vec::with_capacity(n);
         data.resize(n, 0.0_f32);
@@ -617,7 +626,7 @@ impl Tensor {
     pub fn from_data(shape: impl Into<SmallVec<[usize; 4]>>, data: Vec<f32>) -> Self {
         let shape = shape.into();
         let expected = shape.iter().product::<usize>().max(1);
-        debug_assert_eq!(
+        assert_eq!(
             data.len(),
             expected,
             "Tensor::from_data: shape {:?} expects {} elements, got {}",
@@ -643,6 +652,13 @@ impl Tensor {
         let n = self.shape.iter().product::<usize>().max(1);
         self.numel_cache.set(Some(n));
         n
+    }
+
+    /// Invalidate the cached numel so the next call recomputes from shape.
+    /// Must be called after any in-place mutation of self.shape.
+    #[inline(always)]
+    pub fn invalidate_numel_cache(&self) {
+        self.numel_cache.set(None);
     }
 
     #[inline(always)]
@@ -860,10 +876,12 @@ impl Tensor {
         if self.shape.len() != rhs.shape.len() {
             return Err(RuntimeError::new("tensor concat: rank mismatch"));
         }
+        // Currently only axis-0 concatenation is supported.
+        // Verify all non-zero dimensions match.
         for i in 1..self.shape.len() {
             if self.shape[i] != rhs.shape[i] {
                 return Err(RuntimeError::new(format!(
-                    "tensor concat: dim {} mismatch ({} vs {})",
+                    "tensor concat: dim {} mismatch ({} vs {}) — only axis-0 concat is supported",
                     i, self.shape[i], rhs.shape[i]
                 )));
             }
@@ -924,8 +942,8 @@ impl Tensor {
 
         // Softmax: apply row-wise along last dim.
         if matches!(act, Activation::Softmax) {
+            let cols = *t.shape.last().unwrap_or(&1);
             let d = t.cpu_data_mut();
-            let cols = *self.shape.last().unwrap_or(&1);
             let rows = d.len() / cols;
             for r in 0..rows {
                 let row = &mut d[r * cols..(r + 1) * cols];
@@ -992,12 +1010,19 @@ impl Tensor {
         }
         let a = self.cpu_data();
         let b = targets.cpu_data();
+        // Divide by batch size (product of all dims except the last).
+        // For 2-D [B, C] this is B; for 1-D [C] this is 1.
+        let batch = if self.shape.len() > 1 {
+            self.shape[..self.shape.len() - 1].iter().product::<usize>().max(1)
+        } else {
+            1
+        };
         let loss: f32 = a
             .iter()
             .zip(b)
             .map(|(p, t)| -t * p.max(1e-9).ln())
             .sum::<f32>()
-            / self.shape[0] as f32;
+            / batch as f32;
         Ok(loss)
     }
 }
@@ -1698,6 +1723,10 @@ impl EcsWorld {
             let Some(&vi) = vel_set.sparse.get(&id) else {
                 continue;
             };
+            // Bounds-check before indexing to avoid UB from stale sparse indices
+            if vi >= vel_set.dense_vals.len() {
+                continue;
+            }
             let (p, v) = unsafe {
                 let p = pos_set.dense_vals.get_unchecked_mut(i);
                 let v = vel_set.dense_vals.get_unchecked(vi);
@@ -1765,8 +1794,14 @@ impl EcsWorld {
             return 0;
         };
         let mut updated = 0usize;
+        let pos_len = pos_set.dense_vals.len();
+        let vel_len = vel_set.dense_vals.len();
         for chunk in cache.pairs.chunks(cache.chunk_size) {
             for (pi, vi) in chunk {
+                // Bounds-check before unsafe indexing to avoid UB from stale cached indices
+                if *pi >= pos_len || *vi >= vel_len {
+                    continue;
+                }
                 let (p, v) = unsafe {
                     let p = pos_set.dense_vals.get_unchecked_mut(*pi);
                     let v = vel_set.dense_vals.get_unchecked(*vi);
@@ -5930,6 +5965,18 @@ impl Interpreter {
                         })
                     })
                     .collect::<Result<_, _>>()?;
+                let expected = match size {
+                    VecSize::N2 => 2,
+                    VecSize::N3 => 3,
+                    VecSize::N4 => 4,
+                };
+                if vals.len() != expected {
+                    return rt_err!(
+                        "VecCtor: expected {} elements, got {}",
+                        expected,
+                        vals.len()
+                    );
+                }
                 match size {
                     VecSize::N2 => Ok(Value::Vec2([vals[0], vals[1]])),
                     VecSize::N3 => Ok(Value::Vec3([vals[0], vals[1], vals[2]])),
@@ -6448,9 +6495,9 @@ impl Interpreter {
                 comp.cloned()
                     .ok_or_else(|| RuntimeError::new(format!("entity has no component `{field}`")))
             }
-            Value::Vec2(v) => swizzle_vec(&v, field).map_err(RuntimeError::new),
-            Value::Vec3(v) => swizzle_vec(&v, field).map_err(RuntimeError::new),
-            Value::Vec4(v) => swizzle_vec(&v, field).map_err(RuntimeError::new),
+            Value::Vec2(v) => swizzle_vec(&v, field),
+            Value::Vec3(v) => swizzle_vec(&v, field),
+            Value::Vec4(v) => swizzle_vec(&v, field),
             Value::Quat(q) => match field {
                 "x" => Ok(Value::F32(q[0])),
                 "y" => Ok(Value::F32(q[1])),
@@ -7106,8 +7153,8 @@ impl Interpreter {
                 if hi <= lo {
                     return rt_err!("math::rand_int(lo, hi) requires hi > lo");
                 }
-                let r = pseudo_rand();
-                let span = (hi - lo) as f32;
+                let r = pseudo_rand() as f64; // use f64 for 52-bit mantissa
+                let span = (hi - lo) as f64;
                 Ok(Value::I64(lo + (r * span).floor() as i64))
             }
             "math::sigmoid" => {
@@ -7198,7 +7245,12 @@ impl Interpreter {
                     args.get(4).and_then(|v| v.as_f64()),
                 ) {
                     (Some(x), Some(in0), Some(in1), Some(out0), Some(out1)) => {
-                        let denom = (in1 - in0).abs().max(1e-12);
+                        let range = in1 - in0;
+                        let denom = if range.abs() < 1e-12 {
+                            1e-12_f64.copysign(range)
+                        } else {
+                            range
+                        };
                         let t = (x - in0) / denom;
                         Ok(Value::F32((out0 + (out1 - out0) * t) as f32))
                     }
@@ -7491,6 +7543,7 @@ impl Interpreter {
                     batch_size,
                     index: 0,
                     shuffle,
+                    epoch: 0,
                 };
                 if shuffle {
                     loader.reset();
@@ -8025,8 +8078,8 @@ impl Interpreter {
 
             // ── Collection functions ──────────────────────────────────────────
             "len" => match args.first() {
-                Some(Value::Array(a)) => Ok(Value::I32(a.borrow().len() as i32)),
-                Some(Value::Str(s)) => Ok(Value::I32(s.len() as i32)),
+                Some(Value::Array(a)) => Ok(Value::I64(a.borrow().len() as i64)),
+                Some(Value::Str(s)) => Ok(Value::I32(s.chars().count() as i32)),
                 Some(v) => rt_err!("len() not applicable to {}", v.type_name()),
                 None => rt_err!("len() requires an argument"),
             },
@@ -9303,6 +9356,7 @@ impl Interpreter {
                         batch_size: size,
                         index: 0,
                         shuffle,
+                        epoch: 0,
                     }))))
                 } else {
                     unreachable!()
@@ -9328,6 +9382,7 @@ impl Interpreter {
                         batch_size,
                         index: 0,
                         shuffle,
+                        epoch: 0,
                     }))))
                 } else {
                     unreachable!()
@@ -9363,6 +9418,7 @@ impl Interpreter {
                         batch_size,
                         index: 0,
                         shuffle,
+                        epoch: 0,
                     }))))
                 } else {
                     unreachable!()
@@ -9395,6 +9451,7 @@ impl Interpreter {
                         batch_size,
                         index: 0,
                         shuffle,
+                        epoch: 0,
                     }))))
                 } else {
                     unreachable!()
@@ -9423,7 +9480,7 @@ impl Interpreter {
             // ── Array / string methods ─────────────────────────────────────────
             (Value::Array(_), "len") => {
                 if let Value::Array(a) = recv {
-                    Ok(Value::I32(a.borrow().len() as i32))
+                    Ok(Value::I64(a.borrow().len() as i64))
                 } else {
                     unreachable!()
                 }
@@ -9493,7 +9550,7 @@ impl Interpreter {
             }
             (Value::HashMap(_), "len") => {
                 if let Value::HashMap(m) = recv {
-                    Ok(Value::I32(m.borrow().len() as i32))
+                    Ok(Value::I64(m.borrow().len() as i64))
                 } else {
                     unreachable!()
                 }
@@ -9537,7 +9594,7 @@ impl Interpreter {
                     unreachable!()
                 }
             }
-            (Value::Str(s), "len") => Ok(Value::I32(s.len() as i32)),
+            (Value::Str(s), "len") => Ok(Value::I32(s.chars().count() as i32)),
 
             // ── String methods ─────────────────────────────────────────────────
             (Value::Str(s), "to_upper") => Ok(Value::Str(s.to_uppercase())),
@@ -10053,6 +10110,8 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::Div => {
                 if b == 0 {
                     rt_err!("division by zero")
+                } else if b == -1 {
+                    Ok(Value::I32(a.wrapping_div(b)))
                 } else {
                     Ok(Value::I32(a / b))
                 }
@@ -10060,6 +10119,8 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::Rem => {
                 if b == 0 {
                     rt_err!("modulo by zero")
+                } else if b == -1 {
+                    Ok(Value::I32(a.wrapping_rem(b)))
                 } else {
                     Ok(Value::I32(a % b))
                 }
@@ -10073,8 +10134,22 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::BitAnd => Ok(Value::I32(a & b)),
             BinOpKind::BitOr => Ok(Value::I32(a | b)),
             BinOpKind::BitXor => Ok(Value::I32(a ^ b)),
-            BinOpKind::Shl => Ok(Value::I32(a << (b as u32))),
-            BinOpKind::Shr => Ok(Value::I32(a >> (b as u32))),
+            BinOpKind::Shl => {
+                let s = b as u32;
+                if s >= 32 {
+                    rt_err!("shift amount out of range for i32")
+                } else {
+                    Ok(Value::I32(a << s))
+                }
+            }
+            BinOpKind::Shr => {
+                let s = b as u32;
+                if s >= 32 {
+                    rt_err!("shift amount out of range for i32")
+                } else {
+                    Ok(Value::I32(a >> s))
+                }
+            }
             _ => Err(RuntimeError::new(format!(
                 "op {:?} not defined for i32",
                 op
@@ -10125,6 +10200,8 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::Div => {
                 if b == 0 {
                     rt_err!("division by zero")
+                } else if b == -1 {
+                    Ok(Value::I64(a.wrapping_div(b)))
                 } else {
                     Ok(Value::I64(a / b))
                 }
@@ -10132,6 +10209,8 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::Rem => {
                 if b == 0 {
                     rt_err!("modulo by zero")
+                } else if b == -1 {
+                    Ok(Value::I64(a.wrapping_rem(b)))
                 } else {
                     Ok(Value::I64(a % b))
                 }
@@ -10145,8 +10224,22 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::BitAnd => Ok(Value::I64(a & b)),
             BinOpKind::BitOr => Ok(Value::I64(a | b)),
             BinOpKind::BitXor => Ok(Value::I64(a ^ b)),
-            BinOpKind::Shl => Ok(Value::I64(a << (b as u32))),
-            BinOpKind::Shr => Ok(Value::I64(a >> (b as u32))),
+            BinOpKind::Shl => {
+                let s = b as u32;
+                if s >= 64 {
+                    rt_err!("shift amount out of range for i64")
+                } else {
+                    Ok(Value::I64(a << s))
+                }
+            }
+            BinOpKind::Shr => {
+                let s = b as u32;
+                if s >= 64 {
+                    rt_err!("shift amount out of range for i64")
+                } else {
+                    Ok(Value::I64(a >> s))
+                }
+            }
             _ => Err(RuntimeError::new(format!(
                 "op {:?} not defined for i64",
                 op
@@ -10349,19 +10442,39 @@ fn arith_i64(op: BinOpKind, a: i64, b: i64) -> Result<i64, RuntimeError> {
             if b == 0 {
                 return rt_err!("division by zero");
             }
+            // i64::MIN / -1 panics in debug / UB in release; use wrapping_div
+            if b == -1 {
+                return Ok(a.wrapping_div(b));
+            }
             a / b
         }
         BinOpKind::Rem => {
             if b == 0 {
                 return rt_err!("modulo by zero");
             }
+            // i64::MIN % -1 panics in debug / UB in release; use wrapping_rem
+            if b == -1 {
+                return Ok(a.wrapping_rem(b));
+            }
             a % b
         }
         BinOpKind::BitAnd => a & b,
         BinOpKind::BitOr => a | b,
         BinOpKind::BitXor => a ^ b,
-        BinOpKind::Shl => a << (b as u32),
-        BinOpKind::Shr => a >> (b as u32),
+        BinOpKind::Shl => {
+            let s = b as u32;
+            if s >= 64 {
+                return rt_err!("shift amount out of range for i64");
+            }
+            a << s
+        }
+        BinOpKind::Shr => {
+            let s = b as u32;
+            if s >= 64 {
+                return rt_err!("shift amount out of range for i64");
+            }
+            a >> s
+        }
         _ => return rt_err!("operator not defined for integers"),
     })
 }
@@ -10376,19 +10489,39 @@ fn arith_i32(op: BinOpKind, a: i32, b: i32) -> Result<i32, RuntimeError> {
             if b == 0 {
                 return rt_err!("division by zero");
             }
+            // i32::MIN / -1 panics in debug / UB in release; use wrapping_div
+            if b == -1 {
+                return Ok(a.wrapping_div(b));
+            }
             a / b
         }
         BinOpKind::Rem => {
             if b == 0 {
                 return rt_err!("modulo by zero");
             }
+            // i32::MIN % -1 panics in debug / UB in release; use wrapping_rem
+            if b == -1 {
+                return Ok(a.wrapping_rem(b));
+            }
             a % b
         }
         BinOpKind::BitAnd => a & b,
         BinOpKind::BitOr => a | b,
         BinOpKind::BitXor => a ^ b,
-        BinOpKind::Shl => a << (b as u32),
-        BinOpKind::Shr => a >> (b as u32),
+        BinOpKind::Shl => {
+            let s = b as u32;
+            if s >= 32 {
+                return rt_err!("shift amount out of range for i32");
+            }
+            a << s
+        }
+        BinOpKind::Shr => {
+            let s = b as u32;
+            if s >= 32 {
+                return rt_err!("shift amount out of range for i32");
+            }
+            a >> s
+        }
         _ => return rt_err!("operator not defined for integers"),
     })
 }
@@ -10439,6 +10572,41 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         // Cross-type float comparisons (promote to f64)
         (Value::F32(x),  Value::F64(y))  => *x as f64 == *y,
         (Value::F64(x),  Value::F32(y))  => *x == *y as f64,
+        // Cross-type signed ↔ unsigned comparisons:
+        // If the signed value is negative they cannot be equal to any unsigned value.
+        // Otherwise compare both as u64.
+        (Value::I8(x),   Value::U8(y))   => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U8(x),   Value::I8(y))   => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I8(x),   Value::U16(y))  => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U16(x),  Value::I8(y))   => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I8(x),   Value::U32(y))  => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U32(x),  Value::I8(y))   => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I8(x),   Value::U64(y))  => *x >= 0 && *x as u64 == *y,
+        (Value::U64(x),  Value::I8(y))   => *y >= 0 && *x == *y as u64,
+        (Value::I16(x),  Value::U8(y))   => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U8(x),   Value::I16(y))  => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I16(x),  Value::U16(y))  => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U16(x),  Value::I16(y))  => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I16(x),  Value::U32(y))  => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U32(x),  Value::I16(y))  => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I16(x),  Value::U64(y))  => *x >= 0 && *x as u64 == *y,
+        (Value::U64(x),  Value::I16(y))  => *y >= 0 && *x == *y as u64,
+        (Value::I32(x),  Value::U8(y))   => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U8(x),   Value::I32(y))  => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I32(x),  Value::U16(y))  => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U16(x),  Value::I32(y))  => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I32(x),  Value::U32(y))  => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U32(x),  Value::I32(y))  => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I32(x),  Value::U64(y))  => *x >= 0 && *x as u64 == *y,
+        (Value::U64(x),  Value::I32(y))  => *y >= 0 && *x == *y as u64,
+        (Value::I64(x),  Value::U8(y))   => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U8(x),   Value::I64(y))  => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I64(x),  Value::U16(y))  => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U16(x),  Value::I64(y))  => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I64(x),  Value::U32(y))  => *x >= 0 && *x as u64 == *y as u64,
+        (Value::U32(x),  Value::I64(y))  => *y >= 0 && *x as u64 == *y as u64,
+        (Value::I64(x),  Value::U64(y))  => *x >= 0 && *x as u64 == *y,
+        (Value::U64(x),  Value::I64(y))  => *y >= 0 && *x == *y as u64,
         _ => false,
     }
 }
@@ -10471,7 +10639,7 @@ fn tensor_flat_index(shape: &[usize], indices: &[Value]) -> Result<usize, Runtim
 }
 
 /// Vec swizzle: extract x/y/z/w components or multi-component swizzles.
-fn swizzle_vec(components: &[f32], field: &str) -> Result<Value, String> {
+fn swizzle_vec(components: &[f32], field: &str) -> Result<Value, RuntimeError> {
     let mapped: Vec<f32> = field
         .chars()
         .map(|c| match c {
@@ -10482,13 +10650,13 @@ fn swizzle_vec(components: &[f32], field: &str) -> Result<Value, String> {
             _ => None,
         })
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| format!("invalid swizzle `{field}`"))?;
+        .ok_or_else(|| RuntimeError::new(format!("invalid swizzle `{field}`")))?;
     Ok(match mapped.len() {
         1 => Value::F32(mapped[0]),
         2 => Value::Vec2([mapped[0], mapped[1]]),
         3 => Value::Vec3([mapped[0], mapped[1], mapped[2]]),
         4 => Value::Vec4([mapped[0], mapped[1], mapped[2], mapped[3]]),
-        _ => return Err(format!("swizzle `{field}` exceeds 4 components")),
+        _ => return Err(RuntimeError::new(format!("swizzle `{field}` exceeds 4 components"))),
     })
 }
 
