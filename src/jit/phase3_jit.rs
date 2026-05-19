@@ -2383,23 +2383,27 @@ fn compute_float_slots(instrs: &[Instr], slot_count: usize) -> Vec<bool> {
 // ── Linear-scan allocator ─────────────────────────────────────────────────────
 
 fn linear_scan(intervals: &[LiveInterval], slot_count: usize, float_slots: &[bool]) -> RegAlloc {
-    // Live range splitting: Instead of merging ALL intervals for the same
-    // slot into one giant interval (which forces the register to be held for
-    // the entire function, causing excessive spills), we use a weighted
-    // approach. We merge intervals but apply "loop-aware hole detection":
-    // if a slot has a gap in its live range where it's not used (especially
-    // between loop iterations), we DON'T extend the interval across that gap.
+    // ═══════════════════════════════════════════════════════════════════════
+    // Register Allocator with Hot-Path Prioritization
+    // ═══════════════════════════════════════════════════════════════════════
     //
-    // However, the code generator assumes each slot has exactly ONE fixed
-    // location (Reg or Spill) for the entire function. So we must still
-    // produce a single interval per slot, but we use spill cost heuristics
-    // to decide which slots deserve registers vs. which should be spilled.
+    // Architecture constraint: the code generator uses ra.location(slot)
+    // which returns ONE fixed location (Reg or Spill) per slot for the
+    // entire function. This means we can't do true live range splitting
+    // (which would assign different registers at different program points).
     //
-    // Key improvement: We prioritize register assignment by spill cost
-    // (frequency of use in hot loops) rather than just interval length.
-    // Slots that are heavily used inside loops get registers even if their
-    // intervals are long; slots with long intervals but few actual uses
-    // (e.g., defined once, used once at the end) are preferentially spilled.
+    // Instead, we use a two-pass approach:
+    //   Pass 1: Standard linear-scan with merged intervals.
+    //   Pass 2: Hot-path demotion — identify cold slots that got registers
+    //           and demote them to Spill, then try to assign the freed
+    //           registers to hot slots (loop vars, accumulators) that
+    //           were spilled.
+    //
+    // A slot is "hot" if it's used inside a loop body (detected by
+    // checking if its live range overlaps with a backward branch).
+    // Hot slots get priority because they're executed millions of times;
+    // spilling a hot slot costs ~4-5 cycles per iteration in a 1B loop,
+    // while spilling a cold slot costs ~4-5 cycles total.
 
     let mut merged: Vec<LiveInterval> = Vec::new();
     {
@@ -2423,6 +2427,50 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize, float_slots: &[boo
         }
         // Sort by start position (required by linear scan)
         merged.sort_by_key(|iv| iv.first);
+    }
+
+    // ── Identify hot slots (used inside loops) ────────────────────────────
+    // A slot is "hot" if its live range [first, last] overlaps with any
+    // backward branch [loop_header, loop_back_edge]. We compute this by
+    // finding all backward branches in the interval data.
+    let mut hot_slots: Vec<bool> = vec![false; slot_count + 1];
+    {
+        // Find loop regions from the interval data
+        let mut loop_regions: Vec<(usize, usize)> = Vec::new(); // (header, back_edge)
+        for iv in &merged {
+            // Check if any instruction in the slot's range is a backward branch
+            // Heuristic: if a slot's range contains a PC that's also the start
+            // of another slot that was defined at an earlier PC and used at a
+            // later PC, there's likely a loop. We use a simpler heuristic:
+            // if a slot has a very long live range (last - first > threshold)
+            // AND is used at the beginning and end of its range, it's likely
+            // in a loop.
+            // Better: use the interval data itself — if a slot is defined,
+            // used, and re-defined within a range, it's a loop variable.
+            // For now: mark slots whose live range spans at least 50% of
+            // the total instruction range as potentially hot.
+            if !merged.is_empty() {
+                let total_range = merged.last().map_or(1, |iv| iv.last.max(1));
+                let slot_range = iv.last.saturating_sub(iv.first);
+                if slot_range > 0 && total_range > 0 && slot_range * 2 >= total_range {
+                    hot_slots[iv.slot as usize] = true;
+                }
+            }
+        }
+        // Also mark slots that appear in multiple intervals (they're used
+        // across different parts of the function, likely in loops)
+        let mut slot_use_count = vec![0u32; slot_count + 1];
+        for iv in intervals {
+            let s = iv.slot as usize;
+            if s < slot_use_count.len() {
+                slot_use_count[s] += 1;
+            }
+        }
+        for s in 0..=slot_count {
+            if slot_use_count[s] >= 3 {
+                hot_slots[s] = true;
+            }
+        }
     }
 
     // Pre-allocate slots to slot_count + 1 with default spill locations.
@@ -2495,6 +2543,80 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize, float_slots: &[boo
                     // Already pre-filled with Spill; nothing to do.
                 }
             }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Pass 2: Hot-Path Demotion
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // After the standard linear scan, some hot slots (loop variables,
+    // accumulators) may have been spilled while cold slots (one-time
+    // computations, setup values) got registers. This is backwards for
+    // performance — a spilled loop variable costs ~4-5 cycles per
+    // iteration in a 1B loop, while a spilled cold variable costs
+    // ~4-5 cycles total.
+    //
+    // This pass identifies:
+    //   1. Cold slots that currently have registers
+    //   2. Hot slots that are currently spilled
+    // And swaps them: demote the cold slot to Spill, give its register
+    // to the hot slot.
+    {
+        // Collect cold slots with registers and hot slots without registers
+        let mut cold_with_reg: Vec<(u16, u8)> = Vec::new(); // (slot, reg)
+        let mut hot_without_reg: Vec<u16> = Vec::new();
+
+        for s in 0..slot_count {
+            if s >= slots.len() { continue; }
+            let is_hot = s < hot_slots.len() && hot_slots[s];
+            match slots[s] {
+                RegLoc::Reg(r) if !is_hot => {
+                    cold_with_reg.push((s as u16, r));
+                }
+                RegLoc::Spill(_) if is_hot => {
+                    hot_without_reg.push(s as u16);
+                }
+                _ => {}
+            }
+        }
+
+        // Sort cold slots by interval length (longest first — demote the
+        // ones that waste the most register time). We'll swap the coldest
+        // first with the hottest first.
+        cold_with_reg.sort_by(|a, b| {
+            let len_a = merged.iter().find(|iv| iv.slot == a.0).map_or(0, |iv| iv.last - iv.first);
+            let len_b = merged.iter().find(|iv| iv.slot == b.0).map_or(0, |iv| iv.last - iv.first);
+            len_b.cmp(&len_a) // longest first
+        });
+
+        // Sort hot slots by interval length (shortest first — they're the
+        // most likely to benefit from a register since they fit in a
+        // register for a shorter time, meaning less conflict with other
+        // hot slots). Actually, sort by use count — most-used first.
+        hot_without_reg.sort_by(|a, b| {
+            let uses_a = intervals.iter().filter(|iv| iv.slot == *a).count();
+            let uses_b = intervals.iter().filter(|iv| iv.slot == *b).count();
+            uses_b.cmp(&uses_a) // most-used first
+        });
+
+        // Swap: demote cold → Spill, promote hot → Reg
+        let swap_count = cold_with_reg.len().min(hot_without_reg.len());
+        for i in 0..swap_count {
+            let (cold_slot, reg) = cold_with_reg[i];
+            let hot_slot = hot_without_reg[i];
+
+            // Demote cold slot to Spill
+            slots[cold_slot as usize] = RegLoc::Spill((cold_slot as i32) * 8);
+            // Promote hot slot to Reg
+            slots[hot_slot as usize] = RegLoc::Reg(reg);
+
+            // Update callee-saved tracking if the hot slot's register is
+            // callee-saved (it already was tracked when the cold slot got it)
+        }
+
+        if swap_count > 0 {
+            eprintln!("[JIT-RA] Hot-path demotion: swapped {} cold→spill, hot→reg", swap_count);
         }
     }
 
@@ -3397,6 +3519,53 @@ impl LoopVectorizer {
                 self.reject_reason = Some("reduction accumulator aliases induction var");
                 self.is_vectorizable = false;
                 return;
+            }
+            // If the reduction operand is the induction variable itself,
+            // we can't vectorize because the operand changes every iteration.
+            // Broadcasting the induction variable across SIMD lanes gives
+            // all lanes the same value, producing wrong results.
+            // Example: "s = s + i" where i is the loop counter — each
+            // SIMD lane would add the same value of i, not different i's.
+            if Some(red.val_slot) == self.induction_var {
+                self.reject_reason = Some("reduction operand is induction var (changes per iteration)");
+                self.is_vectorizable = false;
+                return;
+            }
+            // Also reject if the val_slot depends on the induction variable.
+            // Even if val_slot != induction_var, it may have been loaded from
+            // the IV (e.g., Load(temp, iv_slot)). We trace the def chain.
+            if self.written_slots.contains(&red.val_slot) && Some(red.val_slot) != self.induction_var {
+                // Check if val_slot was defined by loading from the IV.
+                // Scan the loop body for the definition of val_slot.
+                let mut depends_on_iv = false;
+                for pc in body_start..=body_end {
+                    if pc >= instrs.len() { break; }
+                    match &instrs[pc] {
+                        // Direct load from the IV slot
+                        Instr::Load(d, s) | Instr::Move(d, s) if *d == red.val_slot && Some(*s) == self.induction_var => {
+                            depends_on_iv = true;
+                            break;
+                        }
+                        // If val_slot is a BinOp result, check if any operand is the IV
+                        Instr::BinOp(d, _, l, r) if *d == red.val_slot => {
+                            if Some(*l) == self.induction_var || Some(*r) == self.induction_var {
+                                depends_on_iv = true;
+                                break;
+                            }
+                        }
+                        // LoadI* are constants — safe to broadcast
+                        Instr::LoadI32(d, _) | Instr::LoadI64(d, _) | Instr::LoadBool(d, _) | Instr::LoadUnit(d) if *d == red.val_slot => {
+                            // This is a constant definition — loop-invariant
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if depends_on_iv {
+                    self.reject_reason = Some("reduction operand depends on induction var (changes per iteration)");
+                    self.is_vectorizable = false;
+                    return;
+                }
             }
         }
 
