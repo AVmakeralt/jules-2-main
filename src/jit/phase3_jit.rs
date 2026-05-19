@@ -4302,7 +4302,9 @@ fn emit_vectorized_loop(
             if let Ok(rel32) = i32::try_from(rel) {
                 em.buf[fx.disp_pos..fx.disp_pos + 4].copy_from_slice(&rel32.to_le_bytes());
             }
-            fx.target_pc = 0;
+            // Leave target_pc as usize::MAX so the main patch_fixups()
+            // function skips this fixup — it's already resolved above
+            // using the machine code offset, not the PC-based offset.
             break;
         }
     }
@@ -5082,6 +5084,12 @@ struct Fixup {
 /// short instruction*, not after the 5/6-byte long instruction.
 fn patch_fixups(buf: &mut Vec<u8>, fixups: &[Fixup], pc_to_off: &[usize]) -> Option<()> {
     for fx in fixups {
+        // Skip fixups that were already resolved by emit_vectorized_loop().
+        // The SIMD backward branch is patched inline using the machine code
+        // offset (not PC offset), so it must not be re-patched here.
+        if fx.target_pc == usize::MAX {
+            continue;
+        }
         let target_off = *pc_to_off.get(fx.target_pc)? as isize;
 
         let opcode_start = match fx.kind {
@@ -6733,12 +6741,16 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     let mut vectorizer = LoopVectorizer::new();
     vectorizer.analyze(instrs);
     let vec_factor = vectorizer.vectorization_factor();
-    // DISABLE SIMD vectorization — the emit_vectorized_loop() function has
-    // multiple bugs (infinite loops in SIMD trip count, wrong horizontal
-    // reduction for Mul, broken lane extraction). Re-enable after fixing.
-    let vec_is_applicable = false; // vectorizer.is_vectorizable && vec_factor > 1;
+    // Enable SIMD vectorization for Add/Sub-only reductions.
+    // Mul reductions require stride-based vectorization (polynomial reduction)
+    // which is complex and error-prone, so we fall back to scalar for those.
+    // The emit_vectorized_loop() function also rejects Mul reductions internally.
+    let has_mul_reduction = vectorizer.reductions.iter().any(|r| r.op == BinOpKind::Mul);
+    let vec_is_applicable = vectorizer.is_vectorizable && vec_factor > 1 && !has_mul_reduction;
     if vec_is_applicable {
         eprintln!("[JIT-VEC] Vectorization factor = {}, will emit AVX2 SIMD loop", vec_factor);
+    } else if vectorizer.is_vectorizable && has_mul_reduction {
+        eprintln!("[JIT-VEC] Loop has Mul reductions, falling back to scalar (stride-based vec not yet implemented)");
     } else if vectorizer.reject_reason.is_some() {
         eprintln!("[JIT-VEC] Loop not vectorized: {}", vectorizer.reject_reason.unwrap());
     }
@@ -8241,15 +8253,20 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
     }
 
-    // Determine return type from the last Return instruction.
-    // Default to i32 since most Jules functions return i32.
+    // Determine return type from the last Return instruction using type_at.
+    // The type_at table tracks the actual type of every slot as we emit code,
+    // so we can accurately determine whether the return value is i32 or i64.
+    // Default to i32 since most Jules functions return i32, but respect
+    // explicit i64 return types (fix for bug #14: VM fast-path always returns
+    // Value::I32 regardless of actual return type).
     let mut return_is_i32 = true;
     for instr in instrs {
         if let Instr::Return(src) = instr {
-            // Check if the source slot was loaded as i32.
-            // We scan backwards for the most recent LoadI32 or BinOp
-            // that wrote to this slot.
-            return_is_i32 = true; // Jules functions typically return i32
+            let src_ty = type_at.get(*src);
+            return_is_i32 = !matches!(src_ty, SlotType::I64);
+            if !return_is_i32 {
+                eprintln!("[JIT] Return slot {} is {:?}, using i64 return path", src, src_ty);
+            }
             break;
         }
     }
