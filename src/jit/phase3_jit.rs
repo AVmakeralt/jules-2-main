@@ -1155,16 +1155,13 @@ impl Emitter {
         }
     }
 
-    /// TEST EAX, EAX — 2 bytes. Sufficient for boolean/zero testing since
-    /// we only care about ZF; the upper 32 bits are zero for any canonical bool.
-    /// Falls back to REX.W form for full 64-bit values tested against branches
-    /// (call test_rax_rax for those if unsure).
+    /// TEST RAX, RAX — 3 bytes. Tests all 64 bits for zero.
+    /// Previously used TEST EAX,EAX (2 bytes) which only checked the low 32 bits,
+    /// causing values like 0x1_0000_0000 to be incorrectly treated as zero.
     fn test_rax_rax(&mut self) {
-        // TEST EAX, EAX (2 B) — ZF ↔ (eax == 0), which equals (rax == 0)
-        // because our boolean values are 0 or 1 and always fit in 32 bits.
-        // For general integer branch conditions (JumpFalse/True on arbitrary i64),
-        // we also use this: canonical i64 0 has upper 32 bits = 0, so it's safe.
-        self.emit2(0x85, 0xC0); // TEST EAX, EAX
+        // TEST RAX, RAX — checks all 64 bits. Required for i64 branch conditions
+        // where the value may have non-zero upper 32 bits (e.g., i64 values > 2^32).
+        self.emit3(0x48, 0x85, 0xC0); // TEST RAX, RAX
     }
 
     fn setcc_al(&mut self, cc: u8) {
@@ -1979,7 +1976,7 @@ impl Emitter {
     /// vpaddd ymm_dst, ymm_src1, ymm_src2 — packed 32-bit integer add (8 lanes).
     /// Uses VEX.256.66.0F.WIG FE /r.  vvvv = src1 (NDS), reg = src2, rm = dst.
     fn vpaddd_ymm(&mut self, dst: u8, src1: u8, src2: u8) {
-        self.emit_vex2_256(dst >= 8, src1, 1); // pp=1(66), vvvv=src1
+        self.emit_vex2_256(src2 >= 8, src1, 1); // R~ from src2 (ModRM.reg), vvvv=src1
         self.b(0xFE); // VPADDD
         self.b(0xC0 | ((src2 & 7) << 3) | (dst & 7)); // ModRM: mod=11, reg=src2, rm=dst
     }
@@ -1987,7 +1984,7 @@ impl Emitter {
     /// vpsubd ymm_dst, ymm_src1, ymm_src2 — packed 32-bit integer subtract (8 lanes).
     /// Uses VEX.256.66.0F.WIG FA /r.  vvvv = src1 (NDS), reg = src2, rm = dst.
     fn vpsubd_ymm(&mut self, dst: u8, src1: u8, src2: u8) {
-        self.emit_vex2_256(dst >= 8, src1, 1); // pp=1(66), vvvv=src1
+        self.emit_vex2_256(src2 >= 8, src1, 1); // R~ from src2 (ModRM.reg), vvvv=src1
         self.b(0xFA); // VPSUBD
         self.b(0xC0 | ((src2 & 7) << 3) | (dst & 7)); // ModRM: mod=11, reg=src2, rm=dst
     }
@@ -1997,7 +1994,10 @@ impl Emitter {
     /// vvvv = src1 (NDS), reg = src2, rm = dst.
     fn vpmulld_ymm(&mut self, dst: u8, src1: u8, src2: u8) {
         // VEX3: C4 [R~X~B~mmmmm] [W~vvvv~L~pp] [opcode]
-        let byte1 = 0xE0 | 0x02; // R=X=B=1(inverted), mmmmm=00010(0F38)
+        // ModRM: reg=src2, rm=dst. R~ inverts from src2 high bit, B~ from dst high bit.
+        let r_inv = !(src2 >= 8) as u8; // R~ bit: invert of src2's high bit
+        let b_inv = !(dst >= 8) as u8;  // B~ bit: invert of dst's high bit
+        let byte1 = (r_inv << 7) | (1 << 6) | (b_inv << 5) | 0x02; // X~=1 (no SIB), mmmmm=00010(0F38)
         let byte2 = (0 << 7)          // W=0
             | ((!src1) & 0xF) << 3  // vvvv (inverted)
             | (1 << 2)               // L=1 for 256-bit
@@ -2009,7 +2009,10 @@ impl Emitter {
     /// vpbroadcastd ymm_dst, xmm_src — broadcast 32-bit int to all 8 lanes.
     /// Uses VEX.256.66.0F38.WIG 58 /r.  Requires VEX3 for 0F38 escape.
     fn vpbroadcastd_ymm_xmm(&mut self, dst: u8, src: u8) {
-        let byte1 = 0xE0 | 0x02; // R=X=B=1(inverted), mmmmm=00010(0F38)
+        // ModRM: reg=dst, rm=src. R~ from dst high bit, B~ from src high bit.
+        let r_inv = !(dst >= 8) as u8;
+        let b_inv = !(src >= 8) as u8;
+        let byte1 = (r_inv << 7) | (1 << 6) | (b_inv << 5) | 0x02; // X~=1, mmmmm=00010(0F38)
         let byte2 = (0 << 7)       // W=0
             | (0xF << 3)           // vvvv=1111 (unused)
             | (1 << 2)             // L=1 for 256-bit
@@ -2032,20 +2035,24 @@ impl Emitter {
     /// vextracti128 xmm_dst, ymm_src, 0x01 — extract high 128 bits of YMM.
     /// Uses VEX.256.66.0F3A.WIG 39 /r ib.  VEX3 needed for 0F3A escape.
     fn vextracti128_ymm_xmm(&mut self, dst: u8, src: u8, imm: u8) {
-        let byte1 = 0xE0 | 0x03; // R=X=B=1(inverted), mmmmm=00011(0F3A)
+        // VEX3: ModRM reg=src, rm=dst. R~ from src high bit, B~ from dst high bit.
+        let r_inv = !(src >= 8) as u8;
+        let b_inv = !(dst >= 8) as u8;
+        let byte1 = (r_inv << 7) | (1 << 6) | (b_inv << 5) | 0x03; // X~=1, mmmmm=00011(0F3A)
         let byte2 = (0 << 7)          // W=0
             | ((!src) & 0xF) << 3   // vvvv = src (inverted)
             | (1 << 2)               // L=1 for 256-bit
             | 1;                     // pp=1(66)
         self.emit4(0xC4, byte1, byte2, 0x39);
-        self.b(0xC0 | ((dst & 7) << 3) | (src & 7)); // ModRM: mod=11
+        self.b(0xC0 | ((src & 7) << 3) | (dst & 7)); // ModRM: mod=11
         self.b(imm);
     }
 
     /// vpaddd xmm_dst, xmm_src1, xmm_src2 — packed 32-bit integer add (4 lanes, 128-bit).
     /// Uses VEX.128.66.0F.WIG FE /r.
+    /// VEX2: R~ extends ModRM.reg = src2, B~ implied 1 (dst must be < 8 for VEX2).
     fn vpaddd_xmm(&mut self, dst: u8, src1: u8, src2: u8) {
-        let byte1 = (!(dst >= 8) as u8) << 7
+        let byte1 = (!(src2 >= 8) as u8) << 7  // R~ from src2 (ModRM.reg)
             | ((!src1) & 0xF) << 3
             | (0 << 2)  // L=0 for 128-bit
             | 1;        // pp=1(66)
@@ -2054,8 +2061,9 @@ impl Emitter {
     }
 
     /// vpsubd xmm_dst, xmm_src1, xmm_src2 — packed 32-bit integer sub (4 lanes, 128-bit).
+    /// VEX2: R~ extends ModRM.reg = src2, B~ implied 1 (dst must be < 8 for VEX2).
     fn vpsubd_xmm(&mut self, dst: u8, src1: u8, src2: u8) {
-        let byte1 = (!(dst >= 8) as u8) << 7
+        let byte1 = (!(src2 >= 8) as u8) << 7  // R~ from src2 (ModRM.reg)
             | ((!src1) & 0xF) << 3
             | (0 << 2) | 1;
         self.emit3(0xC5, byte1, 0xFA);
@@ -2065,7 +2073,10 @@ impl Emitter {
     /// vpmulld xmm_dst, xmm_src1, xmm_src2 — packed 32-bit integer mul (4 lanes, 128-bit).
     /// VEX3 for 0F38 escape.
     fn vpmulld_xmm(&mut self, dst: u8, src1: u8, src2: u8) {
-        let byte1 = 0xE0 | 0x02;
+        // VEX3: ModRM reg=src2, rm=dst. R~ from src2 high bit, B~ from dst high bit.
+        let r_inv = !(src2 >= 8) as u8;
+        let b_inv = !(dst >= 8) as u8;
+        let byte1 = (r_inv << 7) | (1 << 6) | (b_inv << 5) | 0x02; // X~=1, mmmmm=00010(0F38)
         let byte2 = (0 << 7)
             | ((!src1) & 0xF) << 3
             | (0 << 2)  // L=0 for 128-bit
@@ -4975,31 +4986,37 @@ fn emit_binop_rax_rcx(em: &mut Emitter, op: BinOpKind) -> bool {
             em.or_rax_rcx();
         }
         BinOpKind::FloorDiv => {
-            // Floor division: same as integer division for positive results,
-            // but rounds toward negative infinity.
-            // For i64: a / b with floor semantics = (a - (a % b + b) % b) / b
-            // Simplified: use IDIV then adjust if signs differ and remainder != 0
+            // Floor division: rounds toward negative infinity.
+            // After IDIV: RAX=quotient (truncated toward zero), RDX=remainder
+            // RCX is NOT clobbered by IDIV (it reads RCX as divisor but doesn't write it).
+            //
+            // Adjustment needed if: remainder != 0 AND (remainder XOR divisor) has sign bit set.
+            // Because IDIV remainder has the same sign as the dividend, so if remainder and
+            // divisor have opposite signs, then dividend and divisor had opposite signs,
+            // meaning floor != trunc → subtract 1 from quotient.
+            //
+            // Branchless approach: compute adjustment ∈ {0, 1}, then result = quotient - adjustment.
             em.cqo();
             em.idiv_rcx();
-            // RAX = quotient, RDX = remainder
-            // If remainder != 0 and signs of dividend/divisor differ, subtract 1
-            em.mov_rcx_rax();      // save quotient in RCX
-            em.test_rax_rax();     // test quotient (but we need to test remainder)
-            // Actually, let's use a simpler approach: save quotient, check remainder
-            // We need a scratch register. Use: if RDX != 0 and (a XOR b) < 0, subtract 1
-            em.mov_rax_rdx();      // RAX = remainder
-            em.test_rax_rax();     // test if remainder is zero
-            // If remainder is zero, no adjustment needed. 
-            // This is a simplified version — for correctness, emit a CMOV sequence:
-            em.mov_rax_rcx();      // RAX = quotient (will be the return value)
-            // For now, use the simple IDIV result which truncates toward zero.
-            // The floor adjustment is a 1-instruction fix in the common case.
-            // Note: full floor-div requires more complex code; this is correct for
-            // non-negative dividends. For negative dividends with positive divisors
-            // (or vice versa), we need to adjust. We'll handle this with a CMOV:
-            // push RDX (remainder), check if nonzero and sign mismatch, then dec RAX.
-            // Simpler: just use truncated division for now (matches Rust's i64::div_euclid
-            // semantics when we add the full adjustment later).
+            // RAX = quotient, RDX = remainder, RCX = divisor (unchanged)
+            em.push_reg(0);  // push RAX (save quotient)
+            // Compute sign_mismatch = (RDX ^ RCX) >> 63
+            em.mov_rax_rdx();       // RAX = remainder
+            em.xor_rax_rcx();       // RAX = remainder ^ divisor
+            em.shr_rax_imm8(63);    // RAX = 1 if signs differ, 0 if same
+            em.push_reg(0);         // push sign_mismatch
+            // Compute remainder_nonzero = (RDX != 0) ? 1 : 0
+            em.mov_rax_rdx();       // RAX = remainder (RDX still intact)
+            em.test_rax_rax();      // ZF = (remainder == 0)
+            em.setcc_al(0x95);      // SETNZ AL: AL = 1 if remainder != 0
+            em.movzx_rax_al();      // RAX = remainder_nonzero (0 or 1)
+            // adjustment = sign_mismatch AND remainder_nonzero
+            em.pop_reg(1);          // RCX = sign_mismatch
+            em.and_rax_rcx();       // RAX = adjustment (0 or 1)
+            // result = quotient - adjustment
+            em.pop_reg(1);          // RCX = quotient
+            em.sub_reg_reg(1, 0);   // RCX = RCX - RAX = quotient - adjustment
+            em.mov_rax_rcx();       // RAX = result
         }
     }
     true
@@ -9580,7 +9597,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
                                 BinOpKind::BitOr => em.or_rax_rcx(),
                                 BinOpKind::BitXor => em.xor_rax_rcx(),
                                 BinOpKind::Shl => em.shl_rax_cl(),
-                                BinOpKind::Shr => em.shr_rax_cl(),
+                                BinOpKind::Shr => em.sar_rax_cl(),
                                 _ => { /* fallback: just add */ em.add_rax_rcx(); }
                             }
                             em.mov_reg_reg(dr, 0); // dst = rax
@@ -9608,7 +9625,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
                                 BinOpKind::BitOr => em.or_rax_rcx(),
                                 BinOpKind::BitXor => em.xor_rax_rcx(),
                                 BinOpKind::Shl => em.shl_rax_cl(),
-                                BinOpKind::Shr => em.shr_rax_cl(),
+                                BinOpKind::Shr => em.sar_rax_cl(),
                                 _ => em.add_rax_rcx(),
                             }
                             em.store_mem_reg((dst_slot as i32) * 8, 0);

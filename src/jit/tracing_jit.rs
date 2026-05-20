@@ -366,15 +366,32 @@ impl TraceRecorder {
             Instr::LoadBool(dst, _) => { slot_types.insert(*dst, ValueType::Bool); }
             Instr::LoadUnit(dst) => { /* Unit is not unboxable, skip */ let _ = dst; }
             Instr::BinOp(dst, op, lhs, rhs) => {
-                // Comparison ops produce Bool; arithmetic ops inherit I64
-                let result_type = match op {
-                    BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt |
-                    BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge => ValueType::Bool,
-                    _ => ValueType::I64,
+                // Comparison ops produce Bool; arithmetic ops inherit operand type
+                let is_cmp = matches!(op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt |
+                    BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge);
+                let result_type = if is_cmp {
+                    ValueType::Bool
+                } else {
+                    // Inherit from operands — respect float types
+                    let lhs_type = slot_types.get(lhs).copied().unwrap_or(ValueType::I64);
+                    let rhs_type = slot_types.get(rhs).copied().unwrap_or(ValueType::I64);
+                    if matches!(lhs_type, ValueType::F64 | ValueType::F32) ||
+                       matches!(rhs_type, ValueType::F64 | ValueType::F32) {
+                        // Float arithmetic — propagate the wider type
+                        if lhs_type == ValueType::F64 || rhs_type == ValueType::F64 {
+                            ValueType::F64
+                        } else {
+                            ValueType::F32
+                        }
+                    } else {
+                        ValueType::I64
+                    }
                 };
                 slot_types.insert(*dst, result_type);
-                slot_types.insert(*lhs, ValueType::I64);
-                slot_types.insert(*rhs, ValueType::I64);
+                // Do NOT override lhs/rhs types — they were set by their defining instructions.
+                // Only insert if they don't already have a type (fallback to I64).
+                slot_types.entry(*lhs).or_insert(ValueType::I64);
+                slot_types.entry(*rhs).or_insert(ValueType::I64);
             }
             Instr::Move(dst, src) => {
                 // Propagate source type if known
@@ -1032,7 +1049,7 @@ impl NativeCodeGenerator {
                         let lhs_reg = self.alloc_reg(*lhs)?;
                         let rhs_reg = self.alloc_reg(*rhs)?;
                         if rhs_reg != Reg::RCX { self.mov_reg_reg(rhs_reg, Reg::RCX); }
-                        self.shr_reg_cl(lhs_reg);
+                        self.sar_reg_cl(lhs_reg); // arithmetic shift right for signed integers
                         self.bind_slot_reg(*dst, lhs_reg);
                         self.mark_dirty(*dst);
                     }
@@ -1152,10 +1169,16 @@ impl NativeCodeGenerator {
                 let lhs_has = unboxed_slots.get(*lhs as usize).and_then(|o| *o).is_some();
                 let rhs_has = unboxed_slots.get(*rhs as usize).and_then(|o| *o).is_some();
                 let dst_has = unboxed_slots.get(*dst as usize).and_then(|o| *o).is_some();
-                if lhs_has && rhs_has && dst_has {
-                    let lhs_vtype = slot_vtype(*lhs);
-                    let rhs_vtype = slot_vtype(*rhs);
-                    let dst_vtype = slot_vtype(*dst);
+                // Check if any operand or result is a float type — float arithmetic
+                // requires SSE instructions (ADDSD/SUBSD/etc.) which are not yet
+                // implemented in the unboxed path. Fall back to boxed path for floats.
+                let lhs_vtype = slot_vtype(*lhs);
+                let rhs_vtype = slot_vtype(*rhs);
+                let dst_vtype = slot_vtype(*dst);
+                let any_float = matches!(lhs_vtype, ValueType::F64 | ValueType::F32)
+                    || matches!(rhs_vtype, ValueType::F64 | ValueType::F32)
+                    || matches!(dst_vtype, ValueType::F64 | ValueType::F32);
+                if lhs_has && rhs_has && dst_has && !any_float {
                     // Load from unboxed buffers using per-slot types
                     if let Some(&Some(lhs_offset)) = unboxed_slots.get(*lhs as usize) {
                         self.emit_unboxed_load(lhs_offset, lhs_vtype, unboxed_buffer, Reg::RAX)?;
@@ -1222,7 +1245,7 @@ impl NativeCodeGenerator {
                         BinOpKind::BitOr => self.or_reg_reg(Reg::RCX, Reg::RAX),
                         BinOpKind::BitXor => self.xor_reg_reg(Reg::RCX, Reg::RAX),
                         BinOpKind::Shl => self.shl_reg_cl(Reg::RAX),
-                        BinOpKind::Shr => self.shr_reg_cl(Reg::RAX),
+                        BinOpKind::Shr => self.sar_reg_cl(Reg::RAX), // arithmetic shift right for signed integers
                         _ => return Err(format!("Unsupported BinOp in unboxed mode: {:?}", op)),
                     }
                     // Store result to unboxed buffer using per-slot dst type
@@ -1264,18 +1287,21 @@ impl NativeCodeGenerator {
         let reg_code = reg as u8;
         if matches!(vtype, ValueType::Bool) {
             // MOVZX r32, byte [r8 + disp32]
-            // REX: W=0 (32-bit dest zero-extends), REX.R if reg >= 8
-            let rex = if reg_code >= 8 { 0x44 } else { 0x00 }; // REX optional for REX.R only
-            if rex != 0 { self.b(rex); }
+            // R8 base requires REX.B (bit 0). REX.R (bit 2) for reg >= 8.
+            // W=0 (32-bit dest zero-extends). 0x41 = REX.B, 0x45 = REX.W+REX.B+REX.R but
+            // we don't need REX.W here; just REX.B + optional REX.R.
+            let rex = 0x41 | if reg_code >= 8 { 0x04 } else { 0x00 }; // 0x41 = REX.B (for R8 base), +REX.R if reg>=8
+            self.b(rex);
             self.b(0x0F);
             self.b(0xB6); // MOVZX r32, r/m8
-            self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
+            self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8 (rm=8 needs REX.B)
             self.i32(offset as i32);
         } else {
-            let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
+            // R8 base requires REX.B (bit 0). 0x49 = REX.W | REX.B.
+            let rex = 0x49 | if reg_code >= 8 { 0x04 } else { 0x00 }; // 0x49 = REX.W+REX.B (R8 base), +REX.R if reg>=8
             self.b(rex);
             self.b(0x8B); // MOV r64, r/m64
-            self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
+            self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8 (rm=8 needs REX.B)
             self.i32(offset as i32);
         }
         Ok(())
@@ -1303,20 +1329,21 @@ impl NativeCodeGenerator {
         let reg_code = reg as u8;
         if matches!(vtype, ValueType::Bool) {
             // MOV byte [r8 + disp32], r8_low  (AL for rax, CL for rcx, etc.)
-            // Use the low byte of the register. For RAX/RCX this is AL/CL.
-            // REX prefix is NOT needed for byte stores to AL/CL/DL/BL.
-            // For R8B-R15B, we need REX prefix (0x41 for REX.B).
-            if reg_code >= 8 {
-                self.b(0x41); // REX.B for r8b-r15b
-            }
+            // R8 base requires REX.B (bit 0). REX.R (bit 2) for source reg >= 8.
+            // WARNING: In x86-64, when a REX prefix is present with byte registers,
+            // REX.B extends the rm field (base register) and REX.R extends the reg field.
+            // 0x41 = REX.B only (R8 base), 0x45 = REX.B + REX.R (R8 base + src >= R8B).
+            let rex = 0x41 | if reg_code >= 8 { 0x04 } else { 0x00 }; // REX.B for R8 base, +REX.R if src>=8
+            self.b(rex);
             self.b(0x88); // MOV r/m8, r8
-            self.modrm(2, reg_code & 7, 8); // mod=10, reg=low_byte(reg), rm=r8
+            self.modrm(2, reg_code & 7, 8); // mod=10, reg=low_byte(reg), rm=r8 (needs REX.B)
             self.i32(offset as i32);
         } else {
-            let rex = 0x48 | if reg_code >= 8 { 0x04 } else { 0x00 };
+            // R8 base requires REX.B (bit 0). 0x49 = REX.W | REX.B.
+            let rex = 0x49 | if reg_code >= 8 { 0x04 } else { 0x00 }; // 0x49 = REX.W+REX.B (R8 base), +REX.R if reg>=8
             self.b(rex);
             self.b(0x89); // MOV r/m64, r64
-            self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8
+            self.modrm(2, reg_code & 7, 8); // mod=10, reg=reg, rm=r8 (needs REX.B)
             self.i32(offset as i32);
         }
     }
@@ -1797,7 +1824,14 @@ impl NativeCodeGenerator {
     fn shr_reg_cl(&mut self, reg: Reg) {
         let r = reg as u8;
         let rex = 0x48 | if r >= 8 { 0x01 } else { 0x00 };
-        self.b(rex); self.b(0xD3); self.modrm(3, 5, r & 7); // /5 = SHR
+        self.b(rex); self.b(0xD3); self.modrm(3, 5, r & 7); // /5 = SHR (logical)
+    }
+
+    /// SAR reg, CL — arithmetic shift right by CL (sign-extending)
+    fn sar_reg_cl(&mut self, reg: Reg) {
+        let r = reg as u8;
+        let rex = 0x48 | if r >= 8 { 0x01 } else { 0x00 };
+        self.b(rex); self.b(0xD3); self.modrm(3, 7, r & 7); // /7 = SAR (arithmetic)
     }
 
     /// NEG reg (opcode 0xF7 /3 with REX.W)
@@ -1813,8 +1847,8 @@ impl NativeCodeGenerator {
     fn add_rax_rcx(&mut self) { self.bbb(0x48, 0x01, 0xC8); }
     fn sub_rax_rcx(&mut self) { self.bbb(0x48, 0x29, 0xC8); }
     fn imul_rax_rcx(&mut self) { self.bbbb(0x48, 0x0F, 0xAF, 0xC1); }
-    fn idiv_rax_rcx(&mut self) { self.bbb(0x48, 0x99, 0xF7); self.b(0xF1); }
-    fn irem_rax_rcx(&mut self) { self.bbb(0x48, 0x99, 0xF7); self.b(0xF1); self.bbb(0x48, 0x89, 0xD0); /* mov rax, rdx — remainder from RDX */ }
+    fn idiv_rax_rcx(&mut self) { self.bbb(0x48, 0x99, 0xF7); self.b(0xF9); } // F9 = /7 = IDIV (signed); was 0xF1=/6=DIV (unsigned)
+    fn irem_rax_rcx(&mut self) { self.bbb(0x48, 0x99, 0xF7); self.b(0xF9); self.bbb(0x48, 0x89, 0xD0); /* mov rax, rdx — remainder from RDX */ }
     fn and_rax_rcx(&mut self) { self.bbb(0x48, 0x21, 0xC8); }
     fn or_rax_rcx(&mut self) { self.bbb(0x48, 0x09, 0xC8); }
     fn xor_rax_rcx(&mut self) { self.bbb(0x48, 0x31, 0xC8); }
