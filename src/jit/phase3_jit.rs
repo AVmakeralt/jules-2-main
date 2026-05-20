@@ -3997,18 +3997,26 @@ fn emit_vectorized_loop(
         // Add high+low: xmm = ymm[0:3] + ymm[4:7]
         em.vpaddd_xmm(ymm, ymm, xmm_tmp);
 
-        // vpsrldq xmm1, xmm, 4 — shift right 4 bytes (32 bits) to swap adjacent i32 lanes
+        // vpsrldq xmm_tmp, ymm_low, 4 — shift right 4 bytes to pair adjacent i32 lanes
+        // VEX.128.66.0F.WIG 73 /3 ib: vvvv=xmm_dst(NDD), reg=/3, rm=xmm_src
         {
-            let byte1 = (!(xmm_tmp >= 8) as u8) << 7 | (0xF << 3) | (0 << 2) | 1;
+            let byte1 = (!(ymm >= 8) as u8) << 7     // R = inverted bit3 of source
+                | ((!xmm_tmp) & 0xF) << 3             // vvvv = inverted destination
+                | (0 << 2)                              // L=0 for 128-bit
+                | 1;                                    // pp=1 (66 prefix)
             em.emit3(0xC5, byte1, 0x73);
-            em.b(0xC0 | (3 << 3) | (ymm & 7));
+            em.b(0xC0 | (3 << 3) | (ymm & 7));        // ModRM: reg=/3, rm=source
             em.b(4);
         }
         em.vpaddd_xmm(ymm, ymm, xmm_tmp);
 
-        // vpsrldq xmm1, xmm, 8 — shift right 8 bytes (64 bits)
+        // vpsrldq xmm_tmp, ymm_low, 8 — shift right 8 bytes (64 bits)
+        // Same VEX encoding pattern as above
         {
-            let byte1 = (!(xmm_tmp >= 8) as u8) << 7 | (0xF << 3) | (0 << 2) | 1;
+            let byte1 = (!(ymm >= 8) as u8) << 7
+                | ((!xmm_tmp) & 0xF) << 3
+                | (0 << 2)
+                | 1;
             em.emit3(0xC5, byte1, 0x73);
             em.b(0xC0 | (3 << 3) | (ymm & 7));
             em.b(8);
@@ -4016,10 +4024,14 @@ fn emit_vectorized_loop(
         em.vpaddd_xmm(ymm, ymm, xmm_tmp);
 
         // vmovd eax, xmm — extract lane 0
+        // VEX.128.66.0F.WIG 7E /r: xmm→ModRM:reg, r32→ModRM:r/m, vvvv=1111
         {
-            let byte1 = (0xF << 3) | (0 << 2) | 1;
+            let byte1 = (!(ymm >= 8) as u8) << 7     // R = inverted bit3 of xmm source
+                | (0xF << 3)                            // vvvv = 1111 (unused)
+                | (0 << 2)                              // L=0 for 128-bit
+                | 1;                                    // pp=1 (66 prefix)
             em.emit3(0xC5, byte1, 0x7E);
-            em.b(0xC0 | ((ymm & 7) << 3) | 0);
+            em.b(0xC0 | ((ymm & 7) << 3) | 0);        // ModRM: reg=xmm, rm=eax
         }
         em.emit3(0x48, 0x63, 0xC0); // MOVSXD RAX, EAX
 

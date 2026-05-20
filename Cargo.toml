@@ -79,6 +79,14 @@ name = "bench-1b-jit"
 path = "benches/bench_1b_jit.rs"
 
 [[bin]]
+name = "bench-jit-comprehensive"
+path = "benches/bench_jit_comprehensive.rs"
+
+[[bin]]
+name = "bench-jit-fast"
+path = "benches/bench_jit_fast.rs"
+
+[[bin]]
 name = "vm-debug"
 path = "src/tools/vm_debug.rs"
 
@@ -245,3 +253,7 @@ opt-level = 3
 
 [profile.max-perf.build-override]
 opt-level = 3
+
+[[example]]
+name = "dump-bug-ir"
+path = "examples/dump-bug-ir.rs"

@@ -421,24 +421,49 @@ impl ConstantPropagator {
                         let old = std::mem::replace(cond, Expr::IntLit { span: Span::dummy(), value: 0, ty: None });
                         *cond = self.substitute(old, &env);
                     }
+
+                    // CRITICAL: Evict body-written variables from the env BEFORE
+                    // propagating into the body.  If we don't, the body sees stale
+                    // pre-loop constants (e.g. i=0) and incorrectly constant-folds
+                    // expressions that depend on variables which change across iterations.
+                    // Example bug: `i - (i/2)*2 == 0` inside a while loop where i
+                    // starts at 0 gets folded to `true` because i=0 is still in the env.
+                    let saved: Vec<(String, Expr)> = body_writes.iter()
+                        .filter_map(|name| env.remove(name.as_str()).map(|expr| (name.clone(), expr)))
+                        .collect();
+                    let _ = saved; // suppress unused warning
+
                     self.propagate_block(body);
-                    // Evict any variables written in the loop body.
+
+                    // After the loop, variables written in the body are no longer
+                    // known constants — their values depend on the number of iterations.
+                    // Do NOT restore the saved pre-loop values; just evict permanently.
                     for name in &body_writes {
                         env.remove(name.as_str());
                     }
                 }
                 Stmt::ForIn { body, .. } | Stmt::EntityFor { body, .. } => {
-                    self.propagate_block(body);
+                    // Same pattern as While: evict body-written variables before
+                    // propagating into the body to prevent stale constant folding.
                     let mut written = std::collections::HashSet::<String>::default();
                     Self::collect_writes_block(body, &mut written);
+                    let _saved: Vec<(String, Expr)> = written.iter()
+                        .filter_map(|name| env.remove(name.as_str()).map(|expr| (name.clone(), expr)))
+                        .collect();
+                    self.propagate_block(body);
                     for name in &written {
                         env.remove(name.as_str());
                     }
                 }
                 Stmt::Loop { body, .. } => {
-                    self.propagate_block(body);
+                    // Same pattern as While: evict body-written variables before
+                    // propagating into the body to prevent stale constant folding.
                     let mut written = std::collections::HashSet::<String>::default();
                     Self::collect_writes_block(body, &mut written);
+                    let _saved: Vec<(String, Expr)> = written.iter()
+                        .filter_map(|name| env.remove(name.as_str()).map(|expr| (name.clone(), expr)))
+                        .collect();
+                    self.propagate_block(body);
                     for name in &written {
                         env.remove(name.as_str());
                     }
@@ -5815,10 +5840,13 @@ impl Superoptimizer {
         }
 
         // ── Pass 14: E-graph equality saturation ────────────────────────────
-        // Runs AFTER conventional passes have reached a fixpoint.  The E-graph
-        // discovers equivalences that individual rules miss by saturating all
-        // possible rewrites simultaneously.
-        if self.config.enable_egraph && self.config.egraph_iterations > 0 {
+        // DISABLED: The EGraph's `sub_self` rule (x - x = 0) combined with
+        // constant propagation can incorrectly fold expressions like
+        // `i - (i/2)*2 == 0` to `true` inside loops.  The EGraph doesn't
+        // track variable binding times (static vs dynamic), so it treats
+        // loop-variant variables the same as constants.  Re-enable after
+        // adding binding-time guards to EGraph rewrite rules.
+        if false && self.config.enable_egraph && self.config.egraph_iterations > 0 {
             let mut ego = EGraphOptimizer::new(self.config.egraph_iterations);
             ego.optimize_block(body);
         }
@@ -5829,7 +5857,15 @@ impl Superoptimizer {
         // a cheaper semantically-equivalent expression, verified by concrete
         // evaluation.  This is the only pass that can discover optimizations
         // not encoded in any of the rules above.
-        if self.config.enable_superopt && self.config.superopt_budget > 0 {
+        //
+        // DISABLED: The stochastic superoptimizer's equivalence verification
+        // (16 random inputs) is insufficient to guarantee correctness for
+        // expressions involving integer division and modulo.  It can replace
+        // a correct conditional like `i - (i/2)*2 == 0` with `true` because
+        // the test inputs happen to satisfy the condition, missing cases where
+        // the original expression evaluates differently.  Re-enable only after
+        // adding path-sensitive or exhaustive small-domain verification.
+        if false && self.config.enable_superopt && self.config.superopt_budget > 0 {
             let mut so = StochasticSuperoptimizer::new(
                 self.config.superopt_budget,
                 self.config.superopt_verif_inputs,
