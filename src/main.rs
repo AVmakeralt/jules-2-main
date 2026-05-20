@@ -24,6 +24,9 @@ pub mod optimizer;
 // JIT/Compilation modules
 pub mod jit;
 
+// Polyhedral JIT optimization engine (Tier-2 / Tracing JIT handoff)
+pub mod polyhedral;
+
 // Runtime modules
 pub mod runtime;
 

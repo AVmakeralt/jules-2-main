@@ -87,6 +87,10 @@ name = "bench-jit-fast"
 path = "benches/bench_jit_fast.rs"
 
 [[bin]]
+name = "bench-polyhedral"
+path = "benches/bench_polyhedral.rs"
+
+[[bin]]
 name = "vm-debug"
 path = "src/tools/vm_debug.rs"
 
