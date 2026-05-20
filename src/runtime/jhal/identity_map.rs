@@ -50,6 +50,11 @@ pub const SANCTUARY_SIZE: u64 = 8 * 1024 * 1024;
 /// 16 PD tables covers 16 GB, sufficient for the Jules bare-metal runtime.
 const MAX_PD_TABLES: usize = 16;
 
+/// C8 fix: Maximum number of on-demand PT (Page Table) tables for 4KB mapping.
+/// Each PT table covers 2MB of address space (512 × 4KB entries).
+/// 64 PT tables covers 128 MB of 4KB-mapped address space.
+const MAX_PT_TABLES: usize = 64;
+
 /// A single PML4 table for identity mapping.
 /// Supports up to 512 × 1GB = 512GB of identity-mapped memory.
 /// Zero-heap: all data is in fixed-size inline arrays.
@@ -64,6 +69,11 @@ pub struct IdentityMap {
     pd_keys: [(usize, usize); MAX_PD_TABLES],
     pd_tables: [[u64; PD_ENTRIES]; MAX_PD_TABLES],
     pd_count: usize,
+    /// C8 fix: PT (Page Table) tables for 4KB page mapping, allocated on demand.
+    /// Each PT table covers 2MB. Key is (pml4_idx, pdpt_idx, pd_idx).
+    pt_keys: [(usize, usize, usize); MAX_PT_TABLES],
+    pt_tables: [[u64; 512]; MAX_PT_TABLES],
+    pt_count: usize,
     /// Whether each PDPT entry has been initialized
     pdpt_used: [bool; PML4_ENTRIES],
     /// Use 1GB gigantic pages (maps entire 1GB per PDPT entry)
@@ -80,6 +90,9 @@ impl IdentityMap {
             pd_keys: [(0, 0); MAX_PD_TABLES],
             pd_tables: [[0; PD_ENTRIES]; MAX_PD_TABLES],
             pd_count: 0,
+            pt_keys: [(0, 0, 0); MAX_PT_TABLES],
+            pt_tables: [[0; 512]; MAX_PT_TABLES],
+            pt_count: 0,
             pdpt_used: [false; PML4_ENTRIES],
             use_1gb_pages,
             mapped_bytes: 0,
@@ -127,6 +140,12 @@ impl IdentityMap {
     }
 
     /// Map a 4KB page as identity: VA = PA.
+    ///
+    /// C8 fix: Now properly uses a 4-level page table (PML4 → PDPT → PD → PT).
+    /// The old code computed pt_idx but never used it, writing the physical
+    /// address directly into the PD entry as if it were a 2MB page. Now we
+    /// allocate PT (Page Table) structures on demand, write the 4KB PTE into
+    /// the PT, and set the PD entry to point to the PT (without the HUGE_PAGE bit).
     pub fn map_4kb(&mut self, phys_addr: u64, flags: u64) {
         let pml4_idx = ((phys_addr >> PML4_SHIFT) & 0x1FF) as usize;
         let pdpt_idx = ((phys_addr >> PDPT_SHIFT) & 0x1FF) as usize;
@@ -142,19 +161,79 @@ impl IdentityMap {
 
         // Ensure PDPT entry points to a PD (not a 1GB huge page)
         if self.pdpt[pml4_idx][pdpt_idx] == 0 || (self.pdpt[pml4_idx][pdpt_idx] & PTE_HUGE_PAGE) != 0 {
-            let pd_idx = self.get_or_create_pd((pml4_idx, pdpt_idx))
+            let pd_table_idx = self.get_or_create_pd((pml4_idx, pdpt_idx))
                 .expect("PD table limit exhausted — increase MAX_PD_TABLES");
-            let pd_addr = self.pd_tables[pd_idx].as_ptr() as u64;
+            let pd_addr = self.pd_tables[pd_table_idx].as_ptr() as u64;
             self.pdpt[pml4_idx][pdpt_idx] = (pd_addr & PAGE_MASK) | PTE_PRESENT | PTE_WRITABLE;
         }
 
-        // PD entry for 4KB page mapping.
+        // C8 fix: PD entry must point to a PT (Page Table), NOT directly to the phys addr.
+        // The PD entry for 4KB mapping points to a PT; the HUGE_PAGE bit must NOT be set.
+        // We need to get/create the PT first, then write the PD entry, to avoid
+        // holding a mutable borrow on pd_table while creating the PT.
+        let pt_key = (pml4_idx, pdpt_idx, pd_idx);
+
+        // First, ensure the PT table exists and get its address
         let pd_table = self.get_pd_mut((pml4_idx, pdpt_idx))
             .expect("pd table must exist after initialization");
-        pd_table[pd_idx] = (phys_addr & PAGE_MASK) | flags | PTE_PRESENT;
-        self.mapped_bytes += 4 * 1024; // 4 KB
+        let pd_entry = pd_table[pd_idx];
 
-        let _ = pt_idx; // Reserved for full PT implementation
+        let pt_addr = if pd_entry == 0 || (pd_entry & PTE_HUGE_PAGE) != 0 {
+            // Need to allocate a PT for this 2MB region
+            // Compute the PT address first before borrowing
+            let pt_table_idx = self.get_or_create_pt(pt_key)
+                .expect("PT table limit exhausted — increase MAX_PT_TABLES");
+            self.pt_tables[pt_table_idx].as_ptr() as u64
+        } else {
+            // PD entry already points to a PT; extract the address
+            pd_entry & PAGE_MASK
+        };
+
+        // Now write the PD entry to point to the PT (without HUGE_PAGE bit)
+        {
+            let pd_table = self.get_pd_mut((pml4_idx, pdpt_idx))
+                .expect("pd table must exist after initialization");
+            let pd_entry = pd_table[pd_idx];
+            if pd_entry == 0 || (pd_entry & PTE_HUGE_PAGE) != 0 {
+                pd_table[pd_idx] = (pt_addr & PAGE_MASK) | PTE_PRESENT | PTE_WRITABLE;
+            }
+        }
+
+        // Write the 4KB PTE into the PT
+        let pt_table = self.get_pt_mut(pt_key)
+            .expect("pt table must exist after initialization");
+        pt_table[pt_idx] = (phys_addr & PAGE_MASK) | flags | PTE_PRESENT;
+        self.mapped_bytes += 4 * 1024; // 4 KB
+    }
+
+    /// Get or create a PT table for the given key. Returns the table index.
+    /// Returns None if MAX_PT_TABLES is exhausted.
+    fn get_or_create_pt(&mut self, key: (usize, usize, usize)) -> Option<usize> {
+        // Check if it already exists
+        for i in 0..self.pt_count {
+            if self.pt_keys[i] == key {
+                return Some(i);
+            }
+        }
+        // Allocate a new one
+        if self.pt_count >= MAX_PT_TABLES {
+            return None;
+        }
+        let idx = self.pt_count;
+        self.pt_keys[idx] = key;
+        self.pt_tables[idx] = [0; 512];
+        self.pt_count += 1;
+        Some(idx)
+    }
+
+    /// Look up a PT table by key mutably. Returns None if not found.
+    fn get_pt_mut(&mut self, key: (usize, usize, usize)) -> Option<&mut [u64; 512]> {
+        for i in 0..self.pt_count {
+            if self.pt_keys[i] == key {
+                return Some(&mut self.pt_tables[i]);
+            }
+        }
+        None
     }
 
     /// Map a 2MB page as identity (using PD huge page bit).

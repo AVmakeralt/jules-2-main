@@ -540,21 +540,30 @@ impl MemoryReorgOrchestrator {
         };
 
         // Write reorganized data back to the actual data store.
-        {
+        // H3 fix: Write to a shadow buffer first, and only copy back after
+        // successful commit. The old code wrote directly to `data` before
+        // tx.commit(), so if the commit failed (e.g., aborted flag set), the
+        // data had already been mutated with no rollback.
+        let shadow: Vec<u8> = {
             let copy_len = flat_result.len().min(data.len());
-            data[..copy_len].copy_from_slice(&flat_result[..copy_len]);
-        }
+            let mut shadow = data.to_vec();
+            shadow[..copy_len].copy_from_slice(&flat_result[..copy_len]);
+            shadow
+        };
 
         // Try to commit
         match tx.commit() {
             Ok(()) => {
+                // Only now copy the shadow buffer back to the real data
+                let copy_len = shadow.len().min(data.len());
+                data[..copy_len].copy_from_slice(&shadow[..copy_len]);
                 self.current_layout = target;
                 self.reorg_count.fetch_add(1, Ordering::SeqCst);
                 self.predictor.train(&self.pattern, target);
                 Ok(target)
             }
             Err(e) => {
-                // Rollback happened automatically
+                // Rollback: data is untouched since we only wrote to shadow
                 Err(e)
             }
         }

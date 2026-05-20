@@ -139,17 +139,12 @@ impl CodeArena {
 
     #[cfg(not(unix))]
     fn alloc(&mut self, size: usize) -> usize {
-        let aligned_size = (size + 15) & !15;
-
-        if self.pages.is_empty() || self.current_offset + aligned_size > self.page_size {
-            self.pages.push(vec![0xCC; self.page_size]);
-            self.current_page_base = 0x7F00_0000_0000 + (self.pages.len() - 1) * self.page_size;
-            self.current_offset = 0;
-        }
-
-        let address = self.current_page_base + self.current_offset;
-        self.current_offset += aligned_size;
-        address
+        // H10 fix: Non-Unix platforms return non-executable fake addresses.
+        // Any code path that tries to call these addresses will segfault.
+        // Panicking is better than silently producing broken JIT code.
+        let _ = size;
+        panic!("CodeArena::alloc: JIT code generation is not supported on non-Unix platforms. \
+                The mmap'd RWX pages required for JIT execution are only available on Unix.")
     }
 
     /// Write code bytes at a previously allocated address.

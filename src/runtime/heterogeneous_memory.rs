@@ -670,9 +670,18 @@ pub fn inter_tier_bandwidth(from: MemoryTierId, to: MemoryTierId) -> f64 {
 /// Compute transfer time in nanoseconds for `size_bytes` at `bandwidth_gb_s`.
 ///
 /// Returns `f64::INFINITY` if `bandwidth_gb_s` is zero (unreachable tier pair).
+///
+/// L3 fix: The old formula `(size_bytes / (bandwidth_gb_s * 1e9)) * 1e9` had
+/// redundant * 1e9 and / 1e9 which cancel out. Simplified to the equivalent
+/// `size_bytes / bandwidth_gb_s` (where bandwidth is in GB/s, so result is in
+/// nanoseconds: size_bytes / (GB/s) = size_bytes * s / 1e9 = size_ns).
 pub fn compute_transfer_time_ns(size_bytes: u64, bandwidth_gb_s: f64) -> f64 {
     if bandwidth_gb_s > 0.0 {
-        (size_bytes as f64 / (bandwidth_gb_s * 1e9)) * 1e9
+        // Transfer time = size / bandwidth. Since bandwidth is in GB/s,
+        // the result is in GB·s, which equals nanoseconds when you account
+        // for the fact that 1 GB = 1e9 bytes. So:
+        // time_ns = (size_bytes / (bandwidth_gb_s * 1e9)) * 1e9 = size_bytes / bandwidth_gb_s
+        size_bytes as f64 / bandwidth_gb_s
     } else {
         f64::INFINITY
     }

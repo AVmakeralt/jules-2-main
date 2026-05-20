@@ -601,9 +601,11 @@ impl Parser {
                     // Direct match instead of Debug-formatting and string manipulation.
                     // This avoids a heap allocation (format!) and string processing
                     // (trim_start_matches, to_lowercase) on every attribute.
+                    // L7 fix: Removed unreachable AtGrad and AtSimd arms from the
+                    // inner match. Those tokens were already handled by the outer
+                    // match arms above, so they could never reach this inner match.
+                    // Their presence was dead code that always fell through to "unknown".
                     let name = match &self.peek().kind {
-                        TokenKind::AtGrad => "grad",
-                        TokenKind::AtSimd => "simd",
                         TokenKind::AtParallel => "parallel",
                         TokenKind::AtSeq => "seq",
                         TokenKind::AtUnroll => "unroll",

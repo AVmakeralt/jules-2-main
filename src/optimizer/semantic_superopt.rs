@@ -225,10 +225,11 @@ impl SemanticSuperoptimizer {
             rule!("mul_one_r",    1.0, ExprShape::BinOp, |s, e| s.identity_right(e, BinOpKind::Mul, 1)),
             // R25 1 * x  →  x
             rule!("mul_one_l",    1.0, ExprShape::BinOp, |s, e| s.identity_left(e, BinOpKind::Mul, 1)),
-            // R26 x * 0  →  0
-            rule!("mul_zero_r",   1.0, ExprShape::BinOp, |s, e| s.annihilator_right(e, BinOpKind::Mul, 0)),
-            // R27 0 * x  →  0
-            rule!("mul_zero_l",   1.0, ExprShape::BinOp, |s, e| s.annihilator_left(e, BinOpKind::Mul, 0)),
+            // R26 x * 0  →  0  (M6 fix: disabled — unsound for NaN/Inf in float context)
+            // NaN * 0 = NaN, Inf * 0 = NaN. Without type info we can't distinguish.
+            // rule!("mul_zero_r",   1.0, ExprShape::BinOp, |s, e| s.annihilator_right(e, BinOpKind::Mul, 0)),
+            // R27 0 * x  →  0  (M6 fix: disabled — same reason)
+            // rule!("mul_zero_l",   1.0, ExprShape::BinOp, |s, e| s.annihilator_left(e, BinOpKind::Mul, 0)),
             // R28 x / 1  →  x
             rule!("div_one",      1.0, ExprShape::BinOp, |s, e| s.identity_right(e, BinOpKind::Div, 1)),
             // R29 0 / x  →  0  (x ≠ 0)
@@ -753,10 +754,19 @@ impl SemanticSuperoptimizer {
     }
 
     fn zero_div(&self, expr: &Expr) -> Option<Expr> {
-        // 0 / x → 0 (x might be non-zero; we can't prove it, but it is safe for integers)
-        if let Expr::BinOp { op: BinOpKind::Div, lhs, span, .. } = expr {
+        // 0 / x → 0 — ONLY when x is provably non-zero.
+        // C3 fix: If x could be zero, the original expression would panic on
+        // division-by-zero, but the transformed one silently returns 0.
+        // An optimizer must not eliminate a trap.
+        if let Expr::BinOp { op: BinOpKind::Div, lhs, rhs, span } = expr {
             if Self::is_int_lit(lhs, 0) {
-                return Some(Expr::IntLit { span: *span, value: 0, ty: None });
+                // Only apply when the divisor is a non-zero literal (provably safe).
+                if let Some(v) = Self::as_int_lit(rhs) {
+                    if v != 0 {
+                        return Some(Expr::IntLit { span: *span, value: 0, ty: None });
+                    }
+                }
+                // If rhs is not a known-non-zero literal, we cannot prove safety; skip.
             }
         }
         None
@@ -872,11 +882,13 @@ impl SemanticSuperoptimizer {
     }
 
     fn distribute_mul_add(&self, expr: &Expr) -> Option<Expr> {
-        // x * (y + z) → x*y + x*z  — only if rhs is a literal on one side (expose const folding)
+        // M10 fix: x * (y + z) → x*y + x*z — ONLY when x is a literal.
+        // Distributing over a non-literal x causes expression blowup in
+        // iterative optimization (exponential growth). Restrict to x = literal.
         if let Expr::BinOp { op: BinOpKind::Mul, lhs: x, rhs, span } = expr {
             if let Expr::BinOp { op: BinOpKind::Add, lhs: y, rhs: z, .. } = rhs.as_ref() {
-                // Only distribute when y or z is a literal to avoid blowup.
-                if Self::as_int_lit(y).is_some() || Self::as_int_lit(z).is_some() {
+                // Only distribute when x is a literal to avoid expression blowup.
+                if Self::as_int_lit(x).is_some() {
                     let span = *span;
                     return Some(Expr::BinOp {
                         span,
@@ -1050,20 +1062,49 @@ impl SemanticSuperoptimizer {
     }
 
     fn cancel_add(&self, expr: &Expr) -> Option<Expr> {
-        // (x + a) - (x + b)  →  a - b
+        // M9 fix: (x + a) - (x + b) → a - b
+        // Also handles (a + x) - (x + b) → a - b and (x + a) - (b + x) → a - b
         if let Expr::BinOp { op: BinOpKind::Sub, lhs, rhs, span } = expr {
             if let (
                 Expr::BinOp { op: BinOpKind::Add, lhs: ll, rhs: lr, .. },
                 Expr::BinOp { op: BinOpKind::Add, lhs: rl, rhs: rr, .. },
             ) = (lhs.as_ref(), rhs.as_ref())
             {
+                let span = *span;
+                // (x + a) - (x + b) → a - b  (left-left match)
                 if Self::exprs_equal(ll, rl) {
-                    let span = *span;
                     return Some(Expr::BinOp {
                         span,
                         op: BinOpKind::Sub,
                         lhs: lr.clone(),
                         rhs: rr.clone(),
+                    });
+                }
+                // (x + a) - (b + x) → a - b  (left-right match)
+                if Self::exprs_equal(ll, rr) {
+                    return Some(Expr::BinOp {
+                        span,
+                        op: BinOpKind::Sub,
+                        lhs: lr.clone(),
+                        rhs: rl.clone(),
+                    });
+                }
+                // (a + x) - (x + b) → a - b  (right-left match)
+                if Self::exprs_equal(lr, rl) {
+                    return Some(Expr::BinOp {
+                        span,
+                        op: BinOpKind::Sub,
+                        lhs: ll.clone(),
+                        rhs: rr.clone(),
+                    });
+                }
+                // (a + x) - (b + x) → a - b  (right-right match)
+                if Self::exprs_equal(lr, rr) {
+                    return Some(Expr::BinOp {
+                        span,
+                        op: BinOpKind::Sub,
+                        lhs: ll.clone(),
+                        rhs: rl.clone(),
                     });
                 }
             }
@@ -1130,40 +1171,25 @@ impl SemanticSuperoptimizer {
     }
 
     fn div_pow2_to_shr(&self, expr: &Expr) -> Option<Expr> {
-        // x / 2^k → x >> k
-        if let Expr::BinOp { op: BinOpKind::Div, lhs, rhs, span } = expr {
-            if let Some(v) = Self::as_int_lit(rhs) {
-                if v > 1 && v.is_power_of_two() {
-                    let k = v.trailing_zeros() as u128;
-                    let span = *span;
-                    return Some(Expr::BinOp {
-                        span,
-                        op: BinOpKind::Shr,
-                        lhs: lhs.clone(),
-                        rhs: Box::new(Expr::IntLit { span, value: k, ty: None }),
-                    });
-                }
-            }
-        }
+        // C1 fix: x / 2^k → x >> k is ONLY valid for unsigned integers.
+        // For signed: (-1) / 2 = 0 (rounds toward zero), but (-1) >> 1 = -1
+        // (arithmetic right shift rounds toward negative infinity).
+        // Since the superoptimizer has no type information, this rule must
+        // be disabled to avoid silently producing wrong code for signed values.
+        //
+        // If the expression's type annotation is available and confirmed unsigned,
+        // this rule could be re-enabled. For now, we return None (rule disabled).
+        let _ = expr; // suppress unused variable warning
         None
     }
 
     fn rem_pow2_to_and(&self, expr: &Expr) -> Option<Expr> {
-        // x % 2^k → x & (2^k - 1)
-        if let Expr::BinOp { op: BinOpKind::Rem, lhs, rhs, span } = expr {
-            if let Some(v) = Self::as_int_lit(rhs) {
-                if v > 1 && v.is_power_of_two() {
-                    let mask = v - 1;
-                    let span = *span;
-                    return Some(Expr::BinOp {
-                        span,
-                        op: BinOpKind::BitAnd,
-                        lhs: lhs.clone(),
-                        rhs: Box::new(Expr::IntLit { span, value: mask, ty: None }),
-                    });
-                }
-            }
-        }
+        // C2 fix: x % 2^k → x & (2^k - 1) is ONLY valid for unsigned integers.
+        // For signed: (-1) % 4 = -1, but (-1) & 3 = 3. The remainder has the
+        // sign of the dividend; the bitwise AND always yields a positive result.
+        // Since the superoptimizer has no type information, this rule must
+        // be disabled to avoid silently producing wrong code for signed values.
+        let _ = expr; // suppress unused variable warning
         None
     }
 
@@ -1725,42 +1751,23 @@ impl SemanticSuperoptimizer {
     // For integers: (x * y) / y ≠ x (overflow) and (x / y) * y ≠ x (truncation)
 
     fn rule_shl_shr_cancel(&self, expr: &Expr) -> Option<Expr> {
-        // (x << k) >> k → x & mask  where mask = ((1 << (bit_width - k)) - 1)
-        // For unsigned: (x << k) >> k == x when k == 0, otherwise masks high bits
-        // For signed: arith shift right preserves sign, so this is only safe for unsigned
-        // We emit: x & ((1u64 << (64 - k)) - 1) which is correct for unsigned
+        // C4 fix: (x << k) >> k → x & mask hardcodes 64-bit width.
+        // For types narrower than 64 bits (i32/u32), the mask is completely
+        // wrong: the correct mask would use (32 - k) not (64 - k).
+        // Since the superoptimizer has no type information, this rule must
+        // be disabled to avoid producing incorrect masks for sub-64-bit types.
+        //
+        // The only safe case is k == 0, which trivially simplifies to x.
         if let Expr::BinOp { op: BinOpKind::Shr, lhs, rhs: k_outer, span } = expr {
             if let Expr::BinOp { op: BinOpKind::Shl, lhs: x, rhs: k_inner, .. } = lhs.as_ref() {
                 if Self::exprs_equal(k_inner, k_outer) {
-                    let span = *span;
-                    // If k == 0, this is just x
+                    // Only apply when k == 0 (trivially safe for all widths)
                     if Self::is_int_lit(k_outer, 0) {
+                        let span = *span;
                         return Some(*x.clone());
                     }
-                    // Otherwise, emit x & mask to mask the high bits that were shifted out
-                    // This is sound for unsigned types and conservative for signed (preserves value)
-                    let mask = Expr::BinOp {
-                        op: BinOpKind::Sub,
-                        lhs: Box::new(Expr::BinOp {
-                            op: BinOpKind::Shl,
-                            lhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
-                            rhs: Box::new(Expr::BinOp {
-                                op: BinOpKind::Sub,
-                                lhs: Box::new(Expr::IntLit { span, value: 64, ty: None }),
-                                rhs: k_outer.clone(),
-                                span,
-                            }),
-                            span,
-                        }),
-                        rhs: Box::new(Expr::IntLit { span, value: 1, ty: None }),
-                        span,
-                    };
-                    return Some(Expr::BinOp {
-                        op: BinOpKind::BitAnd,
-                        lhs: x.clone(),
-                        rhs: Box::new(mask),
-                        span,
-                    });
+                    // For k != 0, the mask width depends on the type, which we
+                    // don't know. Disable the rule to avoid miscompilation.
                 }
             }
         }

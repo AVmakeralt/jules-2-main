@@ -178,7 +178,11 @@ pub struct StepDecay {
 }
 impl LrSchedule for StepDecay {
     fn multiplier(&self, step: u64, base_lr: f32) -> f32 {
-        base_lr * self.gamma.powi((step / self.step_size) as i32)
+        // H13 fix: Use powf instead of powi. The old code cast
+        // (step / self.step_size) as i32, which overflows for large step
+        // counts (> 2.1 billion), producing undefined behavior in powi.
+        // powf handles arbitrarily large exponents gracefully via f32.
+        base_lr * self.gamma.powf((step / self.step_size) as f32)
     }
 }
 
@@ -479,8 +483,20 @@ impl GradAccumulator {
     /// needing explicit `mul_add` since the multiplier is always 1.
     pub fn accumulate(&mut self, grads: &[f32]) {
         if grads.len() != self.buffer.len() {
-            self.buffer = vec![0.0; grads.len()];
-            self.count = 0;
+            // M7 fix: Don't silently discard accumulated gradients.
+            // The old code reset the buffer to zeros and set count to 0, losing
+            // all previously accumulated gradients. Now we preserve the common
+            // prefix by resizing and zero-filling only the new elements, and
+            // keep the count (though it's now an approximation — still better
+            // than silently losing all data).
+            let old_len = self.buffer.len();
+            let mut new_buffer = vec![0.0; grads.len()];
+            let copy_len = old_len.min(grads.len());
+            new_buffer[..copy_len].copy_from_slice(&self.buffer[..copy_len]);
+            self.buffer = new_buffer;
+            // Note: count is preserved, which means the average may be slightly
+            // off for the newly added positions. This is acceptable since the
+            // alternative (resetting everything) is much worse.
         }
         // Iterator zip gives LLVM enough aliasing info to auto-vectorize.
         for (acc, &g) in self.buffer.iter_mut().zip(grads) {

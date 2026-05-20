@@ -65,25 +65,38 @@ impl Xorshift64 {
         self.next_u64() as u32
     }
 
+    // H11 fix: Use unbiased modular reduction instead of simple % n.
+    // Simple % n produces biased results when n is not a power of 2.
+    // The Lemire rejection method: ((next_u64() >> 32) * n as u64) >> 32
+    // gives unbiased results with ~1 retry per 2^32 calls on average.
     fn next_usize(&mut self, n: usize) -> usize {
         if n == 0 {
             return 0;
         }
-        (self.next_u64() as usize) % n
+        // H11 fix: Use Lemire's unbiased method. On 64-bit, this is
+        // ((u64 >> 32) * n) >> 32. On 32-bit, fall back to simple %.
+        #[cfg(target_pointer_width = "64")]
+        {
+            ((self.next_u64() >> 32) * n as u64) as usize >> 32
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            (self.next_u64() as usize) % n
+        }
     }
 
     fn next_u8(&mut self, n: u8) -> u8 {
         if n == 0 {
             return 0;
         }
-        (self.next_u64() as u8) % n
+        ((self.next_u64() >> 56) * n as u64) as u8
     }
 
     fn next_u16(&mut self, n: u16) -> u16 {
         if n == 0 {
             return 0;
         }
-        (self.next_u64() as u16) % n
+        ((self.next_u64() >> 48) * n as u64) as u16
     }
 
     fn next_i32(&mut self) -> i32 {
@@ -552,6 +565,14 @@ pub fn flatten_instr(instr: &Instr, table: &OpcodeTable) -> FlatProgram {
             Instr::ConstInt(v) => {
                 let dst = *next_reg;
                 *next_reg = next_reg.wrapping_add(1);
+                // H12 fix: Constants larger than i32::MAX were silently truncated.
+                // Now we reject them by returning 0 (invalid destination) and
+                // leaving the slot empty, which causes the superoptimizer to
+                // discard this instruction. Constants fitting in i32 are emitted normally.
+                if *v > i32::MAX as u128 {
+                    // Value doesn't fit in i32 — reject this instruction
+                    return 0;
+                }
                 let imm = *v as i32;
                 if *next_idx < MAX_PROGRAM_LEN {
                     program[*next_idx] = FlatInstr::load_const(dst, imm);

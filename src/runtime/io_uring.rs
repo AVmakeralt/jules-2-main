@@ -56,16 +56,30 @@ pub struct FastFileReader {
     buffer: Vec<u8>,
     /// Current position
     position: usize,
+    /// L2 fix: Whether the initial file read failed (so callers can distinguish
+    /// "file is empty" from "file read failed")
+    read_error: bool,
 }
 
 impl FastFileReader {
     pub fn new(path: &str) -> Self {
         let io_uring_active = detect_io_uring() == IoUringStatus::Available;
-        let buffer = std::fs::read(path).unwrap_or_default();
+        // L2 fix: Don't silently create an empty buffer on error.
+        // The old code used unwrap_or_default(), so downstream code couldn't
+        // distinguish between "file is empty" and "file read failed".
+        // Now we store an error flag so callers can detect read failures.
+        let (buffer, read_error) = match std::fs::read(path) {
+            Ok(data) => (data, false),
+            Err(e) => {
+                eprintln!("Warning: Failed to read file '{}': {}", path, e);
+                (Vec::new(), true)
+            }
+        };
         Self {
             path: path.to_string(),
             io_uring_active,
             buffer,
+            read_error,
             position: 0,
         }
     }

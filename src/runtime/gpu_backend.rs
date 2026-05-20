@@ -366,8 +366,12 @@ impl GpuBackendImpl for CpuBackend {
         let (kh, kw) = (ker.shape[0] as isize, ker.shape[1] as isize);
         let stride = stride.max(1) as isize;
         let pad = padding as isize;
-        let out_h = (((h + 2 * pad - kh) / stride) + 1).max(0) as usize;
-        let out_w = (((w + 2 * pad - kw) / stride) + 1).max(0) as usize;
+        // M1 fix: Clamp intermediate to non-negative BEFORE division.
+        // Signed division rounds toward zero, but the conv2d formula requires
+        // floor((H+2P-K)/S)+1. For negative intermediates, / gives the wrong
+        // result. Clamping first ensures correct floor semantics.
+        let out_h = ((h + 2 * pad - kh).max(0) / stride + 1) as usize;
+        let out_w = ((w + 2 * pad - kw).max(0) / stride + 1) as usize;
         // Compute without holding any locks.
         let mut out_data = vec![0.0f32; out_h * out_w];
         for oy in 0..out_h {
@@ -410,8 +414,11 @@ impl GpuBackendImpl for CpuBackend {
             return Err("pool expects [H,W] input".into());
         }
         let p = pool_size.max(1) as usize;
-        let out_h = inp.shape[0] / p;
-        let out_w = inp.shape[1] / p;
+        // M2 fix: Ceiling division to handle non-evenly-divisible dimensions.
+        // ceil(a/b) = (a + b - 1) / b for positive values. Simple integer
+        // division silently drops edge pixels.
+        let out_h = (inp.shape[0] + p - 1) / p;
+        let out_w = (inp.shape[1] + p - 1) / p;
         // Compute without holding any locks.
         let mut out_data = vec![0.0f32; out_h * out_w];
         for oy in 0..out_h {
@@ -1081,8 +1088,12 @@ impl GpuBackendImpl for WgpuBackend {
         let (kh, kw) = (ker.shape[0] as isize, ker.shape[1] as isize);
         let stride = stride.max(1) as isize;
         let pad = padding as isize;
-        let out_h = (((h + 2 * pad - kh) / stride) + 1).max(0) as usize;
-        let out_w = (((w + 2 * pad - kw) / stride) + 1).max(0) as usize;
+        // M1 fix: Clamp intermediate to non-negative BEFORE division.
+        // Signed division rounds toward zero, but the conv2d formula requires
+        // floor((H+2P-K)/S)+1. For negative intermediates, / gives the wrong
+        // result. Clamping first ensures correct floor semantics.
+        let out_h = ((h + 2 * pad - kh).max(0) / stride + 1) as usize;
+        let out_w = ((w + 2 * pad - kw).max(0) / stride + 1) as usize;
         // Compute without holding any locks.
         let mut out_data = vec![0.0f32; out_h * out_w];
         for oy in 0..out_h {
@@ -1128,8 +1139,11 @@ impl GpuBackendImpl for WgpuBackend {
             return Err("pool expects [H,W] input".into());
         }
         let p = pool_size.max(1) as usize;
-        let out_h = inp.shape[0] / p;
-        let out_w = inp.shape[1] / p;
+        // M2 fix: Ceiling division to handle non-evenly-divisible dimensions.
+        // ceil(a/b) = (a + b - 1) / b for positive values. Simple integer
+        // division silently drops edge pixels.
+        let out_h = (inp.shape[0] + p - 1) / p;
+        let out_w = (inp.shape[1] + p - 1) / p;
         // Compute without holding any locks.
         let mut out_data = vec![0.0f32; out_h * out_w];
         for oy in 0..out_h {
@@ -1675,8 +1689,12 @@ impl GpuBackendImpl for CudaBackend {
         let (kh, kw) = (ker.shape[0] as isize, ker.shape[1] as isize);
         let stride = stride.max(1) as isize;
         let pad = padding as isize;
-        let out_h = (((h + 2 * pad - kh) / stride) + 1).max(0) as usize;
-        let out_w = (((w + 2 * pad - kw) / stride) + 1).max(0) as usize;
+        // M1 fix: Clamp intermediate to non-negative BEFORE division.
+        // Signed division rounds toward zero, but the conv2d formula requires
+        // floor((H+2P-K)/S)+1. For negative intermediates, / gives the wrong
+        // result. Clamping first ensures correct floor semantics.
+        let out_h = ((h + 2 * pad - kh).max(0) / stride + 1) as usize;
+        let out_w = ((w + 2 * pad - kw).max(0) / stride + 1) as usize;
         let mut out_data = vec![0.0f32; out_h * out_w];
         for oy in 0..out_h {
             for ox in 0..out_w {
@@ -1720,8 +1738,11 @@ impl GpuBackendImpl for CudaBackend {
             return Err("pool expects [H,W] input".into());
         }
         let p = pool_size.max(1) as usize;
-        let out_h = inp.shape[0] / p;
-        let out_w = inp.shape[1] / p;
+        // M2 fix: Ceiling division to handle non-evenly-divisible dimensions.
+        // ceil(a/b) = (a + b - 1) / b for positive values. Simple integer
+        // division silently drops edge pixels.
+        let out_h = (inp.shape[0] + p - 1) / p;
+        let out_w = (inp.shape[1] + p - 1) / p;
         let mut out_data = vec![0.0f32; out_h * out_w];
         for oy in 0..out_h {
             for ox in 0..out_w {

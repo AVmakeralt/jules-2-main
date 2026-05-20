@@ -529,10 +529,15 @@ impl PartialEvaluator {
                     BinOpKind::Rem if *r != 0 => Some(PartialValue::Int((*l as i64).wrapping_rem(*r as i64) as u128)),
                     BinOpKind::Eq => Some(PartialValue::Bool(*l == *r)),
                     BinOpKind::Ne => Some(PartialValue::Bool(*l != *r)),
-                    BinOpKind::Lt => Some(PartialValue::Bool(*l < *r)),
-                    BinOpKind::Le => Some(PartialValue::Bool(*l <= *r)),
-                    BinOpKind::Gt => Some(PartialValue::Bool(*l > *r)),
-                    BinOpKind::Ge => Some(PartialValue::Bool(*l >= *r)),
+                    // H9 fix: Cast to i64 before comparison. PartialValue::Int
+                    // stores u128, but the runtime uses i64. Negative values
+                    // stored as u128 (e.g., -1_i64 = 0xFFFFFFFFFFFFFFFF as u128)
+                    // would compare incorrectly in unsigned: -1 > 1 unsigned,
+                    // but -1 < 1 in signed. Cast both to i64 for correct semantics.
+                    BinOpKind::Lt => Some(PartialValue::Bool((*l as i64) < (*r as i64))),
+                    BinOpKind::Le => Some(PartialValue::Bool((*l as i64) <= (*r as i64))),
+                    BinOpKind::Gt => Some(PartialValue::Bool((*l as i64) > (*r as i64))),
+                    BinOpKind::Ge => Some(PartialValue::Bool((*l as i64) >= (*r as i64))),
                     BinOpKind::BitAnd => Some(PartialValue::Int(*l & *r)),
                     BinOpKind::BitOr => Some(PartialValue::Int(*l | *r)),
                     BinOpKind::BitXor => Some(PartialValue::Int(*l ^ *r)),

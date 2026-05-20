@@ -437,15 +437,36 @@ impl CacheLineAnalyzer {
     }
 
     /// Calculate cache-line utilization for AoS layout
+    /// M8 fix: Compute average utilization across ALL cache lines, not just
+    /// the last one. The old code used modulo which only gave utilization
+    /// of the last cache line, oscillating between 0 and ~1.0 for large arrays.
     pub fn aos_utilization(&self, structure: &StructureMetadata, num_elements: usize) -> f64 {
         let bytes_per_element = structure.total_size;
+        let total_bytes = num_elements * bytes_per_element;
+        
+        if total_bytes == 0 || self.cache_line_size == 0 {
+            return 0.0;
+        }
+        
         let elements_per_line = self.cache_line_size / bytes_per_element;
         
         if elements_per_line == 0 {
             1.0 // One element spans multiple lines
         } else {
-            let used_bytes = (num_elements * bytes_per_element) % self.cache_line_size;
-            used_bytes as f64 / self.cache_line_size as f64
+            // M8 fix: Average utilization across all cache lines.
+            // Full lines have 100% utilization. The last (partial) line has
+            // (remaining elements * bytes_per_element) / cache_line_size utilization.
+            let full_lines = num_elements / elements_per_line;
+            let remaining_elements = num_elements % elements_per_line;
+            let full_line_bytes = full_lines * self.cache_line_size;
+            let partial_line_bytes = remaining_elements * bytes_per_element;
+            let total_used = full_line_bytes + partial_line_bytes;
+            let total_allocated = (full_lines + if remaining_elements > 0 { 1 } else { 0 }) * self.cache_line_size;
+            if total_allocated == 0 {
+                0.0
+            } else {
+                total_used as f64 / total_allocated as f64
+            }
         }
     }
 

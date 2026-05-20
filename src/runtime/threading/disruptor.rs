@@ -152,35 +152,22 @@ impl<T> DisruptorRing<T> {
         }
     }
     
-    /// Consume data from a slot (consumer)
+    /// Consume data from a specific slot (consumer)
     ///
-    /// Uses compare_exchange to atomically claim the consumer slot,
-    /// preventing TOCTOU races if multiple consumer threads call consume()
-    /// concurrently. The LMAX Disruptor pattern assumes a single consumer
-    /// per ring; this CAS ensures correctness even if that invariant is
-    /// accidentally violated.
-    pub fn consume(&self, _idx: usize) -> *mut T {
-        // Atomically claim the next consumer slot via CAS.
-        // Loop until we succeed — another consumer thread may race us.
-        let current = loop {
-            let cur = self.consumer_sequence.load(Ordering::Acquire);
-            match self.consumer_sequence.compare_exchange_weak(
-                cur,
-                cur.wrapping_add(1),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break cur,
-                Err(_) => continue, // Another thread claimed it; retry
-            }
-        };
-
-        let idx = (current as usize) & self.mask;
-        let entry = &self.entries[idx];
+    /// H8 fix: The _idx parameter was completely ignored. The method computed
+    /// its own index from the consumer sequence, so consume(next().unwrap())
+    /// would advance the consumer sequence twice. Now we use the provided idx
+    /// directly for the data read, and only advance the sequence once.
+    pub fn consume(&self, idx: usize) -> *mut T {
+        // H8 fix: Use the provided idx directly for the data read.
+        // The caller is responsible for providing the correct slot index
+        // (typically obtained from next()). We no longer compute our own index.
+        let entry = &self.entries[idx & self.mask];
         let data = entry.data.load(Ordering::Acquire);
 
         // Mark slot as available for producer
-        entry.sequence.store(current.wrapping_add(self.capacity as u64), Ordering::Release);
+        // H8 fix: Use the idx to compute the sequence value
+        entry.sequence.store(idx.wrapping_add(self.capacity) as u64, Ordering::Release);
 
         data
     }

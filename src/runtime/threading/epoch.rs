@@ -4,30 +4,20 @@
 // =========================================================================
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::RwLock;
-
-/// Wrapper around `*const Participant` that implements `Send` + `Sync`.
-///
-/// # Safety
-/// The caller must ensure that the pointed-to `Participant` outlives
-/// any access through this pointer and that all access is through
-/// atomic operations or methods that are inherently thread-safe.
-#[repr(transparent)]
-struct ParticipantPtr(*const Participant);
-
-unsafe impl Send for ParticipantPtr {}
-unsafe impl Sync for ParticipantPtr {}
+use std::sync::{Arc, RwLock, Weak};
 
 /// Global epoch counter
 static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// FIX (PERF-3): Participant registry for tracking active/pinned state and
-/// epoch across all participants. The original implementation used a single
-/// global ACTIVE_READERS counter, causing severe cache-line contention on
-/// multi-core systems. Now we track per-participant state and check each
-/// participant's `active` flag independently, spreading cache-line traffic
-/// across per-participant cache lines.
-static PARTICIPANT_REGISTRY: RwLock<Vec<ParticipantPtr>> = RwLock::new(Vec::new());
+/// FIX (C5): Store Weak<Participant> instead of raw pointers.
+/// The original code stored ParticipantPtr(&p as *const Participant) which
+/// took a reference to a local variable and stored the raw pointer into a
+/// global registry. The pointer became dangling the moment Participant::new()
+/// returned. Now we store Weak<Participant> so that:
+///   1. The Weak upgrades to Arc only if the Participant is still alive.
+///   2. If the Participant has been dropped, upgrade() returns None (safe).
+///   3. No dangling pointer dereferences are possible.
+static PARTICIPANT_REGISTRY: RwLock<Vec<Weak<Participant>>> = RwLock::new(Vec::new());
 
 /// Number of epochs in the cycle
 const NUM_EPOCHS: usize = 3;
@@ -60,14 +50,16 @@ impl Participant {
                 std::sync::Mutex::new(GarbageBag::new()),
             ],
         };
-        // FIX (PERF-3): Register this participant so advance_epoch can
-        // check its active flag and local_epoch. We store a raw pointer
-        // because Participant is stored in Arc<Participant> in the worker
-        // pool and will outlive the registry entry.
-        if let Ok(mut registry) = PARTICIPANT_REGISTRY.write() {
-            registry.push(ParticipantPtr(&p as *const Participant));
-        }
         p
+    }
+
+    /// Register this participant into the global registry.
+    /// Must be called AFTER the Participant is placed in its Arc.
+    /// C5 fix: Now stores Weak<Participant> instead of raw pointers.
+    pub fn register(this: &Arc<Participant>) {
+        if let Ok(mut registry) = PARTICIPANT_REGISTRY.write() {
+            registry.push(Arc::downgrade(this));
+        }
     }
 
     /// Pin the current epoch
@@ -96,15 +88,20 @@ impl Participant {
     /// Try to collect garbage from old epochs — only when the global
     /// epoch has advanced far enough to guarantee no thread still holds
     /// references to objects in the old bag.
+    ///
+    /// C6 fix: Removed unconditional bag.collect() call. The old code
+    /// called collect() even when try_safe_collect decided it was NOT safe,
+    /// which reclaimed objects that might still be in use by pinned threads.
+    /// Now we only collect when the safety check confirms it.
     fn try_collect(&self, current_epoch: u64) {
-        let _epoch_idx = (current_epoch as usize) % NUM_EPOCHS;
         let old_epoch_idx = ((current_epoch as usize).saturating_sub(2)) % NUM_EPOCHS;
         
-        // Only collect when safe: global epoch must be >= old_epoch + 2
         let mut bag = self.garbage_bags[old_epoch_idx].lock().unwrap();
+        // C6 fix: Only collect when safe — remove unconditional collect().
+        // try_safe_collect checks the global epoch and only clears if it
+        // has advanced enough. The old code also called bag.collect()
+        // unconditionally here, which cleared items even when unsafe.
         bag.try_safe_collect(current_epoch.saturating_sub(2));
-        // Also run the legacy collect to clear any remaining items.
-        bag.collect();
     }
 
     /// Add garbage to the current epoch's bag
@@ -170,11 +167,6 @@ impl GarbageBag {
         if self.items.len() % 256 == 0 {
             advance_epoch();
         }
-        // NOTE: We do NOT eagerly collect when the bag is "full".
-        // Premature collection can reclaim objects still accessed by threads
-        // pinned in older epochs (use-after-free). Collection is now only
-        // performed by try_collect() when the global epoch has advanced by
-        // at least 2 beyond the bag's epoch, guaranteeing a grace period.
     }
 
     /// Collect garbage only when safe: the global epoch must be at least
@@ -187,7 +179,6 @@ impl GarbageBag {
         }
     }
 
-    
     fn collect(&mut self) {
         // Legacy method kept for API compatibility; prefer try_safe_collect.
         self.items.clear();
@@ -200,34 +191,33 @@ impl GarbageBag {
 /// have caught up to the current epoch. This prevents garbage from being
 /// reclaimed while a reader is still accessing it.
 ///
-/// FIX (PERF-3): Replaced global ACTIVE_READERS counter with per-participant
-/// `active` flags. The original single counter caused cache-line contention
-/// on multi-core systems. Now we check each participant's active flag and
-/// local_epoch independently, which spreads the cache-line traffic across
-/// per-participant cache lines (the Participant structs are 128-byte aligned
-/// in the Worker struct, so they're already on separate cache lines).
+/// C5 fix: Now uses Weak<Participant> instead of raw pointers.
+/// The Weak upgrades to Arc only if the Participant is still alive,
+/// preventing dangling pointer dereferences.
 pub fn advance_epoch() {
     // Check if any participant is currently active (pinned).
-    // We use the PARTICIPANT_REGISTRY to iterate all participants.
-    // This replaces the global ACTIVE_READERS counter.
     if let Ok(registry) = PARTICIPANT_REGISTRY.read() {
-        for pp in registry.iter() {
-            // SAFETY: The pointer comes from a Participant that is still alive.
-            // Participants are stored in Arc<Participant> in the worker pool.
-            let participant = unsafe { &*pp.0 };
-            // If any participant is active (pinned), don't advance
-            if participant.active.load(Ordering::Acquire) {
-                return;
+        for weak in registry.iter() {
+            // C5 fix: Use Weak::upgrade() instead of raw pointer deref.
+            // If the Participant has been dropped, upgrade returns None
+            // and we skip it (no dangling pointer dereference).
+            if let Some(participant) = weak.upgrade() {
+                // If any participant is active (pinned), don't advance
+                if participant.active.load(Ordering::Acquire) {
+                    return;
+                }
             }
         }
 
         // Also check that all participants have caught up before advancing.
         let global = GLOBAL_EPOCH.load(Ordering::Acquire);
-        for pp in registry.iter() {
-            let participant_epoch = unsafe { (*pp.0).local_epoch.load(Ordering::Acquire) };
-            // If any participant is more than 1 epoch behind, don't advance yet
-            if global.saturating_sub(participant_epoch) > 1 {
-                return;
+        for weak in registry.iter() {
+            if let Some(participant) = weak.upgrade() {
+                let participant_epoch = participant.local_epoch.load(Ordering::Acquire);
+                // If any participant is more than 1 epoch behind, don't advance yet
+                if global.saturating_sub(participant_epoch) > 1 {
+                    return;
+                }
             }
         }
     }
@@ -258,14 +248,16 @@ mod tests {
 
     #[test]
     fn test_participant_pin() {
-        let participant = Participant::new();
+        let participant = Arc::new(Participant::new());
+        Participant::register(&participant);
         let guard = participant.pin();
-        let _epoch = guard.epoch(); // epoch is always >= 0 for u64
+        let _epoch = guard.epoch();
     }
 
     #[test]
     fn test_garbage_defer() {
-        let participant = Participant::new();
+        let participant = Arc::new(Participant::new());
+        Participant::register(&participant);
         let guard = participant.pin();
         guard.defer(Box::new(42));
     }

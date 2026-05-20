@@ -241,7 +241,11 @@ impl BytecodeFunction {
     
     #[inline(always)]
     pub fn add_constant(&mut self, value: Value) -> u32 {
-        let idx = self.constants.len() as u32;
+        // H4 fix: Add bounds check — u32 truncation if constants.len() > u32::MAX
+        // causes duplicate constant indices and corrupted bytecode.
+        let len = self.constants.len();
+        assert!(len < u32::MAX as usize, "bytecode_vm: constant table overflow (>4 billion entries)");
+        let idx = len as u32;
         self.constants.push(value);
         idx
     }
@@ -962,9 +966,14 @@ impl BytecodeCompiler {
 
     /// Patch the jump offset at `pos` so that it lands at the *current* end of
     /// the instruction stream (i.e. the instruction that will be emitted next).
+    ///
+    /// H5 fix: The jump offset is relative to the instruction AFTER the jump
+    /// instruction. When the dispatch loop fetches the jump instruction at `pos`,
+    /// it increments PC to pos+1 before applying the offset. So the offset
+    /// should be target - (pos + 1), not target - pos.
     fn patch_jump_offset(&mut self, pos: usize) {
         let target = self.current_function.instructions.len();
-        let offset = (target as i32) - (pos as i32);
+        let offset = (target as i32) - ((pos + 1) as i32);
         match &mut self.current_function.instructions[pos] {
             Instr::Jump { offset: ref mut o } => *o = offset,
             Instr::JumpFalse { offset: ref mut o, .. } => *o = offset,
@@ -975,7 +984,7 @@ impl BytecodeCompiler {
 
     /// Patch the jump offset at `pos` to jump to a specific `target` position.
     fn patch_jump_offset_to(&mut self, pos: usize, target: usize) {
-        let offset = (target as i32) - (pos as i32);
+        let offset = (target as i32) - ((pos + 1) as i32);
         match &mut self.current_function.instructions[pos] {
             Instr::Jump { offset: ref mut o } => *o = offset,
             Instr::JumpFalse { offset: ref mut o, .. } => *o = offset,

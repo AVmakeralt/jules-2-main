@@ -79,19 +79,24 @@ impl RseqState {
 pub fn is_rseq_available() -> bool {
     #[cfg(target_os = "linux")]
     {
-        // Check kernel version (4.18+) by reading /proc/version
+        // H6 fix: rseq requires Linux 4.18+, not just 4+.
+        // The old code only checked major_ver >= 4, which incorrectly reported
+        // rseq as available on kernel 4.4 (which lacks rseq). It also fell
+        // through to return true as default, claiming rseq available on 3.x.
         if let Ok(version) = std::fs::read_to_string("/proc/version") {
-            // Parse kernel version (e.g., "Linux version 5.15.0-...")
             if let Some(version_str) = version.split(' ').nth(2) {
-                if let Some(major) = version_str.split('.').next() {
-                    if let Ok(major_ver) = major.parse::<u32>() {
-                        return major_ver >= 4;
+                let parts: Vec<&str> = version_str.split('.').collect();
+                if let (Some(major_s), Some(minor_s)) = (parts.first(), parts.get(1)) {
+                    if let (Ok(major), Ok(minor)) = (major_s.parse::<u32>(), minor_s.parse::<u32>()) {
+                        // rseq is available on Linux 4.18+ or any 5.x+
+                        return major > 4 || (major == 4 && minor >= 18);
                     }
                 }
             }
         }
-        // Fallback: assume available on modern Linux
-        true
+        // If we can't parse the version, conservatively assume NOT available.
+        // The old code defaulted to true, which was wrong for kernel 3.x.
+        false
     }
     
     #[cfg(not(target_os = "linux"))]

@@ -134,17 +134,37 @@ impl SlabAllocator {
     }
 
     /// Allocate a new task descriptor (wait-free with rseq on local CPU)
+    ///
+    /// H7 fix: Per-CPU free list now uses CAS instead of load-then-store.
+    /// The old code used a simple load-then-store pattern (no CAS), which
+    /// has an ABA problem: if rseq is not actually active or the thread is
+    /// migrated mid-operation, two threads on the same CPU can race, both
+    /// reading the same head and both claiming the same task descriptor.
     pub fn allocate(&self) -> *mut TaskDescriptor {
-        // Try per-CPU free list first (wait-free with rseq)
+        // Try per-CPU free list first with CAS protection
         if let Some(cpu_id) = rseq_begin() {
             if cpu_id < self.per_cpu_free_lists.len() {
-                let head = self.per_cpu_free_lists[cpu_id].load(Ordering::Acquire);
-                if !head.is_null() {
+                // H7 fix: Use CAS loop instead of load-then-store
+                loop {
+                    let head = self.per_cpu_free_lists[cpu_id].load(Ordering::Acquire);
+                    if head.is_null() {
+                        break; // Free list empty for this CPU, fall through to global
+                    }
                     let next = unsafe { (*head).next.load(Ordering::Acquire) };
-                    self.per_cpu_free_lists[cpu_id].store(next, Ordering::Release);
-                    unsafe { (*head).in_use.store(true, Ordering::Release); }
-                    rseq_end();
-                    return head;
+                    // CAS: only claim head if it hasn't changed since we read it
+                    match self.per_cpu_free_lists[cpu_id].compare_exchange_weak(
+                        head,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            unsafe { (*head).in_use.store(true, Ordering::Release); }
+                            rseq_end();
+                            return head;
+                        }
+                        Err(_) => continue, // Another thread beat us, retry
+                    }
                 }
             }
             rseq_end();

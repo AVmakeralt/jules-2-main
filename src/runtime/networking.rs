@@ -34,8 +34,11 @@ impl NetworkBackend {
     }
 
     /// Check if this backend provides kernel bypass
+    /// L4 fix: io_uring is NOT kernel bypass — it still goes through the
+    /// kernel, just with fewer syscalls. Only DPDK is true kernel bypass.
+    /// This misclassification could lead to incorrect performance assumptions.
     pub fn is_kernel_bypass(&self) -> bool {
-        matches!(self, NetworkBackend::IoUring | NetworkBackend::Dpdk)
+        matches!(self, NetworkBackend::Dpdk)
     }
 
     /// Human-readable name

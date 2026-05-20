@@ -327,6 +327,10 @@ pub enum PatchInstr {
     CheckType { variable: String, expected: ValueType, if_false: usize },
     /// Check bounds: if index >= bound, jump to fallback
     CheckBounds { index: String, bound: String, if_fail: usize },
+    /// M3 fix: Check if index equals zero — if so, jump to fallback.
+    /// Unlike CheckBounds which checks index >= 0 (always true for unsigned),
+    /// this checks index == 0 and jumps to if_fail, catching division by zero.
+    CheckEqualsZero { index: String, if_fail: usize },
     /// Check integer overflow: compute + check flags
     CheckOverflow { dst: String, lhs: String, rhs: String, op: String, if_overflow: usize },
     /// Type conversion: convert variable from one type to another
@@ -526,10 +530,12 @@ impl IRPatch {
     ) -> Self {
         let mut instructions = Vec::new();
 
-        // 1. Check for zero
-        instructions.push(PatchInstr::CheckBounds {
+        // M3 fix: CheckBounds { index: divisor, bound: "0" } checks divisor >= 0,
+        // which is always true for unsigned integers. This does NOT prevent
+        // division by zero. Replace with a dedicated zero-check instruction
+        // that checks divisor == 0 (the inverse: divisor == 0 → fail).
+        instructions.push(PatchInstr::CheckEqualsZero {
             index: divisor.clone(),
-            bound: "0".into(),
             if_fail: 3,
         });
 
@@ -578,6 +584,9 @@ impl IRPatch {
                 }
                 PatchInstr::CheckBounds { index, bound, if_fail } => {
                     lines.push(format!("  if {} >= {} {{ goto block_{}; }}", index, bound, if_fail));
+                }
+                PatchInstr::CheckEqualsZero { index, if_fail } => {
+                    lines.push(format!("  if {} == 0 {{ goto block_{}; }}", index, if_fail));
                 }
                 PatchInstr::CheckOverflow { dst, lhs, rhs, op, if_overflow } => {
                     lines.push(format!("  {} = checked_{}({}, {}) || goto block_{};", dst, op, lhs, rhs, if_overflow));
@@ -1561,6 +1570,11 @@ impl SelfRepairEngine {
                         return false;
                     }
                 }
+                PatchInstr::CheckEqualsZero { index, .. } => {
+                    if !defined.contains(index) && !is_const(index) {
+                        return false;
+                    }
+                }
                 PatchInstr::CheckOverflow { dst, lhs, rhs, .. } => {
                     if !defined.contains(lhs) && !is_const(lhs) {
                         return false;
@@ -1770,6 +1784,7 @@ impl SelfRepairEngine {
                 }
                 PatchInstr::CheckType { .. } |
                 PatchInstr::CheckBounds { .. } |
+                PatchInstr::CheckEqualsZero { .. } |
                 PatchInstr::CheckOverflow { .. } => {
                     // Guard checks: in our simplified evaluation, we assume
                     // they pass. If they would fail, the real code would jump

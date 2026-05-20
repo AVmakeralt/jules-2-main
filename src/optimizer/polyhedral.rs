@@ -900,6 +900,18 @@ impl PolyhedralOptimizer {
                             (Some(DependenceDirection::Forward), Some(DependenceDirection::Backward)) => {
                                 return false;
                             }
+                            // M4 fix: Backward at outer + Equal at inner → swapping
+                            // a Backward dependence to an inner position is also illegal.
+                            (Some(DependenceDirection::Backward), Some(DependenceDirection::Equal)) => {
+                                return false;
+                            }
+                            // M4 fix: Any could hide a real Backward. Conservatively
+                            // disallow swaps that would move Forward/Any to inner with
+                            // Any/Backward at outer.
+                            (Some(DependenceDirection::Forward), Some(DependenceDirection::Any)) |
+                            (Some(DependenceDirection::Any), Some(DependenceDirection::Backward)) => {
+                                return false;
+                            }
                             _ => {}
                         }
                     }

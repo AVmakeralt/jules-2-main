@@ -75,7 +75,14 @@ impl StringInterner {
         if let Some(&sym) = self.string_to_symbol.get(s) {
             return sym;
         }
-        let sym = Symbol(GLOBAL_SYMBOL_COUNTER.fetch_add(1, Ordering::Relaxed));
+        // L1 fix: Check for counter overflow. After u32::MAX symbols,
+        // the counter wraps to 0 (which is the EMPTY symbol), colliding
+        // with previously-interned symbols. Panic instead of wrapping.
+        let next = GLOBAL_SYMBOL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if next == 0 {
+            panic!("symbol intern: global symbol counter overflow — wrapped to 0 (EMPTY symbol collision)");
+        }
+        let sym = Symbol(next);
         self.string_to_symbol.insert(s.to_string(), sym);
         // Ensure the vec is large enough
         let idx = sym.0 as usize;

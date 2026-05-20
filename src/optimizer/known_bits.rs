@@ -80,8 +80,14 @@ impl KnownBits {
     }
 
     /// Returns true if bit `bit` is unknown.
+    /// L6 fix: Bit positions >= 64 are conceptually "unknown" (they don't exist
+    /// in a u64), so return true for them. The old code returned false because
+    /// the first check (bit < 64) failed, which was misleading.
     pub fn is_unknown(&self, bit: u32) -> bool {
-        bit < 64 && !self.is_known_zero(bit) && !self.is_known_one(bit)
+        if bit >= 64 {
+            return true;
+        }
+        !self.is_known_zero(bit) && !self.is_known_one(bit)
     }
 
     /// If all 64 bits are known, return the concrete value. Otherwise `None`.
@@ -315,8 +321,20 @@ pub fn from_shl(a: &KnownBits, shift: &KnownBits) -> KnownBits {
             return *a;
         }
         if s >= 64 {
-            // Shifting left by 64+ yields 0 (for u64).
-            return KnownBits::constant(0);
+            // M5 fix: In Rust, u64::wrapping_shl(s) masks the shift amount to s & 63,
+            // so a shift by 64 actually shifts by 0, yielding the original value.
+            // Under C-style semantics, shifting by 64 yields 0 (or is UB).
+            // Since Jules uses Rust wrapping semantics, return the input unchanged
+            // when s is a multiple of 64, and compute wrapping_shl for other cases.
+            let effective_shift = s % 64;
+            if effective_shift == 0 {
+                return *a;
+            }
+            let low_zeros = (1u64 << effective_shift) - 1;
+            return KnownBits {
+                zeros: (a.zeros << effective_shift) | low_zeros,
+                ones: a.ones << effective_shift,
+            };
         }
         let low_zeros = (1u64 << s) - 1; // low S bits are 0
         return KnownBits {

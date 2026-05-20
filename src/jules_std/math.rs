@@ -871,6 +871,10 @@ fn quat_slerp(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
             a
         }
     } else {
+        // M12 fix: Clamp d to [-1.0, 1.0] before acos. Due to floating-point
+        // precision, d could be slightly > 1.0 even after the sign flip, and
+        // acos(d > 1.0) returns NaN. Clamping prevents this.
+        let d = d.clamp(-1.0, 1.0);
         let theta = d.acos();
         let sin_t = theta.sin();
         let wa = ((1.0 - t) * theta).sin() / sin_t;

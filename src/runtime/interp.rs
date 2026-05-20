@@ -10227,20 +10227,15 @@ fn eval_numeric_binop(op: BinOpKind, l: Value, r: Value) -> Result<Value, Runtim
             BinOpKind::BitOr => Ok(Value::I64(a | b)),
             BinOpKind::BitXor => Ok(Value::I64(a ^ b)),
             BinOpKind::Shl => {
-                let s = b as u32;
-                if s >= 64 {
-                    rt_err!("shift amount out of range for i64")
-                } else {
-                    Ok(Value::I64(a << s))
-                }
+                // M11 fix: b is i64, casting to u32 truncates upper bits.
+                // Use rem_euclid to get a valid shift amount in [0, 63].
+                let s = b.rem_euclid(64) as u32;
+                Ok(Value::I64(a << s))
             }
             BinOpKind::Shr => {
-                let s = b as u32;
-                if s >= 64 {
-                    rt_err!("shift amount out of range for i64")
-                } else {
-                    Ok(Value::I64(a >> s))
-                }
+                // M11 fix: Same as above for right shift.
+                let s = b.rem_euclid(64) as u32;
+                Ok(Value::I64(a >> s))
             }
             _ => Err(RuntimeError::new(format!(
                 "op {:?} not defined for i64",
