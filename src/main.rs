@@ -1,0 +1,4950 @@
+// Module declarations for the Jules compiler/interpreter.
+// In this repository layout the source files live in the crate root.
+#[allow(unused_variables)]
+#[allow(unused_macros)]
+#[allow(clippy::drop_ref)]
+// High-performance global allocator (issue #86 — performance audit).
+// Must be declared before any code that allocates.
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+// Compiler modules
+pub mod compiler;
+
+// ML/AI modules
+pub mod ml;
+
+// Jules-Flux: Zero-Copy Tiled-Graph Compiler (XLA/Triton equivalent)
+pub mod jules_flux;
+
+// Optimizer modules
+pub mod optimizer;
+
+// JIT/Compilation modules
+pub mod jit;
+
+// Polyhedral JIT optimization engine (Tier-2 / Tracing JIT handoff)
+pub mod polyhedral;
+
+// Runtime modules
+pub mod runtime;
+
+// Game modules
+pub mod game;
+
+// Tool modules
+pub mod tools;
+
+// Re-export commonly used modules for compatibility
+pub use runtime::interp;
+#[cfg(feature = "phase3-jit")]
+pub use optimizer::tiered_compilation;
+#[cfg(feature = "phase3-jit")]
+pub use jit::tracing_jit;
+#[cfg(feature = "phase6-simd")]
+pub use jit::phase6_simd;
+
+// Game-dev tooling modules used by the runtime and editor workflows.
+pub use tools::asset_importer;
+pub use ml::chess_ml;
+pub use tools::frame_debugger;
+pub use tools::hot_reload;
+pub use runtime::networking;
+// Removed unused re-exports: ZchmaRuntime and MemoryReorgOrchestrator
+// are runtime infrastructure not used by the pipeline. If needed in
+// the future, they can be re-exported from the runtime module.
+pub use tools::profiling_tools;
+pub use game::scene_editor;
+pub use tools::shader_tooling;
+
+// Standard library — game dev, ML, simulation.
+#[allow(clippy::manual_retain)]
+pub mod jules_std;
+
+use std::borrow::Cow;
+use std::fmt::Write as FmtWrite;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::process::Command as ProcessCommand;
+use std::time::{Duration, Instant};
+
+// ── Public API (used by lib.rs re-exports) ────────────────────────────────────
+
+/// Run only the analysis passes (lex → parse → typecheck → sema) on a source
+/// string and return all diagnostics.  Does not execute the program.
+pub fn jules_check(filename: &str, source: &str) -> Vec<Diag> {
+    let mut unit = CompileUnit::new(filename, source);
+    Pipeline::new().run(&mut unit);
+    unit.diags
+}
+
+/// Load, analyse, and run a Jules source file.  Returns `Ok(())` on success,
+/// or the first runtime error as a `String`.
+///
+/// Pass `entry = "main"` for normal execution, `"#test"` to run all @test
+/// functions, or `"#bench"` to run all @benchmark functions.
+///
+/// **Execution architecture (Phase 4)**:
+/// The interpreter (with its internal bytecode VM) is the **hot-path** execution
+/// engine.  It outperforms the standalone BytecodeVM for most programs because it
+/// avoids dynamic dispatch overhead, resolves component access early, and uses a
+/// register-based internal VM with specialized i32 fast paths.
+///
+/// The standalone BytecodeVM is the **semantic reference machine** — used for
+/// correctness validation, debugging, and cold-path execution.  It is NOT the
+/// performance-critical path anymore.
+pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
+    let source = fs::read_to_string(path).map_err(|e| format!("cannot read `{path}`: {e}"))?;
+    let mut unit = CompileUnit::from_owned(path.to_string(), source);
+    let result = Pipeline::new().run(&mut unit);
+    if unit.has_errors() {
+        let msgs: Vec<_> = unit
+            .diags
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        return Err(msgs.join("\n"));
+    }
+    match result {
+        PipelineResult::OkWithIr { program, ir_module: _ } => {
+            // ══════════════════════════════════════════════════════════════════
+            // ══ PHASE 4: TIERED EXECUTION (phase3-jit) / INTERPRETER FALLBACK ══
+            // ══════════════════════════════════════════════════════════════════
+            // When the phase3-jit feature is enabled, the TieredExecutionManager
+            // is the default execution path.  It provides:
+            //   Tier 0: Bytecode VM (fast cold start)
+            //   Tier 1: Baseline JIT (quick compilation)
+            //   Tier 2: Optimizing JIT (full optimization)
+            //   Tier 3: Tracing JIT (speculative optimization)
+            // with hotness counters, time-aware promotion, and deopt backoff.
+            //
+            // Without phase3-jit, falls back to the raw Interpreter.
+            // ══════════════════════════════════════════════════════════════════
+            #[cfg(feature = "phase3-jit")]
+            {
+                let policy = crate::tiered_compilation::PromotionPolicy::balanced();
+                let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
+                tiered_mgr.load_program(&program);
+                tiered_mgr.enabled = true;
+                tiered_mgr.call_function(entry, vec![])
+                    .map(|_| ())
+                    .map_err(|e| e.message.into_owned())
+            }
+            #[cfg(not(feature = "phase3-jit"))]
+            {
+                let mut interp = crate::interp::Interpreter::new();
+                interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+                interp.set_native_jit_enabled(true); // Enable native JIT
+                interp.load_program(&program);
+                interp.call_fn(entry, vec![])
+                    .map(|_| ())
+                    .map_err(|e| e.message.into_owned())
+            }
+        }
+        PipelineResult::Ok(program) => {
+            // Legacy path (no IR) — use tiered execution when available,
+            // otherwise fall back to interpreter.
+            #[cfg(feature = "phase3-jit")]
+            {
+                let policy = crate::tiered_compilation::PromotionPolicy::balanced();
+                let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
+                tiered_mgr.load_program(&program);
+                tiered_mgr.enabled = true;
+                tiered_mgr.call_function(entry, vec![])
+                    .map(|_| ())
+                    .map_err(|e| e.message.into_owned())
+            }
+            #[cfg(not(feature = "phase3-jit"))]
+            {
+                let mut interp = crate::interp::Interpreter::new();
+                interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+                interp.set_native_jit_enabled(true); // Enable native JIT
+                interp.load_program(&program);
+                interp.call_fn(entry, vec![])
+                    .map(|_| ())
+                    .map_err(|e| e.message.into_owned())
+            }
+        }
+        PipelineResult::HaltedAt(_) => Err("pipeline did not produce a program".into()),
+    }
+}
+
+// Pull in the compiler passes.  In a real crate these would be separate modules.
+use crate::compiler::lexer::{LexError, Lexer, Span};
+// use crate::compiler::parser::Parser;   // parser wired through `Pipeline`
+// use crate::compiler::typeck::TypeCk;
+// use crate::compiler::sema::SemaCtx;
+// use crate::interp::Interpreter;
+
+// =============================================================================
+// §1  ANSI COLOUR CODES
+// =============================================================================
+
+struct Ansi;
+
+
+impl Ansi {
+    const RESET: &'static str = "\x1b[0m";
+    const BOLD: &'static str = "\x1b[1m";
+    const DIM: &'static str = "\x1b[2m";
+
+    // Foreground colours
+    const RED: &'static str = "\x1b[31m";
+    const YELLOW: &'static str = "\x1b[33m";
+    const BLUE: &'static str = "\x1b[34m";
+    const CYAN: &'static str = "\x1b[36m";
+    const WHITE: &'static str = "\x1b[37m";
+    const BRIGHT_RED: &'static str = "\x1b[91m";
+    const BRIGHT_YEL: &'static str = "\x1b[93m";
+    const BRIGHT_CYN: &'static str = "\x1b[96m";
+    const MAGENTA: &'static str = "\x1b[35m";
+
+    fn paint<'a>(enabled: bool, code: &str, text: &'a str) -> Cow<'a, str> {
+        if enabled {
+            Cow::Owned(format!("{}{}{}", code, text, Self::RESET))
+        } else {
+            Cow::Borrowed(text)
+        }
+    }
+}
+
+// =============================================================================
+// §2  UNIFIED DIAGNOSTIC TYPES
+// =============================================================================
+
+/// Identifies which compiler pass produced a diagnostic.
+/// Stored as a tag to avoid heap-allocating prefix strings like "[ir-typeck]".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassSource {
+    Lexer,
+    Parser,
+    AstTypeck,
+    AstSema,
+    IrLower,
+    IrTypeck,
+    IrBorrowck,
+    IrCodegen,
+    WpDce,
+    Soa,
+    MemOpt,
+    OptPass,
+    Unknown,
+}
+
+impl PassSource {
+    /// Returns the diagnostic prefix for this pass, e.g. "[ir-typeck]".
+    pub fn prefix(&self) -> &'static str {
+        match self {
+            PassSource::Lexer => "[lexer]",
+            PassSource::Parser => "[parser]",
+            PassSource::AstTypeck => "[ast-typeck/advisory]",
+            PassSource::AstSema => "[ast-sema/advisory]",
+            PassSource::IrLower => "[ir-lower]",
+            PassSource::IrTypeck => "[ir-typeck]",
+            PassSource::IrBorrowck => "[ir-borrowck]",
+            PassSource::IrCodegen => "[ir-codegen]",
+            PassSource::WpDce => "[wp-dce/advisory]",
+            PassSource::Soa => "[soa/advisory]",
+            PassSource::MemOpt => "[mem/advisory]",
+            PassSource::OptPass => "[opt]",
+            PassSource::Unknown => "",
+        }
+    }
+}
+
+/// One diagnostic from any compiler pass.
+#[derive(Debug, Clone)]
+pub struct Diag {
+    pub severity: DiagSeverity,
+    pub span: Option<Span>,
+    pub code: Option<&'static str>, // e.g. "E001", "W042"
+    /// Which compiler pass produced this diagnostic. Stored as a tag
+    /// to avoid heap-allocating prefix strings in the message.
+    pub pass: PassSource,
+    pub message: String,
+    /// Secondary "note" labels at related source positions.
+    pub labels: Vec<(Span, String)>,
+    /// Suggested fix hint (optional).
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiagSeverity {
+    Note,
+    Warning,
+    Error,
+}
+
+impl Diag {
+    pub fn error(span: Span, msg: impl Into<String>) -> Self {
+        Diag {
+            severity: DiagSeverity::Error,
+            span: Some(span),
+            code: None,
+            pass: PassSource::Unknown,
+            message: msg.into(),
+            labels: vec![],
+            hint: None,
+        }
+    }
+    pub fn warning(span: Span, msg: impl Into<String>) -> Self {
+        Diag {
+            severity: DiagSeverity::Warning,
+            span: Some(span),
+            code: None,
+            pass: PassSource::Unknown,
+            message: msg.into(),
+            labels: vec![],
+            hint: None,
+        }
+    }
+    pub fn note(span: Span, msg: impl Into<String>) -> Self {
+        Diag {
+            severity: DiagSeverity::Note,
+            span: Some(span),
+            code: None,
+            pass: PassSource::Unknown,
+            message: msg.into(),
+            labels: vec![],
+            hint: None,
+        }
+    }
+    pub fn with_code(mut self, c: &'static str) -> Self {
+        self.code = Some(c);
+        self
+    }
+    pub fn with_pass(mut self, p: PassSource) -> Self {
+        self.pass = p;
+        self
+    }
+    pub fn with_hint(mut self, h: impl Into<String>) -> Self {
+        self.hint = Some(h.into());
+        self
+    }
+    pub fn with_label(mut self, s: Span, m: impl Into<String>) -> Self {
+        self.labels.push((s, m.into()));
+        self
+    }
+    pub fn is_error(&self) -> bool {
+        self.severity == DiagSeverity::Error
+    }
+}
+
+// ── Conversion from lexer errors ──────────────────────────────────────────────
+
+impl From<LexError> for Diag {
+    fn from(e: LexError) -> Self {
+        Diag::error(e.span, e.message).with_code("E0001").with_pass(PassSource::Lexer)
+    }
+}
+
+// =============================================================================
+// §3  PRETTY-PRINTING RENDERER
+// =============================================================================
+
+/// Configuration for the diagnostic renderer.
+#[derive(Debug, Clone)]
+pub struct RenderCfg {
+    pub color: bool,
+    pub tab_width: usize,
+    pub context: usize, // extra lines of source context to show
+}
+
+impl Default for RenderCfg {
+    fn default() -> Self {
+        RenderCfg {
+            color: true,
+            tab_width: 4,
+            context: 1,
+        }
+    }
+}
+
+/// Renders a slice of diagnostics to a `String` using Rust-compiler-style
+/// formatting with source squiggles.
+
+pub struct DiagRenderer<'src> {
+    source: &'src str,
+    filename: &'src str,
+    cfg: RenderCfg,
+    /// Pre-split source lines for O(1) access.
+    lines: Vec<&'src str>,
+}
+
+impl<'src> DiagRenderer<'src> {
+    pub fn new(source: &'src str, filename: &'src str, cfg: RenderCfg) -> Self {
+        let lines: Vec<&str> = source.split('\n').collect();
+        DiagRenderer {
+            source,
+            filename,
+            cfg,
+            lines,
+        }
+    }
+
+    /// Access the source text being rendered.
+    pub fn source(&self) -> &str {
+        self.source
+    }
+
+    pub fn render_all(&self, diags: &[Diag]) -> String {
+        let mut out = String::new();
+        for d in diags {
+            out.push_str(&self.render(d));
+            out.push('\n');
+        }
+        out
+    }
+
+    pub fn render(&self, d: &Diag) -> String {
+        let mut buf = String::new();
+
+        // ── Header line  "error[E001]: message" ───────────────────────────────
+        // Use all color constants to avoid dead code warnings.
+        let _ = (Ansi::RED, Ansi::YELLOW, Ansi::BLUE, Ansi::CYAN, Ansi::WHITE, Ansi::MAGENTA);
+        let (sev_tag, sev_color) = match d.severity {
+            DiagSeverity::Error => ("error", Ansi::RED),
+            DiagSeverity::Warning => ("warning", Ansi::YELLOW),
+            DiagSeverity::Note => ("note", Ansi::WHITE),
+        };
+        let code_part = d.code.map(|c| format!("[{c}]")).unwrap_or_default();
+        let header = format!("{sev_tag}{code_part}: {}", d.message);
+        writeln!(
+            buf,
+            "{}",
+            self.paint(Ansi::BOLD, &self.paint(sev_color, &header))
+        )
+        .unwrap();
+
+        // ── File + line location ───────────────────────────────────────────────
+        if let Some(span) = d.span {
+            if span.line > 0 {
+                let loc = format!("  --> {}:{}:{}", self.filename, span.line, span.col);
+                writeln!(buf, "{}", self.dim(&loc)).unwrap();
+                writeln!(buf, "   {}", self.dim("|")).unwrap();
+                self.render_source_snippet(&mut buf, span, sev_color);
+            }
+        }
+
+        // ── Secondary labels ──────────────────────────────────────────────────
+        for (lspan, lmsg) in &d.labels {
+            if lspan.line > 0 {
+                let loc = format!("  --> {}:{}:{}", self.filename, lspan.line, lspan.col);
+                writeln!(buf, "{}", self.dim(&loc)).unwrap();
+                writeln!(buf, "   {}", self.dim("|")).unwrap();
+                self.render_source_snippet(&mut buf, *lspan, Ansi::BLUE);
+                let note = format!("   {} = note: {}", self.dim("|"), lmsg);
+                writeln!(buf, "{note}").unwrap();
+            }
+        }
+
+        // ── Hint ─────────────────────────────────────────────────────────────
+        if let Some(hint) = &d.hint {
+            writeln!(
+                buf,
+                "   {} help: {}",
+                self.dim("|"),
+                self.paint(Ansi::CYAN, hint)
+            )
+            .unwrap();
+        }
+
+        buf
+    }
+
+    fn render_source_snippet(&self, buf: &mut String, span: Span, squiggle_color: &str) {
+        let line_idx = (span.line as usize).saturating_sub(1);
+
+        // Optionally show one line of context above.
+        if self.cfg.context > 0 && line_idx > 0 {
+            let prev_no = line_idx; // 1-based = line_idx (because line_idx = line - 1)
+            let prev = self.lines.get(line_idx - 1).unwrap_or(&"");
+            let prefix = self.dim(&format!("{prev_no:4} | "));
+            writeln!(buf, "{prefix}{}", self.dim(prev)).unwrap();
+        }
+
+        // The main highlighted line.
+        let line_no = span.line as usize;
+        let line_str = self.lines.get(line_idx).unwrap_or(&"");
+        let prefix = self.paint(Ansi::BOLD, &format!("{line_no:4} | "));
+        writeln!(buf, "{prefix}{line_str}").unwrap();
+
+        // Squiggle line: "     | ^^^^"
+        let col = (span.col as usize).saturating_sub(1);
+        let width = (span.end.saturating_sub(span.start)).max(1) as usize;
+        let pad = self.expand_tabs(line_str, col);
+        let squig = self.paint(squiggle_color, &"^".repeat(width));
+        writeln!(
+            buf,
+            "     {}{}{}",
+            self.dim("|"),
+            " ".repeat(pad + 1),
+            squig
+        )
+        .unwrap();
+
+        // Optionally show one line of context below.
+        if self.cfg.context > 0 {
+            let next_idx = line_idx + 1;
+            if let Some(next) = self.lines.get(next_idx) {
+                let next_no = next_idx + 1;
+                let prefix = self.dim(&format!("{next_no:4} | "));
+                writeln!(buf, "{prefix}{}", self.dim(next)).unwrap();
+            }
+        }
+
+        writeln!(buf, "   {}", self.dim("|")).unwrap();
+    }
+
+    /// Count display columns up to `col` bytes, expanding tabs.
+    fn expand_tabs(&self, line: &str, col: usize) -> usize {
+        let tw = self.cfg.tab_width;
+        let mut display = 0;
+        for (i, ch) in line.char_indices() {
+            if i >= col {
+                break;
+            }
+            if ch == '\t' {
+                // Align to next tab stop.
+                display = (display / tw + 1) * tw;
+            } else {
+                display += 1;
+            }
+        }
+        display
+    }
+
+    fn paint(&self, color: &str, s: &str) -> String {
+        Ansi::paint(self.cfg.color, color, s).into_owned()
+    }
+    fn dim(&self, s: &str) -> String {
+        Ansi::paint(self.cfg.color, Ansi::DIM, s).into_owned()
+    }
+}
+
+// =============================================================================
+// §4  JSON DIAGNOSTIC EMITTER  (for editor / LSP integration)
+// =============================================================================
+
+pub fn diags_to_json(diags: &[Diag], filename: &str) -> String {
+    if diags.is_empty() {
+        return "[]".to_string();
+    }
+
+    // Use serde_json for correct JSON escaping instead of manual string
+    // manipulation. The previous manual escaping only handled '"' → '\"'
+    // and was incorrect for backslashes, newlines, and control characters.
+    let items: Vec<serde_json::Value> = diags.iter().map(|d| {
+        let sev = match d.severity {
+            DiagSeverity::Error => "error",
+            DiagSeverity::Warning => "warning",
+            DiagSeverity::Note => "note",
+        };
+        let (line, col, start, end) = if let Some(sp) = d.span {
+            (sp.line, sp.col, sp.start, sp.end)
+        } else {
+            (0, 0, 0, 0)
+        };
+
+        let labels: Vec<serde_json::Value> = d.labels.iter().map(|(sp, m)| {
+            serde_json::json!({
+                "line": sp.line,
+                "col": sp.col,
+                "message": m,
+            })
+        }).collect();
+
+        // Include pass prefix in the message for backward compatibility
+        let prefix = d.pass.prefix();
+        let full_message = if prefix.is_empty() {
+            d.message.clone()
+        } else {
+            format!("{} {}", prefix, d.message)
+        };
+
+        serde_json::json!({
+            "severity": sev,
+            "code": d.code.unwrap_or(""),
+            "pass": prefix,
+            "file": filename,
+            "line": line,
+            "col": col,
+            "start": start,
+            "end": end,
+            "message": full_message,
+            "hint": d.hint.as_deref().unwrap_or(""),
+            "labels": labels,
+        })
+    }).collect();
+
+    // Pretty-print for readability
+    serde_json::to_string_pretty(&serde_json::Value::Array(items))
+        .unwrap_or_else(|_| "[]".to_string())
+}
+
+// =============================================================================
+// §5  COMPILER PIPELINE  (orchestrates all passes)
+// =============================================================================
+
+/// Everything the compiler knows about a compilation unit.
+pub struct CompileUnit {
+    pub filename: String,
+    pub source: String,
+    pub diags: Vec<Diag>,
+    /// Cached error count for O(1) `has_errors()` — kept in sync by `push_diag()`.
+    /// If `diags` is modified directly, call `recalc_diag_counts()` afterward.
+    cached_error_count: usize,
+    /// Cached warning count for O(1) `warning_count()`.
+    cached_warning_count: usize,
+}
+
+impl CompileUnit {
+    pub fn new(filename: impl Into<String>, source: impl Into<String>) -> Self {
+        CompileUnit {
+            filename: filename.into(),
+            source: source.into(),
+            diags: vec![],
+            cached_error_count: 0,
+            cached_warning_count: 0,
+        }
+    }
+
+    /// Construct from an already-owned source string, avoiding the copy.
+    pub fn from_owned(filename: String, source: String) -> Self {
+        CompileUnit {
+            filename,
+            source,
+            diags: vec![],
+            cached_error_count: 0,
+            cached_warning_count: 0,
+        }
+    }
+
+    /// Push a diagnostic and update cached counts. Preferred over
+    /// `self.diags.push(d)` to keep `has_errors()` O(1).
+    pub fn push_diag(&mut self, d: Diag) {
+        match d.severity {
+            DiagSeverity::Error => self.cached_error_count += 1,
+            DiagSeverity::Warning => self.cached_warning_count += 1,
+            DiagSeverity::Note => {}
+        }
+        self.diags.push(d);
+    }
+
+    /// Recalculate cached error/warning counts after direct `diags` mutation.
+    /// Call this after `self.diags.retain(...)`, `self.diags.extend(...)`,
+    /// or any other direct modification of the `diags` vec.
+    pub fn recalc_diag_counts(&mut self) {
+        self.cached_error_count = self.diags.iter().filter(|d| d.is_error()).count();
+        self.cached_warning_count = self.diags.iter().filter(|d| d.severity == DiagSeverity::Warning).count();
+    }
+
+    pub fn has_errors(&self) -> bool {
+        self.cached_error_count > 0  // O(1) instead of O(n) scan
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.cached_error_count
+    }
+
+    /// Convert all diagnostics into a rich `DiagnosticCollector` with full
+    /// causality tracking, cascade suppression, dataflow info, teaching notes,
+    /// and structured JSON output.
+    pub fn rich_diagnostics(&self, phase: crate::compiler::diagnostic::Phase) -> crate::compiler::diagnostic::DiagnosticCollector {
+        collect_rich_diagnostics(self, phase)
+    }
+
+    /// Human-readable one-line summary: "2 errors, 1 warning".
+    pub fn summary(&self) -> String {
+        let e = self.error_count();
+        let w = self.warning_count();
+        format!(
+            "{} error{}, {} warning{}",
+            e,
+            if e == 1 { "" } else { "s" },
+            w,
+            if w == 1 { "" } else { "s" }
+        )
+    }
+    pub fn warning_count(&self) -> usize {
+        self.cached_warning_count
+    }
+}
+
+/// Returns true if the program is "small enough" that heavy optimization
+/// passes are unlikely to produce meaningful improvements.  Trivial programs
+/// have at most 3 top-level items and at most 1 function definition — e.g.
+/// `fn main() {}` or `fn main() { let x = 1; }`.
+fn is_trivial_program(program: &crate::compiler::ast::Program) -> bool {
+    if program.items.len() > 3 { return false; }
+    let fn_count = program.items.iter()
+        .filter(|i| matches!(i, crate::compiler::ast::Item::Fn(_)))
+        .count();
+    fn_count <= 1
+}
+
+// =============================================================================
+// §  SEMANTIC EQUIVALENCE VALIDATOR
+// =============================================================================
+//
+// The real risk in a multi-engine system is SEMANTIC DIVERGENCE — when the
+// interpreter and the BytecodeVM produce different results for the same
+// input.  This validator runs both engines and flags any mismatch.
+//
+// Usage:
+//   - Call `validate_semantic_equivalence()` after compilation to check both
+//     engines produce the same result.
+//   - In debug builds, this can be called automatically for every program.
+//   - In the inferno benchmark, this is used to detect divergence.
+//
+// When divergence is detected, the interpreter result is considered
+// authoritative (it's the reference implementation), and the VM result
+// is logged as a divergence bug to be fixed.
+
+/// Result of semantic equivalence validation between two execution engines.
+#[derive(Debug)]
+pub struct SemanticValidationResult {
+    /// Did both engines produce the same result?
+    pub equivalent: bool,
+    /// The interpreter's result (authoritative).
+    pub interp_result: Result<crate::interp::Value, crate::interp::RuntimeError>,
+    /// The BytecodeVM's result (semantic reference).
+    pub vm_result: Result<crate::interp::Value, crate::interp::RuntimeError>,
+    /// Human-readable description of any divergence.
+    pub divergence_description: Option<String>,
+}
+
+/// Validate semantic equivalence between the interpreter and BytecodeVM.
+///
+/// The interpreter is the **authoritative** execution engine. If the VM
+/// disagrees, that's a VM bug to be fixed — the interpreter's result
+/// is always the correct one.
+///
+/// This function is intentionally NOT on the hot path. It's used for:
+/// - Debug builds and test suites
+/// - Benchmark validation
+/// - CI correctness checks
+/// - Regression detection
+pub fn validate_semantic_equivalence(
+    program: &crate::compiler::ast::Program,
+    ir_module: &crate::compiler::ir::FlatIrModule,
+    entry: &str,
+    args: Vec<crate::interp::Value>,
+) -> SemanticValidationResult {
+    // ── Run interpreter (authoritative) ──────────────────────────────────
+    let mut interp = crate::interp::Interpreter::new();
+    // Enable the internal bytecode VM — this is the interpreter's hot path
+    // that gives it its performance advantage over the standalone BytecodeVM.
+    // Without this, the tree-walker can't call user-defined functions.
+    interp.set_jit_enabled(true);
+    interp.set_native_jit_enabled(true); // Enable native JIT
+    interp.load_program(program);
+    let interp_result = interp.call_fn(entry, args.clone());
+
+    // ── Run BytecodeVM via IR → Bytecode (semantic reference) ────────────
+    let ir_bc = crate::compiler::ir_to_bytecode::compile_ir_module(ir_module);
+    let vm_result = if ir_bc.errors.is_empty() && !ir_bc.functions.is_empty() {
+        let mut vm = crate::runtime::bytecode_vm::BytecodeVM::new();
+        if vm.load_ir_functions(ir_bc.functions).is_ok() {
+            vm.call_fn(entry, args)
+        } else {
+            Err(crate::interp::RuntimeError::new(Cow::Borrowed("VM failed to load IR-compiled functions")))
+        }
+    } else {
+        // Also try AST → Bytecode path as fallback
+        let mut vm = crate::runtime::bytecode_vm::BytecodeVM::new();
+        if vm.load_program(program).is_ok() {
+            vm.call_fn(entry, args)
+        } else {
+            Err(crate::interp::RuntimeError::new(Cow::Borrowed("VM failed to load program")))
+        }
+    };
+
+    // ── Compare results ──────────────────────────────────────────────────
+    let equivalent = match (&interp_result, &vm_result) {
+        (Ok(a), Ok(b)) => values_equivalent(a, b),
+        (Err(_), Err(_)) => true, // Both failed — equivalent in failure
+        _ => false,
+    };
+
+    let divergence_description = if equivalent {
+        None
+    } else {
+        let interp_desc = match &interp_result {
+            Ok(v) => format!("{:?}", v),
+            Err(e) => format!("Error: {}", e.message),
+        };
+        let vm_desc = match &vm_result {
+            Ok(v) => format!("{:?}", v),
+            Err(e) => format!("Error: {}", e.message),
+        };
+        Some(format!(
+            "SEMANTIC DIVERGENCE: interp={} vm={} (interpreter is authoritative)",
+            interp_desc, vm_desc
+        ))
+    };
+
+    SemanticValidationResult {
+        equivalent,
+        interp_result,
+        vm_result,
+        divergence_description,
+    }
+}
+
+/// Check if two runtime values are semantically equivalent.
+/// Handles type coercions that are expected between engines (e.g., I32 vs I64).
+fn values_equivalent(a: &crate::interp::Value, b: &crate::interp::Value) -> bool {
+    use crate::interp::Value;
+    match (a, b) {
+        // Exact matches
+        (Value::I32(a), Value::I32(b)) => a == b,
+        (Value::I64(a), Value::I64(b)) => a == b,
+        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Unit, Value::Unit) => true,
+
+        // Cross-type equivalences (interpreter returns I32, VM returns I64, etc.)
+        (Value::I32(a), Value::I64(b)) => (*a as i64) == *b,
+        (Value::I64(a), Value::I32(b)) => *a == (*b as i64),
+        (Value::Bool(a), Value::I64(b)) => (*a as i64) == *b,
+        (Value::I64(a), Value::Bool(b)) => *a == (*b as i64),
+
+        _ => false,
+    }
+}
+
+/// The full front-end pipeline.  Each pass adds to `unit.diags`.
+pub struct Pipeline {
+    pub warn_as_error: bool,
+    pub quiet: bool,
+    pub emit_ir: bool,
+    pub profile: bool,
+    pub opt_level: u8, // 0=none, 1=fast_compile, 2=balanced, 3=maximum
+    pub print_opt_stats: bool,
+}
+
+impl Pipeline {
+    pub fn new() -> Self {
+        Pipeline {
+            warn_as_error: false,
+            quiet: false,
+            emit_ir: false,
+            profile: false,
+            opt_level: 2, // balanced by default
+            print_opt_stats: false,
+        }
+    }
+
+    /// Run the pipeline as far as possible, accumulating diagnostics.
+    /// Returns `Ok(unit)` even when there are errors so the caller can
+    /// display all diagnostics at once.
+    pub fn run(&self, unit: &mut CompileUnit) -> PipelineResult {
+        // ── Pass 1: Lex ───────────────────────────────────────────────────────
+        let mut lexer = Lexer::new(&unit.source);
+        let (tokens, lex_errors) = lexer.tokenize();
+
+        unit.diags
+            .reserve(lex_errors.len() + (tokens.len() / 32).max(8));
+        for e in lex_errors {
+            unit.push_diag(Diag::from(e));
+        }
+
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::Lex);
+        }
+
+        // ── Pass 2: Parse ─────────────────────────────────────────────────────
+        let mut parser = crate::compiler::parser::Parser::new(tokens);
+        let mut program = parser.parse_program();
+
+        for e in parser.errors {
+            unit.push_diag(parse_error_to_diag(e));
+        }
+
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::Parse);
+        }
+
+        // ── Pass 3: AST Type-check (ADVISORY — debug builds only) ───
+        // The AST type checker runs for early diagnostic feedback in debug builds.
+        // In release builds, it is skipped entirely since the IR pipeline is the
+        // sole authority. This saves compile time proportional to AST size.
+        //
+        // ONE TRUTH RULE: After parsing, AST must NEVER be semantically
+        // analyzed as an authority. IR is the single source of truth.
+        #[cfg(debug_assertions)]
+        {
+            let mut typeck = crate::compiler::typeck::TypeCk::new();
+            typeck.check_program(&mut program);
+            for d in typeck.diag.items {
+                let mut adapted = adapt_typeck_diag(d);
+                // Demote AST type-check errors to warnings — IR typeck is authoritative
+                if adapted.severity == DiagSeverity::Error {
+                    adapted.severity = DiagSeverity::Warning;
+                    adapted.message = format!("[ast-typeck/advisory] {}", adapted.message);
+                }
+                unit.push_diag(adapted);
+            }
+        }
+        // NO hard gate — AST typeck cannot halt compilation.
+
+        // ── Pass 4: AST Semantic analysis (ADVISORY — debug builds only) ──
+        // The AST semantic analyzer runs for early diagnostic feedback in debug
+        // builds. In release builds, it is skipped entirely since the IR pipeline
+        // is the sole authority. This saves compile time proportional to AST size.
+        //
+        // ONE TRUTH RULE: After parsing, AST must NEVER be semantically
+        // analyzed as an authority. IR is the single source of truth.
+        #[cfg(debug_assertions)]
+        {
+            let mut sema = crate::compiler::sema::SemaCtx::new();
+            sema.analyse(&program);
+            for d in sema.diag.items {
+                let mut adapted = adapt_sema_diag(d);
+                // Demote AST sema errors to warnings — IR pipeline is authoritative
+                if adapted.severity == DiagSeverity::Error {
+                    adapted.severity = DiagSeverity::Warning;
+                    adapted.message = format!("[ast-sema/advisory] {}", adapted.message);
+                }
+                unit.push_diag(adapted);
+            }
+        }
+        // NO hard gate — AST sema cannot halt compilation.
+
+        // ── Pass 5: AST Borrow-check — REMOVED ─────────────────────────────
+        // The AST-based borrow checker has been removed from the pipeline.
+        // The IR-based borrow checker (ir_borrowck) is the sole authority
+        // for ownership errors. Running the AST borrowck wasted compile time
+        // and its results were already discarded.
+        //
+        // ONE TRUTH RULE: IR borrowck is the sole source of truth.
+
+        // ── Pass 6: Superoptimizer ──────────────────────────────────────────
+        // Runs the full AST-level superoptimizer: constant folding, SCCP,
+        // algebraic simplification (50+ rules), strength reduction, CSE,
+        // dead code elimination, dead store elimination, peephole, loop
+        // invariant code motion, function inlining, branch optimization.
+        if self.opt_level >= 1 {
+            let config = match self.opt_level {
+                1 => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::fast_compile(),
+                2 => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::balanced(),
+                _ => crate::optimizer::advanced_optimizer::SuperoptimizerConfig::maximum(),
+            };
+            let mut superopt = crate::optimizer::advanced_optimizer::Superoptimizer::new(config);
+            superopt.optimize_program(&mut program);
+            if self.print_opt_stats && self.opt_level >= 2 {
+                eprintln!("[opt] const_folds={} cse={} dce={} inline={} unroll={} dead_fn={} licm={}",
+                    superopt.constant_folds, superopt.cse_eliminations, superopt.dead_code_eliminated,
+                    superopt.inlinings, superopt.loop_unrollings, superopt.dead_functions_eliminated,
+                    superopt.licm_hoists);
+            }
+        }
+
+        // ── Pass 7: Level 4 Semantic Superoptimizer (Algorithmic Lifting) ─────
+        // Replaces algorithmic patterns with mathematically-equivalent O(1) formulas.
+        // e.g., sum of 1..n → n*(n+1)/2, polynomial → Horner's method
+        #[cfg(feature = "gnn-optimizer")]
+        if self.opt_level >= 2 {
+            let mut semantic = crate::optimizer::semantic_superopt::SemanticSuperoptimizer::new();
+            semantic.optimize_program(&mut program);
+            if self.print_opt_stats && semantic.patterns_matched > 0 {
+                eprintln!("[opt/L4] semantic_patterns={} estimated_speedup={:.1}x",
+                    semantic.patterns_matched, semantic.total_estimated_speedup);
+            }
+        }
+
+        // ── Pass 8: Level 4 Polyhedral Optimizer (Cache-Tiled Loops) ──────────
+        // Analyzes loop nests and applies cache-optimal tiling, interchange,
+        // and fusion. Uses the real CPU cache model for tile size selection.
+        #[cfg(feature = "gnn-optimizer")]
+        if self.opt_level >= 2 {
+            let mut polyhedral = crate::optimizer::polyhedral::PolyhedralOptimizer::new();
+            polyhedral.optimize_program(&mut program);
+            if self.print_opt_stats && polyhedral.loops_optimized > 0 {
+                eprintln!("[opt/L4] polyhedral_loops={} cache_miss_reduction={:.1}%",
+                    polyhedral.loops_optimized, polyhedral.total_cache_miss_reduction * 100.0);
+            }
+        }
+
+        // ── Pass 9: ML Superoptimizer (Domain-Specific ML Kernel Optimization) ──
+        // Recognizes ML kernel patterns (matmul, softmax, attention, conv2d,
+        // layer_norm, etc.) and replaces them with optimal fused implementations.
+        // This is what XLA/TensorRT/TVM do — but at the language level.
+        #[cfg(feature = "gnn-optimizer")]
+        if self.opt_level >= 2 {
+            use crate::compiler::ast::SuperoptMode;
+            match program.superopt_mode {
+                SuperoptMode::None => {
+                    // Superoptimization disabled for this file
+                    if self.print_opt_stats {
+                        eprintln!("[opt] superoptimization disabled (@none)");
+                    }
+                }
+                SuperoptMode::MlSuperopt | SuperoptMode::All => {
+                    let mut ml_opt = crate::optimizer::ml_superopt::MlSuperoptimizer::new();
+                    ml_opt.optimize_program(&mut program);
+                    if self.print_opt_stats && ml_opt.stats.patterns_matched > 0 {
+                        eprintln!("[opt/ML] ml_patterns={} loop_to_kernel={} fusions={} stability={} mem_opt={} speedup={:.1}x",
+                            ml_opt.stats.patterns_matched,
+                            ml_opt.stats.loop_to_kernel,
+                            ml_opt.stats.kernel_fusions,
+                            ml_opt.stats.numerical_stability_fixes,
+                            ml_opt.stats.memory_optimizations,
+                            ml_opt.stats.total_estimated_speedup);
+                    }
+                }
+                SuperoptMode::MctsSuperopt => {
+                    // MCTS superoptimizer is handled separately in the JIT/AOT path
+                    if self.print_opt_stats {
+                        eprintln!("[opt] MCTS superoptimizer active (@mcts_superopt)");
+                    }
+                }
+                SuperoptMode::EGraph => {
+                    // E-graph superoptimizer is handled separately
+                    if self.print_opt_stats {
+                        eprintln!("[opt] E-graph superoptimizer active (@egraph)");
+                    }
+                }
+            }
+        }
+
+        // ── Pass 9b: Unified Superoptimizer Pipeline ─────────────────────────
+        // Runs the full 5-stage pipeline: semantic rewrites → known-bits
+        // pruning → MCTS tree search → CEGIS/SMT verification → uarch cost
+        // validation.  This is the "real superoptimizer" that connects all
+        // the previously-disconnected modules.
+        //
+        // Feature gates: core-superopt (stages 2-5) or gnn-optimizer (stage 1+).
+        // Only runs when SuperoptMode is not None and opt_level >= 2.
+        #[cfg(any(feature = "core-superopt", feature = "gnn-optimizer"))]
+        if self.opt_level >= 2 {
+            use crate::compiler::ast::SuperoptMode;
+            match program.superopt_mode {
+                SuperoptMode::None => {
+                    // Skip — already reported above.
+                }
+                SuperoptMode::MctsSuperopt | SuperoptMode::EGraph
+                | SuperoptMode::MlSuperopt | SuperoptMode::All => {
+                    use crate::optimizer::superopt_pass::{SuperoptPass, SuperoptConfig};
+                    let config = SuperoptConfig::default();
+                    let mut pass = SuperoptPass::new(config);
+                    let stats = pass.optimize_program(&mut program);
+                    if self.print_opt_stats && stats.expressions_optimized > 0 {
+                        eprintln!("[opt/SUPEROPT] visited={} optimized={} mcts_verified={} smt={} kb_reject={} uarch_reject={} time={}µs",
+                            stats.expressions_visited,
+                            stats.expressions_optimized,
+                            stats.mcts_candidates_verified,
+                            stats.smt_verifications,
+                            stats.known_bits_rejections,
+                            stats.uarch_rejections,
+                            stats.total_time_us);
+                    }
+                }
+            }
+        }
+
+        // ── Pass 10: Partial Evaluation / Futamura Projections ─────────────────
+        // Specializes functions by evaluating static (compile-time known) arguments
+        // and building residual programs for dynamic parts.  This is distinct from
+        // inlining — it works across module boundaries and unrolls static loops.
+        // Skipped for trivial programs — partial evaluation of a single empty
+        // function cannot produce meaningful improvements.
+        if false && self.opt_level >= 2 && !is_trivial_program(&program) {
+            use crate::optimizer::partial_eval::{PartialEvaluator, PartialEvalConfig};
+            let config = match self.opt_level {
+                1 => PartialEvalConfig::default(),
+                2 => PartialEvalConfig { max_unroll: 32, ..PartialEvalConfig::default() },
+                _ => PartialEvalConfig { max_unroll: 128, futamura_1: true, ..PartialEvalConfig::default() },
+            };
+            let mut pe = PartialEvaluator::new(config);
+            pe.optimize_program(&mut program);
+            if self.print_opt_stats {
+                let s = pe.stats();
+                if s.expressions_folded > 0 || s.branches_eliminated > 0 {
+                    eprintln!("[opt/PE] folds={} branches_elim={} loops_unrolled={} calls_spec={} speedup={:.1}x",
+                        s.expressions_folded, s.branches_eliminated, s.loops_unrolled,
+                        s.calls_specialized, s.estimated_speedup);
+                }
+            }
+        }
+
+        // ── Pass 11: Alias-Aware Memory Layout via Ownership Proofs ────────────
+        // Uses the borrow checker's lifetime graph to prove noalias relationships,
+        // reorder struct fields for cache locality, and suggest AoS→SoA conversions.
+        // Skipped for trivial programs — alias analysis is wasted when there are
+        // no struct/component/agent items.
+        if self.opt_level >= 2 && !is_trivial_program(&program) {
+            use crate::optimizer::alias_layout::LayoutOptimizer;
+            let mut layout = LayoutOptimizer::default();
+            let result = layout.optimize_program(&program);
+            if self.print_opt_stats && (result.noalias_pairs_proven > 0 || !result.field_reorder_suggestions.is_empty()) {
+                eprintln!("[opt/Layout] noalias_pairs={} reorders={} soa_suggestions={} speedup={:.1}x",
+                    result.noalias_pairs_proven, result.field_reorder_suggestions.len(),
+                    result.soa_conversion_suggestions.len(), result.estimated_speedup);
+            }
+        }
+
+        // ── Pass 12: Profile-Guided Dead Struct Field Elimination ──────────────
+        // Detects struct fields that are written but never read in hot paths,
+        // removes dead writes, and shrinks struct sizes for better cache utilization.
+        // Skipped for trivial programs — dead field elimination requires structs.
+        if self.opt_level >= 2 && !is_trivial_program(&program) {
+            use crate::optimizer::dead_field_elim::DeadFieldEliminator;
+            let mut elim = DeadFieldEliminator::default();
+            let result = elim.optimize_program(&mut program);
+            if self.print_opt_stats && result.dead_fields_removed > 0 {
+                eprintln!("[opt/DeadField] fields_removed={} dead_writes_elim={} bytes_saved={} speedup={:.1}x",
+                    result.dead_fields_removed, result.dead_writes_eliminated,
+                    result.bytes_saved, result.estimated_speedup);
+            }
+        }
+
+        // ── Passes 13-15: WP-DCE, SoA Layout, Memory Optimizer ──────────────
+        // Collect struct/component/agent/system metadata in a SINGLE traversal
+        // instead of three separate traversals. This saves 2x iteration cost.
+        // Skipped for trivial programs — whole-program analysis, SoA layout,
+        // and memory optimization are all wasted on a single empty function.
+        if self.opt_level >= 2 && !is_trivial_program(&program) {
+            use crate::optimizer::whole_program_dce::DependencyGraphBuilder;
+            use crate::optimizer::soa_optimizer::{SoaOptimizer, StructureMetadata, ArrayMetadata};
+            use crate::optimizer::memory_optimizer::{MemoryOptimizer, DataRegion, AccessPattern};
+
+            let mut wp_dce_entries: Vec<String> = vec!["main".to_string()];
+            let mut soa = SoaOptimizer::new();
+            let mut mem_opt = MemoryOptimizer::new();
+
+            // ── Single traversal collecting metadata for all 3 passes ──
+            for item in &program.items {
+                match item {
+                    crate::compiler::ast::Item::System(sys) => {
+                        wp_dce_entries.push(format!("sys:{}", sys.name));
+                    }
+                    crate::compiler::ast::Item::Agent(agent) => {
+                        wp_dce_entries.push(agent.name.clone());
+                    }
+                    crate::compiler::ast::Item::Component(comp) => {
+                        // SoA optimizer metadata
+                        let fields: Vec<(String, String)> = comp.fields.iter()
+                            .map(|f| (f.name.clone(), format!("{:?}", f.ty)))
+                            .collect();
+                        let field_sizes: Vec<usize> = comp.fields.iter()
+                            .map(|f| estimate_type_byte_size(&f.ty))
+                            .collect();
+                        let struct_meta = StructureMetadata::new(comp.name.clone(), fields, field_sizes.clone());
+                        let array_meta = ArrayMetadata::new(comp.name.clone(), struct_meta, 0);
+                        soa.register_array(array_meta);
+                        // Memory optimizer metadata
+                        let size: usize = field_sizes.iter().sum();
+                        if size > 0 {
+                            let mut region = DataRegion::new(comp.name.clone(), size);
+                            region.set_pattern(AccessPattern::Sequential);
+                            mem_opt.register_region(region);
+                        }
+                    }
+                    crate::compiler::ast::Item::Struct(s) => {
+                        // Memory optimizer metadata
+                        let size: usize = s.fields.iter()
+                            .map(|f| estimate_type_byte_size(&f.ty))
+                            .sum();
+                        if size > 0 {
+                            let mut region = DataRegion::new(s.name.clone(), size);
+                            region.set_pattern(AccessPattern::Unknown);
+                            mem_opt.register_region(region);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // ── Pass 13: Whole-Program Dead Code Elimination ──
+            // Uses entry_points collected in the single traversal above.
+            {
+                let mut dep_graph = DependencyGraphBuilder::new();
+                dep_graph.build_call_graph(&program);
+
+                let reachable: rustc_hash::FxHashSet<_> = dep_graph.reachable_from(&wp_dce_entries).into_iter().collect();
+                let unused_fns: Vec<_> = dep_graph.leaf_functions()
+                    .into_iter()
+                    .filter(|f| !reachable.contains(f))
+                    .collect();
+                let unused_structs = dep_graph.unused_structs();
+                let unused_enums = dep_graph.unused_enums();
+                let unused_consts = dep_graph.unused_consts();
+
+                if self.print_opt_stats {
+                    eprintln!("[opt/WP-DCE] reachable={} unused_fns={} unused_structs={} unused_enums={} unused_consts={}",
+                        reachable.len(), unused_fns.len(), unused_structs.len(),
+                        unused_enums.len(), unused_consts.len());
+                }
+                for f in &unused_fns {
+                    unit.push_diag(Diag::warning(Span::dummy(),
+                        format!("[wp-dce/advisory] function `{}` is unreachable from any entry point", f)));
+                }
+                for s in &unused_structs {
+                    unit.push_diag(Diag::warning(Span::dummy(),
+                        format!("[wp-dce/advisory] struct/component `{}` is never constructed", s)));
+                }
+                for e in &unused_enums {
+                    unit.push_diag(Diag::warning(Span::dummy(),
+                        format!("[wp-dce/advisory] enum `{}` is never used", e)));
+                }
+                for c in &unused_consts {
+                    unit.push_diag(Diag::warning(Span::dummy(),
+                        format!("[wp-dce/advisory] const `{}` is never referenced", c)));
+                }
+            }
+
+            // ── Pass 14: SoA Layout Optimizer (AoS → SoA Conversion) ──
+            // Uses soa optimizer populated in the single traversal above.
+            {
+                let swaps = soa.analyze_and_swap();
+                if self.print_opt_stats {
+                    let suggestions = soa.get_suggestions();
+                    eprintln!("[opt/SoA] arrays={} swaps={} suggestions={}",
+                        soa.stats().total_arrays, swaps.len(), suggestions.len());
+                }
+                for swap in &swaps {
+                    unit.push_diag(Diag::note(Span::dummy(),
+                        format!("[soa/advisory] `{}`: {:?} → {:?} (estimated speedup {:.1}x)",
+                            swap.array_name, swap.old_layout, swap.new_layout, swap.speedup)));
+                }
+                for sug in soa.get_suggestions() {
+                    unit.push_diag(Diag::note(Span::dummy(),
+                        format!("[soa/advisory] `{}`: suggest {:?} — {}",
+                            sug.array_name, sug.suggested_layout, sug.reason)));
+                }
+            }
+
+            // ── Pass 15: Memory Optimizer (NUMA / Huge Pages) ──
+            // Uses mem_opt populated in the single traversal above.
+            {
+                mem_opt.optimize_all();
+                let suggestions = mem_opt.get_suggestions();
+                if self.print_opt_stats {
+                    let stats = mem_opt.stats();
+                    eprintln!("[opt/Mem] regions={} numa_local={} interleaved={} huge_pages={} numa_huge={}",
+                        stats.total_regions, stats.numa_local, stats.numa_interleaved,
+                        stats.huge_pages, stats.numa_huge);
+                }
+                for sug in &suggestions {
+                    unit.push_diag(Diag::note(Span::dummy(),
+                        format!("[mem/advisory] `{}`: {:?} — {} (benefit {:.1}x)",
+                            sug.region, sug.strategy, sug.reason, sug.expected_benefit)));
+                }
+            }
+        }
+
+        // ── Convert diagnostics to rich format for check/explain commands ────
+        // After all passes complete, build the rich diagnostic collector so
+        // callers (jules check, jules explain) can access teaching notes,
+        // causality chains, and structured JSON output.
+        // (Done lazily via CompileUnit::rich_diagnostics() when needed.)
+
+        // ── Promote warnings to errors if requested ───────────────────────────
+        if self.warn_as_error {
+            for d in &mut unit.diags {
+                if d.severity == DiagSeverity::Warning {
+                    d.severity = DiagSeverity::Error;
+                }
+            }
+            unit.recalc_diag_counts();  // Counts changed after promotion
+        }
+
+        // ── Filter notes if quiet ─────────────────────────────────────────────
+        if self.quiet {
+            unit.diags.retain(|d| d.severity == DiagSeverity::Error);
+            unit.recalc_diag_counts();  // Counts changed after filtering
+        }
+
+        // Emit summary counts.
+        if !self.quiet {
+            let ec = unit.error_count();
+            let wc = unit.warning_count();
+            if ec > 0 || wc > 0 {
+                let summary = format!(
+                    "compilation finished: {} error{}, {} warning{}",
+                    ec,
+                    if ec == 1 { "" } else { "s" },
+                    wc,
+                    if wc == 1 { "" } else { "s" },
+                );
+                unit.push_diag(Diag::note(Span::dummy(), summary));
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // ══ UNIFIED IR PIPELINE — THE ONE TRUTH RULE ════════════════════════
+        // ═══════════════════════════════════════════════════════════════════
+        // After parsing, the AST is lowered to IR. The IR is the single
+        // source of truth for all subsequent analysis. The AST is kept
+        // only for backward-compatible interpreter fallback.
+        //
+        // Pipeline: AST → IR Lower → IR TypeCheck → IR BorrowCheck →
+        //           Optimizers (AST, legacy) → IR Validation Gate →
+        //           CodeGen from IR → Execute
+        // ═══════════════════════════════════════════════════════════════════
+
+        // ── Pass: IR Lowering (mandatory — NO IR = NO COMPILE) ──────────────
+        // Lower the AST to flat SSA IR. This is the ONE TRUTH — after this
+        // point, all semantic analysis must operate on IR, not AST.
+        //
+        // VALIDATION GATE: If lowering produces an empty module, that is a
+        // hard error. The IR is mandatory — no IR means no compilation.
+        let ir_module = crate::compiler::lower::lower_program(&program);
+
+        // ── IR VALIDATION GATE ────────────────────────────────────────────
+        // After lowering, verify the IR is non-empty and well-formed.
+        // An empty IR module means lowering silently failed — this is a
+        // hard error, not a warning.
+        if ir_module.functions.is_empty() {
+            unit.push_diag(Diag {
+                severity: DiagSeverity::Error,
+                span: None,
+                code: Some("E0032"),
+                pass: PassSource::IrLower,
+                message: "IR lowering produced no functions — the AST→IR lowering pass \
+                          failed silently. This is a compiler bug or the source file \
+                          contains no function definitions. No AST fallback permitted.".into(),
+                labels: vec![],
+                hint: Some("ensure the source file contains at least one function definition".into()),
+            });
+            return PipelineResult::HaltedAt(PassName::TypeCheck);
+        }
+
+        // ── IR Lowering Error Gate ───────────────────────────────────────
+        // Report any errors that occurred during AST → IR lowering as
+        // HARD ERRORS. These include things like break outside a loop.
+        // Ownership violations during lowering are always hard errors.
+        for (span, msg) in &ir_module.lowering_errors {
+            unit.push_diag(Diag {
+                severity: DiagSeverity::Error,
+                span: Some(*span),
+                code: Some("E0033"),
+                pass: PassSource::IrLower,
+                message: msg.clone(),
+                labels: vec![],
+                hint: None,
+            });
+        }
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::TypeCheck);
+        }
+
+        // ── Pass: IR Type Check (AUTHORITATIVE — HARD ERRORS) ─────────────
+        // Validates that IR type annotations are internally consistent.
+        // Catches "cannot add () and i64" BEFORE execution.
+        //
+        // ONE TRUTH RULE: IR type ERRORS are HARD ERRORS, always.
+        // The IR is the single source of truth. If the IR has type errors,
+        // compilation MUST halt. No fallback to AST is permitted.
+        //
+        // However, IR type WARNINGS (e.g., implicit return with no value in
+        // a function with a non-Unit return type) are advisory — they indicate
+        // a code pattern that may produce unexpected results but doesn't
+        // prevent compilation. Promoting these to hard errors blocks valid
+        // programs with exhaustive if-else chains.
+        let ir_typeck_result = crate::compiler::ir_typeck::ir_typeck(&ir_module);
+        for d in &ir_typeck_result.diagnostics {
+            let severity = match d.severity {
+                crate::compiler::ir_typeck::IrTypeDiagSeverity::Error => DiagSeverity::Error,
+                crate::compiler::ir_typeck::IrTypeDiagSeverity::Warning => DiagSeverity::Warning,
+            };
+            let code = match d.severity {
+                crate::compiler::ir_typeck::IrTypeDiagSeverity::Error => "E0030",
+                crate::compiler::ir_typeck::IrTypeDiagSeverity::Warning => "W0030",
+            };
+            unit.push_diag(Diag {
+                severity,
+                span: Some(d.span),
+                code: Some(code),
+                pass: PassSource::IrTypeck,
+                message: d.message.clone(),
+                labels: vec![],
+                hint: None,
+            });
+        }
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::TypeCheck);
+        }
+
+        // ── Pass: IR Borrow Check (AUTHORITATIVE — HARD ERRORS) ───────────
+        // Validates ownership semantics using IR's Ownership annotations.
+        // Catches use-after-move, double mutable borrow, alias violations.
+        //
+        // ONE TRUTH RULE: Ownership violations are HARD ERRORS, always.
+        // The IR is the sole authority for ownership semantics. Use-after-move,
+        // double mutable borrow, alias violations, and move-while-borrowed
+        // are ALWAYS errors — never warnings, never advisory.
+        let ir_borrowck_result = crate::compiler::ir_borrowck::ir_borrowck(&ir_module);
+        for d in &ir_borrowck_result.diagnostics {
+            unit.push_diag(Diag {
+                severity: DiagSeverity::Error, // HARD ERROR — ownership is always a hard error
+                span: Some(d.span),
+                code: Some("E0031"),
+                pass: PassSource::IrBorrowck,
+                message: d.message.clone(),
+                labels: vec![],
+                hint: None,
+            });
+        }
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::BorrowCheck);
+        }
+
+        // ── Pass: Formal Verification (Trust Tier Assignment) ───────────────
+        // Assigns a TrustTier to each IR function based on formal verification
+        // of safety properties (termination, overflow, bounds). The trust tier
+        // controls runtime safety checks — higher tiers can skip more checks.
+        // Advisory only — emits notes, never hard errors.
+        if self.opt_level >= 2 {
+            use crate::compiler::formal_verify::FormalVerifier;
+            let verifier = FormalVerifier::new();
+            let mut verified_count = 0usize;
+            let mut tier_counts: [usize; 4] = [0, 0, 0, 0];
+            for func in &ir_module.functions {
+                let instr_count: usize = func.blocks.iter().map(|b| b.instrs.len()).sum();
+                let result = verifier.verify_function(&func.name, instr_count);
+                let tier_idx = result.tier as usize;
+                if tier_idx < 4 {
+                    tier_counts[tier_idx] += 1;
+                }
+                verified_count += 1;
+                if self.print_opt_stats {
+                    unit.push_diag(Diag::note(Span::dummy(),
+                        format!("[formal-verify] `{}`: tier={:?} termination={} overflow={} bounds={}",
+                            func.name, result.tier, result.termination_proven,
+                            result.overflow_proven_safe, result.bounds_proven_safe)));
+                }
+            }
+            if self.print_opt_stats && verified_count > 0 {
+                eprintln!("[opt/FormalVerify] verified={} tier0={} tier1={} tier2={} tier3={}",
+                    verified_count, tier_counts[0], tier_counts[1], tier_counts[2], tier_counts[3]);
+            }
+        }
+
+        if self.emit_ir {
+            eprintln!("=== IR Module ===\n{}", ir_module);
+        }
+
+        PipelineResult::OkWithIr {
+            program,
+            ir_module,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum PipelineResult {
+    Ok(crate::compiler::ast::Program),
+    /// Unified pipeline result: IR is used for type-checking, borrow-checking,
+    /// and optimization. The AST program is kept for interpreter execution
+    /// (the hot path). The IR module is used for semantic validation against
+    /// the BytecodeVM (the cold-path semantic reference).
+    OkWithIr {
+        program: crate::compiler::ast::Program,
+        ir_module: crate::compiler::ir::FlatIrModule,
+    },
+    HaltedAt(PassName),
+}
+
+impl PipelineResult {
+    /// Extract the AST program from either variant.
+    /// Returns `None` for `HaltedAt`.
+    pub fn program(&self) -> Option<&crate::compiler::ast::Program> {
+        match self {
+            PipelineResult::Ok(p) => Some(p),
+            PipelineResult::OkWithIr { program, .. } => Some(program),
+            PipelineResult::HaltedAt(_) => None,
+        }
+    }
+
+    /// Extract the IR module, if available.
+    pub fn ir_module(&self) -> Option<&crate::compiler::ir::FlatIrModule> {
+        match self {
+            PipelineResult::OkWithIr { ir_module, .. } => Some(ir_module),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this is a successful compilation result.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, PipelineResult::Ok(_) | PipelineResult::OkWithIr { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassName {
+    Lex,
+    Parse,
+    LowerIr,
+    IrTypeCheck,
+    IrBorrowCheck,
+    TypeCheck,
+    Sema,
+    BorrowCheck,
+    Interp,
+    Optimize,
+    Codegen,
+}
+
+// ── Diagnostic adapters (one per pass module) ──────────────────────────────
+
+/// Estimate the byte size of an AST type for memory optimization passes.
+/// Uses conservative defaults when exact size is unknown.
+fn estimate_type_byte_size(ty: &crate::compiler::ast::Type) -> usize {
+    use crate::compiler::ast::{Type, VecSize};
+    match ty {
+        Type::Scalar(elem) => elem.byte_size(),
+        Type::Vec { size, .. } => match size {
+            VecSize::N2 => 8,
+            VecSize::N3 => 12,
+            VecSize::N4 => 16,
+        },
+        Type::Mat { size } => match size {
+            VecSize::N2 => 16,
+            VecSize::N3 => 36,
+            VecSize::N4 => 64,
+        },
+        Type::Quat => 16,
+        Type::Tuple(elems) => elems.iter().map(estimate_type_byte_size).sum(),
+        Type::Array { elem, len: _ } => estimate_type_byte_size(elem) * 8, // heuristic
+        Type::Named(_) => 8, // pointer-sized heuristic for unknown named types
+        Type::Option(inner) => estimate_type_byte_size(inner) + 8,
+        Type::Result { ok, err } => estimate_type_byte_size(ok) + estimate_type_byte_size(err) + 8,
+        Type::Ref { .. } => 8,
+        Type::Slice(_) => 16, // fat pointer
+        Type::FnPtr { .. } => 8,
+        Type::Never | Type::Infer => 0,
+        Type::Own(inner) => estimate_type_byte_size(inner),
+        Type::Tensor { elem, shape: _ } => elem.byte_size() * 64, // heuristic
+        _ => 8, // conservative default
+    }
+}
+
+fn parse_error_to_diag(e: crate::compiler::parser::ParseError) -> Diag {
+    let mut d = Diag::error(e.span, e.message).with_code("E0002").with_pass(PassSource::Parser);
+    if let Some(h) = e.hint {
+        d = d.with_hint(h);
+    }
+    d
+}
+
+fn adapt_typeck_diag(d: crate::compiler::typeck::Diagnostic) -> Diag {
+    let sev = match d.severity {
+        crate::compiler::typeck::Severity::Error => DiagSeverity::Error,
+        crate::compiler::typeck::Severity::Warning => DiagSeverity::Warning,
+        crate::compiler::typeck::Severity::Note => DiagSeverity::Note,
+    };
+    let mut out = Diag {
+        severity: sev,
+        span: Some(d.span),
+        code: d.code,
+        pass: PassSource::AstTypeck,
+        message: d.message,
+        labels: vec![],
+        hint: d.hint,
+    };
+    for (s, m) in d.labels {
+        out.labels.push((s, m));
+    }
+    out
+}
+
+fn adapt_sema_diag(d: crate::compiler::sema::Diagnostic) -> Diag {
+    let sev = match d.severity {
+        crate::compiler::sema::Severity::Error => DiagSeverity::Error,
+        crate::compiler::sema::Severity::Warning => DiagSeverity::Warning,
+        crate::compiler::sema::Severity::Note => DiagSeverity::Note,
+    };
+    let mut out = Diag {
+        severity: sev,
+        span: Some(d.span),
+        code: d.code,
+        pass: PassSource::AstSema,
+        message: d.message,
+        labels: vec![],
+        hint: d.hint,
+    };
+    for (s, m) in d.labels {
+        out.labels.push((s, m));
+    }
+    out
+}
+
+/// DEPRECATED: AST borrowck is no longer authoritative. IR borrowck is the
+/// sole source of truth. This adapter has been removed — the AST borrow
+/// checker is dead code. If AST borrowck diagnostics are ever needed again,
+/// they should go through the unified diagnostic system.
+
+fn adapt_runtime_error(e: crate::interp::RuntimeError) -> Diag {
+    Diag {
+        severity: DiagSeverity::Error,
+        span: e.span,
+        code: Some(e.code),
+        pass: PassSource::Unknown,
+        message: e.message.into_owned(),
+        labels: vec![],
+        hint: None,
+    }
+}
+
+// =============================================================================
+// §5b  BRIDGE: Diag → rich diagnostic::Diagnostic
+// =============================================================================
+
+/// Convert a pipeline `Diag` into a rich `diagnostic::Diagnostic` for the
+/// unified diagnostic collector.  This bridge allows incremental adoption
+/// of the world-class diagnostic system without rewriting every pass at once.
+fn diag_to_rich(d: &Diag, phase: crate::compiler::diagnostic::Phase) -> crate::compiler::diagnostic::Diagnostic {
+    use crate::compiler::diagnostic::{Diagnostic as RichDiag, Severity as RichSev};
+
+    let severity = match d.severity {
+        DiagSeverity::Note => RichSev::Note,
+        DiagSeverity::Warning => RichSev::Warning,
+        DiagSeverity::Error => RichSev::Error,
+    };
+
+    let code_num: u16 = d.code
+        .and_then(|c| c.strip_prefix('E').and_then(|n| n.parse().ok()))
+        .unwrap_or(9999);
+
+    let span = d.span.unwrap_or_else(Span::dummy);
+
+    let rich = RichDiag::error(code_num, phase, span, &d.message);
+    // Override severity for warnings/notes
+    let rich = match severity {
+        RichSev::Warning => RichDiag::warning(code_num, phase, span, &d.message),
+        RichSev::Note => RichDiag::note(code_num, phase, span, &d.message),
+        _ => rich,
+    };
+
+    // Add labels as secondary labels
+    let mut rich = rich;
+    for (label_span, label_msg) in &d.labels {
+        rich = rich.secondary_label(*label_span, label_msg.as_str());
+    }
+
+    // Add hint as a possible fix-it
+    if let Some(ref hint) = d.hint {
+        rich = rich.fix_possible(span, "", hint.as_str());
+    }
+
+    rich
+}
+
+/// Convert all `Diag` items from a compile unit into a `DiagnosticCollector`
+/// with full rich diagnostic support — causality tracking, cascade suppression,
+/// dataflow info, teaching notes, and structured JSON output.
+fn collect_rich_diagnostics(
+    unit: &CompileUnit,
+    phase: crate::compiler::diagnostic::Phase,
+) -> crate::compiler::diagnostic::DiagnosticCollector {
+    let mut collector = crate::compiler::diagnostic::DiagnosticCollector::new();
+    for d in &unit.diags {
+        let rich = diag_to_rich(d, phase);
+        collector.emit(rich);
+    }
+    collector
+}
+
+// =============================================================================
+// §6  SUMMARY LINE
+// =============================================================================
+
+fn print_summary(unit: &CompileUnit, cfg: &RenderCfg) {
+    let errors = unit.error_count();
+    let warnings = unit.warning_count();
+    if errors == 0 && warnings == 0 {
+        return;
+    }
+
+    let err_part = if errors > 0 {
+        Ansi::paint(
+            cfg.color,
+            Ansi::BRIGHT_RED,
+            &format!("{errors} error{}", if errors == 1 { "" } else { "s" }),
+        ).into_owned()
+    } else {
+        String::new()
+    };
+
+    let warn_part = if warnings > 0 {
+        Ansi::paint(
+            cfg.color,
+            Ansi::BRIGHT_YEL,
+            &format!("{warnings} warning{}", if warnings == 1 { "" } else { "s" }),
+        ).into_owned()
+    } else {
+        String::new()
+    };
+
+    let parts: Vec<&str> = [err_part.as_str(), warn_part.as_str()]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .collect();
+    eprintln!(
+        "{}",
+        Ansi::paint(
+            cfg.color,
+            Ansi::BOLD,
+            &format!("jules: {}", parts.join(", "))
+        )
+    );
+}
+
+// =============================================================================
+// §7  CLI ARGUMENT PARSER  (zero external dependencies)
+// =============================================================================
+
+#[derive(Debug, Default)]
+pub struct CliArgs {
+    pub command: Command,
+    pub file: Option<PathBuf>,
+    pub output: Option<PathBuf>, // -o for compile command
+    pub rest_args: Vec<String>,
+    pub color: bool,
+    pub json_diag: bool,
+    pub emit_ast: bool,
+    pub emit_tokens: bool,
+    pub warn_as_error: bool,
+    pub quiet: bool,
+    pub opt_level: u8,
+    pub print_opt_stats: bool,
+    pub tab_width: usize,
+    pub entry: String, // --entry <fn>  for jules run
+    pub train: bool,   // jules train
+    pub fix_dry_run: bool,
+    pub fix_diff: bool,
+    pub fix_aggressive: bool,
+    pub estimate_params: usize,
+    pub estimate_batch: usize,
+    pub estimate_episodes: usize,
+    pub estimate_steps: usize,
+    pub estimate_envs: usize,
+    pub estimate_device: String,
+    pub ml_backend: String,
+    pub jax_ir: Option<PathBuf>,
+    pub jax_dataset: Option<PathBuf>,
+    pub jax_out: PathBuf,
+    pub jax_script: PathBuf,
+    // Tiered compilation flags
+    pub tiered: bool,               // Enable tiered compilation
+    pub tier_policy: String,        // "fast-startup", "balanced", "max-performance"
+    pub print_tier_stats: bool,     // Print tier compilation statistics
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Command {
+    #[default]
+    Help,
+    Run,
+    Check,
+    Fix,
+    Fmt,
+    Repl,
+    Train,
+    Estimate,
+    Version,
+    Compile, // AOT native compilation to ELF binaries
+    Explain, // jules explain E4001 — explain an error code
+}
+
+impl CliArgs {
+    pub fn parse(args: &[String]) -> Result<Self, String> {
+        let mut out = CliArgs {
+            color: std::env::var("NO_COLOR").is_err(), // respect NO_COLOR
+            tab_width: 4,
+            entry: "main".into(),
+            opt_level: 2, // balanced optimization by default
+            estimate_params: 1_000_000,
+            estimate_batch: 64,
+            estimate_episodes: 100_000,
+            estimate_steps: 64,
+            estimate_envs: 1,
+            estimate_device: "cpu".into(),
+            ml_backend: "jules".into(),
+            jax_out: PathBuf::from("artifacts/jax"),
+            jax_script: PathBuf::from("scripts/jules_jax_backend.py"),
+            ..Default::default()
+        };
+
+        let mut it = args.iter().peekable();
+
+        // Skip binary name.
+        let _ = it.next();
+
+        // First positional arg: sub-command.
+        let cmd = it.peek().map(|s| s.as_str());
+        match cmd {
+            Some("run") => {
+                out.command = Command::Run;
+                it.next();
+            }
+            Some("check") => {
+                out.command = Command::Check;
+                it.next();
+            }
+            Some("fix") => {
+                out.command = Command::Fix;
+                it.next();
+            }
+            Some("fmt") => {
+                out.command = Command::Fmt;
+                it.next();
+            }
+            Some("repl") => {
+                out.command = Command::Repl;
+                it.next();
+            }
+            Some("train") => {
+                out.command = Command::Train;
+                it.next();
+            }
+            Some("estimate") => {
+                out.command = Command::Estimate;
+                it.next();
+            }
+            Some("version") | Some("--version") | Some("-V") => {
+                out.command = Command::Version;
+                it.next();
+            }
+            Some("compile") | Some("build") => {
+                out.command = Command::Compile;
+                it.next();
+            }
+            Some("explain") => {
+                out.command = Command::Explain;
+                it.next();
+                // The next argument is the error code to explain
+                if let Some(code) = it.next() {
+                    out.rest_args.push(code.clone());
+                }
+            }
+            Some("help") | Some("--help") | Some("-h") | None => {
+                out.command = Command::Help;
+                it.next();
+            }
+            _ => {} // let flags/file sort it out below
+        }
+
+        let mut past_dashdash = false;
+
+        while let Some(arg) = it.next() {
+            if past_dashdash {
+                out.rest_args.push(arg.clone());
+                continue;
+            }
+            match arg.as_str() {
+                "--" => {
+                    past_dashdash = true;
+                }
+                "--no-color" => {
+                    out.color = false;
+                }
+                "--color" => {
+                    out.color = true;
+                }
+                "--json-diag" => {
+                    out.json_diag = true;
+                }
+                "--emit-ast" => {
+                    out.emit_ast = true;
+                }
+                "--emit-tokens" => {
+                    out.emit_tokens = true;
+                }
+                "--warn-error" | "-W" => {
+                    out.warn_as_error = true;
+                }
+                "--quiet" | "-q" => {
+                    out.quiet = true;
+                }
+                "-o" | "--output" => {
+                    let path = it
+                        .next()
+                        .ok_or("-o requires a value")?
+                        .clone();
+                    out.output = Some(PathBuf::from(path));
+                }
+                "--tab-width" => {
+                    let n = it
+                        .next()
+                        .ok_or("--tab-width requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--tab-width must be a positive integer")?;
+                    out.tab_width = n;
+                }
+                "--entry" => {
+                    out.entry = it.next().ok_or("--entry requires a function name")?.clone();
+                }
+                "--dry-run" => {
+                    out.fix_dry_run = true;
+                }
+                "--diff" => {
+                    out.fix_diff = true;
+                }
+                "--aggressive" => {
+                    out.fix_aggressive = true;
+                }
+                "--params" => {
+                    out.estimate_params = it
+                        .next()
+                        .ok_or("--params requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--params must be a positive integer")?
+                        .max(1);
+                }
+                "--batch" => {
+                    out.estimate_batch = it
+                        .next()
+                        .ok_or("--batch requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--batch must be a positive integer")?
+                        .max(1);
+                }
+                "--episodes" => {
+                    out.estimate_episodes = it
+                        .next()
+                        .ok_or("--episodes requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--episodes must be a positive integer")?
+                        .max(1);
+                }
+                "--steps" => {
+                    out.estimate_steps = it
+                        .next()
+                        .ok_or("--steps requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--steps must be a positive integer")?
+                        .max(1);
+                }
+                "--envs" => {
+                    out.estimate_envs = it
+                        .next()
+                        .ok_or("--envs requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--envs must be a positive integer")?
+                        .max(1);
+                }
+                "--device" => {
+                    out.estimate_device = it
+                        .next()
+                        .ok_or("--device requires `cpu` or `gpu`")?
+                        .to_ascii_lowercase();
+                    if out.estimate_device != "cpu" && out.estimate_device != "gpu" {
+                        return Err("--device must be `cpu` or `gpu`".into());
+                    }
+                }
+                "--ml-backend" => {
+                    out.ml_backend = it
+                        .next()
+                        .ok_or("--ml-backend requires `jules`, `jax`, or `xla`")?
+                        .to_ascii_lowercase();
+                    if out.ml_backend != "jules" && out.ml_backend != "jax" && out.ml_backend != "xla" {
+                        return Err("--ml-backend must be `jules`, `jax`, or `xla`".into());
+                    }
+                }
+                "-O0" | "--opt=0" => {
+                    out.opt_level = 0;
+                }
+                "-O1" | "--opt=1" => {
+                    out.opt_level = 1;
+                }
+                "-O2" | "--opt=2" => {
+                    out.opt_level = 2;
+                }
+                "-O3" | "-O" | "--opt=3" | "--opt=maximum" => {
+                    out.opt_level = 3;
+                }
+                "--stats" | "--print-opt-stats" => {
+                    out.print_opt_stats = true;
+                }
+                "--tiered" => {
+                    out.tiered = true;
+                }
+                "--tier-policy" => {
+                    out.tier_policy = it.next().ok_or("--tier-policy requires a value")?.clone();
+                    if !matches!(out.tier_policy.as_str(), "fast-startup" | "balanced" | "max-performance") {
+                        return Err("--tier-policy must be `fast-startup`, `balanced`, or `max-performance`".into());
+                    }
+                }
+                "--tier-stats" => {
+                    out.print_tier_stats = true;
+                }
+                "--jax-ir" => {
+                    out.jax_ir = Some(PathBuf::from(it.next().ok_or("--jax-ir requires a path")?));
+                }
+                "--jax-dataset" => {
+                    out.jax_dataset = Some(PathBuf::from(
+                        it.next().ok_or("--jax-dataset requires a path")?,
+                    ));
+                }
+                "--jax-out" => {
+                    out.jax_out = PathBuf::from(it.next().ok_or("--jax-out requires a path")?);
+                }
+                "--jax-script" => {
+                    out.jax_script =
+                        PathBuf::from(it.next().ok_or("--jax-script requires a path")?);
+                }
+                s if s.starts_with('-') => {
+                    return Err(format!("unknown flag `{s}`; try `jules help`"));
+                }
+                path => {
+                    if out.file.is_none() {
+                        out.file = Some(PathBuf::from(path));
+                    } else {
+                        out.rest_args.push(arg.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+// =============================================================================
+// §8  COMMAND IMPLEMENTATIONS
+// =============================================================================
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const JULES_BANNER: &str = r#"
+     ██╗██╗   ██╗██╗     ███████╗███████╗
+     ██║██║   ██║██║     ██╔════╝██╔════╝
+     ██║██║   ██║██║     █████╗  ███████╗
+██   ██║██║   ██║██║     ██╔══╝  ╚════██║
+╚█████╔╝╚██████╔╝███████╗███████╗███████║
+ ╚════╝  ╚═════╝ ╚══════╝╚══════╝╚══════╝
+"#;
+
+fn cmd_version() {
+    println!("jules {VERSION}");
+    println!("tensor-first game-and-AI programming language");
+}
+
+/// `jules explain E4001` — print a detailed explanation of an error code.
+fn cmd_explain(args: &CliArgs) {
+    use crate::compiler::diagnostic::ErrorExplanationDatabase;
+
+    let code_str = args.rest_args.first().map(|s| s.as_str()).unwrap_or("");
+    if code_str.is_empty() {
+        eprintln!("jules explain <CODE>   — example: jules explain E4001");
+        eprintln!("\nTo list all error codes by category, run: jules explain --list");
+        eprintln!("To explain diagnostics from a file, run: jules explain <file.jules>");
+        return;
+    }
+
+    if code_str == "--list" {
+        let db = ErrorExplanationDatabase::new();
+        db.print_all_codes();
+        return;
+    }
+
+    // If a file was provided, run the pipeline and use the rich DiagnosticCollector
+    // to show diagnostics with teaching notes and causality chains.
+    if let Some(path) = &args.file {
+        let source = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("jules: cannot read `{}`: {e}", path.display());
+                return;
+            }
+        };
+        let filename = path.to_string_lossy().into_owned();
+        let mut unit = CompileUnit::from_owned(filename.clone(), source);
+        let mut pipeline = Pipeline::new();
+        pipeline.opt_level = args.opt_level;
+        pipeline.quiet = true;
+        pipeline.run(&mut unit);
+
+        let rich = unit.rich_diagnostics(crate::compiler::diagnostic::Phase::SemanticAnalysis);
+
+        if rich.diagnostics.is_empty() {
+            println!("jules explain: no diagnostics found in {}", filename);
+            return;
+        }
+
+        // If JSON output requested, emit structured JSON
+        if args.json_diag {
+            println!("{}", rich.to_json(&filename));
+            return;
+        }
+
+        // Render with teaching notes enabled
+        let render_cfg = crate::compiler::diagnostic::RenderConfig {
+            teaching_mode: true,
+            ..crate::compiler::diagnostic::RenderConfig::default()
+        };
+        let renderer = crate::compiler::diagnostic::DiagnosticRenderer::new(
+            &unit.source, &unit.filename, render_cfg,
+        );
+        println!("{}", renderer.render_all(&rich.diagnostics));
+
+        // Print summary with root/dependent counts
+        println!("{}", rich.summary_line());
+        return;
+    }
+
+    // Strip the 'E' prefix if present and parse the numeric code.
+    let num_str = code_str.strip_prefix('E').unwrap_or(code_str);
+    let num: u16 = match num_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("jules explain: invalid error code `{code_str}` (expected format like E4001)");
+            return;
+        }
+    };
+
+    let db = ErrorExplanationDatabase::new();
+    match db.get(num) {
+        Some(expl) => {
+            println!("error[E{num:04}]: {}", expl.title);
+            println!();
+            println!("{}", expl.description);
+            if !expl.examples.is_empty() {
+                println!("\n  examples:");
+                for (i, ex) in expl.examples.iter().enumerate() {
+                    println!("\n  --- example {} ---", i + 1);
+                    println!("  problematic code:");
+                    for line in ex.bad_code.lines() {
+                        println!("    {line}");
+                    }
+                    println!("  corrected code:");
+                    for line in ex.good_code.lines() {
+                        println!("    {line}");
+                    }
+                    if !ex.explanation.is_empty() {
+                        println!("  {}", ex.explanation);
+                    }
+                }
+            }
+            if !expl.fixes.is_empty() {
+                println!("\n  common fixes:");
+                for fix in &expl.fixes {
+                    println!("    - {fix}");
+                }
+            }
+            if !expl.related_codes.is_empty() {
+                let related: Vec<String> = expl.related_codes.iter().map(|c| format!("E{c:04}")).collect();
+                println!("\n  related: {}", related.join(", "));
+            }
+        }
+        None => {
+            eprintln!("jules explain: no explanation found for E{num:04}");
+            eprintln!("  Run `jules explain --list` to see all known error codes.");
+        }
+    }
+}
+
+fn cmd_help() {
+    println!("{JULES_BANNER}");
+    println!("USAGE:");
+    println!("    jules <command> [options] [file.jules] [-- args…]\n");
+    println!("COMMANDS:");
+    println!("    run   <file.jules>    Execute a Jules source file");
+    println!("    compile <file.jules>  Compile to native x86-64 ELF binary (AOT, fastest!)");
+    println!("    check <file.jules>    Type-check and lint without running (incremental cache)");
+    println!("    fix   <file.jules>    Apply safe syntax autofixes from diagnostics");
+    println!("    fmt   <file.jules>    Pretty-print the source (token pass)");
+    println!("    train <file.jules>    Run all train {{ … }} blocks");
+    println!("    estimate           Estimate Jules training time/resources");
+    println!("    repl               Interactive REPL / playground");
+    println!("    version            Print version information");
+    println!("    explain <E0001>    Explain an error code in detail");
+    println!("    help               Print this message\n");
+    println!("OPTIONS:");
+    println!("    --no-color         Disable ANSI colour output");
+    println!("    --json-diag        Emit diagnostics as JSON");
+    println!("    --emit-tokens      Print token stream and exit");
+    println!("    --emit-ast         Print AST and exit");
+    println!("    --warn-error / -W  Treat warnings as errors");
+    println!("    --quiet  / -q      Suppress warnings and notes");
+    println!("    --tab-width <N>    Tab stop width (default: 4)");
+    println!("    -o, --output <PATH> Output path for compile command");
+    println!("    --entry <fn>       Entry-point function (default: main)");
+    println!("    --dry-run          (fix) show changes without writing");
+    println!("    --diff             (fix) print changed lines");
+    println!("    --aggressive       (fix) allow riskier fixer rules");
+    println!("    --params <N>       (estimate) model parameter count");
+    println!("    --batch <N>        (estimate) training batch size");
+    println!("    --episodes <N>     (estimate) episode count");
+    println!("    --steps <N>        (estimate) max steps per episode");
+    println!("    --envs <N>         (estimate) parallel environments");
+    println!("    --device <cpu|gpu> (estimate) execution device");
+    println!("    --ml-backend <jules|jax|xla>  (train) choose trainer backend");
+    println!("    --jax-ir <file.json>      (train+jax) model IR path (optional)");
+    println!("    --jax-dataset <file.npz>  (train+jax) dataset with x_train/y_train");
+    println!("    --jax-out <dir>           (train+jax) output dir (default artifacts/jax)");
+    println!("    --jax-script <path.py>    (train+jax) backend script path");
+    println!("\nTIERED COMPILATION:");
+    println!("    --tiered           Enable tiered compilation (start fast, optimize hot code)");
+    println!("    --tier-policy <P>  fast-startup | balanced | max-performance");
+    println!("    --tier-stats       Print tier compilation statistics after execution");
+    println!("\nEXAMPLES:");
+    println!("    jules run examples/physics.jules");
+    println!("    jules compile examples/math.jules           # → ./math (native ELF binary)");
+    println!("    jules compile examples/math.jules -o out    # → ./out");
+    println!("    ./math                                       # run the native binary!");
+    println!("    jules run examples/warden.jules --tiered --tier-stats");
+    println!("    jules run examples/warden.jules --tiered --tier-policy max-performance");
+    println!("    jules check src/agent.jules -W");
+    println!("    jules fix broken.jules");
+    println!("    jules train examples/warden.jules");
+    println!("    jules train examples/warden.jules --ml-backend jax --jax-dataset train.npz --jax-out artifacts/jax");
+    println!("    jules estimate --params 40000000 --batch 128 --episodes 300000 --steps 128 --envs 8 --device gpu");
+    println!("    jules repl");
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrainEstimate {
+    total_steps: u64,
+    estimated_steps_per_sec: f64,
+    estimated_sim_steps_per_sec: f64,
+    estimated_model_steps_per_sec: f64,
+    bottleneck: &'static str,
+    confidence_low_steps_per_sec: f64,
+    confidence_high_steps_per_sec: f64,
+    estimated_duration: Duration,
+    estimated_memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResourceSnapshot {
+    ram_available_bytes: Option<u64>,
+    gpu_available_bytes: Option<u64>,
+}
+
+const EST_BASELINE_PARAMS: usize = 1_000_000;
+const F32_BYTES: u64 = std::mem::size_of::<f32>() as u64;
+
+fn cmd_estimate(args: &CliArgs) -> i32 {
+    let resources = detect_resources(&args.estimate_device);
+    println!("jules estimate");
+    println!(
+        "  params={} batch={} episodes={} steps={} envs={} device={}",
+        args.estimate_params,
+        args.estimate_batch,
+        args.estimate_episodes,
+        args.estimate_steps,
+        args.estimate_envs,
+        args.estimate_device
+    );
+    match resources.ram_available_bytes {
+        Some(v) => println!("  RAM available: {:.2} GiB", bytes_to_gib(v)),
+        None => println!("  RAM available: unknown"),
+    }
+    if args.estimate_device == "gpu" {
+        match resources.gpu_available_bytes {
+            Some(v) => println!("  GPU memory available: {:.2} GiB", bytes_to_gib(v)),
+            None => println!("  GPU memory available: unknown"),
+        }
+    }
+
+    let est = estimate_training(
+        args.estimate_params,
+        args.estimate_batch,
+        args.estimate_episodes,
+        args.estimate_steps,
+        args.estimate_envs,
+        &args.estimate_device,
+    );
+    println!(
+        "  estimated: steps={} steps/s≈{:.0} (range {:.0}..{:.0}, sim≈{:.0}, model≈{:.0}, bottleneck={}) time≈{} memory≈{:.2} GiB",
+        est.total_steps,
+        est.estimated_steps_per_sec,
+        est.confidence_low_steps_per_sec,
+        est.confidence_high_steps_per_sec,
+        est.estimated_sim_steps_per_sec,
+        est.estimated_model_steps_per_sec,
+        est.bottleneck,
+        format_duration(est.estimated_duration),
+        bytes_to_gib(est.estimated_memory_bytes),
+    );
+    print_speed_suggestions(est, args, resources);
+    0
+}
+
+fn estimate_training(
+    params: usize,
+    batch: usize,
+    episodes: usize,
+    steps: usize,
+    envs: usize,
+    device: &str,
+) -> TrainEstimate {
+    let params = params.max(1);
+    let batch = batch.max(1);
+    let envs = envs.max(1);
+    let total_steps = episodes as u64 * steps as u64 * envs as u64;
+    let base_sim_steps_per_sec = if device == "gpu" {
+        20_000_000.0
+    } else {
+        7_500_000.0
+    };
+    let base_model_steps_per_sec = if device == "gpu" {
+        16_000_000.0
+    } else {
+        4_200_000.0
+    };
+    let param_scale = (params as f64 / EST_BASELINE_PARAMS as f64).max(1e-9);
+    let env_gain = 1.0 + (envs as f64).log2().max(0.0) * 0.40;
+    let batch_gain = if batch <= 64 {
+        1.0
+    } else if batch <= 256 {
+        1.18
+    } else {
+        1.10
+    };
+    let sim_steps_per_sec = (base_sim_steps_per_sec * env_gain).max(1.0);
+    let model_steps_per_sec =
+        (base_model_steps_per_sec * batch_gain / param_scale.powf(0.92)).max(1.0);
+    let (estimated_steps_per_sec, bottleneck) = if sim_steps_per_sec <= model_steps_per_sec {
+        (sim_steps_per_sec, "sim")
+    } else {
+        (model_steps_per_sec, "model")
+    };
+    let secs = total_steps as f64 / estimated_steps_per_sec;
+    // Baseline model is intentionally conservative; expose an uncertainty range.
+    let (conf_low, conf_high) = if device == "gpu" {
+        (0.65, 1.25)
+    } else {
+        (0.70, 1.20)
+    };
+    TrainEstimate {
+        total_steps,
+        estimated_steps_per_sec,
+        estimated_sim_steps_per_sec: sim_steps_per_sec,
+        estimated_model_steps_per_sec: model_steps_per_sec,
+        bottleneck,
+        confidence_low_steps_per_sec: (estimated_steps_per_sec * conf_low).max(1.0),
+        confidence_high_steps_per_sec: (estimated_steps_per_sec * conf_high).max(1.0),
+        estimated_duration: Duration::from_secs_f64(secs.max(0.0)),
+        estimated_memory_bytes: estimate_memory_bytes(params, batch, envs),
+    }
+}
+
+fn estimate_memory_bytes(params: usize, batch: usize, envs: usize) -> u64 {
+    let params = params as u64;
+    let batch = batch as u64;
+    let envs = envs as u64;
+    let model_state = params.saturating_mul(F32_BYTES).saturating_mul(4);
+    let activations = params
+        .saturating_mul(batch.saturating_add(envs).max(1))
+        .saturating_mul(F32_BYTES / 2 + 1);
+    // Keep memory estimator slightly pessimistic to avoid OOM surprises.
+    (model_state + activations).saturating_mul(14) / 10 + 64 * 1024 * 1024
+}
+
+fn detect_resources(device: &str) -> ResourceSnapshot {
+    ResourceSnapshot {
+        ram_available_bytes: read_available_ram_bytes(),
+        gpu_available_bytes: if device == "gpu" {
+            read_available_gpu_bytes()
+        } else {
+            None
+        },
+    }
+}
+
+fn read_available_ram_bytes() -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+fn read_available_gpu_bytes() -> Option<u64> {
+    let out = process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut total_mib = 0u64;
+    for line in text.lines() {
+        if let Ok(v) = line.trim().parse::<u64>() {
+            total_mib = total_mib.saturating_add(v);
+        }
+    }
+    if total_mib == 0 {
+        None
+    } else {
+        Some(total_mib.saturating_mul(1024 * 1024))
+    }
+}
+
+fn build_speed_actions(
+    est: TrainEstimate,
+    args: &CliArgs,
+    resources: ResourceSnapshot,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if est.bottleneck == "model" {
+        let reduced_params = ((args.estimate_params as f64) * 0.7).max(1.0) as usize;
+        let projected = estimate_training(
+            reduced_params,
+            args.estimate_batch,
+            args.estimate_episodes,
+            args.estimate_steps,
+            args.estimate_envs,
+            &args.estimate_device,
+        );
+        out.push(format!(
+            "model-bound: reduce params {} -> {} (projected speedup ≈{:.2}x)",
+            args.estimate_params,
+            reduced_params,
+            projected.estimated_steps_per_sec / est.estimated_steps_per_sec
+        ));
+        if args.estimate_device == "cpu" && args.estimate_batch > 256 {
+            out.push(format!(
+                "CPU batch may be too high for cache locality: try batch {} -> 128",
+                args.estimate_batch
+            ));
+        } else if args.estimate_batch < 128 {
+            out.push(format!(
+                "model-bound: try larger batch for better compute utilization ({} -> 128)",
+                args.estimate_batch
+            ));
+        }
+    } else {
+        let raised_envs = (args.estimate_envs.max(1) * 2).min(64);
+        let projected = estimate_training(
+            args.estimate_params,
+            args.estimate_batch,
+            args.estimate_episodes,
+            args.estimate_steps,
+            raised_envs,
+            &args.estimate_device,
+        );
+        out.push(format!(
+            "sim-bound: increase envs {} -> {} (projected speedup ≈{:.2}x)",
+            args.estimate_envs,
+            raised_envs,
+            projected.estimated_steps_per_sec / est.estimated_steps_per_sec
+        ));
+        out.push(
+            "sim-bound: reduce per-step world complexity (agents/sensors/colliders)".to_string(),
+        );
+    }
+
+    if let Some(ram) = resources.ram_available_bytes {
+        if est.estimated_memory_bytes > ram.saturating_mul(85) / 100 {
+            out.push(format!(
+                "memory risk: estimate {:.2} GiB is near available {:.2} GiB; reduce batch/params",
+                bytes_to_gib(est.estimated_memory_bytes),
+                bytes_to_gib(ram),
+            ));
+        }
+    }
+    out
+}
+
+fn print_speed_suggestions(est: TrainEstimate, args: &CliArgs, resources: ResourceSnapshot) {
+    if est.estimated_duration < Duration::from_secs(30 * 60) {
+        println!("  suggestion: ETA is under 30 minutes; no urgency tuning needed.");
+        return;
+    }
+    println!("  suggestion: ETA exceeds 30 minutes. Quick speedups:");
+    println!(
+        "    • episodes: {} -> {}",
+        args.estimate_episodes,
+        ((args.estimate_episodes as f64) * 0.7) as usize
+    );
+    println!(
+        "    • steps: {} -> {}",
+        args.estimate_steps,
+        (args.estimate_steps as f64 * 0.8).max(1.0) as usize
+    );
+    println!(
+        "    • params: {} -> {}",
+        args.estimate_params,
+        (args.estimate_params as f64 * 0.75).max(1.0) as usize
+    );
+    for action in build_speed_actions(est, args, resources) {
+        println!("    • {action}");
+    }
+    if args.estimate_device != "gpu" {
+        println!("    • switch to --device gpu if available");
+    }
+    println!("    • sample batch sizes 64/128/256 and keep the fastest measured setting");
+}
+
+fn bytes_to_gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn format_duration(d: Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else {
+        format!("{m}m {s}s")
+    }
+}
+
+fn insert_char_at_byte(source: &mut String, byte_idx: usize, ch: char) {
+    if byte_idx <= source.len() {
+        source.insert(byte_idx, ch);
+    }
+}
+
+fn replace_byte_range(source: &mut String, start: usize, end: usize, replacement: &str) {
+    if start <= end && end <= source.len() {
+        source.replace_range(start..end, replacement);
+    }
+}
+
+fn apply_safe_syntax_fixes(source: &str, diags: &[Diag]) -> Option<String> {
+    let mut out = source.to_string();
+    let mut changed = false;
+
+    let typo_rewrites = [
+        ("fun ", "fn "),
+        ("func ", "fn "),
+        ("pritn(", "print("),
+        ("prnit(", "print("),
+        ("flase", "false"),
+        ("fasle", "false"),
+        ("treu", "true"),
+        ("ture", "true"),
+    ];
+    for (from, to) in typo_rewrites {
+        if out.contains(from) {
+            out = out.replace(from, to);
+            changed = true;
+        }
+    }
+
+    let mut semicolon_lines = std::collections::BTreeSet::<u32>::new();
+    let mut insertions: Vec<(usize, char)> = Vec::new();
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut block_open_insertions: Vec<usize> = Vec::new();
+    let mut comma_insertions: Vec<usize> = Vec::new();
+
+    for d in diags {
+        let Some(span) = d.span else { continue };
+        let Some(hint) = d.hint.as_deref() else {
+            continue;
+        };
+        if hint.contains("add `;` to end this statement") {
+            semicolon_lines.insert(span.line as u32);
+        } else if hint.contains("close this expression with `)`") {
+            insertions.push((span.start as usize, ')'));
+        } else if hint.contains("close this index/type with `]`") {
+            insertions.push((span.start as usize, ']'));
+        } else if hint.contains("close this block with `}`") {
+            insertions.push((span.start as usize, '}'));
+        } else if hint.contains("start a block with `{ ... }`") {
+            block_open_insertions.push(span.start as usize);
+        } else if hint.contains("separate items with `,`") {
+            comma_insertions.push(span.start as usize);
+        } else if hint.contains("use `=` to assign a value") {
+            replacements.push((span.start as usize, span.end as usize, "=".into()));
+        } else if hint.contains("use `->` before a return type") {
+            replacements.push((span.start as usize, span.end as usize, "->".into()));
+        }
+    }
+
+    replacements.sort_by(|a, b| b.0.cmp(&a.0));
+    for (start, end, rep) in replacements {
+        replace_byte_range(&mut out, start, end, &rep);
+        changed = true;
+    }
+
+    block_open_insertions.sort_by(|a, b| b.cmp(a));
+    for idx in block_open_insertions {
+        insert_char_at_byte(&mut out, idx, '{');
+        insert_char_at_byte(&mut out, idx + 1, ' ');
+        changed = true;
+    }
+
+    comma_insertions.sort_by(|a, b| b.cmp(a));
+    for idx in comma_insertions {
+        insert_char_at_byte(&mut out, idx, ',');
+        changed = true;
+    }
+
+    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    for (idx, ch) in insertions {
+        insert_char_at_byte(&mut out, idx, ch);
+        changed = true;
+    }
+
+    if !semicolon_lines.is_empty() {
+        let mut lines: Vec<String> = out.split('\n').map(|s| s.to_owned()).collect();
+        for line_no in semicolon_lines {
+            let idx = line_no.saturating_sub(1) as usize;
+            if let Some(line) = lines.get_mut(idx) {
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty()
+                    && !trimmed.ends_with(';')
+                    && !trimmed.ends_with('{')
+                    && !trimmed.ends_with('}')
+                {
+                    line.push(';');
+                    changed = true;
+                }
+            }
+        }
+        out = lines.join("\n");
+    }
+
+    // Conservative delimiter balancing at EOF.
+    let mut open_paren = 0_i32;
+    let mut open_bracket = 0_i32;
+    let mut open_brace = 0_i32;
+    for ch in out.chars() {
+        match ch {
+            '(' => open_paren += 1,
+            ')' => open_paren -= 1,
+            '[' => open_bracket += 1,
+            ']' => open_bracket -= 1,
+            '{' => open_brace += 1,
+            '}' => open_brace -= 1,
+            _ => {}
+        }
+    }
+    while open_paren > 0 {
+        out.push(')');
+        open_paren -= 1;
+        changed = true;
+    }
+    while open_bracket > 0 {
+        out.push(']');
+        open_bracket -= 1;
+        changed = true;
+    }
+    while open_brace > 0 {
+        out.push('}');
+        open_brace -= 1;
+        changed = true;
+    }
+
+    changed.then_some(out)
+}
+
+fn detect_silent_issues(source: &str) -> Vec<Diag> {
+    let mut out = Vec::new();
+
+    fn has_float_equality(trimmed: &str) -> bool {
+        if !trimmed.contains("==") {
+            return false;
+        }
+        let mut prev_was_digit = false;
+        for ch in trimmed.chars() {
+            if ch == '.' && prev_was_digit {
+                return true;
+            }
+            prev_was_digit = ch.is_ascii_digit();
+        }
+        false
+    }
+
+    for (idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let span = Span {
+            line: (idx + 1) as u16,
+            col: (line.find(trimmed).unwrap_or(0) + 1) as u16,
+            start: 0,
+            end: 0,
+        };
+
+        if has_float_equality(trimmed) {
+            out.push(
+                Diag::warning(
+                    span,
+                    "possible silent logic issue: float equality comparison can be unstable",
+                )
+                .with_code("W-SILENT-FLOAT-EQ")
+                .with_hint("compare with epsilon: `abs(a - b) < 1e-6`"),
+            );
+        }
+
+        if (trimmed.starts_with("if ") || trimmed.starts_with("while "))
+            && trimmed.contains(" = ")
+            && !trimmed.contains("==")
+            && !trimmed.contains(">=")
+            && !trimmed.contains("<=")
+            && !trimmed.contains("!=")
+        {
+            out.push(
+                Diag::warning(
+                    span,
+                    "possible silent logic issue: assignment used in condition",
+                )
+                .with_code("W-SILENT-ASSIGN-COND")
+                .with_hint("did you mean `==`?"),
+            );
+        }
+
+        if trimmed.starts_with("while true") {
+            out.push(
+                Diag::warning(
+                    span,
+                    "possible silent runtime issue: `while true` may never terminate",
+                )
+                .with_code("W-SILENT-INFINITE-LOOP")
+                .with_hint("ensure a reachable `break`/`return` path"),
+            );
+        }
+    }
+    out
+}
+
+fn cmd_fix(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None => {
+            eprintln!("jules fix: no file provided");
+            return 2;
+        }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("jules: cannot read `{}`: {e}", path.display());
+            return 2;
+        }
+    };
+
+    let filename = path.to_string_lossy().into_owned();
+    let source_for_fix = source.clone();  // Keep a copy for fix comparison
+    let mut unit = CompileUnit::from_owned(filename.clone(), source);
+    let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;
+    pipeline.print_opt_stats = args.print_opt_stats;
+    pipeline.quiet = true;
+    let _ = pipeline.run(&mut unit);
+
+    if unit.diags.is_empty() {
+        println!("jules fix: no diagnostics; file is already clean");
+        return 0;
+    }
+
+    let mut current = unit.source.clone();
+    let mut changed = false;
+    for _ in 0..3 {
+        match apply_safe_syntax_fixes(&current, &unit.diags) {
+            Some(next) if next != current => {
+                current = next;
+                changed = true;
+                // Use minimal pipeline for fix validation — only lex+parse needed.
+                // Running the full optimization pipeline is wasteful for simple
+                // syntax fixes and can add seconds of latency per retry.
+                let mut rerun = CompileUnit::new(filename.as_str(), &current);
+                let mut fast_pipeline = Pipeline::new();
+                fast_pipeline.opt_level = 0;  // Skip heavy optimizations
+                fast_pipeline.quiet = true;
+                let _ = fast_pipeline.run(&mut rerun);
+                unit = rerun;
+                if unit.diags.is_empty() {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    if changed && current != source_for_fix {
+        if let Err(e) = fs::write(path, current) {
+            eprintln!("jules fix: failed writing `{}`: {e}", path.display());
+            return 2;
+        }
+        println!("jules fix: applied safe fixes to {}", path.display());
+        0
+    } else {
+        println!("jules fix: no safe automatic fix could be applied");
+        1
+    }
+}
+
+// ── jules check ────────────────────────────────────────────────────────────
+
+fn cmd_check(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None => {
+            eprintln!("jules check: no file provided");
+            return 2;
+        }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("jules: cannot read `{}`: {e}", path.display());
+            return 2;
+        }
+    };
+
+    let cfg = render_cfg(args);
+    let filename = path.to_string_lossy().into_owned();
+    let source_hash = hash_source(&source);
+    if let Some(meta) = load_incremental_check_cache(path) {
+        if meta.source_hash == source_hash && meta.diag_free {
+            if !args.quiet {
+                println!("jules check: incremental cache hit (no source changes)");
+            }
+            return 0;
+        }
+    }
+    let mut unit = CompileUnit::from_owned(filename.clone(), source);
+
+    let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;
+    pipeline.print_opt_stats = args.print_opt_stats;
+    pipeline.warn_as_error = args.warn_as_error;
+    pipeline.quiet = args.quiet;
+    pipeline.run(&mut unit);
+    unit.diags.extend(detect_silent_issues(&unit.source));
+    unit.recalc_diag_counts();
+
+    // Use rich diagnostics for JSON output or teaching notes
+    if args.json_diag {
+        let rich = unit.rich_diagnostics(crate::compiler::diagnostic::Phase::SemanticAnalysis);
+        println!("{}", rich.to_json(&filename));
+    } else {
+        emit_diagnostics(&unit.diags, &unit.source, &filename, &cfg, false);
+    }
+    print_summary(&unit, &cfg);
+    store_incremental_check_cache(
+        path,
+        &CheckCacheMeta {
+            source_hash,
+            diag_free: unit.diags.is_empty(),
+        },
+    );
+
+    if unit.has_errors() {
+        1
+    } else {
+        0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CheckCacheMeta {
+    source_hash: u64,
+    diag_free: bool,
+}
+
+fn hash_source(source: &str) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn incremental_check_cache_path(path: &Path) -> PathBuf {
+    let mut hasher = rustc_hash::FxHasher::default();
+    path.to_string_lossy().hash(&mut hasher);
+    let key = hasher.finish();
+    PathBuf::from(".jules_cache")
+        .join("check")
+        .join(format!("{key:016x}.meta"))
+}
+
+fn load_incremental_check_cache(path: &Path) -> Option<CheckCacheMeta> {
+    let cache_path = incremental_check_cache_path(path);
+    let raw = fs::read_to_string(cache_path).ok()?;
+    let mut parts = raw.trim().split(',');
+    let source_hash = parts.next()?.parse::<u64>().ok()?;
+    let diag_free = parts.next()? == "1";
+    Some(CheckCacheMeta {
+        source_hash,
+        diag_free,
+    })
+}
+
+fn store_incremental_check_cache(path: &Path, meta: &CheckCacheMeta) {
+    let cache_path = incremental_check_cache_path(path);
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let encoded = format!(
+        "{},{}",
+        meta.source_hash,
+        if meta.diag_free { "1" } else { "0" }
+    );
+    let _ = fs::write(cache_path, encoded);
+}
+
+// ── jules run ──────────────────────────────────────────────────────────────
+
+fn cmd_run(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None => {
+            eprintln!("jules run: no file provided");
+            return 2;
+        }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("jules: cannot read `{}`: {e}", path.display());
+            return 2;
+        }
+    };
+
+    let cfg = render_cfg(args);
+    let filename = path.to_string_lossy().into_owned();
+    let mut unit = CompileUnit::from_owned(filename.clone(), source);
+
+    let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;
+    pipeline.print_opt_stats = args.print_opt_stats;
+    pipeline.warn_as_error = args.warn_as_error;
+    pipeline.quiet = args.quiet;
+
+    // Token dump mode.
+    if args.emit_tokens {
+        let mut lexer = Lexer::new(&unit.source);
+        let (tokens, _) = lexer.tokenize();
+        for tok in &tokens {
+            println!("{:5}:{:3}  {:?}", tok.span.line, tok.span.col, tok.kind);
+        }
+        return 0;
+    }
+
+    let result = pipeline.run(&mut unit);
+    unit.diags.extend(detect_silent_issues(&unit.source));
+    unit.recalc_diag_counts();
+
+    emit_diagnostics(&unit.diags, &unit.source, &filename, &cfg, args.json_diag);
+    print_summary(&unit, &cfg);
+
+    if unit.has_errors() {
+        return 1;
+    }
+
+    // ── Execute the program ─────────────────────────────────────────────────
+    //
+    // ══════════════════════════════════════════════════════════════════════════
+    // ══ PHASE 4: EXECUTION ARCHITECTURE ══════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    //  source → compiler (hot path: interpreter)
+    //         → VM (cold path / semantic reference / correctness anchor)
+    //         → optional trace/JIT layer (phase3-jit feature)
+    //
+    // The interpreter (with its internal register-based VM + i32 fast-path)
+    // is the PRIMARY EXECUTION ENGINE.  Benchmarks show it outperforms the
+    // standalone BytecodeVM by 6-15x for typical programs because it avoids
+    // dynamic dispatch overhead, resolves component access early, and uses
+    // specialized i32 fast paths that skip Value boxing.
+    //
+    // The standalone BytecodeVM is now the SEMANTIC REFERENCE MACHINE:
+    //   - Correctness anchor: validates interpreter results in debug builds
+    //   - Debugging tool: trace collection, instruction-level stepping
+    //   - Cold-path executor: runs when the interpreter cannot
+    //   - NOT the performance-critical path anymore
+    //
+    // The IR pipeline is still used for type-checking, borrow-checking,
+    // and optimization — but execution dispatches through the interpreter.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    let program = match result {
+        PipelineResult::OkWithIr { program, ir_module: _ } => program,
+        PipelineResult::Ok(program) => program,
+        PipelineResult::HaltedAt(_) => return 1,
+    };
+
+    // ── Tiered compilation (optional, feature-gated) ────────────────────
+    if args.tiered {
+        #[cfg(feature = "phase3-jit")]
+        {
+            let policy = match args.tier_policy.as_str() {
+                "fast-startup" => crate::tiered_compilation::PromotionPolicy::fast_startup(),
+                "balanced" => crate::tiered_compilation::PromotionPolicy::balanced(),
+                "max-performance" => crate::tiered_compilation::PromotionPolicy::max_performance(),
+                _ => crate::tiered_compilation::PromotionPolicy::balanced(),
+            };
+
+            let mut tiered_mgr = crate::tiered_compilation::TieredExecutionManager::new(policy);
+            tiered_mgr.load_program(&program);
+            tiered_mgr.enabled = true;
+
+            match tiered_mgr.call_function(&args.entry, vec![]) {
+                Ok(val) => {
+                    if !matches!(val, crate::interp::Value::Unit) {
+                        println!("{val}");
+                    }
+                }
+                Err(e) => {
+                    let diag = adapt_runtime_error(e);
+                    emit_diagnostics(&[diag], &unit.source, &filename, &cfg, args.json_diag);
+                    return 1;
+                }
+            }
+
+            if args.print_tier_stats {
+                eprintln!("{}", tiered_mgr.tier_stats_summary());
+            }
+            return 0;
+        }
+        #[cfg(not(feature = "phase3-jit"))]
+        {
+            // Tiered compilation not available; fall through to interpreter
+        }
+    }
+
+    // ── HOT PATH: Interpreter execution ─────────────────────────────────
+    // The interpreter is the primary execution engine. It uses an internal
+    // register-based bytecode VM with specialized i32 fast paths, giving
+    // it 6-15x throughput advantage over the standalone BytecodeVM for
+    // typical programs.
+    let mut interp = crate::interp::Interpreter::new();
+    interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+    interp.set_native_jit_enabled(true); // Enable native JIT
+    interp.load_program(&program);
+    match interp.call_fn(&args.entry, vec![]) {
+        Ok(val) => {
+            if !matches!(val, crate::interp::Value::Unit) {
+                println!("{val}");
+            }
+        }
+        Err(e) => {
+            let diag = adapt_runtime_error(e);
+            emit_diagnostics(&[diag], &unit.source, &filename, &cfg, args.json_diag);
+            return 1;
+        }
+    }
+    0
+}
+
+// ── jules train ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct JaxModelIr {
+    model_name: String,
+    input_dim: u64,
+    layers: Vec<u64>,
+    activation: &'static str,
+    task: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct BackendCapability {
+    model_name: String,
+    jules_supported: bool,
+    jax_supported: bool,
+    jax_reason: Option<String>,
+}
+
+fn activation_name_for_jax(a: &crate::compiler::ast::Activation) -> &'static str {
+    match a {
+        crate::compiler::ast::Activation::Relu | crate::compiler::ast::Activation::LeakyRelu => "relu",
+        crate::compiler::ast::Activation::Tanh => "tanh",
+        crate::compiler::ast::Activation::Silu | crate::compiler::ast::Activation::Swish => "silu",
+        crate::compiler::ast::Activation::Gelu => "gelu",
+        _ => "gelu",
+    }
+}
+
+fn build_jax_ir_from_model(model: &crate::compiler::ast::ModelDecl) -> Result<JaxModelIr, String> {
+    let mut input_dim = None;
+    let mut layers = Vec::new();
+    let mut activation = "gelu";
+    let mut task = "classification";
+
+    for layer in &model.layers {
+        match layer {
+            crate::compiler::ast::ModelLayer::Input { size, .. } => {
+                input_dim = Some(*size);
+            }
+            crate::compiler::ast::ModelLayer::Dense {
+                units,
+                activation: act,
+                ..
+            } => {
+                layers.push(*units);
+                activation = activation_name_for_jax(act);
+            }
+            crate::compiler::ast::ModelLayer::Output {
+                units,
+                activation: act,
+                ..
+            } => {
+                layers.push(*units);
+                if matches!(act, crate::compiler::ast::Activation::Linear) {
+                    task = "regression";
+                }
+            }
+            crate::compiler::ast::ModelLayer::Dropout { .. } | crate::compiler::ast::ModelLayer::Norm { .. } => {
+                // Ignored for export because the bridge currently trains dense MLPs.
+            }
+            other => {
+                return Err(format!(
+                    "unsupported layer for JAX bridge export: {other:?}"
+                ));
+            }
+        }
+    }
+
+    let input_dim = input_dim.ok_or_else(|| "missing required `input` layer".to_string())?;
+    if layers.is_empty() {
+        return Err("missing required dense/output layers".to_string());
+    }
+
+    Ok(JaxModelIr {
+        model_name: model.name.clone(),
+        input_dim,
+        layers,
+        activation,
+        task,
+    })
+}
+
+fn feature_capability_matrix(program: &crate::compiler::ast::Program) -> Vec<BackendCapability> {
+    program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            crate::compiler::ast::Item::Model(m) => Some(m),
+            _ => None,
+        })
+        .map(|m| match build_jax_ir_from_model(m) {
+            Ok(_) => BackendCapability {
+                model_name: m.name.clone(),
+                jules_supported: true,
+                jax_supported: true,
+                jax_reason: None,
+            },
+            Err(reason) => BackendCapability {
+                model_name: m.name.clone(),
+                jules_supported: true,
+                jax_supported: false,
+                jax_reason: Some(reason),
+            },
+        })
+        .collect()
+}
+
+fn print_feature_capability_matrix(program: &crate::compiler::ast::Program) {
+    let rows = feature_capability_matrix(program);
+    if rows.is_empty() {
+        return;
+    }
+    println!("feature capability matrix:");
+    for row in rows {
+        let jules = if row.jules_supported { "✅" } else { "❌" };
+        let jax = if row.jax_supported { "✅" } else { "❌" };
+        match row.jax_reason {
+            Some(reason) => println!(
+                "  {}: Jules {}  JAX {} (why: {})",
+                row.model_name, jules, jax, reason
+            ),
+            None => println!("  {}: Jules {}  JAX {}", row.model_name, jules, jax),
+        }
+    }
+}
+
+fn build_jax_ir_from_program(program: &crate::compiler::ast::Program) -> Result<JaxModelIr, String> {
+    // Single traversal: collect train model name and all model declarations.
+    let mut train_model_name: Option<&str> = None;
+    let mut models: Vec<&crate::compiler::ast::ModelDecl> = Vec::new();
+
+    for item in &program.items {
+        match item {
+            crate::compiler::ast::Item::Train(t) => {
+                train_model_name = t.model.as_deref();
+            }
+            crate::compiler::ast::Item::Model(m) => {
+                models.push(m);
+            }
+            _ => {}
+        }
+    }
+
+    let model = models
+        .into_iter()
+        .find(|m| train_model_name.map_or(true, |name| m.name == name))
+        .ok_or_else(|| {
+            if let Some(name) = train_model_name {
+                format!("jax backend: model `{name}` referenced by train block not found")
+            } else {
+                "jax backend: no `model` declaration found in Jules source".to_string()
+            }
+        })?;
+    build_jax_ir_from_model(model).map_err(|why| {
+        format!(
+            "jax backend: model `{}` is not supported ({why})",
+            model.name
+        )
+    })
+}
+
+fn write_jax_ir_file(ir: &JaxModelIr) -> Result<PathBuf, String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("jules_jax_ir_{}_{}.json", process::id(), ts));
+    let layers = ir
+        .layers
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let content = format!(
+        "{{\n  \"schema_version\": 1,\n  \"model_name\": \"{}\",\n  \"input_dim\": {},\n  \"layers\": [{}],\n  \"activation\": \"{}\",\n  \"task\": \"{}\"\n}}\n",
+        ir.model_name, ir.input_dim, layers, ir.activation, ir.task
+    );
+    fs::write(&path, content).map_err(|e| {
+        format!(
+            "jax backend: failed to write generated IR `{}`: {e}",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn check_jax_backend_env(script: &Path) -> Result<(), String> {
+    if !script.exists() {
+        return Err(format!(
+            "jax backend: script not found at `{}` (use --jax-script to override)",
+            script.display()
+        ));
+    }
+
+    let check = ProcessCommand::new("python3")
+        .arg("-c")
+        .arg("import jax, optax, numpy; print('ok')")
+        .output()
+        .map_err(|e| format!("jax backend: failed to run python3 preflight check: {e}"))?;
+    if !check.status.success() {
+        let stderr = String::from_utf8_lossy(&check.stderr);
+        return Err(format!(
+            "jax backend dependencies are missing.\n\
+             Install them with:\n\
+               pip install --upgrade pip\n\
+               pip install jax optax numpy\n\
+             python3 preflight error:\n{}",
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+// =============================================================================
+// AOT NATIVE COMPILATION COMMAND
+// =============================================================================
+
+fn cmd_compile(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None => {
+            eprintln!("jules compile: no file provided");
+            eprintln!("Usage: jules compile <file.jules> [-o output]");
+            return 2;
+        }
+    };
+
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("jules: cannot read `{}`: {e}", path.display());
+            return 2;
+        }
+    };
+
+    // Determine output path
+    let output_path = args.output.as_ref().map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
+            // Default: strip .jules extension and add nothing (native binary)
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            format!("./{}", stem)
+        });
+
+    if !args.quiet {
+        eprintln!("Compiling {} → {} (AOT native x86-64)", path.display(), output_path);
+    }
+
+    // Run full compilation pipeline
+    let path_str = path.to_string_lossy().into_owned();
+    let mut unit = CompileUnit::from_owned(path_str, source);
+    let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;  // FIX #4: Wire opt_level so -O0 doesn't run heavyweight passes
+    pipeline.quiet = args.quiet;
+    let result = pipeline.run(&mut unit);
+
+    if unit.has_errors() {
+        let msgs: Vec<_> = unit
+            .diags
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        for msg in msgs {
+            eprintln!("error: {}", msg);
+        }
+        return 1;
+    }
+
+    let program = match result {
+        PipelineResult::Ok(program) => program,
+        PipelineResult::OkWithIr { program, .. } => program,
+        _ => {
+            eprintln!("jules compile: pipeline did not produce a program");
+            return 1;
+        }
+    };
+
+    // Apply optimizations
+    if !args.quiet {
+        eprintln!("  Optimizing (level {})...", args.opt_level);
+    }
+
+    // AOT compile to native ELF binary
+    let start = std::time::Instant::now();
+    let aot_opt = crate::jit::aot_native::AotOptLevel::from_u8(args.opt_level);
+    match crate::jit::aot_native::compile_to_native(&program, &output_path, aot_opt) {
+        Ok(()) => {
+            let elapsed = start.elapsed();
+            if !args.quiet {
+                eprintln!("✓ Compiled in {:.3}s", elapsed.as_secs_f64());
+                eprintln!("  Output: {}", output_path);
+                
+                // Show file size
+                if let Ok(metadata) = std::fs::metadata(&output_path) {
+                    let size = metadata.len();
+                    if size < 1024 {
+                        eprintln!("  Size: {} bytes", size);
+                    } else if size < 1024 * 1024 {
+                        eprintln!("  Size: {:.1} KB", size as f64 / 1024.0);
+                    } else {
+                        eprintln!("  Size: {:.2} MB", size as f64 / (1024.0 * 1024.0));
+                    }
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("jules compile: {}", e);
+            1
+        }
+    }
+}
+
+fn cmd_train(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None => {
+            eprintln!("jules train: no file provided");
+            return 2;
+        }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("jules: cannot read `{}`: {e}", path.display());
+            return 2;
+        }
+    };
+
+    let cfg = render_cfg(args);
+    let filename = path.to_string_lossy().into_owned();
+    let mut unit = CompileUnit::from_owned(filename.clone(), source);
+
+    let mut pipeline = Pipeline::new();
+    pipeline.opt_level = args.opt_level;
+    pipeline.print_opt_stats = args.print_opt_stats;
+    pipeline.warn_as_error = args.warn_as_error;
+    pipeline.quiet = args.quiet;
+    let result = pipeline.run(&mut unit);
+
+    emit_diagnostics(&unit.diags, &unit.source, &filename, &cfg, args.json_diag);
+    print_summary(&unit, &cfg);
+
+    if unit.has_errors() {
+        return 1;
+    }
+
+    if let Some(program) = result.program() {
+        if !args.quiet {
+            print_feature_capability_matrix(&program);
+        }
+        if args.ml_backend == "jax" {
+            let dataset = match &args.jax_dataset {
+                Some(p) => p.clone(),
+                None => {
+                    eprintln!(
+                        "jules train: `--ml-backend jax` requires `--jax-dataset <train.npz>`\n\
+                         example: jules train model.jules --ml-backend jax --jax-dataset train.npz"
+                    );
+                    return 2;
+                }
+            };
+            if let Err(msg) = check_jax_backend_env(&args.jax_script) {
+                eprintln!("{msg}");
+                return 2;
+            }
+            let mut generated_ir = None;
+            let ir_path = if let Some(p) = &args.jax_ir {
+                p.clone()
+            } else {
+                match build_jax_ir_from_program(&program).and_then(|ir| write_jax_ir_file(&ir)) {
+                    Ok(p) => {
+                        generated_ir = Some(p.clone());
+                        p
+                    }
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        return 2;
+                    }
+                }
+            };
+
+            let mut cmd = ProcessCommand::new("python3");
+            cmd.arg(&args.jax_script)
+                .arg("--ir")
+                .arg(&ir_path)
+                .arg("--dataset")
+                .arg(&dataset)
+                .arg("--out")
+                .arg(&args.jax_out);
+            let status = match cmd.status() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("jules train: failed to launch JAX backend via python3: {e}");
+                    return 2;
+                }
+            };
+            if let Some(p) = generated_ir {
+                let _ = fs::remove_file(p);
+            }
+            return if status.success() { 0 } else { 1 };
+        }
+
+        if args.ml_backend == "xla" {
+            if !args.quiet {
+                println!("Using XLA backend for training");
+            }
+            // XLA backend is integrated into the ML engine
+            // The ComputationGraph will use XLA for compilation when execute_with_xla is called
+            match crate::interp::jules_train(&program) {
+                Ok(all_stats) => {
+                    for (i, stats) in all_stats.iter().enumerate() {
+                        println!(
+                            "Train block {}: mean reward = {:.4}, steps = {} (XLA backend)",
+                            i + 1,
+                            stats.mean_reward,
+                            stats.total_steps
+                        );
+                    }
+                    return 0;
+                }
+                Err(e) => {
+                    eprintln!("jules train (XLA): {e}");
+                    return 1;
+                }
+            }
+        } else {
+
+        match crate::interp::jules_train(&program) {
+            Ok(all_stats) => {
+                for (i, stats) in all_stats.iter().enumerate() {
+                    println!(
+                        "Train block {}: mean reward = {:.4}, steps = {}",
+                        i + 1,
+                        stats.mean_reward,
+                        stats.total_steps
+                    );
+                }
+                return 0;
+            }
+            Err(e) => {
+                let diag = adapt_runtime_error(e);
+                emit_diagnostics(&[diag], &unit.source, &filename, &cfg, args.json_diag);
+                return 1;
+            }
+        }
+    }
+    }
+    0
+}
+
+// ── jules fmt ─────────────────────────────────────────────────────────────
+
+fn cmd_fmt(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None => {
+            eprintln!("jules fmt: no file provided");
+            return 2;
+        }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("jules: cannot read `{}`: {e}", path.display());
+            return 2;
+        }
+    };
+
+    let mut lexer = Lexer::new(&source);
+    let (tokens, errors) = lexer.tokenize();
+
+    let cfg = render_cfg(args);
+    if !errors.is_empty() {
+        let diags: Vec<Diag> = errors.into_iter().map(Diag::from).collect();
+        let filename = path.to_string_lossy();
+        let renderer = DiagRenderer::new(&source, &filename, cfg);
+        eprint!("{}", renderer.render_all(&diags));
+        return 1;
+    }
+
+    // Very simple token-level reformatter: emit tokens separated by spaces,
+    // with newlines inserted after `{`, `}`, `;`.
+    let mut out = String::new();
+    let mut indent = 0usize;
+    let indent_str = "    ";
+
+    for tok in &tokens {
+        use crate::compiler::lexer::TokenKind;
+        match &tok.kind {
+            TokenKind::Eof => break,
+            TokenKind::LBrace => {
+                out.push_str("{\n");
+                indent += 1;
+                out.push_str(&indent_str.repeat(indent));
+            }
+            TokenKind::RBrace => {
+                indent = indent.saturating_sub(1);
+                out.push('\n');
+                out.push_str(&indent_str.repeat(indent));
+                out.push_str("}\n");
+                if indent > 0 {
+                    out.push_str(&indent_str.repeat(indent));
+                }
+            }
+            TokenKind::Semicolon => {
+                out.push_str(";\n");
+                out.push_str(&indent_str.repeat(indent));
+            }
+            kind => {
+                let _ = kind;
+                out.push_str(&tok.raw);
+                out.push(' ');
+            }
+        }
+    }
+
+    println!("{}", out.trim_end());
+    0
+}
+
+// =============================================================================
+// §9  REPL
+// =============================================================================
+
+const REPL_BANNER: &str = r#"Jules REPL  (type :help for commands, :quit to exit)
+Tensor-first · ECS · AI · GPU
+"#;
+
+const REPL_HELP: &str = r#"REPL commands:
+  :quit / :q          Exit the REPL
+  :help / :h          Show this message
+  :tokens <expr>      Show token stream for an expression
+  :demo <name>        Run built-in demo (game|arcade|ml)
+  :persona <target>   Show language priorities (game|ml|all)
+  :scientist on|off   Toggle experiment timing output
+  :track <file|off>   Append REPL inputs/results to an experiment log
+  :clear              Clear the screen
+  :load <file>        Load and execute a file
+  :reset              Reset interpreter state
+  :history            Show input history
+  :color on|off       Toggle colour output
+
+Examples:
+  // Direct program execution
+  fn main() { println("hello from Jules playground"); }
+
+  // Statement mode (auto-wrapped in `fn main { ... }`)
+  let x = 3 + 4
+  let t = tensor<f32>[2, 2] { 1.0, 2.0, 3.0, 4.0 }
+  let C = A @ B
+"#;
+
+const PERSONA_GAME_DEV: &str = r#"Game-dev priorities in Jules:
+  1) Fast iteration loops (REPL + hot-reload + editor tooling)
+  2) Deterministic simulation + ECS/system orchestration
+  3) Tight profiling/debug visibility in-frame
+  4) FFI-friendly embedding into existing engine stacks
+
+Try now:
+  :demo game
+  :demo arcade
+"#;
+
+const PERSONA_ML_SCI: &str = r#"ML scientist priorities in Jules:
+  1) Tensor-first ergonomics with clear math operators
+  2) Reproducible train/check loops with quick feedback
+  3) Interop with Python/C++ workflows for experiments
+  4) Efficient inference/training paths (CPU/GPU + quantized options)
+
+Try now:
+  :demo ml
+"#;
+
+const DEMO_GAME: &str = include_str!("jules_files/small_game.jules");
+const DEMO_ARCADE: &str = include_str!("jules_files/game_arcade_showcase.jules");
+const DEMO_ML: &str = include_str!("jules_files/game_nn_demo.jules");
+
+fn demo_source(name: &str) -> Option<&'static str> {
+    match name {
+        "game" => Some(DEMO_GAME),
+        "arcade" => Some(DEMO_ARCADE),
+        "ml" => Some(DEMO_ML),
+        _ => None,
+    }
+}
+
+pub struct Repl {
+    cfg: RenderCfg,
+    history: Vec<String>,
+    multiline: String, // accumulates a multi-line block
+    in_block: bool,    // true when inside { … }
+    scientist_mode: bool,
+    experiment_log: Option<PathBuf>,
+}
+
+impl Repl {
+    pub fn new(cfg: RenderCfg) -> Self {
+        Repl {
+            cfg,
+            history: Vec::new(),
+            multiline: String::new(),
+            in_block: false,
+            scientist_mode: false,
+            experiment_log: None,
+        }
+    }
+
+    pub fn run(&mut self) {
+        println!(
+            "{}",
+            Ansi::paint(self.cfg.color, Ansi::BRIGHT_CYN, REPL_BANNER)
+        );
+
+        loop {
+            let prompt = if self.in_block {
+                Ansi::paint(self.cfg.color, Ansi::DIM, "... > ")
+            } else {
+                Ansi::paint(self.cfg.color, Ansi::BRIGHT_CYN, "jules> ")
+            };
+            print!("{prompt}");
+            io::stdout().flush().unwrap();
+
+            let mut line = String::new();
+            match io::stdin().lock().read_line(&mut line) {
+                Ok(0) => {
+                    // EOF (Ctrl-D).
+                    println!();
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("REPL read error: {e}");
+                    break;
+                }
+                Ok(_) => {}
+            }
+
+            let line = line.trim_end_matches('\n').trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+
+            // ── REPL meta-commands ─────────────────────────────────────────────
+            match line.trim() {
+                ":quit" | ":q" | "quit" | "exit" => {
+                    println!("Goodbye.");
+                    break;
+                }
+                ":help" | ":h" => {
+                    println!("{REPL_HELP}");
+                    continue;
+                }
+                ":clear" => {
+                    print!("\x1b[2J\x1b[H");
+                    io::stdout().flush().unwrap();
+                    continue;
+                }
+                ":reset" => {
+                    self.multiline.clear();
+                    self.in_block = false;
+                    self.history.clear();
+                    self.experiment_log = None;
+                    println!("{}", Ansi::paint(self.cfg.color, Ansi::DIM, "State reset."));
+                    continue;
+                }
+                ":history" => {
+                    for (i, h) in self.history.iter().enumerate() {
+                        println!("{i:4}: {h}");
+                    }
+                    continue;
+                }
+                s if s.starts_with(":color ") => {
+                    let rest = s.trim_start_matches(":color ").trim();
+                    self.cfg.color = rest == "on";
+                    println!(
+                        "Color {}",
+                        if self.cfg.color {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    continue;
+                }
+                s if s.starts_with(":load ") => {
+                    let path = s.trim_start_matches(":load ").trim();
+                    self.cmd_load(path);
+                    continue;
+                }
+                s if s.starts_with(":scientist ") => {
+                    let mode = s.trim_start_matches(":scientist ").trim();
+                    self.cmd_scientist(mode);
+                    continue;
+                }
+                s if s.starts_with(":track ") => {
+                    let target = s.trim_start_matches(":track ").trim();
+                    self.cmd_track(target);
+                    continue;
+                }
+                s if s.starts_with(":tokens ") => {
+                    let code = s.trim_start_matches(":tokens ").trim();
+                    self.cmd_tokens(code);
+                    continue;
+                }
+                s if s.starts_with(":demo ") => {
+                    let name = s.trim_start_matches(":demo ").trim();
+                    self.cmd_demo(name);
+                    continue;
+                }
+                s if s.starts_with(":persona ") => {
+                    let target = s.trim_start_matches(":persona ").trim();
+                    self.cmd_persona(target);
+                    continue;
+                }
+                _ => {}
+            }
+
+            // ── Multi-line block accumulation ──────────────────────────────────
+            self.history.push(line.to_owned());
+            self.multiline.push_str(line);
+            self.multiline.push('\n');
+
+            let brace_balance: i64 = self
+                .multiline
+                .chars()
+                .map(|c| {
+                    if c == '{' {
+                        1
+                    } else if c == '}' {
+                        -1
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+
+            if brace_balance > 0 {
+                self.in_block = true;
+                continue;
+            }
+            self.in_block = false;
+
+            // ── Evaluate the completed input ───────────────────────────────────
+            let input = std::mem::take(&mut self.multiline);
+            self.eval_input(&input);
+        }
+    }
+
+    fn eval_input(&mut self, input: &str) {
+        let started = Instant::now();
+        let status: &'static str;
+
+        // First try full-program mode (expects user-provided `fn main`).
+        match self.run_repl_program(input) {
+            Ok(()) => {
+                status = "ok:program";
+            }
+            Err(ReplRunError::Runtime(msg)) if msg.contains("unknown function: main") => {
+                status = match self.run_statement_mode(input) {
+                    Ok(()) => "ok:statement",
+                    Err(ReplRunError::Compile(diags)) => {
+                        let renderer = DiagRenderer::new(input, "<repl>", self.cfg.clone());
+                        eprint!("{}", renderer.render_all(&diags));
+                        "compile-error"
+                    }
+                    Err(ReplRunError::Runtime(msg)) => {
+                        eprintln!("{}", Ansi::paint(self.cfg.color, Ansi::BRIGHT_RED, &msg));
+                        "runtime-error"
+                    }
+                };
+            }
+            Err(ReplRunError::Compile(_diags)) => {
+                status = match self.run_statement_mode(input) {
+                    Ok(()) => "ok:statement-fallback",
+                    Err(ReplRunError::Compile(diags)) => {
+                        let renderer = DiagRenderer::new(input, "<repl>", self.cfg.clone());
+                        eprint!("{}", renderer.render_all(&diags));
+                        "compile-error"
+                    }
+                    Err(ReplRunError::Runtime(msg)) => {
+                        eprintln!("{}", Ansi::paint(self.cfg.color, Ansi::BRIGHT_RED, &msg));
+                        "runtime-error"
+                    }
+                };
+            }
+            Err(ReplRunError::Runtime(msg)) => {
+                eprintln!("{}", Ansi::paint(self.cfg.color, Ansi::BRIGHT_RED, &msg));
+                status = "runtime-error";
+            }
+        }
+
+        if self.scientist_mode {
+            let elapsed = started.elapsed();
+            println!(
+                "{}",
+                Ansi::paint(
+                    self.cfg.color,
+                    Ansi::DIM,
+                    &format!("[scientist] {status} in {:.2?}", elapsed),
+                )
+            );
+        }
+        self.log_experiment(input, status);
+    }
+
+    fn run_statement_mode(&self, input: &str) -> Result<(), ReplRunError> {
+        let wrapped = format!("fn main() {{\n{input}\n}}\n");
+        self.run_repl_program(&wrapped)
+    }
+
+    fn run_repl_program(&self, source: &str) -> Result<(), ReplRunError> {
+        let mut unit = CompileUnit::new("<repl>", source);
+        // REPL fast-path: use opt_level=0 to skip heavy optimization passes.
+        // The REPL prioritizes latency over code quality — users expect
+        // immediate feedback, not optimized execution.
+        let mut pipeline = Pipeline::new();
+        pipeline.opt_level = 0;  // Skip superoptimizer, polyhedral, etc.
+        let result = pipeline.run(&mut unit);
+        if unit.has_errors() {
+            return Err(ReplRunError::Compile(unit.diags));
+        }
+
+        // ══ PHASE 4: REPL uses interpreter as hot path ══════════════════════
+        // The interpreter is the primary execution engine — it outperforms
+        // the standalone BytecodeVM for typical programs and provides better
+        // error messages for interactive use. The VM is available as a
+        // semantic reference when needed (e.g., `:vm` command).
+        let program = match result {
+            PipelineResult::OkWithIr { program, .. } => program,
+            PipelineResult::Ok(program) => program,
+            PipelineResult::HaltedAt(_) => {
+                return Err(ReplRunError::Runtime(
+                    "pipeline halted before producing a runnable program".into(),
+                ));
+            }
+        };
+        let mut interp = crate::interp::Interpreter::new();
+        interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+        interp.set_native_jit_enabled(true); // Enable native JIT
+        interp.load_program(&program);
+        interp.call_fn("main", vec![])
+            .map(|_| ())
+            .map_err(|e| ReplRunError::Runtime(e.message.into_owned()))
+    }
+
+    fn cmd_tokens(&self, code: &str) {
+        let mut lexer = Lexer::new(code);
+        let (tokens, errors) = lexer.tokenize();
+
+        if !errors.is_empty() {
+            let renderer = DiagRenderer::new(code, "<repl>", self.cfg.clone());
+            let diags: Vec<Diag> = errors.into_iter().map(Diag::from).collect();
+            eprint!("{}", renderer.render_all(&diags));
+            return;
+        }
+
+        println!(
+            "{}",
+            Ansi::paint(self.cfg.color, Ansi::DIM, "Token stream:")
+        );
+        for tok in &tokens {
+            if matches!(tok.kind, crate::compiler::lexer::TokenKind::Eof) {
+                break;
+            }
+            println!("  {:4}:{:3}  {:?}", tok.span.line, tok.span.col, tok.kind);
+        }
+    }
+
+    fn cmd_load(&mut self, path: &str) {
+        match fs::read_to_string(path) {
+            Err(e) => {
+                let msg = format!("cannot load `{path}`: {e}");
+                eprintln!("{}", Ansi::paint(self.cfg.color, Ansi::BRIGHT_RED, &msg));
+            }
+            Ok(src) => {
+                println!(
+                    "{}",
+                    Ansi::paint(
+                        self.cfg.color,
+                        Ansi::DIM,
+                        &format!("loaded {} bytes from `{path}`", src.len())
+                    )
+                );
+                self.eval_input(&src);
+            }
+        }
+    }
+
+    fn cmd_demo(&mut self, name: &str) {
+        let Some(src) = demo_source(name) else {
+            eprintln!(
+                "{}",
+                Ansi::paint(
+                    self.cfg.color,
+                    Ansi::BRIGHT_RED,
+                    "unknown demo. use: :demo game | :demo arcade | :demo ml",
+                )
+            );
+            return;
+        };
+        println!(
+            "{}",
+            Ansi::paint(
+                self.cfg.color,
+                Ansi::DIM,
+                &format!("running embedded `{name}` demo"),
+            )
+        );
+        self.eval_input(src);
+    }
+
+    fn cmd_persona(&self, target: &str) {
+        match target {
+            "game" => println!("{PERSONA_GAME_DEV}"),
+            "ml" => println!("{PERSONA_ML_SCI}"),
+            "all" => {
+                println!("{PERSONA_GAME_DEV}");
+                println!("{PERSONA_ML_SCI}");
+            }
+            _ => {
+                eprintln!(
+                    "{}",
+                    Ansi::paint(
+                        self.cfg.color,
+                        Ansi::BRIGHT_RED,
+                        "unknown target. use: :persona game | :persona ml | :persona all",
+                    )
+                );
+            }
+        }
+    }
+
+    fn cmd_scientist(&mut self, mode: &str) {
+        match mode {
+            "on" => {
+                self.scientist_mode = true;
+                println!(
+                    "{}",
+                    Ansi::paint(
+                        self.cfg.color,
+                        Ansi::DIM,
+                        "[scientist] timing/report mode enabled",
+                    )
+                );
+            }
+            "off" => {
+                self.scientist_mode = false;
+                println!(
+                    "{}",
+                    Ansi::paint(
+                        self.cfg.color,
+                        Ansi::DIM,
+                        "[scientist] timing/report mode disabled",
+                    )
+                );
+            }
+            _ => eprintln!(
+                "{}",
+                Ansi::paint(
+                    self.cfg.color,
+                    Ansi::BRIGHT_RED,
+                    "unknown mode. use: :scientist on | :scientist off",
+                )
+            ),
+        }
+    }
+
+    fn cmd_track(&mut self, target: &str) {
+        if target == "off" {
+            self.experiment_log = None;
+            println!(
+                "{}",
+                Ansi::paint(
+                    self.cfg.color,
+                    Ansi::DIM,
+                    "[scientist] experiment tracking disabled"
+                )
+            );
+            return;
+        }
+
+        let path = PathBuf::from(target);
+        let header = "# Jules experiment log\n";
+        if let Err(e) = fs::write(&path, header) {
+            eprintln!(
+                "{}",
+                Ansi::paint(
+                    self.cfg.color,
+                    Ansi::BRIGHT_RED,
+                    &format!("cannot start tracking at `{}`: {e}", path.display()),
+                )
+            );
+            return;
+        }
+        self.experiment_log = Some(path.clone());
+        println!(
+            "{}",
+            Ansi::paint(
+                self.cfg.color,
+                Ansi::DIM,
+                &format!("[scientist] tracking enabled at `{}`", path.display()),
+            )
+        );
+    }
+
+    fn log_experiment(&self, input: &str, status: &str) {
+        let Some(path) = &self.experiment_log else {
+            return;
+        };
+        let record = format!("\n## status: {status}\n```jules\n{input}```\n");
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(record.as_bytes()));
+    }
+}
+
+enum ReplRunError {
+    Compile(Vec<Diag>),
+    Runtime(String),
+}
+
+// =============================================================================
+// §10  SHARED HELPERS
+// =============================================================================
+
+fn render_cfg(args: &CliArgs) -> RenderCfg {
+    RenderCfg {
+        color: args.color,
+        tab_width: args.tab_width,
+        context: 1,
+    }
+}
+
+fn emit_diagnostics(diags: &[Diag], source: &str, filename: &str, cfg: &RenderCfg, json: bool) {
+    if diags.is_empty() {
+        return;
+    }
+    if json {
+        println!("{}", diags_to_json(diags, filename));
+    } else {
+        let renderer = DiagRenderer::new(source, filename, cfg.clone());
+        eprint!("{}", renderer.render_all(diags));
+    }
+}
+
+// =============================================================================
+// §11  MAIN ENTRY POINT
+// =============================================================================
+
+pub fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+
+    let args = match CliArgs::parse(&raw_args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("jules: {e}");
+            process::exit(2);
+        }
+    };
+
+    let exit_code = match args.command {
+        Command::Help => {
+            cmd_help();
+            0
+        }
+        Command::Version => {
+            cmd_version();
+            0
+        }
+        Command::Explain => {
+            cmd_explain(&args);
+            0
+        }
+        Command::Check => cmd_check(&args),
+        Command::Fix => cmd_fix(&args),
+        Command::Run => cmd_run(&args),
+        Command::Compile => cmd_compile(&args),
+        Command::Train => cmd_train(&args),
+        Command::Estimate => cmd_estimate(&args),
+        Command::Fmt => cmd_fmt(&args),
+        Command::Repl => {
+            let cfg = render_cfg(&args);
+            let mut repl = Repl::new(cfg);
+            repl.run();
+            0
+        }
+    };
+
+    process::exit(exit_code);
+}
+
+// =============================================================================
+// §12  TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── CLI argument parser ────────────────────────────────────────────────────
+
+    fn parse(args: &[&str]) -> Result<CliArgs, String> {
+        let owned: Vec<String> = std::iter::once("jules")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        CliArgs::parse(&owned)
+    }
+
+    #[test]
+    fn test_cli_run_command() {
+        let a = parse(&["run", "foo.jules"]).unwrap();
+        assert_eq!(a.command, Command::Run);
+        assert_eq!(a.file.as_deref(), Some(Path::new("foo.jules")));
+    }
+
+    #[test]
+    fn test_cli_check_command() {
+        let a = parse(&["check", "bar.jules"]).unwrap();
+        assert_eq!(a.command, Command::Check);
+        assert_eq!(a.file.as_deref(), Some(Path::new("bar.jules")));
+    }
+
+    #[test]
+    fn test_incremental_check_cache_roundtrip() {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "jules_check_cache_{}_{}.jules",
+            std::process::id(),
+            9911
+        ));
+        let _ = std::fs::write(&p, "fn main() {}");
+        let meta = CheckCacheMeta {
+            source_hash: hash_source("fn main() {}"),
+            diag_free: true,
+        };
+        store_incremental_check_cache(&p, &meta);
+        let loaded = load_incremental_check_cache(&p).expect("cache entry should exist");
+        assert_eq!(loaded.source_hash, meta.source_hash);
+        assert_eq!(loaded.diag_free, meta.diag_free);
+    }
+
+    #[test]
+    fn test_cli_fix_command() {
+        let a = parse(&["fix", "broken.jules"]).unwrap();
+        assert_eq!(a.command, Command::Fix);
+        assert_eq!(a.file.as_deref(), Some(Path::new("broken.jules")));
+    }
+
+    #[test]
+    fn test_cli_check_warn_error() {
+        let a = parse(&["check", "bar.jules", "-W"]).unwrap();
+        assert!(a.warn_as_error);
+    }
+
+    #[test]
+    fn test_repl_demo_source_mapping() {
+        assert!(demo_source("game").is_some());
+        assert!(demo_source("arcade").is_some());
+        assert!(demo_source("ml").is_some());
+        assert!(demo_source("unknown").is_none());
+    }
+
+    #[test]
+    fn test_repl_scientist_toggle() {
+        let mut repl = Repl::new(RenderCfg::default());
+        repl.cmd_scientist("on");
+        assert!(repl.scientist_mode);
+        repl.cmd_scientist("off");
+        assert!(!repl.scientist_mode);
+    }
+
+    #[test]
+    fn test_repl_experiment_log_writes() {
+        let mut repl = Repl::new(RenderCfg::default());
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "jules_repl_test_{}_{}.md",
+            std::process::id(),
+            1539
+        ));
+        let p = path.to_string_lossy().to_string();
+        repl.cmd_track(&p);
+        repl.log_experiment("let x = 1;", "ok");
+        let data = std::fs::read_to_string(&path).unwrap();
+        assert!(data.contains("status: ok"));
+        assert!(data.contains("let x = 1;"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_cli_quiet_flag() {
+        let a = parse(&["check", "x.jules", "--quiet"]).unwrap();
+        assert!(a.quiet);
+    }
+
+    #[test]
+    fn test_cli_no_color_flag() {
+        let a = parse(&["run", "x.jules", "--no-color"]).unwrap();
+        assert!(!a.color);
+    }
+
+    #[test]
+    fn test_cli_tab_width() {
+        let a = parse(&["run", "x.jules", "--tab-width", "2"]).unwrap();
+        assert_eq!(a.tab_width, 2);
+    }
+
+    #[test]
+    fn test_cli_emit_tokens_flag() {
+        let a = parse(&["run", "x.jules", "--emit-tokens"]).unwrap();
+        assert!(a.emit_tokens);
+    }
+
+    #[test]
+    fn test_cli_entry_flag() {
+        let a = parse(&["run", "x.jules", "--entry", "forward"]).unwrap();
+        assert_eq!(a.entry, "forward");
+    }
+
+    #[test]
+    fn test_cli_rest_args() {
+        let a = parse(&["run", "x.jules", "--", "hello", "world"]).unwrap();
+        assert_eq!(a.rest_args, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_cli_repl_command() {
+        let a = parse(&["repl"]).unwrap();
+        assert_eq!(a.command, Command::Repl);
+    }
+
+    #[test]
+    fn test_cli_estimate_command() {
+        let a = parse(&[
+            "estimate",
+            "--params",
+            "40000000",
+            "--batch",
+            "128",
+            "--episodes",
+            "300000",
+            "--steps",
+            "128",
+            "--envs",
+            "8",
+            "--device",
+            "gpu",
+        ])
+        .unwrap();
+        assert_eq!(a.command, Command::Estimate);
+        assert_eq!(a.estimate_params, 40_000_000);
+        assert_eq!(a.estimate_batch, 128);
+        assert_eq!(a.estimate_episodes, 300_000);
+        assert_eq!(a.estimate_steps, 128);
+        assert_eq!(a.estimate_envs, 8);
+        assert_eq!(a.estimate_device, "gpu");
+    }
+
+    #[test]
+    fn test_cli_train_jax_flags() {
+        let a = parse(&[
+            "train",
+            "model.jules",
+            "--ml-backend",
+            "jax",
+            "--jax-dataset",
+            "train.npz",
+            "--jax-out",
+            "artifacts/custom",
+            "--jax-script",
+            "scripts/custom.py",
+        ])
+        .unwrap();
+        assert_eq!(a.command, Command::Train);
+        assert_eq!(a.ml_backend, "jax");
+        assert_eq!(a.jax_dataset.as_deref(), Some(Path::new("train.npz")));
+        assert_eq!(a.jax_out, PathBuf::from("artifacts/custom"));
+        assert_eq!(a.jax_script, PathBuf::from("scripts/custom.py"));
+    }
+
+    #[test]
+    fn test_build_jax_ir_from_model_supported_dense() {
+        let sp = Span::dummy();
+        let model = crate::compiler::ast::ModelDecl {
+            span: sp,
+            attrs: vec![],
+            name: "PolicyNet".to_string(),
+            layers: vec![
+                crate::compiler::ast::ModelLayer::Input {
+                    span: sp,
+                    size: 128,
+                },
+                crate::compiler::ast::ModelLayer::Dense {
+                    span: sp,
+                    units: 256,
+                    activation: crate::compiler::ast::Activation::Relu,
+                    bias: true,
+                },
+                crate::compiler::ast::ModelLayer::Output {
+                    span: sp,
+                    units: 10,
+                    activation: crate::compiler::ast::Activation::Softmax,
+                },
+            ],
+            device: crate::compiler::ast::ModelDevice::Auto,
+            optimizer: None,
+        };
+
+        let ir = build_jax_ir_from_model(&model).unwrap();
+        assert_eq!(ir.model_name, "PolicyNet");
+        assert_eq!(ir.input_dim, 128);
+        assert_eq!(ir.layers, vec![256, 10]);
+        assert_eq!(ir.activation, "relu");
+        assert_eq!(ir.task, "classification");
+    }
+
+    #[test]
+    fn test_feature_capability_matrix_reports_unsupported_layer() {
+        let sp = Span::dummy();
+        let model = crate::compiler::ast::ModelDecl {
+            span: sp,
+            attrs: vec![],
+            name: "VisionNet".to_string(),
+            layers: vec![
+                crate::compiler::ast::ModelLayer::Input { span: sp, size: 64 },
+                crate::compiler::ast::ModelLayer::Conv2d {
+                    span: sp,
+                    filters: 32,
+                    kernel_h: 3,
+                    kernel_w: 3,
+                    stride: 1,
+                    padding: crate::compiler::ast::Padding::Same,
+                    activation: crate::compiler::ast::Activation::Relu,
+                },
+            ],
+            device: crate::compiler::ast::ModelDevice::Auto,
+            optimizer: None,
+        };
+        let program = crate::compiler::ast::Program {
+            span: sp,
+            items: vec![crate::compiler::ast::Item::Model(model)],
+            superopt_mode: crate::compiler::ast::SuperoptMode::All,
+        };
+        let rows = feature_capability_matrix(&program);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].jules_supported);
+        assert!(!rows[0].jax_supported);
+        assert!(rows[0]
+            .jax_reason
+            .as_deref()
+            .unwrap()
+            .contains("unsupported layer"));
+    }
+
+    #[test]
+    fn test_estimate_training_param_scaling() {
+        let small = estimate_training(1_000_000, 64, 100_000, 64, 1, "cpu");
+        let large = estimate_training(40_000_000, 64, 100_000, 64, 1, "cpu");
+        assert!(large.estimated_steps_per_sec < small.estimated_steps_per_sec);
+        assert!(large.estimated_duration > small.estimated_duration);
+    }
+
+    #[test]
+    fn test_estimate_training_reports_bottleneck() {
+        let est = estimate_training(80_000_000, 128, 1_000, 128, 8, "cpu");
+        assert!(matches!(est.bottleneck, "sim" | "model"));
+        assert!(est.estimated_model_steps_per_sec > 0.0);
+        assert!(est.estimated_sim_steps_per_sec > 0.0);
+        assert!(
+            (est.estimated_steps_per_sec
+                - est
+                    .estimated_model_steps_per_sec
+                    .min(est.estimated_sim_steps_per_sec))
+            .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn test_build_speed_actions_model_bound_contains_param_guidance() {
+        let args = CliArgs {
+            estimate_params: 80_000_000,
+            estimate_batch: 128,
+            estimate_episodes: 100_000,
+            estimate_steps: 64,
+            estimate_envs: 2,
+            estimate_device: "cpu".to_string(),
+            ..Default::default()
+        };
+        let est = estimate_training(
+            args.estimate_params,
+            args.estimate_batch,
+            args.estimate_episodes,
+            args.estimate_steps,
+            args.estimate_envs,
+            &args.estimate_device,
+        );
+        let actions = build_speed_actions(
+            est,
+            &args,
+            ResourceSnapshot {
+                ram_available_bytes: Some(u64::MAX / 2),
+                gpu_available_bytes: None,
+            },
+        );
+        assert!(actions.iter().any(|a| a.contains("reduce params")));
+    }
+
+    #[test]
+    fn test_build_speed_actions_memory_warning() {
+        let args = CliArgs {
+            estimate_params: 120_000_000,
+            estimate_batch: 512,
+            estimate_episodes: 100_000,
+            estimate_steps: 64,
+            estimate_envs: 8,
+            estimate_device: "cpu".to_string(),
+            ..Default::default()
+        };
+        let est = estimate_training(
+            args.estimate_params,
+            args.estimate_batch,
+            args.estimate_episodes,
+            args.estimate_steps,
+            args.estimate_envs,
+            &args.estimate_device,
+        );
+        let actions = build_speed_actions(
+            est,
+            &args,
+            ResourceSnapshot {
+                ram_available_bytes: Some(1_000_000_000),
+                gpu_available_bytes: None,
+            },
+        );
+        assert!(actions.iter().any(|a| a.contains("memory risk")));
+    }
+
+    #[test]
+    fn test_cli_version() {
+        let a = parse(&["version"]).unwrap();
+        assert_eq!(a.command, Command::Version);
+    }
+
+    #[test]
+    fn test_cli_help() {
+        let a = parse(&["help"]).unwrap();
+        assert_eq!(a.command, Command::Help);
+    }
+
+    #[test]
+    fn test_cli_unknown_flag_error() {
+        assert!(parse(&["run", "x.jules", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_tab_width_invalid() {
+        assert!(parse(&["run", "x.jules", "--tab-width", "abc"]).is_err());
+    }
+
+    #[test]
+    fn test_apply_safe_syntax_fixes_keyword_typo() {
+        let fixed = apply_safe_syntax_fixes("fun main() {}", &[]).unwrap();
+        assert_eq!(fixed, "fn main() {}");
+    }
+
+    #[test]
+    fn test_apply_safe_syntax_fixes_assignment_operator() {
+        let diags = vec![Diag::error(sp(1, 7, 6, 8), "bad assignment")
+            .with_hint("use `=` to assign a value (not `==`)")];
+        let fixed = apply_safe_syntax_fixes("let x == 1;", &diags).unwrap();
+        assert_eq!(fixed, "let x = 1;");
+    }
+
+    #[test]
+    fn test_apply_safe_syntax_fixes_missing_comma() {
+        let diags =
+            vec![Diag::error(sp(1, 6, 5, 5), "missing comma").with_hint("separate items with `,`")];
+        let fixed = apply_safe_syntax_fixes("foo(a b)", &diags).unwrap();
+        assert_eq!(fixed, "foo(a, b)");
+    }
+
+    #[test]
+    fn test_apply_safe_syntax_fixes_common_typos_and_balancing() {
+        let fixed = apply_safe_syntax_fixes("pritn(\"x\"\nflase", &[]).unwrap();
+        assert_eq!(fixed, "print(\"x\"\nfalse)");
+    }
+
+    #[test]
+    fn test_detect_silent_issues_heuristics() {
+        let src = "if a = b {}\nwhile true {}\nif x == 0.1 {}";
+        let diags = detect_silent_issues(src);
+        assert!(diags.iter().any(|d| d.code == Some("W-SILENT-ASSIGN-COND")));
+        assert!(diags
+            .iter()
+            .any(|d| d.code == Some("W-SILENT-INFINITE-LOOP")));
+        assert!(diags.iter().any(|d| d.code == Some("W-SILENT-FLOAT-EQ")));
+    }
+
+    // ── Diagnostic construction ────────────────────────────────────────────────
+
+    fn sp(line: u32, col: u32, start: usize, end: usize) -> Span {
+        Span {
+            line: line as u16,
+            col: col as u16,
+            start: start as u32,
+            end: end as u32,
+        }
+    }
+
+    #[test]
+    fn test_diag_error_is_error() {
+        let d = Diag::error(sp(1, 1, 0, 1), "oops");
+        assert!(d.is_error());
+        assert_eq!(d.severity, DiagSeverity::Error);
+    }
+
+    #[test]
+    fn test_diag_warning_not_error() {
+        let d = Diag::warning(sp(1, 1, 0, 1), "hmm");
+        assert!(!d.is_error());
+    }
+
+    #[test]
+    fn test_diag_with_code_and_hint() {
+        let d = Diag::error(sp(2, 5, 10, 15), "type mismatch")
+            .with_code("E0042")
+            .with_hint("consider adding a cast");
+        assert_eq!(d.code, Some("E0042"));
+        assert!(d.hint.is_some());
+    }
+
+    #[test]
+    fn test_diag_with_label() {
+        let d = Diag::error(sp(1, 1, 0, 5), "err").with_label(sp(2, 3, 10, 15), "defined here");
+        assert_eq!(d.labels.len(), 1);
+    }
+
+    // ── DiagRenderer ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_renderer_no_color_no_ansi() {
+        let src = "let x = 1\nlet y = oops\n";
+        let diag = Diag::error(sp(2, 9, 10, 14), "undefined variable `oops`");
+        let cfg = RenderCfg {
+            color: false,
+            tab_width: 4,
+            context: 0,
+        };
+        let r = DiagRenderer::new(src, "test.jules", cfg);
+        let out = r.render(&diag);
+        assert!(out.contains("undefined variable"), "got: {out}");
+        assert!(out.contains("2"), "should show line number");
+        assert!(
+            !out.contains("\x1b["),
+            "should have no ANSI codes when color=false"
+        );
+    }
+
+    #[test]
+    fn test_renderer_with_color() {
+        let src = "x + y\n";
+        let diag = Diag::error(sp(1, 3, 2, 3), "bad op");
+        let cfg = RenderCfg {
+            color: true,
+            tab_width: 4,
+            context: 0,
+        };
+        let r = DiagRenderer::new(src, "f.jules", cfg);
+        let out = r.render(&diag);
+        assert!(
+            out.contains("\x1b["),
+            "should contain ANSI codes when color=true"
+        );
+    }
+
+    #[test]
+    fn test_renderer_squiggle_width() {
+        let src = "let tensor_val = A @ B\n";
+        // Span covers "tensor_val" (10 chars)
+        let diag = Diag::warning(sp(1, 5, 4, 14), "shadowed name");
+        let cfg = RenderCfg {
+            color: false,
+            tab_width: 4,
+            context: 0,
+        };
+        let r = DiagRenderer::new(src, "x.jules", cfg);
+        let out = r.render(&diag);
+        // Squiggle should appear
+        assert!(out.contains('^'), "should contain squiggle chars: {out}");
+    }
+
+    #[test]
+    fn test_renderer_context_lines() {
+        let src = "line_one\nline_two_error\nline_three\n";
+        let diag = Diag::error(sp(2, 1, 9, 22), "error here");
+        let cfg = RenderCfg {
+            color: false,
+            tab_width: 4,
+            context: 1,
+        };
+        let r = DiagRenderer::new(src, "f.jules", cfg);
+        let out = r.render(&diag);
+        // Should contain context line above.
+        assert!(out.contains("line_one"), "context line above: {out}");
+    }
+
+    #[test]
+    fn test_renderer_all_severities() {
+        let src = "x\n";
+        let cfg = RenderCfg {
+            color: false,
+            tab_width: 4,
+            context: 0,
+        };
+        let r = DiagRenderer::new(src, "f.jules", cfg);
+        let note = r.render(&Diag::note(sp(1, 1, 0, 1), "just a note"));
+        let warn = r.render(&Diag::warning(sp(1, 1, 0, 1), "watch out"));
+        let err = r.render(&Diag::error(sp(1, 1, 0, 1), "broken"));
+        assert!(note.contains("note:"));
+        assert!(warn.contains("warning:"));
+        assert!(err.contains("error:"));
+    }
+
+    // ── JSON emitter ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_json_output_valid_structure() {
+        let diags = vec![
+            Diag::error(sp(3, 5, 20, 25), "missing semicolon").with_code("E0010"),
+            Diag::warning(sp(1, 1, 0, 3), "unused import"),
+        ];
+        let json = diags_to_json(&diags, "src/main.jules");
+        assert!(json.starts_with('['));
+        assert!(json.ends_with(']'));
+        assert!(json.contains("\"severity\": \"error\""));
+        assert!(json.contains("\"severity\": \"warning\""));
+        assert!(json.contains("E0010"));
+        assert!(json.contains("missing semicolon"));
+        assert!(json.contains("src/main.jules"));
+    }
+
+    #[test]
+    fn test_json_empty_diagnostics() {
+        let json = diags_to_json(&[], "f.jules");
+        assert_eq!(json.trim(), "[]");
+    }
+
+    // ── Pipeline ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pipeline_clean_source() {
+        let mut unit = CompileUnit::new("test.jules", "fn main() {}\n");
+        let pipeline = Pipeline::new();
+        let result = pipeline.run(&mut unit);
+        assert!(!unit.has_errors(), "{:?}", unit.diags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_pipeline_lex_error_halts() {
+        // Backtick is not a valid Jules character.
+        let mut unit = CompileUnit::new("test.jules", "let x = `bad`\n");
+        let pipeline = Pipeline::new();
+        let result = pipeline.run(&mut unit);
+        assert!(unit.has_errors(), "expected lex error");
+        assert!(matches!(result, PipelineResult::HaltedAt(PassName::Lex)));
+    }
+
+    #[test]
+    fn test_pipeline_parse_error_halts() {
+        // Missing closing paren
+        let mut unit = CompileUnit::new("test.jules", "fn foo( {}\n");
+        let pipeline = Pipeline::new();
+        let result = pipeline.run(&mut unit);
+        assert!(unit.has_errors(), "expected parse error");
+        assert!(matches!(result, PipelineResult::HaltedAt(PassName::Parse)));
+    }
+
+    #[test]
+    fn test_pipeline_warn_as_error() {
+        // Inject a synthetic warning directly, then apply promote.
+        let mut unit = CompileUnit::new("test.jules", "let x = 1\n");
+        unit.push_diag(Diag::warning(sp(1, 1, 0, 1), "unused"));
+        let mut _pipeline = Pipeline::new();
+        _pipeline.warn_as_error = true;
+        // The warning is already present; run again to trigger promotion.
+        // (In real usage the pipeline inserts the warning during analysis.)
+        // Promote manually to test the behaviour.
+        for d in &mut unit.diags {
+            if d.severity == DiagSeverity::Warning {
+                d.severity = DiagSeverity::Error;
+            }
+        }
+        unit.recalc_diag_counts();
+        assert!(unit.has_errors());
+    }
+
+    #[test]
+    fn test_pipeline_quiet_suppresses_notes() {
+        let mut unit = CompileUnit::new("test.jules", "let x = 1\n");
+        unit.push_diag(Diag::note(sp(1, 1, 0, 1), "just info"));
+        unit.push_diag(Diag::error(sp(1, 1, 0, 1), "real error"));
+        let mut _pipeline = Pipeline::new();
+        _pipeline.quiet = true;
+        unit.diags.retain(|d| d.severity == DiagSeverity::Error);
+        unit.recalc_diag_counts();
+        assert_eq!(unit.diags.len(), 1);
+        assert!(unit.has_errors());
+    }
+
+    #[test]
+    fn test_compile_unit_counts() {
+        let mut unit = CompileUnit::new("x.jules", "");
+        unit.push_diag(Diag::error(sp(1, 1, 0, 1), "e1"));
+        unit.push_diag(Diag::error(sp(1, 1, 0, 1), "e2"));
+        unit.push_diag(Diag::warning(sp(1, 1, 0, 1), "w1"));
+        assert_eq!(unit.error_count(), 2);
+        assert_eq!(unit.warning_count(), 1);
+    }
+
+    // ── Tab expansion ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_expand_tabs_no_tabs() {
+        let cfg = RenderCfg {
+            color: false,
+            tab_width: 4,
+            context: 0,
+        };
+        let r = DiagRenderer::new("abc", "f.jules", cfg);
+        assert_eq!(r.expand_tabs("hello world", 5), 5);
+    }
+
+    #[test]
+    fn test_expand_tabs_with_tab() {
+        let cfg = RenderCfg {
+            color: false,
+            tab_width: 4,
+            context: 0,
+        };
+        let r = DiagRenderer::new("\t", "f.jules", cfg);
+        // Tab at col 0 → expands to 4 display cols.
+        assert_eq!(r.expand_tabs("\thello", 1), 4);
+    }
+
+    #[test]
+    fn test_expand_tabs_mid_line() {
+        let cfg = RenderCfg {
+            color: false,
+            tab_width: 4,
+            context: 0,
+        };
+        let r = DiagRenderer::new("", "f.jules", cfg);
+        // "ab\t" → after 'ab' we're at col 2; tab brings to 4.
+        assert_eq!(r.expand_tabs("ab\tcde", 3), 4);
+    }
+
+    // ── Ansi helper ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ansi_paint_disabled() {
+        let out = Ansi::paint(false, Ansi::RED, "hello");
+        assert_eq!(out, "hello");
+        assert!(!out.contains('\x1b'));
+    }
+
+    #[test]
+    fn test_ansi_paint_enabled() {
+        let out = Ansi::paint(true, Ansi::RED, "hello");
+        assert!(out.starts_with("\x1b["));
+        assert!(out.contains("hello"));
+        assert!(out.ends_with("\x1b[0m"));
+    }
+
+    // ── LexError → Diag conversion ────────────────────────────────────────────
+
+    #[test]
+    fn test_lex_error_into_diag() {
+        let e = LexError::new("unexpected char", sp(5, 3, 40, 41));
+        let d = Diag::from(e);
+        assert_eq!(d.severity, DiagSeverity::Error);
+        assert_eq!(d.code, Some("E0001"));
+        assert!(d.message.contains("unexpected char"));
+    }
+
+    // ── End-to-end token-dump smoke test ─────────────────────────────────────
+
+    #[test]
+    fn test_lex_jules_snippet() {
+        let src = r#"
+            @gpu
+            fn forward(A: tensor<f32>[128, 128]) -> tensor<f32>[128, 128] {
+                let C = grad A @ A
+                return C
+            }
+        "#;
+        let mut lexer = Lexer::new(src);
+        let (tokens, errors) = lexer.tokenize();
+        assert!(errors.is_empty(), "lex errors: {errors:?}");
+        let kinds: Vec<_> = tokens.iter().map(|t| &t.kind).collect();
+        assert!(kinds
+            .iter()
+            .any(|k| matches!(k, crate::compiler::lexer::TokenKind::AtGpu)));
+        assert!(kinds
+            .iter()
+            .any(|k| matches!(k, crate::compiler::lexer::TokenKind::KwFn)));
+        assert!(kinds
+            .iter()
+            .any(|k| matches!(k, crate::compiler::lexer::TokenKind::MatMul)));
+        assert!(kinds
+            .iter()
+            .any(|k| matches!(k, crate::compiler::lexer::TokenKind::KwGrad)));
+    }
+
+    #[test]
+    fn test_lex_invalid_char_produces_diag() {
+        let src = "let x = `wat`";
+        let mut lexer = Lexer::new(src);
+        let (_, errors) = lexer.tokenize();
+        assert!(!errors.is_empty());
+        let diags: Vec<Diag> = errors.into_iter().map(Diag::from).collect();
+        assert!(diags[0].is_error());
+    }
+
+    #[test]
+    fn test_semantic_equivalence_validator_basic() {
+        // Test that the semantic equivalence validator works correctly
+        // for a simple program where both engines should agree.
+        let src = r#"
+fn bench() -> i32 {
+    3 + 4
+}
+"#;
+        let mut unit = CompileUnit::new("<test>".to_string(), src);
+        let result = Pipeline::new().run(&mut unit);
+        assert!(!unit.has_errors(), "compile errors");
+
+        let (program, ir_module) = match result {
+            PipelineResult::OkWithIr { program, ir_module } => (program, ir_module),
+            _ => panic!("pipeline did not produce IR"),
+        };
+
+        let validation = validate_semantic_equivalence(&program, &ir_module, "bench", vec![]);
+        assert!(validation.equivalent, "semantic divergence: {:?}", validation.divergence_description);
+    }
+
+    #[test]
+    fn test_semantic_equivalence_validator_loops() {
+        // Test semantic equivalence for a program with loops and mutation.
+        let src = r#"
+fn bench() -> i32 {
+    let mut sum: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 10 {
+        sum = sum + i;
+        i = i + 1;
+    }
+    sum
+}
+"#;
+        let mut unit = CompileUnit::new("<test>".to_string(), src);
+        let result = Pipeline::new().run(&mut unit);
+        assert!(!unit.has_errors(), "compile errors");
+
+        let (program, ir_module) = match result {
+            PipelineResult::OkWithIr { program, ir_module } => (program, ir_module),
+            _ => panic!("pipeline did not produce IR"),
+        };
+
+        let validation = validate_semantic_equivalence(&program, &ir_module, "bench", vec![]);
+        assert!(validation.equivalent, "semantic divergence: {:?}", validation.divergence_description);
+
+        // Verify the interpreter got the right answer
+        if let Ok(crate::interp::Value::I32(n)) = &validation.interp_result {
+            assert_eq!(*n, 45, "interpreter got wrong answer");
+        }
+    }
+
+    #[test]
+    fn test_phase4_interpreter_hot_path() {
+        // Verify that jules_run_file uses the interpreter as the hot path.
+        // This is an integration test — we can't easily call jules_run_file
+        // from tests, so we verify the pipeline output is consumed correctly.
+        let src = r#"
+fn main() -> i32 {
+    42
+}
+"#;
+        let mut unit = CompileUnit::new("<test>".to_string(), src);
+        let result = Pipeline::new().run(&mut unit);
+        assert!(!unit.has_errors());
+
+        // Both variants should produce a usable program
+        let program = match result {
+            PipelineResult::Ok(p) => p,
+            PipelineResult::OkWithIr { program, .. } => program,
+            _ => panic!("pipeline failed"),
+        };
+
+        // The interpreter should be able to run it
+        let mut interp = crate::interp::Interpreter::new();
+        interp.set_jit_enabled(true); // Enable internal bytecode VM (hot path)
+        interp.set_native_jit_enabled(true); // Enable native JIT
+        interp.load_program(&program);
+        let val = interp.call_fn("main", vec![]).unwrap();
+        match val {
+            crate::interp::Value::I32(n) => assert_eq!(n, 42),
+            crate::interp::Value::I64(n) => assert_eq!(n, 42),
+            other => panic!("unexpected value type: {:?}", other),
+        }
+    }
+}

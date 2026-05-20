@@ -1,0 +1,31 @@
+pub mod bytecode_vm;
+pub mod gpu_backend;
+pub mod heterogeneous_memory;
+pub mod interp;
+pub mod io_uring;
+/// PrefetchEngine with CPU topology detection, stride prediction, etc.
+/// Not actual memory management — feature-gated to reduce default build size.
+#[cfg(feature = "gnn-optimizer")]
+pub mod memory_management;
+pub mod networking;
+pub mod speculative_memory;
+pub mod symbol;
+pub mod threading;
+
+// ── Jules Hardware Abstraction Layer (JHAL) ──────────────────────────────────
+// Low-level drivers for bare-metal boot: Local APIC, UART 16550, PCIe.
+// Uses "Provable Hardware Modeling" — every bit named, Acquire/Release
+// ordering, zero heap allocation, TSX-safe.
+pub mod jhal;
+
+// ── Re-exports for convenient access ─────────────────────────────────────────
+pub use heterogeneous_memory::{
+    AccessPattern as HeteroAccessPattern, AccessPatternClass, Lifetime, MemoryTierId,
+    MigrationCostEstimate, MigrationRequest, MigrationResult, PlacementDistribution,
+    PlacementHintEmitter, TierCharacteristics, ZchmaRuntime,
+};
+pub use speculative_memory::{
+    AccessPattern as SpecAccessPattern, AccessType, AosToSoaConverter, ComponentDescriptor,
+    HtmError, HtmTransaction, LayoutPredictor, MemoryLayout, MemoryReorgOrchestrator,
+    SharedMemoryReorg,
+};

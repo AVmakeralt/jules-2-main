@@ -1,0 +1,263 @@
+[package]
+name = "jules"
+version = "0.2.0"
+edition = "2021"
+authors = ["jules"]
+description = "Jules programming language compiler/interpreter with game dev, ML, and FFI support"
+license = "MIT"
+autobenches = false
+
+[lib]
+name = "jules"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "jules"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench-ecs"
+path = "benches/bench_ecs.rs"
+
+[[bin]]
+name = "micro-benchmark"
+path = "src/micro-benchmark.rs"
+
+[[bin]]
+name = "bench-chess-ml"
+path = "src/tools/bench_chess_ml.rs"
+
+[[bin]]
+name = "bench-interp-vs-rust"
+path = "src/tools/bench_interp_vs_rust.rs"
+
+[[bin]]
+name = "bench-prime-race"
+path = "src/tools/bench_prime_race.rs"
+
+[[bin]]
+name = "bench-extreme"
+path = "src/tools/bench_extreme.rs"
+
+[[bin]]
+name = "bench-genesis-weave"
+path = "src/tools/bench_genesis_weave.rs"
+
+[[bin]]
+name = "bench-mcts-superopt"
+path = "src/tools/bench_mcts_superopt.rs"
+required-features = ["core-superopt"]
+
+[[bin]]
+name = "train-gnn"
+path = "src/tools/train_gnn.rs"
+required-features = ["gnn-optimizer"]
+
+[[bin]]
+name = "bench-speed"
+path = "benches/bench_speed.rs"
+
+[[bin]]
+name = "bench-jhal"
+path = "benches/bench_jhal.rs"
+
+[[bin]]
+name = "bench-inferno"
+path = "benches/bench_inferno.rs"
+
+[[bin]]
+name = "quick-inferno"
+path = "benches/quick_inferno.rs"
+
+[[bin]]
+name = "bench-tracing-jit"
+path = "benches/bench_tracing_jit.rs"
+
+[[bin]]
+name = "bench-1b-jit"
+path = "benches/bench_1b_jit.rs"
+
+[[bin]]
+name = "bench-jit-comprehensive"
+path = "benches/bench_jit_comprehensive.rs"
+
+[[bin]]
+name = "bench-jit-fast"
+path = "benches/bench_jit_fast.rs"
+
+[[bin]]
+name = "bench-polyhedral"
+path = "benches/bench_polyhedral.rs"
+
+[[bin]]
+name = "vm-debug"
+path = "src/tools/vm_debug.rs"
+
+[[bin]]
+name = "pipeline-debug"
+path = "src/tools/pipeline_debug.rs"
+
+[[bin]]
+name = "ast-dump"
+path = "src/tools/ast_dump.rs"
+
+[[bin]]
+name = "fib-debug"
+path = "src/tools/fib_debug.rs"
+
+[[bin]]
+name = "superopt-debug"
+path = "src/tools/superopt_debug.rs"
+
+[[bin]]
+name = "bench-adversarial"
+path = "src/tools/bench_adversarial.rs"
+
+[[bin]]
+name = "bench-ant-colony"
+path = "src/tools/bench_ant_colony.rs"
+
+[[bin]]
+name = "bench-mlp-hard"
+path = "src/tools/bench_mlp_hard.rs"
+
+[[bin]]
+name = "bench-mlp-1m"
+path = "src/tools/bench_mlp_1m.rs"
+
+[[bin]]
+name = "bench-jules-ml-chess"
+path = "src/tools/bench_jules_ml_chess.rs"
+
+[[bin]]
+name = "bench-optimizations"
+path = "src/tools/bench_optimizations.rs"
+
+[[example]]
+name = "dump-ir"
+path = "examples/dump_ir.rs"
+
+[dependencies]
+mimalloc = "0.1"
+pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
+numpy = { version = "0.21", optional = true }
+libc = "0.2"
+lazy_static = "1.4"
+parking_lot = "0.12"
+matrixmultiply = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+rustyline = "12"
+rustc-hash = "2"
+# rayon = "1"  # Replaced by custom threading engine
+bumpalo = "3.14"
+smallvec = { version = "1", features = ["union", "const_generics"] }
+ahash = "0.8"
+bitflags = "2"
+memmap2 = "0.9"
+# Cranelift backend — optional, NOT required for the hand-written x86-64 JIT.
+# The Phase 3 JIT (phase3_jit.rs / tracing_jit.rs) is self-contained and
+# emits raw x86-64 machine code via mmap/mprotect.  Enable this feature
+# only if you want a Cranelift-based backend as an alternative.
+cranelift-codegen = { version = "0.110", optional = true }
+cranelift-module = { version = "0.110", optional = true }
+cranelift-jit = { version = "0.110", optional = true }
+region = "3.0"
+# XLA FFI bindings (optional, requires XLA library) - removed: not available on crates.io
+# xla-ffi = { version = "0.1", optional = true }
+# Threading engine dependencies
+nix = { version = "0.28", features = ["sched"], optional = true }
+num_cpus = "1.16"
+windows = { version = "0.52", features = ["Win32_System_Threading"], optional = true }
+# SMT verification (CEGIS loop)
+# Uses bindgen + prebuilt Z3 from /home/z/.local (or system Z3).
+# Set Z3_SYS_Z3_HEADER and LIBCLANG_PATH env vars if needed.
+z3 = { version = "0.12", optional = true }
+# E-graph equality saturation — uses our own implementation, not the egg crate.
+
+[features]
+default = ["ffi-c", "phase1", "phase2", "phase3-jit", "core-superopt", "machine-instr-model"]
+python = ["pyo3", "numpy"]
+ffi-c = []
+nightly = []
+phase1 = []
+phase2 = []
+# Phase 3 JIT — hand-written x86-64 emitter, zero external deps beyond libc.
+# Cranelift is an OPTIONAL backend, not a requirement.
+phase3-jit = []
+cranelift-backend = ["cranelift-codegen", "cranelift-module", "cranelift-jit"]
+numa = ["nix"]
+phase6-simd = []
+# XLA FFI backend — code-gated feature. The XLA library is optional;
+# when disabled the backend falls back to CPU execution.
+xla = []
+gnn-optimizer = []
+core-superopt = []
+smt-verify = ["z3"]  # Requires libclang + Z3 lib/headers (see README)
+machine-instr-model = ["core-superopt"]  # Machine-instruction-aware optimization layer
+ultra-fast = ["phase3-jit", "phase6-simd", "core-superopt", "machine-instr-model"]
+full = ["python", "ffi-c", "phase1", "phase2", "phase3-jit", "cranelift-backend", "phase6-simd", "xla", "gnn-optimizer", "core-superopt", "machine-instr-model"]
+
+[lints.rust]
+dead_code = "warn"
+unused_variables = "warn"
+unused_mut = "warn"
+unused_imports = "warn"
+unused_macros = "warn"
+unused_doc_comments = "warn"
+private_interfaces = "allow"
+non_camel_case_types = "allow"
+unreachable_patterns = "warn"
+
+# =============================================================================
+# PERFORMANCE PROFILES
+# =============================================================================
+
+# Fast compile for development (default: `cargo build`)
+[profile.dev]
+opt-level = 1              # Basic optimizations for speed
+codegen-units = 16         # Parallel codegen for fast builds
+incremental = true         # Incremental compilation
+debug = "line-tables-only" # Minimal debug info
+panic = "unwind"
+overflow-checks = true
+
+# Production release: optimized for speed
+[profile.release]
+opt-level = 3
+lto = "fat"               # Full LTO for maximum cross-crate inlining
+codegen-units = 1          # Single unit for maximum inlining & optimization
+panic = "abort"            # Removes unwinding machinery (~5% speedup)
+strip = "symbols"
+incremental = false
+debug = false
+overflow-checks = false
+rpath = false
+
+# Benchmarks: same as release
+[profile.bench]
+inherits = "release"
+
+# MAXIMUM PERFORMANCE: use only for final builds (slow compile!)
+[profile.max-perf]
+inherits = "release"
+lto = "fat"                # Full LTO (slow but best performance)
+codegen-units = 1          # Single unit for maximum inlining
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"
+debug = false
+overflow-checks = false
+
+[profile.release.build-override]
+opt-level = 3
+
+[profile.max-perf.build-override]
+opt-level = 3
+
+[[example]]
+name = "dump-bug-ir"
+path = "examples/dump-bug-ir.rs"

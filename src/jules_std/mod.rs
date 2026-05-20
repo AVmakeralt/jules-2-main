@@ -1,0 +1,618 @@
+// =============================================================================
+// std — Jules Standard Library
+//
+// Module registry: all stdlib dispatch functions centralized here.
+// Each submodule exposes `pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError>>`.
+// =============================================================================
+
+use rustc_hash::FxHashMap;
+
+mod ai;
+mod alloc;
+mod collections;
+mod geometry;
+mod math;
+mod net;
+mod noise;
+mod pathfind;
+mod random;
+mod spatial;
+pub mod sieve_210;
+pub mod prng_simd;
+pub mod morton;
+pub mod genesis_weave;
+pub mod collision;
+pub mod sdf_ray;
+pub mod gaussian_splat;
+pub mod vpl_lighting;
+pub mod sprite_pipe;
+pub mod simd_batch;
+pub mod voxel_mesh;
+pub mod aurora_flux;
+pub mod aurora_threading;
+pub mod simd_math;
+
+use crate::interp::{RuntimeError, Value};
+
+/// Master dispatch: routes `module::function` calls to the right stdlib module.
+pub fn dispatch(name: &str, args: &[Value]) -> Option<Result<Value, RuntimeError>> {
+    // Try each module in order of likely frequency.
+    // Most-used modules first for shorter dispatch chains.
+    math::dispatch(name, args)
+        .or_else(|| geometry::dispatch(name, args))
+        .or_else(|| random::dispatch(name, args))
+        .or_else(|| noise::dispatch(name, args))
+        .or_else(|| spatial::dispatch(name, args))
+        .or_else(|| pathfind::dispatch(name, args))
+        .or_else(|| ai::dispatch(name, args))
+        .or_else(|| net::dispatch(name, args))
+        .or_else(|| alloc::dispatch(name, args))
+        .or_else(|| collections::dispatch(name, args))
+        .or_else(|| sieve_210::dispatch(name, args))
+        .or_else(|| prng_simd::dispatch(name, args))
+        .or_else(|| morton::dispatch(name, args))
+        .or_else(|| genesis_weave::dispatch(name, args))
+        .or_else(|| collision::dispatch(name, args))
+        .or_else(|| sdf_ray::dispatch(name, args))
+        .or_else(|| gaussian_splat::dispatch(name, args))
+        .or_else(|| vpl_lighting::dispatch(name, args))
+        .or_else(|| sprite_pipe::dispatch(name, args))
+        .or_else(|| simd_batch::dispatch(name, args))
+        .or_else(|| voxel_mesh::dispatch(name, args))
+        .or_else(|| aurora_flux::dispatch(name, args))
+        .or_else(|| aurora_threading::dispatch(name, args))
+}
+
+/// List all available stdlib modules and functions (for introspection).
+pub fn modules_value() -> Value {
+    let mut out = FxHashMap::default();
+
+    let math_fns = vec![
+        "vec2",
+        "vec3",
+        "vec4",
+        "dot2",
+        "dot3",
+        "dot4",
+        "cross3",
+        "length2",
+        "length3",
+        "length4",
+        "distance2",
+        "distance3",
+        "normalize2",
+        "normalize3",
+        "normalize4",
+        "lerp",
+        "mix",
+        "reflect2",
+        "reflect3",
+        "refract2",
+        "min",
+        "max",
+        "clamp",
+        "sign",
+        "step",
+        "smoothstep",
+        "smootherstep",
+        "radians",
+        "degrees",
+        "quat",
+        "quat_identity",
+        "quat_mul",
+        "quat_conjugate",
+        "quat_inverse",
+        "quat_normalize",
+        "quat_axis_angle",
+        "quat_rotate_vec3",
+        "quat_slerp",
+        "quat_from_euler",
+        "mat4_identity",
+        "mat4_perspective",
+        "mat4_look_at",
+        "mat4_translate",
+        "mat4_scale",
+        "mat4_rotate_x",
+        "mat4_rotate_y",
+        "mat4_rotate_z",
+        "mat4_mul",
+        "mat4_mul_vec4",
+        "mat4_inverse",
+        "mat4_transpose",
+        "transform",
+        "transform_from_mat4",
+        "prime_count_segmented",
+    ];
+    out.insert(
+        "math".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            math_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("math::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let geom_fns = vec![
+        "vec2",
+        "vec2_x",
+        "ray",
+        "ray_at",
+        "aabb",
+        "aabb_contains",
+        "aabb_intersects",
+        "aabb_ray_intersect",
+        "aabb_center",
+        "aabb_extent",
+        "sphere",
+        "sphere_intersects",
+        "sphere_ray_intersect",
+        "plane",
+        "plane_distance",
+        "plane_ray_intersect",
+        "frustum_from_perspective",
+        "frustum_contains_aabb",
+        "frustum_contains_sphere",
+        "sdf_sphere",
+        "sdf_box",
+        "sdf_plane",
+        "sdf_torus",
+        "gjk_intersects",
+        "closest_point_on_segment",
+        "triangle_normal",
+        "point_in_triangle",
+    ];
+    out.insert(
+        "geom".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            geom_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("geom::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let random_fns = vec![
+        "seed",
+        "rand",
+        "rand_f32",
+        "rand_f64",
+        "rand_range",
+        "rand_int",
+        "rand_normal",
+        "rand_bool",
+        "choice",
+        "weighted_choice",
+        "shuffle",
+        "sample",
+        "pcg32",
+        "pcg32_next",
+        "pcg32_next_f32",
+        "pcg32_range",
+        "splitmix64",
+        "splitmix64_next",
+        "splitmix64_next_u32",
+        "splitmix64_next_f64",
+    ];
+    out.insert(
+        "random".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            random_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("random::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let noise_fns = vec![
+        "perlin2",
+        "perlin3",
+        "value2",
+        "value3",
+        "simplex2",
+        "worley2",
+        "worley2_cellular",
+        "fbm2",
+        "fbm3",
+        "turbulence2",
+        "ridged2",
+    ];
+    out.insert(
+        "noise".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            noise_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("noise::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let spatial_fns = vec![
+        "hash_new",
+        "hash_insert",
+        "hash_query",
+        "hash_clear",
+        "quadtree_new",
+        "quadtree_insert",
+        "quadtree_query",
+        "octree_new",
+        "octree_insert",
+        "octree_query",
+        "bvh_new",
+        "bvh_build",
+        "bvh_query",
+    ];
+    out.insert(
+        "spatial".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            spatial_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("spatial::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let path_fns = vec![
+        "astar",
+        "dijkstra",
+        "flow_field",
+        "distance",
+        "heuristic_manhattan",
+        "heuristic_chebyshev",
+        "heuristic_octile",
+    ];
+    out.insert(
+        "path".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            path_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("path::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let ai_fns = vec![
+        "seek",
+        "flee",
+        "arrive",
+        "pursue",
+        "evade",
+        "wander",
+        "avoid",
+        "boid_separation",
+        "boid_cohesion",
+        "boid_alignment",
+        "boid_update",
+        "utility_score",
+        "utility_pick",
+        "bt_sequence",
+        "bt_selector",
+        "bt_evaluate",
+    ];
+    out.insert(
+        "ai".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            ai_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("ai::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let net_fns = vec![
+        "tcp_listen",
+        "tcp_accept",
+        "tcp_send",
+        "tcp_connect",
+        "tcp_client_send",
+        "tcp_client_recv",
+        "udp_bind",
+        "udp_send_to",
+        "udp_recv",
+        "url_encode",
+        "url_decode",
+        "serialize",
+        "parse_url",
+    ];
+    out.insert(
+        "net".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            net_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("net::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let alloc_fns = vec![
+        "arena_new",
+        "arena_alloc",
+        "arena_alloc_zero",
+        "arena_reset",
+        "arena_used",
+        "arena_capacity",
+        "arena_free",
+        "arena_write_u8",
+        "arena_write_u16",
+        "arena_write_u32",
+        "arena_write_u64",
+        "arena_write_f32",
+        "arena_write_f64",
+        "arena_read_u8",
+        "arena_read_u32",
+        "arena_read_f32",
+        "arena_read_f64",
+        "pool_new",
+        "pool_alloc",
+        "pool_free",
+        "pool_used",
+        "pool_block_size",
+        "pool_capacity",
+        "pool_write",
+        "pool_read",
+        "slab_new",
+        "slab_insert",
+        "slab_remove",
+        "slab_len",
+        "slab_get",
+        "slab_capacity",
+    ];
+    out.insert(
+        "alloc".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            alloc_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("alloc::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let coll_fns = vec![
+        "mpsc_new",
+        "mpsc_push",
+        "mpsc_try_pop",
+        "mpsc_is_empty",
+        "mpsc_clear",
+        "ring_new",
+        "ring_push",
+        "ring_pop",
+        "ring_len",
+        "ring_peek",
+        "ring_capacity",
+        "ring_is_empty",
+        "ring_is_full",
+        "pq_new",
+        "pq_push",
+        "pq_pop",
+        "pq_len",
+        "pq_peek",
+        "pq_is_empty",
+        "sorted_set_new",
+        "sorted_set_insert",
+        "sorted_set_remove",
+        "sorted_set_contains",
+        "sorted_set_len",
+        "sorted_set_is_empty",
+        "sorted_set_to_array",
+        "par_map",
+        "par_filter",
+        "par_reduce",
+    ];
+    out.insert(
+        "collections".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            coll_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("collections::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let sieve_fns = vec![
+        "prime_count",
+        "naive_prime_count",
+        "verify",
+    ];
+    out.insert(
+        "sieve_210".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            sieve_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("sieve_210::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let prng_fns = vec![
+        "squares_next",
+        "shishiua_next",
+        "simd8_batch",
+        "verify",
+    ];
+    out.insert(
+        "prng_simd".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            prng_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("prng_simd::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let morton_fns = vec![
+        "encode2d",
+        "decode2d",
+        "encode3d",
+        "decode3d",
+        "distance",
+        "tile_index",
+        "verify",
+    ];
+    out.insert(
+        "morton".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            morton_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("morton::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let genesis_fns = vec![
+        "terrain_height",
+        "biome_at",
+        "entity_at",
+        "check_exclusion",
+        "jittered_position",
+        "biome_weight",
+        "generate_structure",
+        "verify",
+    ];
+    out.insert(
+        "genesis".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            genesis_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("genesis::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let collision_fns = vec![
+        "probe",
+        "probe_8",
+        "resolve",
+        "probe_3d",
+        "morton_probe",
+        "verify",
+    ];
+    out.insert(
+        "collision".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            collision_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("collision::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let sdf_ray_fns = vec![
+        "march",
+        "sdf_world",
+        "normal",
+        "verify",
+    ];
+    out.insert(
+        "sdf_ray".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            sdf_ray_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("sdf_ray::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let gaussian_splat_fns = vec![
+        "generate",
+        "fog",
+        "god_rays",
+        "verify",
+    ];
+    out.insert(
+        "gaussian_splat".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            gaussian_splat_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("gaussian_splat::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let vpl_lighting_fns = vec![
+        "compute",
+        "shadow",
+        "ao",
+        "god_rays",
+        "vec3_reflect",
+        "vec3_lerp",
+        "vec3_cmul",
+        "mie_beta",
+        "verify",
+    ];
+    out.insert(
+        "vpl_lighting".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            vpl_lighting_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("vpl_lighting::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let sprite_pipe_fns = vec![
+        "at_morton",
+        "generate",
+        "palette",
+        "anim_frame",
+        "verify",
+    ];
+    out.insert(
+        "sprite_pipe".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            sprite_pipe_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("sprite_pipe::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let voxel_mesh_fns = vec![
+        "is_solid",
+        "generate_chunk",
+        "mesh",
+        "lod_query",
+        "verify",
+    ];
+    out.insert(
+        "voxel_mesh".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            voxel_mesh_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("voxel_mesh::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let simd_batch_fns = vec![
+        "verify",
+        "benchmark_morton_uv",
+        "sprite_at_morton_8",
+    ];
+    out.insert(
+        "simd_batch".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            simd_batch_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("simd_batch::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    let aurora_threading_fns = vec![
+        "verify",
+        "benchmark",
+        "director_info",
+        "fiber_pool_info",
+    ];
+    out.insert(
+        "aurora_threading".into(),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            aurora_threading_fns
+                .into_iter()
+                .map(|s| Value::Str(format!("aurora_threading::{}", s)))
+                .collect(),
+        ))),
+    );
+
+    Value::HashMap(std::rc::Rc::new(std::cell::RefCell::new(out)))
+}

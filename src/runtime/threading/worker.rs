@@ -1,0 +1,640 @@
+// =========================================================================
+// Worker Pool and Thread Management
+// Fixed-size thread pool with per-worker work-stealing deques
+// Implements Michael-Scott MPMC queue for injectors
+// =========================================================================
+
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use super::deque::WorkStealingDeque;
+use super::epoch::{Guard, Participant};
+use super::numa::{NumaTopology, num_cores};
+use super::percpu_deque::PerCpuDeque;
+use super::rseq::register_rseq;
+
+/// Number of worker threads (one per CPU core)
+fn num_workers() -> usize {
+    num_cores()
+}
+
+/// Michael-Scott MPMC queue node
+struct MpmcNode {
+    data: *mut (),
+    next: AtomicPtr<MpmcNode>,
+}
+
+/// Michael-Scott MPMC queue for injector
+///
+/// TODO (PERF-12): Each push() allocates a new MpmcNode on the heap.
+/// This is a per-task allocation overhead that should be replaced with
+/// an array-based MPMC ring buffer for the injector queue. The ring
+/// buffer would pre-allocate all slots and use sequence numbers for
+/// coordination, similar to the Disruptor pattern already implemented
+/// in disruptor.rs.
+///
+/// Issue #80: The per-push heap allocation (Box::new(MpmcNode) in push())
+/// costs ~50ns per task submission on modern x86-64 (allocator fast path).
+/// For high-throughput workloads (millions of tasks/sec), this becomes
+/// the dominant cost. Alternatives:
+///   1. Bounded MPMC ring buffer: pre-allocate N slots, use sequence
+///      numbers for coordination (Dmitry Vyukov's bounded MPMC queue).
+///      Pro: zero allocation on push. Con: bounded capacity, requires
+///      backpressure or overflow handling.
+///   2. Object pool: pre-allocate a pool of MpmcNodes and recycle them
+///      from try_pop() back into the pool. Pro: unbounded, zero alloc
+///      after warmup. Con: pool management complexity, ABA problem.
+///   3. Disruptor-style: already implemented in disruptor.rs; migrate
+///      the injector to use it. This is the preferred long-term fix.
+struct MpmcQueue {
+    head: AtomicPtr<MpmcNode>,
+    tail: AtomicPtr<MpmcNode>,
+}
+
+impl MpmcQueue {
+    fn new() -> Self {
+        let dummy = Box::into_raw(Box::new(MpmcNode {
+            data: std::ptr::null_mut(),
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        }));
+        
+        Self {
+            head: AtomicPtr::new(dummy),
+            tail: AtomicPtr::new(dummy),
+        }
+    }
+
+    fn push(&self, task: *mut ()) {
+        let node = Box::into_raw(Box::new(MpmcNode {
+            data: task,
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        }));
+
+        loop {
+            let tail = self.tail.load(Ordering::Acquire);
+            let tail_node = unsafe { &*tail };
+            let next = tail_node.next.load(Ordering::Acquire);
+
+            if next.is_null() {
+                if tail_node.next.compare_exchange_weak(
+                    std::ptr::null_mut(),
+                    node,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ).is_ok() {
+                    let _ = self.tail.compare_exchange_weak(
+                        tail,
+                        node,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    );
+                    return;
+                }
+            } else {
+                let _ = self.tail.compare_exchange_weak(
+                    tail,
+                    next,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                );
+            }
+        }
+    }
+
+    fn try_pop(&self) -> Option<*mut ()> {
+        loop {
+            let head = self.head.load(Ordering::Acquire);
+            let tail = self.tail.load(Ordering::Acquire);
+            let head_node = unsafe { &*head };
+            let next = head_node.next.load(Ordering::Acquire);
+
+            if head == tail {
+                if next.is_null() {
+                    return None;
+                }
+                let _ = self.tail.compare_exchange_weak(
+                    tail,
+                    next,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                );
+            } else {
+                let data = unsafe { (*next).data };
+                if self.head.compare_exchange_weak(
+                    head,
+                    next,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ).is_ok() {
+                    // Free the dummy node
+                    let _ = unsafe { Box::from_raw(head) };
+                    return Some(data);
+                }
+            }
+        }
+    }
+}
+
+/// Notification mechanism for waking workers using condvar
+///
+/// FIX (PERF-2): Replaced the spin-wait with thread::sleep(100us) with a
+/// proper Condvar-based wait/notify. The original polling approach wasted
+/// CPU cycles when no work was available and introduced up to 100us of
+/// latency before a sleeping worker noticed new work. The Condvar approach
+/// provides kernel-level wake/sleep with microsecond response times and
+/// zero CPU usage while sleeping.
+struct Notify {
+    flag: AtomicBool,
+    condvar: std::sync::Condvar,
+    mutex: std::sync::Mutex<()>,
+}
+
+impl Notify {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            condvar: std::sync::Condvar::new(),
+            mutex: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn notify_one(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.condvar.notify_one();
+    }
+
+    fn notify_all(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.condvar.notify_all();
+    }
+
+    fn wait(&self) {
+        // FIX (PERF-2): Use Condvar wait instead of polling with sleep.
+        // This blocks the thread with zero CPU usage until notified,
+        // with microsecond wake latency on Linux.
+        //
+        // FIX (PERF-9): Reduced timeout from 10ms to 1ms to lower the
+        // latency before a sleeping worker picks up new work. The 10ms
+        // timeout caused unnecessary delays in work acquisition.
+        let guard = self.mutex.lock().unwrap();
+        let _guard = self.condvar.wait_timeout(guard, Duration::from_millis(1)).unwrap();
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+/// Global injector queue for external task submission
+struct Injector {
+    queue: MpmcQueue,
+    notify: Arc<Notify>,
+    shutdown_notify: Arc<Notify>,
+    wait_notify: Arc<Notify>,
+}
+
+impl Injector {
+    fn new() -> Self {
+        let notify = Arc::new(Notify::new());
+        Self {
+            queue: MpmcQueue::new(),
+            notify: notify.clone(),
+            shutdown_notify: Arc::new(Notify::new()),
+            wait_notify: notify,
+        }
+    }
+
+    fn push(&self, task: *mut ()) {
+        self.queue.push(task);
+        self.notify.notify_one();
+    }
+
+    fn try_pop(&self) -> Option<*mut ()> {
+        self.queue.try_pop()
+    }
+
+    fn notify_shutdown(&self) {
+        self.shutdown_notify.notify_all();
+    }
+
+    fn wait_for_work(&self) {
+        self.wait_notify.wait();
+    }
+}
+
+/// Per-worker state with 128-byte alignment to prevent false sharing
+#[repr(C, align(128))]
+pub struct Worker {
+    /// Worker ID
+    id: usize,
+    _pad1: [u8; 64],
+    /// Local work-stealing deque (fallback)
+    deque: WorkStealingDeque,
+    _pad2: [u8; 64],
+    /// Per-CPU deque (wait-fast with rseq)
+    percpu_deque: Arc<PerCpuDeque>,
+    _pad3: [u8; 64],
+    /// Reference to global injector
+    injector: Arc<Injector>,
+    /// Reference to all workers (for stealing) — late-initialized via OnceLock
+    workers: Arc<std::sync::OnceLock<Arc<Vec<Arc<Worker>>>>>,
+    /// Epoch participant
+    participant: Arc<Participant>,
+    /// Shutdown flag
+    shutdown: Arc<AtomicBool>,
+    /// NUMA node ID (if NUMA is enabled)
+    numa_node: Option<usize>,
+    /// Statistics
+    tasks_executed: AtomicUsize,
+    steals_performed: AtomicUsize,
+}
+
+impl Worker {
+    /// Create a new worker
+    fn new(
+        id: usize,
+        injector: Arc<Injector>,
+        workers: Arc<std::sync::OnceLock<Arc<Vec<Arc<Worker>>>>>,
+        participant: Arc<Participant>,
+        shutdown: Arc<AtomicBool>,
+        numa_node: Option<usize>,
+        percpu_deque: Arc<PerCpuDeque>,
+    ) -> Self {
+        Self {
+            id,
+            _pad1: [0; 64],
+            deque: WorkStealingDeque::new(participant.clone()),
+            _pad2: [0; 64],
+            percpu_deque,
+            _pad3: [0; 64],
+            injector,
+            workers,
+            participant,
+            shutdown,
+            numa_node,
+            tasks_executed: AtomicUsize::new(0),
+            steals_performed: AtomicUsize::new(0),
+        }
+    }
+
+    /// Main worker loop with exponential backoff for idle periods
+    fn run(&self) {
+        // Register rseq for this thread
+        let _ = register_rseq();
+        
+        let mut idle_iterations = 0;
+        
+        while !self.shutdown.load(Ordering::Acquire) {
+            let guard = self.participant.pin();
+            
+            // Try to pop from per-CPU deque first (wait-free with rseq)
+            if let Some(task) = self.percpu_deque.pop(&guard) {
+                self.execute_task(task);
+                idle_iterations = 0;
+                continue;
+            }
+            
+            // Try to pop from local deque (fallback)
+            if let Some(task) = self.deque.pop(&guard) {
+                self.execute_task(task);
+                idle_iterations = 0;
+                continue;
+            }
+            
+            // Try to steal from injector
+            if let Some(task) = self.injector.try_pop() {
+                self.execute_task(task);
+                idle_iterations = 0;
+                continue;
+            }
+            
+            // Try to steal from other workers
+            if let Some(task) = self.steal(&guard) {
+                self.execute_task(task);
+                idle_iterations = 0;
+                continue;
+            }
+            
+            // No work found, adaptive backoff
+            //
+            // FIX (PERF-9): Replaced thread::sleep() with adaptive backoff
+            // strategy. The old approach used thread::sleep(1us) which
+            // actually sleeps 50-100us on Linux due to OS scheduler
+            // granularity. The new strategy uses:
+            //   - spin_loop() for very short idle (PAUSE on x86, YIELD on ARM)
+            //   - yield_now() for medium idle (OS scheduler yield)
+            //   - condvar wait for long idle (zero CPU, 1ms timeout)
+            idle_iterations += 1;
+            if idle_iterations > 1000 {
+                // Long idle: condvar-based wait (zero CPU usage)
+                self.injector.wait_for_work();
+            } else if idle_iterations > 100 {
+                // Medium idle: yield to OS scheduler
+                std::thread::yield_now();
+            } else {
+                // Short idle: spin pause (PAUSE instruction on x86)
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Steal work from other workers with NUMA-aware priority
+    ///
+    /// FIX (PERF-1): Instead of scanning all N workers sequentially (O(N)
+    /// per steal attempt, causing cache-line contention on 64+ core machines),
+    /// we now use randomized probing: try a small number of random workers
+    /// before falling back to a full scan. This reduces contention from O(N)
+    /// to O(K) where K is the number of probes (default 3).
+    ///
+    /// TODO (PERF-14): The NUMA-aware fallback scans all workers twice
+    /// (once for same-node, once for cross-node). Should pre-compute
+    /// numa_local_peers and numa_remote_peers lists in Worker::new()
+    /// or ThreadPool::new() to avoid the O(N) scan on every steal attempt.
+    /// The pre-computed lists would allow O(K) NUMA-aware stealing.
+    fn steal(&self, guard: &Guard) -> Option<*mut ()> {
+        let workers = match self.workers.get() {
+            Some(w) => w,
+            None => return None,
+        };
+        let num_workers = workers.len();
+        if num_workers <= 1 {
+            return None;
+        }
+        
+        // FIX (PERF-1): Randomized probing — try up to 3 random workers
+        // before falling back to a sequential scan. This significantly
+        // reduces cache-line contention on machines with many cores.
+        let num_probes = 3.min(num_workers - 1);
+        for _ in 0..num_probes {
+            // Simple fast random: use the worker's own ID + steal counter
+            // as a pseudorandom offset. Not cryptographically random but
+            // sufficient for load balancing.
+            let offset = (self.id.wrapping_add(self.steals_performed.load(Ordering::Relaxed))) % (num_workers - 1) + 1;
+            let target_id = (self.id + offset) % num_workers;
+            let target = &workers[target_id];
+            
+            for task in target.percpu_deque.steal_half(target_id, guard) {
+                if !task.is_null() {
+                    self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                    return Some(task);
+                }
+            }
+            for task in target.deque.steal_half(guard) {
+                if !task.is_null() {
+                    self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                    return Some(task);
+                }
+            }
+        }
+        
+        // Fallback: NUMA-aware sequential scan for remaining work
+        if let Some(my_node) = self.numa_node {
+            // Try same-node workers first
+            for offset in 1..num_workers {
+                let target_id = (self.id + offset) % num_workers;
+                let target = &workers[target_id];
+                
+                if target.numa_node == Some(my_node) {
+                    for task in target.percpu_deque.steal_half(target_id, guard) {
+                        if !task.is_null() {
+                            self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                            return Some(task);
+                        }
+                    }
+                    for task in target.deque.steal_half(guard) {
+                        if !task.is_null() {
+                            self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                            return Some(task);
+                        }
+                    }
+                }
+            }
+            
+            // Then try cross-node workers
+            for offset in 1..num_workers {
+                let target_id = (self.id + offset) % num_workers;
+                let target = &workers[target_id];
+                
+                if target.numa_node != Some(my_node) {
+                    for task in target.percpu_deque.steal_half(target_id, guard) {
+                        if !task.is_null() {
+                            self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                            return Some(task);
+                        }
+                    }
+                    for task in target.deque.steal_half(guard) {
+                        if !task.is_null() {
+                            self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                            return Some(task);
+                        }
+                    }
+                }
+            }
+        } else {
+            // No NUMA info, steal from any worker (sequential scan as fallback)
+            for offset in 1..num_workers {
+                let target_id = (self.id + offset) % num_workers;
+                let target = &workers[target_id];
+                
+                for task in target.percpu_deque.steal_half(target_id, guard) {
+                    if !task.is_null() {
+                        self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                        return Some(task);
+                    }
+                }
+                for task in target.deque.steal_half(guard) {
+                    if !task.is_null() {
+                        self.steals_performed.fetch_add(1, Ordering::Relaxed);
+                        return Some(task);
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+
+    /// Execute a task
+    ///
+    /// FIX (PERF-8): Replaced the old double-boxing dispatch (Box<Box<dyn FnOnce()>>)
+    /// with uniform vtable dispatch. All task types (SlabTask from spawn(),
+    /// BoxedTask from par_for()) have a vtable pointer at offset 0, so we
+    /// read the vtable and call run() directly. This eliminates 2 heap
+    /// allocations per spawn() and 1 per par_for() chunk.
+    fn execute_task(&self, task: *mut ()) {
+        self.tasks_executed.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            // Read the vtable pointer at offset 0 (common to SlabTask and BoxedTask)
+            let vtable_ptr = *(task as *const *const super::join::TaskVtable);
+            if !vtable_ptr.is_null() {
+                let vtable = &*vtable_ptr;
+                (vtable.run)(task);
+            }
+        }
+    }
+
+    /// Push a task to this worker's deque
+    pub fn push(&self, task: *mut ()) {
+        let guard = self.participant.pin();
+        // Try per-CPU deque first (wait-free with rseq)
+        self.percpu_deque.push(task, &guard);
+    }
+
+    /// Get worker statistics
+    pub fn stats(&self) -> WorkerStats {
+        WorkerStats {
+            id: self.id,
+            tasks_executed: self.tasks_executed.load(Ordering::Relaxed),
+            steals_performed: self.steals_performed.load(Ordering::Relaxed),
+            deque_size: self.deque.len(),
+        }
+    }
+}
+
+/// Worker statistics
+#[derive(Debug, Clone)]
+pub struct WorkerStats {
+    pub id: usize,
+    pub tasks_executed: usize,
+    pub steals_performed: usize,
+    pub deque_size: usize,
+}
+
+/// Thread pool for managing workers
+pub struct ThreadPool {
+    workers: Arc<Vec<Arc<Worker>>>,
+    injector: Arc<Injector>,
+    shutdown: Arc<AtomicBool>,
+    participant: Arc<Participant>,
+}
+
+impl ThreadPool {
+    /// Create a new thread pool
+    ///
+    /// FIX (TH-5): Each worker now gets its own Participant for epoch-based
+    /// reclamation. Previously, a single Participant was shared across all
+    /// workers via Arc::clone(), causing lost updates to local_epoch when
+    /// multiple threads called pin() concurrently.
+    pub fn new() -> Self {
+        let num_workers = num_workers();
+        let injector = Arc::new(Injector::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        
+        // Detect NUMA topology
+        let topology = NumaTopology::detect();
+        
+        let mut workers = Vec::with_capacity(num_workers);
+        
+        for id in 0..num_workers {
+            // Determine NUMA node for this worker
+            let numa_node = topology.get_node_for_cpu(id).map(|n| n.id);
+            
+            // FIX (TH-5): Create one Participant per worker instead of sharing
+            // a single Participant. This ensures each thread's pin()/unpin()
+            // operates on its own local_epoch, preventing lost updates.
+            let participant = Arc::new(Participant::new());
+            let percpu_deque = Arc::new(PerCpuDeque::new(participant.clone()));
+            
+            let worker = Arc::new(Worker::new(
+                id,
+                injector.clone(),
+                // Placeholder — will be set after all workers are created
+                Arc::new(std::sync::OnceLock::new()),
+                participant,
+                shutdown.clone(),
+                numa_node,
+                percpu_deque,
+            ));
+            workers.push(worker);
+        }
+        
+        // Build the shared worker list and initialize each worker's OnceLock
+        let workers_arc = Arc::new(workers);
+        for worker in workers_arc.iter() {
+            let _ = worker.workers.set(workers_arc.clone());
+        }
+        
+        // Spawn worker threads with CPU affinity
+        for worker in workers_arc.iter() {
+            let worker_clone = worker.clone();
+            let _cpu_id = worker.id;
+            
+            thread::spawn(move || {
+                // Set CPU affinity if NUMA is enabled
+                #[cfg(feature = "numa")]
+                let _ = set_thread_affinity(_cpu_id);
+                
+                worker_clone.run();
+            });
+        }
+        
+        Self {
+            workers: workers_arc,
+            injector,
+            shutdown,
+            // No longer store a shared participant — each worker has its own
+            participant: Arc::new(Participant::new()), // placeholder for API compat
+        }
+    }
+
+    /// Submit a task to the global injector
+    pub fn submit(&self, task: *mut ()) {
+        self.injector.push(task);
+    }
+
+    /// Get the number of workers
+    pub fn num_workers(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Get statistics for all workers
+    pub fn stats(&self) -> Vec<WorkerStats> {
+        self.workers.iter().map(|w| w.stats()).collect()
+    }
+
+    /// Shutdown the thread pool
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.injector.notify_shutdown();
+    }
+
+    /// Get a reference to the epoch participant
+    pub fn participant(&self) -> &Arc<Participant> {
+        &self.participant
+    }
+}
+
+impl Default for ThreadPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_thread_pool_creation() {
+        let pool = ThreadPool::new();
+        assert!(pool.num_workers() > 0);
+    }
+
+    #[test]
+    fn test_num_workers() {
+        let n = num_workers();
+        assert!(n > 0);
+    }
+
+    #[test]
+    fn test_worker_stats() {
+        let pool = ThreadPool::new();
+        let stats = pool.stats();
+        assert_eq!(stats.len(), pool.num_workers());
+    }
+}
