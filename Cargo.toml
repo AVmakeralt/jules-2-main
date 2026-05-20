@@ -91,6 +91,10 @@ name = "bench-polyhedral"
 path = "benches/bench_polyhedral.rs"
 
 [[bin]]
+name = "bench-1t-polyhedral"
+path = "benches/bench_1t_polyhedral.rs"
+
+[[bin]]
 name = "vm-debug"
 path = "src/tools/vm_debug.rs"
 

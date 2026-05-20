@@ -152,17 +152,66 @@ pub fn analyze_dependency_multivariate(
 
     let combined_mask = diff_expr.active_mask;
     if combined_mask == 0 {
-        return if target == 0 {
-            let limit = bounds.len().min(MAX_POLY_DEPTH);
-            Some(Dependency {
+        // All coefficients cancelled — the two expressions differ only by a
+        // constant offset.  This is still a valid dependence when the offset
+        // is within the loop bounds (e.g., src=i, dst=i+1 → offset=1 →
+        // flow dependence with distance 1).
+        //
+        // Previously this returned None for any non-zero target, which
+        // incorrectly eliminated i → i+1 (constant-distance flow dep) and
+        // i+1 → i (anti-dep), both of which are critical for correctness.
+        let limit = bounds.len().min(MAX_POLY_DEPTH);
+
+        // Apply GCD divisibility test using the original (pre-cancellation)
+        // coefficients.  If the original coefficients had a common factor g > 1
+        // that doesn't divide the target, there is no integer solution.
+        let mut g = 0i64;
+        let src_mask = src_expr.active_mask | dst_expr.active_mask;
+        let mut m = src_mask;
+        while m != 0 {
+            let d = m.trailing_zeros() as usize;
+            let sc = src_expr.coefficients[d];
+            let dc = dst_expr.coefficients[d];
+            let c_gcd = safe_gcd(sc, dc);
+            g = safe_gcd(g, c_gcd);
+            m &= m - 1;
+        }
+        if g > 1 && target % g != 0 {
+            return None;
+        }
+
+        if target == 0 {
+            return Some(Dependency {
                 src_stmt: 0, dst_stmt: 0,
                 direction_vector: [Direction::EQ; MAX_POLY_DEPTH],
                 distance_matrix: [0; MAX_POLY_DEPTH],
                 len: limit,
-            })
-        } else {
-            None
-        };
+            });
+        }
+        // Constant-offset dependence: the direction depends on the sign
+        // of the offset in every active loop dimension.
+        let mut dir_vec = [Direction::ANY; MAX_POLY_DEPTH];
+        let mut dist_vec = [0i64; MAX_POLY_DEPTH];
+        let mut m2 = src_mask;
+        while m2 != 0 {
+            let d = m2.trailing_zeros() as usize;
+            if d < limit {
+                if target > 0 {
+                    dir_vec[d] = Direction::LT;
+                    dist_vec[d] = target;
+                } else {
+                    dir_vec[d] = Direction::GT;
+                    dist_vec[d] = target;
+                }
+            }
+            m2 &= m2 - 1;
+        }
+        return Some(Dependency {
+            src_stmt: 0, dst_stmt: 0,
+            direction_vector: dir_vec,
+            distance_matrix: dist_vec,
+            len: limit,
+        });
     }
 
     let mut coeffs = [0i64; MAX_POLY_DEPTH];
@@ -181,16 +230,70 @@ pub fn analyze_dependency_multivariate(
     }
 
     if active_count == 0 {
-        return if target == 0 {
-            Some(Dependency {
+        // All coefficients cancelled after filtering zeros — the two
+        // expressions differ only by a constant offset.  This is the same
+        // constant-offset dependency case as the combined_mask==0 branch
+        // above (the mask may be non-zero but the actual coefficient
+        // values are all zero due to cancellation in add/sub).
+        //
+        // However, we must still apply the GCD divisibility test: if the
+        // original coefficients had a common factor GCD g > 1, and g does
+        // not divide the target (constant offset), then no integer solution
+        // exists and there is no dependency.  For example, src=2i, dst=2i+1
+        // → coefficients cancel (0), target=1, GCD=2, 1%2≠0 → independent.
+        let limit = bounds.len().min(MAX_POLY_DEPTH);
+
+        // Compute GCD of the original (pre-cancellation) coefficients.
+        let mut g = 0i64;
+        let src_mask = src_expr.active_mask | dst_expr.active_mask;
+        let mut m = src_mask;
+        while m != 0 {
+            let d = m.trailing_zeros() as usize;
+            // Take the larger |coefficient| from src or dst for this dimension
+            let sc = src_expr.coefficients[d];
+            let dc = dst_expr.coefficients[d];
+            let c_gcd = safe_gcd(sc, dc);
+            g = safe_gcd(g, c_gcd);
+            m &= m - 1;
+        }
+
+        if g > 1 && target % g != 0 {
+            // GCD test eliminates this: no integer solution exists.
+            return None;
+        }
+
+        if target == 0 {
+            return Some(Dependency {
                 src_stmt: 0, dst_stmt: 0,
                 direction_vector: [Direction::EQ; MAX_POLY_DEPTH],
                 distance_matrix: [0; MAX_POLY_DEPTH],
-                len: bounds.len().min(MAX_POLY_DEPTH),
-            })
-        } else {
-            None
-        };
+                len: limit,
+            });
+        }
+        // Constant-offset dependence: compute direction from original
+        // source/destination expression masks.
+        let mut dir_vec = [Direction::ANY; MAX_POLY_DEPTH];
+        let mut dist_vec = [0i64; MAX_POLY_DEPTH];
+        let mut m2 = src_mask;
+        while m2 != 0 {
+            let d = m2.trailing_zeros() as usize;
+            if d < limit {
+                if target > 0 {
+                    dir_vec[d] = Direction::LT;
+                    dist_vec[d] = target;
+                } else {
+                    dir_vec[d] = Direction::GT;
+                    dist_vec[d] = target;
+                }
+            }
+            m2 &= m2 - 1;
+        }
+        return Some(Dependency {
+            src_stmt: 0, dst_stmt: 0,
+            direction_vector: dir_vec,
+            distance_matrix: dist_vec,
+            len: limit,
+        });
     }
 
     let mut g = coeffs[0];
@@ -522,12 +625,17 @@ fn analyze_loop(
     #[derive(Debug)]
     struct IvCandidate { slot: u16, step: i64 }
 
-    // Find all slots compared with Lt in the loop body
+    // Find all slots compared with Lt in the loop body (including a few
+    // instructions before the header, since the back-edge may target the
+    // JumpFalse rather than the comparison BinOp).
     let mut loop_compare_slots: Vec<u16> = Vec::new();
-    for pc in header..=back_edge {
-        if let Instr::BinOp(_, BinOpKind::Lt, l, _) = instrs[pc] {
-            if !loop_compare_slots.contains(&l) {
-                loop_compare_slots.push(l);
+    let compare_start = header.saturating_sub(3);
+    for pc in compare_start..=back_edge {
+        if pc < instrs.len() {
+            if let Instr::BinOp(_, BinOpKind::Lt, l, _) = instrs[pc] {
+                if !loop_compare_slots.contains(&l) {
+                    loop_compare_slots.push(l);
+                }
             }
         }
     }
@@ -593,50 +701,62 @@ fn analyze_loop(
 
     if let Some(ref iv_ref) = iv {
         // Search for the loop condition that tests the induction variable.
-        // Three patterns to handle:
+        // Four patterns to handle:
         //   1. JumpTrue at back_edge (do-while style)
         //   2. JumpFalse near header (while-style, early exit)
         //   3. JumpFalse anywhere in loop body (general case)
+        //   4. Comparison BEFORE the header (back-edge targets JumpFalse
+        //      rather than the comparison BinOp — the BinOp(Lt) is one
+        //      instruction before the JumpFalse, which is before "header")
         let mut found_ub = false;
+        let search_start = header.saturating_sub(3);
 
         // Pattern 1: JumpTrue at back_edge
         if let Instr::JumpTrue(cond, _) = instrs[back_edge] {
-            for pc in (header..back_edge).rev() {
-                if let Instr::BinOp(d, BinOpKind::Lt, l, r) = instrs[pc] {
-                    if d == cond && l == iv_ref.slot {
-                        if let Some(expr) = cache.get(r) { ub = expr; }
-                        found_ub = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Pattern 2 & 3: JumpFalse anywhere in the loop body
-        if !found_ub {
-            for pc in header..=back_edge {
-                if let Instr::JumpFalse(cond, _) = instrs[pc] {
-                    for cond_pc in (header..=pc).rev() {
-                        if let Instr::BinOp(d, BinOpKind::Lt, l, r) = instrs[cond_pc] {
-                            if d == cond && l == iv_ref.slot {
-                                if let Some(expr) = cache.get(r) { ub = expr; }
-                                found_ub = true;
-                                break;
-                            }
+            for pc in (search_start..back_edge).rev() {
+                if pc < instrs.len() {
+                    if let Instr::BinOp(d, BinOpKind::Lt, l, r) = instrs[pc] {
+                        if d == cond && l == iv_ref.slot {
+                            if let Some(expr) = cache.get(r) { ub = expr; }
+                            found_ub = true;
+                            break;
                         }
                     }
-                    if found_ub { break; }
                 }
             }
         }
 
-        // Fallback: search for any BinOp(Lt, iv, bound) in the loop body
+        // Pattern 2 & 3: JumpFalse anywhere in the loop body (or just before)
         if !found_ub {
-            for pc in header..=back_edge {
-                if let Instr::BinOp(_, BinOpKind::Lt, l, r) = instrs[pc] {
-                    if l == iv_ref.slot {
-                        if let Some(expr) = cache.get(r) { ub = expr; }
-                        break;
+            for pc in search_start..=back_edge {
+                if pc < instrs.len() {
+                    if let Instr::JumpFalse(cond, _) = instrs[pc] {
+                        for cond_pc in (search_start..=pc).rev() {
+                            if cond_pc < instrs.len() {
+                                if let Instr::BinOp(d, BinOpKind::Lt, l, r) = instrs[cond_pc] {
+                                    if d == cond && l == iv_ref.slot {
+                                        if let Some(expr) = cache.get(r) { ub = expr; }
+                                        found_ub = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if found_ub { break; }
+                    }
+                }
+            }
+        }
+
+        // Fallback: search for any BinOp(Lt, iv, bound) near the loop
+        if !found_ub {
+            for pc in search_start..=back_edge {
+                if pc < instrs.len() {
+                    if let Instr::BinOp(_, BinOpKind::Lt, l, r) = instrs[pc] {
+                        if l == iv_ref.slot {
+                            if let Some(expr) = cache.get(r) { ub = expr; }
+                            break;
+                        }
                     }
                 }
             }
