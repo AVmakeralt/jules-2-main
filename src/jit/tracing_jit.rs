@@ -698,14 +698,29 @@ impl NativeCodeGenerator {
         //     dependency analysis, and SIMD hints when the trace contains
         //     affine loop nests.  This is a post-constant-fold pass so it
         //     benefits from the simpler instruction stream.
-        let _poly_block = {
+        //
+        //     WIRED IN: The polyhedral block's optimized instruction stream
+        //     replaces the original optimized trace when it produces a
+        //     non-empty result.  SIMD hints are stored for future emitter
+        //     integration.
+        let poly_block = {
             let raw_instrs: Vec<Instr> = optimized.iter().map(|ti| ti.instruction.clone()).collect();
             crate::polyhedral::optimize_trace_polyhedral(&raw_instrs)
         };
-        // Note: The polyhedral block is computed but not yet applied to
-        // replace the instruction stream — that requires deeper integration
-        // with the register allocator and SIMD emission.  For now we track
-        // the overhead of the analysis pass and validate correctness.
+
+        // If polyhedral optimization produced a different instruction stream
+        // (e.g., with tiled loops, strength-reduced IVs, interleaved unrolling),
+        // convert those back to TraceInstrs and replace the optimized stream.
+        let optimized: Vec<TraceInstruction> = if !poly_block.instrs.is_empty() {
+            poly_block.instrs.iter().map(|instr| TraceInstruction { original_pc: 0, instruction: instr.clone(), guard: None }).collect()
+        } else {
+            optimized
+        };
+
+        // Store SIMD hints for emitter integration — these inform the
+        // vectorizer about which BinOps are vectorizable and which slots
+        // should be register-locked for the loop duration.
+        let _simd_hints = poly_block.hints;
 
         // ── Opt7: Pin loop variables to callee-saved registers ──────────
         // After optimization, identify induction variables and accumulators
@@ -2097,14 +2112,27 @@ impl TracingJIT {
     /// polyhedral loop tiling, and aggressive inlining. This is the slow
     /// compile path that produces the fastest executable code.
     fn compile_tier2(&mut self, trace: &Trace) -> Result<CompiledTrace, String> {
-        // Apply polyhedral optimizations to the instruction stream
+        // Apply polyhedral optimizations to the instruction stream.
+        // WIRED IN: When polyhedral produces a non-empty instruction stream,
+        // create a modified trace with the optimized instructions and compile
+        // that instead of the original.
         let raw_instrs: Vec<Instr> = trace.instructions.iter().map(|ti| ti.instruction.clone()).collect();
-        let _poly_block = crate::polyhedral::optimize_trace_polyhedral(&raw_instrs);
+        let poly_block = crate::polyhedral::optimize_trace_polyhedral(&raw_instrs);
 
-        // Compile with the standard codegen — the polyhedral analysis
-        // results will be used in future integration. For now, Tier 2
-        // benefits from the extra analysis time to make better decisions.
-        self.codegen.compile_trace(trace, None)
+        if !poly_block.instrs.is_empty() {
+            // Build a modified trace with the polyhedrally-optimized instructions.
+            // This includes tiled loops, strength-reduced IVs, and interleaved
+            // unrolling from the polyhedral engine.
+            let mut optimized_trace = trace.clone();
+            optimized_trace.instructions = poly_block.instrs.iter()
+                .map(|instr| TraceInstruction { original_pc: 0, instruction: instr.clone(), guard: None })
+                .collect();
+            // SIMD hints are available in poly_block.hints for future emitter use.
+            let _simd_hints = poly_block.hints;
+            self.codegen.compile_trace(&optimized_trace, None)
+        } else {
+            self.codegen.compile_trace(trace, None)
+        }
     }
 
     pub fn execute_with_jit(&mut self, entry_pc: usize, slots: &mut [Value], types: &mut [u8], _instructions: &[Instr]) -> Result<Value, RuntimeError> {
